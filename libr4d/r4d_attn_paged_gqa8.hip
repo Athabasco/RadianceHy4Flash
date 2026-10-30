@@ -73,13 +73,19 @@ using std::max;
 #define G8_BLOCK_SIZE 16
 #endif
 /* q_len * gqa a single decode workgroup can hold: q_len <= 8 here. An including unit may raise it
- * to 128 (eight waves): gqa 16 then verifies 7 drafts in the decode kernel, as gqa 8 does. */
+ * to 128 (eight waves): gqa 16 then verifies 7 drafts in the decode kernel, as gqa 8 does. A unit
+ * may also lower it (see the gqa7 unit: 63 rows and 21 warps at gqa 7), so each bound below is a
+ * guard the including unit can win; the defaults are the numbers the row table states for gqa 8. */
 #ifndef G8_MAX_DECODE_ROWS
 #define G8_MAX_DECODE_ROWS 64
 #endif
 
+#ifndef G8_P_NWARPS
 #define G8_P_NWARPS 24
+#endif
+#ifndef G8_P_TILE
 #define G8_P_TILE   48
+#endif
 // K prefetch 2 at head_dim 256, as in the h256/gqa6 prefill (P_OPT there): 4 spills the m-tile
 // loop. The head_dim-128 set keeps prefetch 4, which fits.
 #define G8_P_OPT_256 3954187

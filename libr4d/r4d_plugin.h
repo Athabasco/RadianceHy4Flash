@@ -370,6 +370,13 @@ int     r4d_rad_attn_prefill_h128_gqa8_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h128_gqa8_fp8  (const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h128_gqa8_bf16 (const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h128_gqa8_scratch(const RadArgs*);
+/* SEVEN queries a KV head, head_dim 128 -- Nanbeige4.3-33B (56 over 8). Same body at 21 warps and
+ * a 63-row decode cap (r4d_attn_paged_h128_gqa7.hip). */
+int     r4d_rad_attn_prefill_h128_gqa7_fp8 (const RadArgs*, RadStream);
+int     r4d_rad_attn_prefill_h128_gqa7_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_h128_gqa7_fp8  (const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_h128_gqa7_bf16 (const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h128_gqa7_scratch(const RadArgs*);
 /* ONE query a KV head, head_dim 128 -- plain MHA, the Unlimited-OCR decoder (10 over 10). Both
  * legs from the generic body instantiated at ratio 1 (r4d_attn_paged_h128_gqa1.hip). */
 int     r4d_rad_attn_prefill_h128_gqa1_fp8 (const RadArgs*, RadStream);

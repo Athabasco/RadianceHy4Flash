@@ -4593,6 +4593,28 @@ static const RadConstraint cAttnDecodeH128G8Bf16[] = {
     C_GE("causal", 0), C_LE("q_len", 8), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
 };
 
+/* Seven queries per kv head at head_dim 128 (Nanbeige4.3-33B: 56 query heads over 8), from
+ * r4d_attn_paged_h128_gqa7.hip. Same body and the same 48 query positions a prefill block as the
+ * gqa-8 pair above, at 21 warps rather than 24 because 7 does not divide 384 rows. The decode leg
+ * holds 63 rows of q_len * gqa, so nine query positions where gqa 8 stops at eight; a wider verify
+ * takes the prefill kernel. */
+static const RadConstraint cAttnPrefillH128G7Fp8[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 7), C_EQ("block_size", 16),
+    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
+};
+static const RadConstraint cAttnPrefillH128G7Bf16[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 7), C_EQ("block_size", 16),
+    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
+};
+static const RadConstraint cAttnDecodeH128G7Fp8[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 7), C_EQ("block_size", 16),
+    C_GE("causal", 0), C_LE("q_len", 9), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
+};
+static const RadConstraint cAttnDecodeH128G7Bf16[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 7), C_EQ("block_size", 16),
+    C_GE("causal", 0), C_LE("q_len", 9), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
+};
+
 /* head_dim 128 at ratio ONE: plain MHA (the Unlimited-OCR decoder, 10 query heads over 10), from
  * r4d_attn_paged_h128_gqa1.hip. The decode leg caps at 64 query rows, which at this ratio is a
  * plain q_len <= 64; the prefill leg has no query-row cap. */
@@ -7945,6 +7967,47 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
   ROW(cAttnDecodeH128G8Bf16), ROW(tAttnSplit), nullptr,
   nullptr, nullptr, r4d_rad_attn_decode_h128_gqa8_bf16, r4d_rad_attn_decode_h128_gqa8_scratch,
+  nullptr, nullptr,
+  r4d_shape_attn_paged },
+
+/* Seven queries per kv head at head_dim 128, from r4d_attn_paged_h128_gqa7.hip: Nanbeige4.3-33B,
+ * 56 query heads over 8, the same ratio at one or two ranks. 48 query positions a prefill block
+ * (21 warps), and a decode workgroup of 63 rows -- nine query positions. */
+{ "attn_prefill_h128_gqa7_fp8kv", "attn_paged", "attn",
+  "paged causal attention, query-tiled (prefill / chunked prefill)",
+  "head_dim 128, 7 queries per kv head, paged block 16, varlen",
+  "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
+  ROW(cAttnPrefillH128G7Fp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_prefill_h128_gqa7_fp8, nullptr, nullptr, nullptr,
+  r4d_shape_attn_paged },
+
+{ "attn_prefill_h128_gqa7_bf16kv", "attn_paged", "attn",
+  "paged causal attention, query-tiled (prefill / chunked prefill)",
+  "head_dim 128, 7 queries per kv head, paged block 16, varlen",
+  "bf16 query, bf16 kv cache, bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
+  ROW(cAttnPrefillH128G7Bf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_prefill_h128_gqa7_bf16, nullptr, nullptr, nullptr,
+  r4d_shape_attn_paged },
+
+{ "attn_decode_h128_gqa7_fp8kv", "attn_paged", "attn",
+  "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",
+  "head_dim 128, 7 queries per kv head, paged block 16, q_len*gqa <= 63, no window",
+  "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH128G7Fp8), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h128_gqa7_fp8, r4d_rad_attn_decode_h128_gqa7_scratch,
+  nullptr, nullptr,
+  r4d_shape_attn_paged },
+
+{ "attn_decode_h128_gqa7_bf16kv", "attn_paged", "attn",
+  "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",
+  "head_dim 128, 7 queries per kv head, paged block 16, q_len*gqa <= 63, no window",
+  "bf16 query, bf16 kv cache, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH128G7Bf16), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h128_gqa7_bf16, r4d_rad_attn_decode_h128_gqa7_scratch,
   nullptr, nullptr,
   r4d_shape_attn_paged },
 
