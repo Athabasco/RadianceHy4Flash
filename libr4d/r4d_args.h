@@ -316,6 +316,10 @@ struct R4dTileCfg { int variant; int bm; int bn; };
  * default, decides at issue; a fixed value is for a tuner. */
 struct R4dMxTileCfg { int tn; };
 
+/* The int4/int5 x int8 tiled GEMM's tile arm (r4d_gemm_wpa8i8_tiled.hip, WPT_ARMS). Arm 0 is the
+ * prefill tile as it always ran; the others serve the decode band above the skinny kernel's 64 rows. */
+struct R4dWpaCfg { int arm; };
+
 /* The MXFP4 decode GEMM's split-K width, K slab and weight-load hint. 0 on each is the rule in
  * r4d_gemm_mxfp4a8_decode.hip (it needs M and the shape, which exist only at issue); `nt` 1 streams
  * the weight past L2/MALL, 2 loads it plainly. */
@@ -357,6 +361,7 @@ void r4d_cfg_gemm   (const RadArgs*, struct R4dGemmCfg*);
 void r4d_cfg_tiled  (const RadArgs*, struct R4dTileCfg*);
 void r4d_cfg_prefill(const RadArgs*, struct R4dTileCfg*);
 void r4d_cfg_mxfp4_tiled(const RadArgs*, struct R4dMxTileCfg*);
+void r4d_cfg_wpa8i8 (const RadArgs*, struct R4dWpaCfg*);
 void r4d_cfg_mxfp4_decode(const RadArgs*, struct R4dMxDecCfg*);
 void r4d_cfg_split  (const RadArgs*, struct R4dSplitCfg*);
 void r4d_cfg_ar     (const RadArgs*, struct R4dArCfg*);

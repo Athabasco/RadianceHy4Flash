@@ -6077,14 +6077,14 @@ static void w5a16_perf(const Plugin& pl, int bits, int64_t M, int64_t N, int64_t
  * scale and a u8 zero per 128 of K, an int8 activation with an f32 scale per (row, 128), parts
  * side by side. */
 static void wpa8i8_numeric(const Plugin& pl, int bits, int64_t M, int64_t N, int64_t K, int64_t pb1 = 0,
-                            int64_t pb2 = 0, uint32_t zdt = RAD_U8) {
+                            int64_t pb2 = 0, uint32_t zdt = RAD_U8, int64_t arm = 0) {
     const char* row = bits == 4 ? "gemm_w4a8i8_tiled" : "gemm_w5a8i8_tiled";
     if (!sel(row)) return;
     const PartCut cut(N, pb1, pb2);
     const int parts = cut.parts;
     char nm[160];
-    std::snprintf(nm, sizeof nm, "%s numeric M=%lld N=%lld K=%lld parts=%d zero %s", row,
-                  (long long)M, (long long)N, (long long)K, parts, rad_dtype_name(zdt));
+    std::snprintf(nm, sizeof nm, "%s numeric M=%lld N=%lld K=%lld parts=%d zero %s arm %lld", row,
+                  (long long)M, (long long)N, (long long)K, parts, rad_dtype_name(zdt), (long long)arm);
     const RadKernelInfo* r = find(pl, row);
     if (!r || !r->layout || !r->relayout) { ok(nm, false, "row or hooks absent"); return; }
     const int64_t G = K / 128;
@@ -6132,6 +6132,7 @@ static void wpa8i8_numeric(const Plugin& pl, int bits, int64_t M, int64_t N, int
                                  PS("dtype", bits == 4 ? "w4a8i8_asym" : "w5a8i8") };
     if (pb1) ps.push_back(PI("pb1", pb1));
     if (pb2) ps.push_back(PI("pb2", pb2));
+    if (arm) ps.push_back(PI("arm", arm));
     RadArgs a;
     std::memset(&a, 0, sizeof(a));
     a.t = ts.data(); a.n_t = (int)ts.size();
@@ -6230,6 +6231,9 @@ static void wpa_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iter
         std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PI("group", 128),
                                      PS("dtype", bits == 4 ? "w4a8i8_asym" : "w5a8i8") };
         if (pb1) ps.push_back(PI("pb1", pb1));
+        /* R4D_PERF_ARM pins the row's tile arm, for a sweep by hand. */
+        int64_t perf_arm = 0;
+        if (const char* e = std::getenv("R4D_PERF_ARM")) { perf_arm = std::atoll(e); ps.push_back(PI("arm", perf_arm)); }
         RadArgs a;
         std::memset(&a, 0, sizeof(a));
         a.t = ts.data(); a.n_t = (int)ts.size();
@@ -6239,7 +6243,8 @@ static void wpa_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iter
             const int64_t sb = r->scratch(&a);
             if (sb > 0) { a.scratch = dalloc((size_t)sb); a.scratch_bytes = sb; }
         }
-        for (int i = 0; i < 3; ++i) r->launch(&a, nullptr);
+        if (r->launch(&a, nullptr) != RAD_OK) { std::printf("--perfwpa: arm %lld refused\n", (long long)perf_arm); return; }
+        for (int i = 0; i < 2; ++i) r->launch(&a, nullptr);
         st_stream_sync(nullptr);
         st_memcpy(hy.data(), d_y, hy.size() * 2, hipMemcpyDeviceToHost);
         uint64_t hash = 1469598103934665603ull;
@@ -33799,6 +33804,13 @@ static void device_phase(const Plugin& pl) {
         wpa8i8_numeric(pl, bits, 2100, 34816, 5120, 17408);
         wpa8i8_numeric(pl, bits, 2048, 17408, 5120);
         wpa8i8_numeric(pl, bits, 2048, 5120, 17408);
+        /* The decode arms: a whole block, ragged M (a partial 16-row tile and a partial block)
+         * and a partitioned weight, on every arm. */
+        for (int arm = 1; arm <= 8; ++arm) {
+            wpa8i8_numeric(pl, bits, 128, 1280, 1024, 0, 0, RAD_U8, arm);
+            wpa8i8_numeric(pl, bits, 40, 1280, 1024, 0, 0, RAD_U8, arm);
+            wpa8i8_numeric(pl, bits, 100, 2560, 1280, 1536, 0, RAD_U8, arm);
+        }
         if (bits == 4) {
             /* An int4 W4A16 release imported with a u4 zero plane and no rotation: five groups
              * a row, so each zero row ends in a pad nibble; then the delta net's qkv|z, the MLP's

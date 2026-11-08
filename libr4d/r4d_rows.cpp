@@ -5766,6 +5766,15 @@ static const RadTunable tGemmPrefill[] = {
     "compiled tile arm; 0 is BM 128 x BN 256, libr4d's own default" },
 };
 
+/* The int4 / int5 x int8 tiled GEMM's one axis (r4d_gemm_wpa8i8_tiled.hip): its tile arm. Arm 0 is
+ * the 256x64 prefill tile as it always ran. */
+static const int64_t kWpaArm[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8 };
+static const RadTunable tGemmWpa8i8[] = {
+  { "arm", kWpaArm, NELEM(kWpaArm), 0,
+    "tile arm (r4d_gemm_wpa8i8_tiled.hip WPT_ARMS): 0 = 256x64 prefill, 1 = 128x128, 2 = 128x64, "
+    "3 = 128x32, 4 = 64x128, 5 = 64x64, 6 = 64x32, 7 = 32x128, 8 = 32x32" },
+};
+
 /* The MXFP4 tiled GEMM's one axis: compiled arms of one template. 0 is the M crossover (TN=4 from
  * M >= 2048), which needs M. */
 static const int64_t kMxTn[] = { 0, 2, 4 };
@@ -8661,7 +8670,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "I8 A (parts side by side) with an f32 scale per (row, part, 128), 4-bit W with an f16 scale and "
   "integer zero per 128 K, bf16 C, int32 accumulate per 128 of K",
   RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_SKINNY,
-  ROW(cGemmNtW4A8I8), NOTUNE,
+  ROW(cGemmNtW4A8I8), ROW(tGemmWpa8i8), nullptr,
   nullptr, nullptr, r4d_rad_gemm_w4a8i8_tiled, r4d_rad_gemm_mxfp4a8_tiled_scratch,
   r4d_rad_layout_w4, r4d_rad_relayout_w4, nullptr, r4d_rad_unrelayout_w4 },
 
@@ -8673,7 +8682,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "I8 A (parts side by side) with an f32 scale per (row, part, 128), 5-bit W with an f16 scale and "
   "integer zero per 128 K, bf16 C, int32 accumulate per 128 of K",
   RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_SKINNY,
-  ROW(cGemmNtW5A8I8), NOTUNE,
+  ROW(cGemmNtW5A8I8), ROW(tGemmWpa8i8), nullptr,
   nullptr, nullptr, r4d_rad_gemm_w5a8i8_tiled, r4d_rad_gemm_mxfp4a8_tiled_scratch,
   r4d_rad_layout_w5, r4d_rad_relayout_w5, nullptr, r4d_rad_unrelayout_w5 },
 
@@ -11332,6 +11341,10 @@ static int64_t tune_i(const RadArgs* a, const RadTunable* tab, int n, const char
     return 0;
 }
 #define TUNE(a, tab, key) ((int)tune_i((a), (tab), NELEM(tab), (key)))
+
+extern "C" void r4d_cfg_wpa8i8(const RadArgs* a, R4dWpaCfg* out) {
+    out->arm = TUNE(a, tGemmWpa8i8, "arm");
+}
 
 extern "C" void r4d_cfg_gemm(const RadArgs* a, R4dGemmCfg* out) {
     out->wv  = TUNE(a, tGemmSkinny, "wv");
