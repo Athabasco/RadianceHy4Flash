@@ -4459,10 +4459,36 @@ std::vector<std::string> lfm3_layer_ops(bool attention) {
     return v;
 }
 
+/* The mixed step of the four-layer model: two decode rows (a verify of 3 and a plain decode) and
+ * one prefill chunk of 5. `kv` is the caller's, three groups. */
+RadBatch lfm3_mixed_batch(RadKVGroupBatch* kv) {
+    static const int32_t tok[9]  = { 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    static const int32_t pos[9]  = { 40, 41, 42, 30, 0, 1, 2, 3, 4 };
+    static const int32_t cu[4]   = { 0, 3, 4, 9 };
+    static const int32_t ctxl[3] = { 40, 30, 0 };
+    static const int32_t nacc[3] = { 2, 1, 1 };
+    static const int32_t out[3]  = { 2, 3, 8 };
+    static int32_t cv_idx[3] = { 4, 5, 6 };
+    const lfm3_bf16::Model& m = lfm3_bf16::g_model[0];
+    kv[0] = RadKVGroupBatch{}; kv[1] = RadKVGroupBatch{}; kv[2] = RadKVGroupBatch{};
+    kv[0].group = m.full.kv;
+    kv[1].group = m.sliding.kv;
+    kv[2].group = m.kv_conv; kv[2].state_index = cv_idx;
+    RadBatch mixed{};
+    mixed.phase = RAD_PHASE_MIXED;
+    mixed.n_tok = 9; mixed.n_seq = 3; mixed.max_q_len = 5;
+    mixed.n_seq_decode = 2; mixed.n_tok_decode = 4;
+    mixed.token_ids = tok; mixed.positions = pos; mixed.cu_seqlens = cu; mixed.ctx_lens = ctxl;
+    mixed.num_accepted = nacc; mixed.n_out = 3; mixed.out_ids = out;
+    mixed.n_kv_groups = 3; mixed.kv = kv;
+    return mixed;
+}
+
 }  /* namespace */
 
 TEST(lfm3_declares_three_layer_kinds_with_their_own_rotary_and_window) {
     RadBuilder b;
+    b.undeclared.insert("norm_add_norm");   /* a host engine's graph; the joins have their own test */
     RadModelMeta meta = lfm3_meta();
     RadBuildCtx ctx = build_ctx();
     CHECK_OK(lfm3_bf16::declare(&b, &meta, &ctx));
@@ -4611,27 +4637,8 @@ TEST(lfm3_issues_a_mixed_step_through_both_attention_groups) {
     RadBuildCtx ctx = build_ctx();
     CHECK_OK(lfm3_bf16::declare(&b, &meta, &ctx));
 
-    /* Two decode rows (a verify of 3 and a plain decode) and one prefill chunk of 5. */
-    static const int32_t tok[9]  = { 1, 2, 3, 4, 5, 6, 7, 8, 9 };
-    static const int32_t pos[9]  = { 40, 41, 42, 30, 0, 1, 2, 3, 4 };
-    static const int32_t cu[4]   = { 0, 3, 4, 9 };
-    static const int32_t ctxl[3] = { 40, 30, 0 };
-    static const int32_t nacc[3] = { 2, 1, 1 };
-    static const int32_t out[3]  = { 2, 3, 8 };
-    static int32_t cv_idx[3] = { 4, 5, 6 };
-    const lfm3_bf16::Model& m = lfm3_bf16::g_model[0];
-    RadKVGroupBatch kv[3]{};
-    kv[0].group = m.full.kv;
-    kv[1].group = m.sliding.kv;
-    kv[2].group = m.kv_conv; kv[2].state_index = cv_idx;
-    RadBatch mixed{};
-    mixed.phase = RAD_PHASE_MIXED;
-    mixed.n_tok = 9; mixed.n_seq = 3; mixed.max_q_len = 5;
-    mixed.n_seq_decode = 2; mixed.n_tok_decode = 4;
-    mixed.token_ids = tok; mixed.positions = pos; mixed.cu_seqlens = cu; mixed.ctx_lens = ctxl;
-    mixed.num_accepted = nacc; mixed.n_out = 3; mixed.out_ids = out;
-    mixed.n_kv_groups = 3; mixed.kv = kv;
-
+    RadKVGroupBatch kv[3];
+    RadBatch mixed = lfm3_mixed_batch(kv);
     RadCtx c{ .b = &b, .batch = &mixed };
     lfm3_bf16::step(&c, &mixed);
     CHECK_LINT(b, &c);
@@ -4658,6 +4665,111 @@ TEST(lfm3_issues_a_mixed_step_through_both_attention_groups) {
     RadCtx c2{ .b = &b, .batch = &draft };
     lfm3_bf16::step(&c2, &draft);
     CHECK(!c2.step_fail.empty());
+}
+
+/* The sandwich joins. Where a library serves `norm_add_norm`, a layer's post norm, add and
+ * feed-forward norm are one launch, and so are its feed-forward's post norm, add and the next
+ * layer's norm, which that layer then neither declares nor issues; the last layer's feed-forward
+ * keeps the chain, since the final norm is on the gathered rows. Where no loaded library declares
+ * the op (a host engine) it is not asked for, and where it is declared and does not resolve the
+ * chain is declared beside it: both issue the chain. */
+TEST(lfm3_fuses_its_sandwich_joins_where_a_library_serves_them) {
+    /* 0: served; 1: declared, not resolved; 2: not declared */
+    auto run = [](int form, std::vector<std::string>* declared, std::string* note) {
+        RadBuilder b;
+        if (form == 1) b.refuse.insert("norm_add_norm");
+        if (form == 2) b.undeclared.insert("norm_add_norm");
+        RadModelMeta meta = lfm3_meta();
+        RadBuildCtx ctx = build_ctx();
+        CHECK_OK(lfm3_bf16::declare(&b, &meta, &ctx));
+        CHECK(b.asked_undeclared.empty());
+        RadKVGroupBatch kv[3];
+        RadBatch mixed = lfm3_mixed_batch(kv);
+        RadCtx c{ .b = &b, .batch = &mixed };
+        lfm3_bf16::step(&c, &mixed);
+        CHECK_LINT(b, &c);
+        CHECK(c.step_fail.empty());
+        *declared = op_names(b);
+        for (const auto& n : b.notes)
+            if (n.find("sandwich joins") != std::string::npos) *note = n;
+        return issued_ops(b, c);
+    };
+    /* What a step issues: the convolution once per half of the mixed step. */
+    auto want = [](bool fused) {
+        std::vector<std::string> v = { "embed_lookup" };
+        int l = 0;
+        for (bool att : { false, true, true, false }) {
+            if (!fused || l == 0) v.push_back("rmsnorm");
+            if (att)
+                for (const char* s : { "gemm_nt", "gemm_nt", "gemm_nt", "gemm_nt", "rmsnorm_rows",
+                                       "rmsnorm_rows", "rope_rows", "rope_rows", "kv_store",
+                                       "attn_paged", "sigmoid", "mul", "gemm_nt" })
+                    v.push_back(s);
+            else
+                for (const char* s : { "gemm_nt", "mul", "causal_conv1d", "causal_conv1d", "mul",
+                                       "gemm_nt" })
+                    v.push_back(s);
+            if (fused) v.push_back("norm_add_norm");
+            else for (const char* s : { "rmsnorm", "add", "rmsnorm" }) v.push_back(s);
+            for (const char* s : { "gemm_nt", "silu_mul", "gemm_nt" }) v.push_back(s);
+            if (fused && l < 3) v.push_back("norm_add_norm");
+            else for (const char* s : { "rmsnorm", "add" }) v.push_back(s);
+            ++l;
+        }
+        for (const char* s : { "gather_rows", "rmsnorm", "logits_gemm" }) v.push_back(s);
+        return v;
+    };
+
+    std::vector<std::string> decl;
+    std::string note;
+    const std::vector<std::string> fused = run(0, &decl, &note);
+    CHECK_EQ(join(fused), join(want(true)));
+    CHECK_EQ(count_issued(fused, "norm_add_norm"), 2 * 4 - 1);
+    CHECK_EQ(count_issued(fused, "add"), 1);
+    CHECK_EQ(count_issued(fused, "rmsnorm"), 1 + 1 + 1);   /* layer 0's, the last post norm, final */
+    /* nothing of the chain is declared where a join stands in for it */
+    CHECK_EQ(count_issued(decl, "rmsnorm"), 3);
+    CHECK_EQ(count_issued(decl, "add"), 1);
+    CHECK(note.find("7 of 7 fused") != std::string::npos);
+
+    const std::vector<std::string> refused = run(1, &decl, &note);
+    CHECK_EQ(join(refused), join(want(false)));
+    CHECK_EQ(count_issued(decl, "norm_add_norm"), 7);          /* asked for, each time */
+    CHECK(note.find("0 of 7 fused") != std::string::npos);
+
+    const std::vector<std::string> host = run(2, &decl, &note);
+    CHECK_EQ(join(host), join(want(false)));
+    CHECK_EQ(count_issued(decl, "norm_add_norm"), 0);
+    CHECK(note.find("0 of 7 fused") != std::string::npos);
+
+    /* The join's operands: the arm's output and the stream in, the stream and the next norm out,
+     * with the post norm's gain and the gain of the norm it writes -- the next layer's between
+     * two layers. */
+    {
+        RadBuilder b;
+        RadModelMeta meta = lfm3_meta();
+        RadBuildCtx ctx = build_ctx();
+        CHECK_OK(lfm3_bf16::declare(&b, &meta, &ctx));
+        const lfm3_bf16::Model& m = lfm3_bf16::g_model[0];
+        const RecOp* a = find_op(b, "norm_add_norm", 0);
+        const RecOp* f = find_op(b, "norm_add_norm", 1);
+        REQUIRE(a != nullptr && f != nullptr);
+        for (const RecOp* r : { a, f }) {
+            CHECK_EQ(pint(r, "n"), 64);
+            CHECK_NEAR(pflt(r, "eps"), 1e-5, 1e-9);
+            CHECK_EQ(pstr(r, "dtype"), "bf16");
+            REQUIRE(r->reads.size() == 2 && r->writes.size() == 2 && r->w.size() == 2);
+            CHECK_EQ(r->reads[0], m.b_arm);
+            CHECK_EQ(r->reads[1], m.b_x);
+            CHECK_EQ(r->writes[0], m.b_x);
+            CHECK_EQ(r->writes[1], m.b_h);
+        }
+        CHECK_EQ(a->w[0], m.layers[0].w_post_norm);
+        CHECK_EQ(a->w[1], m.layers[0].w_ffn_norm);
+        CHECK_EQ(f->w[0], m.layers[0].w_ffn_post_norm);
+        CHECK_EQ(f->w[1], m.layers[1].w_norm);
+        CHECK(m.layers[1].op_norm == 0 && m.layers[3].op_ffn_join == 0);
+    }
 }
 
 /* ==================================================================== LFM2-VL's tower */

@@ -1915,6 +1915,17 @@ that, for the full layers (window 0) as for the sliding ones. libhalo carries th
 attention rows, and `rope_rows` and `rmsnorm_rows` under their row-form names (launched as
 `rope` and `rmsnorm`).
 
+The sandwich joins are `norm_add_norm` where a library serves it (libr4d and libhalo; Gemma's
+join): a layer's post norm, add and feed-forward norm are one launch, and so are its
+feed-forward's post norm, add and the next layer's input norm. At 24 layers that is 50 launches
+for the chain's 144. The last layer's feed-forward keeps the chain (the final norm is on the
+gathered rows), and so does every layer on libref and libavx, which do not carry the op. The
+fused kernel rounds where the chain rounds. On libr4d a step gives the chain's bytes. On libhalo
+it does at prefill row counts and not at decode ones: libhalo's `rmsnorm` folds a row's sum of
+squares over the workgroup width `halo_act_threads` picks for the row count, the join over 256
+lanes whatever the count, so below 73 rows (at a hidden width under 4096) the two sum in
+different orders.
+
 Checked against the reference's float32 forward on a tiny random LFM3 (conv, full, conv, sliding;
 window 8) at every position of the golden prompt (`tests/lfm3_golden.h`, made by
 `tests/mklfm3golden.py`), and in the family tests for chunking, batching, decode against prefill,

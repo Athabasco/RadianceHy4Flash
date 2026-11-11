@@ -16,7 +16,9 @@
  * each followed by a SwiGLU feed-forward (w1 the gate, w3 the up, w2 the down). The norms are a
  * sandwich: `operator_norm` before the mixer and `post_operator_norm` on its output, before the
  * residual add; `ffn_norm` and `post_ffn_norm` likewise. Every norm is a plain RMSNorm
- * (`x_hat * w`), and the final one is `embedding_norm`. At 1.7B: 24 layers (13 conv, 6 full, 5
+ * (`x_hat * w`), and the final one is `embedding_norm`. A post norm, its add and the norm that
+ * reads the sum are one `norm_add_norm` where a library serves it (Gemma's sandwich join; see
+ * declare). At 1.7B: 24 layers (13 conv, 6 full, 5
  * sliding with a window of 256), hidden 2048, 16 heads over 4 at head_dim 128, ffn 7680,
  * vocabulary 128000 with the lm_head tied to the embedding, conv width 7; theta 1e6 over half the
  * head on the full layers, 1e4 on the sliding ones.
@@ -80,6 +82,9 @@ struct Layer {
     /* the feed-forward: norm, gate|up (w1 | w3), SiLU(gate) * up, down (w2), norm, residual add */
     Linear gate_up, down;
     rad_op op_ffn_norm = 0, op_act = 0, op_ffn_post_norm = 0, op_ffn_add = 0;
+    /* The sandwich joins, fused: op_join is post_norm + add + ffn_norm, and op_ffn_join is
+     * ffn_post_norm + ffn_add + the next layer's norm, which that layer then does not declare. */
+    rad_op op_join = 0, op_ffn_join = 0;
 };
 
 struct Model {
@@ -89,7 +94,7 @@ struct Model {
     AttnClass full{}, sliding{};
     rad_kvgroup kv_conv = 0;
 
-    rad_buf b_x = 0, b_h = 0, b_bcx = 0, b_conv_in = 0, b_conv_out = 0;
+    rad_buf b_x = 0, b_h = 0, b_arm = 0, b_bcx = 0, b_conv_in = 0, b_conv_out = 0;
     rad_buf b_q = 0, b_k = 0, b_v = 0, b_attn = 0, b_gate = 0, b_gate_up = 0, b_ffn = 0;
     rad_buf b_hout = 0, b_logits = 0;
 
@@ -260,6 +265,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     m.b_x        = decl_b(b, nm.f("x"),        RAD_BF16, {g.max_tok, g.n_embd});
     m.b_h        = decl_b(b, nm.f("h"),        RAD_BF16, {g.max_tok, g.n_embd});
+    /* a mixer's or a feed-forward's output, before its post norm: a join reads it beside x and
+     * writes h, so it is not h */
+    m.b_arm      = decl_b(b, nm.f("arm"),      RAD_BF16, {g.max_tok, g.n_embd});
     m.b_bcx      = decl_b(b, nm.f("conv_bcx"), RAD_BF16, {g.max_tok, 3 * g.n_embd});
     m.b_conv_in  = decl_b(b, nm.f("conv_in"),  RAD_BF16, {g.max_tok, g.n_embd});
     m.b_conv_out = decl_b(b, nm.f("conv_out"), RAD_BF16, {g.max_tok, g.n_embd});
@@ -354,14 +362,42 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return rw(b, rad_decl_op(b, "rope_rows", ps, n, nullptr, 0), {buf}, {buf});
     };
 
+
+    /* ---- the sandwich joins. `norm_add_norm` is a post norm, the residual add and the norm that
+     * reads the sum in one launch: post_norm + add + ffn_norm inside a layer, and ffn_post_norm +
+     * add + the next layer's norm between two. It rounds where the chain rounds. The device
+     * libraries serve it and libref and libavx do not, and declaring an op no loaded library
+     * declares is an error, so it is asked for first; without it, or where it does not resolve,
+     * the rmsnorm / add / rmsnorm chain runs. The last layer's feed-forward keeps the chain: the
+     * final norm is on the gathered rows. */
+    const bool has_join = rad_op_declared(b, "norm_add_norm") != 0;
+    auto join = [&](rad_weight w_a, rad_weight w_y) {
+        return rw(b, RAD_OP(b, "norm_add_norm",
+                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                 RAD_F64("eps", g.eps), RAD_STR("dtype", g.dtype)),
+                      RAD_WEIGHTS(w_a, w_y)),
+                  {m.b_arm, m.b_x}, {m.b_x, m.b_h});
+    };
+    int n_joins = 0;
+
+    /* Every layer's input norm gain, ahead of the layers: a feed-forward join names the next
+     * layer's, and an op can only name weights already declared. */
+    for (int l = 0; l < (int)m.layers.size(); ++l)
+        RAD_ARCH_TRY(norm_w(&m.layers[(size_t)l].w_norm, "blk.%d.attn_norm.weight", l,
+                            nm.ckpt("%s.layers.%d.%s", pre, l, "operator_norm.weight"), g.n_embd));
+
     for (int l = 0; l < (int)m.layers.size(); ++l) {
         Layer& L = m.layers[(size_t)l];
         const char* lay = "%s.layers.%d.%s";
-        RAD_ARCH_TRY(norm_w(&L.w_norm, "blk.%d.attn_norm.weight", l,
-                            nm.ckpt(lay, pre, l, "operator_norm.weight"), g.n_embd));
         RAD_ARCH_TRY(norm_w(&L.w_post_norm, "blk.%d.attn_post_norm.weight", l,
                             nm.ckpt(lay, pre, l, "post_operator_norm.weight"), g.n_embd));
-        L.op_norm = rmsnorm(g.max_tok, g.n_embd, L.w_norm, m.b_x, m.b_h);
+        RAD_ARCH_TRY(norm_w(&L.w_ffn_norm, "blk.%d.ffn_norm.weight", l,
+                            nm.ckpt(lay, pre, l, "ffn_norm.weight"), g.n_embd));
+        RAD_ARCH_TRY(norm_w(&L.w_ffn_post_norm, "blk.%d.ffn_post_norm.weight", l,
+                            nm.ckpt(lay, pre, l, "post_ffn_norm.weight"), g.n_embd));
+        /* written by the layer before, where its feed-forward join is fused */
+        if (!(l > 0 && m.layers[(size_t)l - 1].op_ffn_join))
+            L.op_norm = rmsnorm(g.max_tok, g.n_embd, L.w_norm, m.b_x, m.b_h);
 
         if (L.kind != kConv) {
             const AttnClass& c = m.cls(L);
@@ -439,7 +475,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                               {m.b_gate}, {m.b_gate});
             L.op_gate_mul = mul({m.b_gate, m.b_attn}, m.b_attn, g.q_dim());
             RAD_ARCH_TRY(linear(L.out, l, "blk.%d.attn_output.weight", g.n_embd, g.q_dim(),
-                                m.b_attn, m.b_h, {}));
+                                m.b_attn, m.b_arm, {}));
         } else {
             RAD_ARCH_TRY(rad_bind_layer_kv(b, l, m.kv_conv));
             const char* c = "%s.layers.%d.conv.%s";
@@ -462,24 +498,24 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                            {m.b_conv_in}, {m.b_conv_out});
             L.op_gate_out = mul({m.b_bcx, m.b_conv_out}, m.b_conv_out, g.n_embd);
             RAD_ARCH_TRY(linear(L.conv_out, l, "blk.%d.conv_out.weight", g.n_embd, g.n_embd,
-                                m.b_conv_out, m.b_h, {}));
+                                m.b_conv_out, m.b_arm, {}));
         }
-        /* the sandwich: the mixer's output is normed before it joins the stream */
-        L.op_post_norm = rmsnorm(g.max_tok, g.n_embd, L.w_post_norm, m.b_h, m.b_h);
-        L.op_add = add(m.b_x, m.b_h);
+        /* the sandwich: the mixer's output is normed before it joins the stream, and the
+         * feed-forward reads the norm of the sum */
+        if (has_join) L.op_join = join(L.w_post_norm, L.w_ffn_norm);
+        if (!L.op_join) {
+            L.op_post_norm = rmsnorm(g.max_tok, g.n_embd, L.w_post_norm, m.b_arm, m.b_arm);
+            L.op_add = add(m.b_x, m.b_arm);
+            L.op_ffn_norm = rmsnorm(g.max_tok, g.n_embd, L.w_ffn_norm, m.b_x, m.b_h);
+        }
 
         /* ---- the feed-forward */
         const char* ffn = "%s.layers.%d.feed_forward.%s";
-        RAD_ARCH_TRY(norm_w(&L.w_ffn_norm, "blk.%d.ffn_norm.weight", l,
-                            nm.ckpt(lay, pre, l, "ffn_norm.weight"), g.n_embd));
-        RAD_ARCH_TRY(norm_w(&L.w_ffn_post_norm, "blk.%d.ffn_post_norm.weight", l,
-                            nm.ckpt(lay, pre, l, "post_ffn_norm.weight"), g.n_embd));
         RAD_ARCH_TRY(map_concat(b, nm.f("blk.%d.ffn_gate_up.weight", l),
                                 { nm.ckpt(ffn, pre, l, "w1.weight"),
                                   nm.ckpt(ffn, pre, l, "w3.weight") }));
         RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.ffn_down.weight", l),
                               nm.ckpt(ffn, pre, l, "w2.weight")));
-        L.op_ffn_norm = rmsnorm(g.max_tok, g.n_embd, L.w_ffn_norm, m.b_x, m.b_h);
         RAD_ARCH_TRY(linear(L.gate_up, l, "blk.%d.ffn_gate_up.weight", 2 * g.n_ff, g.n_embd,
                             m.b_h, m.b_gate_up, { g.n_ff, g.n_ff }));
         L.op_act = rw(b, RAD_OP(b, "silu_mul",
@@ -488,9 +524,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                           RAD_NOWEIGHTS),
                       {m.b_gate_up}, {m.b_ffn});
         RAD_ARCH_TRY(linear(L.down, l, "blk.%d.ffn_down.weight", g.n_embd, g.n_ff, m.b_ffn,
-                            m.b_h, {}));
-        L.op_ffn_post_norm = rmsnorm(g.max_tok, g.n_embd, L.w_ffn_post_norm, m.b_h, m.b_h);
-        L.op_ffn_add = add(m.b_x, m.b_h);
+                            m.b_arm, {}));
+        if (has_join && l + 1 < (int)m.layers.size())
+            L.op_ffn_join = join(L.w_ffn_post_norm, m.layers[(size_t)l + 1].w_norm);
+        if (!L.op_ffn_join) {
+            L.op_ffn_post_norm = rmsnorm(g.max_tok, g.n_embd, L.w_ffn_post_norm, m.b_arm, m.b_arm);
+            L.op_ffn_add = add(m.b_x, m.b_arm);
+        }
+        n_joins += (L.op_join ? 1 : 0) + (L.op_ffn_join ? 1 : 0);
     }
 
     /* The final norm runs on the gathered rows only: it is per token, and those are the rows the
@@ -524,6 +565,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              (long long)m.sliding.window, (long long)(g.n_layer - n_full - n_sliding),
              (long long)m.width, (long long)g.n_head, (long long)g.n_head_kv,
              (long long)g.head_dim, (long long)g.n_ff, (long long)g.n_vocab);
+    rad_note(b, "sandwich joins: %d of %lld fused (norm_add_norm)%s", n_joins,
+             (long long)(2 * g.n_layer - 1),
+             n_joins == 0 ? " -- not served, the rmsnorm / add / rmsnorm chain" : "");
     return RAD_OK;
 }
 
@@ -572,7 +616,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
 
     for (int l = 0; l < (int)m.layers.size(); ++l) {
         const Layer& L = m.layers[(size_t)l];
-        RAD_ISSUE(c, L.op_norm, brows(m.b_x, T), RAD_W(L.w_norm), brows(m.b_h, T));
+        if (!(l > 0 && m.layers[(size_t)l - 1].op_ffn_join))
+            RAD_ISSUE(c, L.op_norm, brows(m.b_x, T), RAD_W(L.w_norm), brows(m.b_h, T));
         if (L.kind != kConv) {
             const rad_kvgroup grp = m.cls(L).kv;
             const RadKVGroupBatch* kv = kv_batch(batch, grp);
@@ -598,7 +643,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
                         brows(m.b_attn, T));
             RAD_ISSUE(c, L.op_sigmoid, brows(m.b_gate, T), brows(m.b_gate, T));
             RAD_ISSUE(c, L.op_gate_mul, brows(m.b_gate, T), brows(m.b_attn, T), brows(m.b_attn, T));
-            lin_step(c, L.out, m.b_attn, m.b_h, T);
+            lin_step(c, L.out, m.b_attn, m.b_arm, T);
         } else {
             lin_step(c, L.conv_in, m.b_h, m.b_bcx, T);
             RAD_ISSUE(c, L.op_gate_in, bcol(m.b_bcx, 0, n, T), bcol(m.b_bcx, 2 * n, n, T),
@@ -606,18 +651,29 @@ static void step(RadCtx* c, const RadBatch* batch) {
             conv_step(m, L, c, batch, l);
             RAD_ISSUE(c, L.op_gate_out, bcol(m.b_bcx, n, n, T), brows(m.b_conv_out, T),
                       brows(m.b_conv_out, T));
-            lin_step(c, L.conv_out, m.b_conv_out, m.b_h, T);
+            lin_step(c, L.conv_out, m.b_conv_out, m.b_arm, T);
         }
-        RAD_ISSUE(c, L.op_post_norm, brows(m.b_h, T), RAD_W(L.w_post_norm), brows(m.b_h, T));
-        RAD_ISSUE(c, L.op_add, brows(m.b_x, T), brows(m.b_h, T), brows(m.b_x, T));
-
-        RAD_ISSUE(c, L.op_ffn_norm, brows(m.b_x, T), RAD_W(L.w_ffn_norm), brows(m.b_h, T));
+        if (L.op_join) {
+            RAD_ISSUE(c, L.op_join, brows(m.b_arm, T), RAD_W(L.w_post_norm), brows(m.b_x, T),
+                      RAD_W(L.w_ffn_norm), brows(m.b_h, T));
+        } else {
+            RAD_ISSUE(c, L.op_post_norm, brows(m.b_arm, T), RAD_W(L.w_post_norm),
+                      brows(m.b_arm, T));
+            RAD_ISSUE(c, L.op_add, brows(m.b_x, T), brows(m.b_arm, T), brows(m.b_x, T));
+            RAD_ISSUE(c, L.op_ffn_norm, brows(m.b_x, T), RAD_W(L.w_ffn_norm), brows(m.b_h, T));
+        }
         lin_step(c, L.gate_up, m.b_h, m.b_gate_up, T);
         RAD_ISSUE(c, L.op_act, brows(m.b_gate_up, T), brows(m.b_ffn, T));
-        lin_step(c, L.down, m.b_ffn, m.b_h, T);
-        RAD_ISSUE(c, L.op_ffn_post_norm, brows(m.b_h, T), RAD_W(L.w_ffn_post_norm),
-                  brows(m.b_h, T));
-        RAD_ISSUE(c, L.op_ffn_add, brows(m.b_x, T), brows(m.b_h, T), brows(m.b_x, T));
+        lin_step(c, L.down, m.b_ffn, m.b_arm, T);
+        if (L.op_ffn_join) {
+            /* y is the next layer's input norm */
+            RAD_ISSUE(c, L.op_ffn_join, brows(m.b_arm, T), RAD_W(L.w_ffn_post_norm),
+                      brows(m.b_x, T), RAD_W(m.layers[(size_t)l + 1].w_norm), brows(m.b_h, T));
+        } else {
+            RAD_ISSUE(c, L.op_ffn_post_norm, brows(m.b_arm, T), RAD_W(L.w_ffn_post_norm),
+                      brows(m.b_arm, T));
+            RAD_ISSUE(c, L.op_ffn_add, brows(m.b_x, T), brows(m.b_arm, T), brows(m.b_x, T));
+        }
     }
 
     /* The lm_head runs only on the rows the sampler asked for; a prefill chunk that finishes no
