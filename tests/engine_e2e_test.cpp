@@ -2067,6 +2067,70 @@ TEST(a_prompt_resumed_from_a_window_snapshot_returns_what_a_cold_run_does) {
     }
 }
 
+/* LFM3 resumes three kinds of state at once: the full-attention layers from the cached blocks, the
+ * sliding layers from a window snapshot, and the convolutions' last inputs from the same checkpoint
+ * slot. The convolutions make it a linear-state model to the scheduler, so checkpoints follow the
+ * interval and not the window's lower floor. Under `exact` a prompt sharing a 200-token head
+ * resumes at a checkpoint (every 64 tokens) inside it; under `nearest` a prompt that extends a
+ * 600-token one resumes from that prompt's tail checkpoint, 75 windows deep. Either way the reply,
+ * and every probability in it, equals a cold run's, and so does a repeat, which resumes further
+ * in. */
+TEST(lfm3_resumed_from_the_prefix_cache_returns_what_a_cold_run_does) {
+    REQUIRE(world().ok);
+    struct Case {
+        const char* name;
+        std::vector<int32_t> first, second;
+        std::vector<std::string> args;
+        int64_t lo, hi;                     /* where the shared hit must end */
+    };
+    std::vector<Case> cases;
+    {
+        const std::vector<int32_t> head = prompt_ids(7, 200);
+        std::vector<int32_t> a = head, b = head;
+        for (int32_t t : prompt_ids(8, 70)) a.push_back(t);
+        for (int32_t t : prompt_ids(9, 90)) b.push_back(t);
+        cases.push_back({ "exact", a, b,
+                          { "--num-speculative-tokens", "0", "--checkpoint-interval", "64" }, 1,
+                          200 });
+        const std::vector<int32_t> c = prompt_ids(51, 600);
+        std::vector<int32_t> d = c;
+        for (int32_t t : prompt_ids(52, 60)) d.push_back(t);
+        cases.push_back({ "nearest", c, d,
+                          { "--num-speculative-tokens", "0", "--checkpoint-interval", "64",
+                            "--prefix-resume", "nearest" },
+                          512, 599 });
+    }
+    for (const Case& k : cases) {
+        json cold;
+        {
+            Server s;
+            REQUIRE(s.start(world().lfm3, kPlain));
+            cold = post(s.port, "/completion", completion(k.second, 24, 0.0, 0, 3));
+            CHECK_EQ(s.stop(), 0);
+        }
+        Server s;
+        REQUIRE(s.start(world().lfm3, k.args));
+        (void)post(s.port, "/completion", completion(k.first, 24, 0.0, 0, 3));
+        const json shared = post(s.port, "/completion", completion(k.second, 24, 0.0, 0, 3));
+        const json again = post(s.port, "/completion", completion(k.second, 24, 0.0, 0, 3));
+        const int64_t c1 = timing(shared, "cache_n"), c2 = timing(again, "cache_n");
+        REQUIRE(cold.contains("completion_probabilities"));
+        const bool same = tokens_of(shared) == tokens_of(cold) &&
+                          tokens_of(again) == tokens_of(cold) &&
+                          shared["completion_probabilities"] == cold["completion_probabilities"] &&
+                          again["completion_probabilities"] == cold["completion_probabilities"];
+        if (!(c1 >= k.lo && c1 <= k.hi && c2 > c1 && same))
+            fprintf(stderr, "    %s: cached %lld then %lld, %s a cold run's\n", k.name,
+                    (long long)c1, (long long)c2, same ? "equal to" : "NOT equal to");
+        CHECK(c1 >= k.lo);
+        CHECK(c1 <= k.hi);
+        CHECK(c2 > c1);
+        CHECK_EQ(tokens_of(cold).size(), (size_t)24);
+        CHECK(same);
+        CHECK_EQ(s.stop(), 0);
+    }
+}
+
 /* The row a running server's /diagnostics reports for `option`, or null. */
 json config_row(int port, const std::string& option) {
     Call c;
