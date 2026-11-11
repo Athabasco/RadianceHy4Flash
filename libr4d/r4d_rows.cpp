@@ -4368,7 +4368,9 @@ static const RadConstraint cAttnPrefillH64G4Bf16[] = {
 /* The windowed kernels (r4d_attn_paged_window.hip): head_dim 128, 256 and 512, 1/2/4/8 queries per
  * KV head (16 at 512), any window, causal or not. Gemma 4's sliding layers are h256/gqa2 with a
  * 1024-token window, its full layers h512 at gqa 8 (TP1/TP2), 4 (TP4) or 2 (TP8), the 12B's at
- * gqa 16 (TP1); h128/gqa1 is Unlimited-OCR's MHA decoder. One kernel serves every q_len (splitting
+ * gqa 16 (TP1); h128/gqa1 is Unlimited-OCR's MHA decoder; h128/gqa4 is LFM3 (full layers, and
+ * sliding ones with a 256-token window), whose decode band (q_len <= 16) stays on the h128/gqa4
+ * decode leg, which ranks above these rows. One kernel serves every q_len (splitting
  * the key range when there are too few tiles to fill the card), so `q_len` cuts no band. `causal` and `window` are runtime fields; block_size
  * is derived: 16.
  *
@@ -4381,6 +4383,7 @@ static const RadConstraint cAttnPrefillH64G4Bf16[] = {
         C_GE("window", WMIN), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", KV),                       \
     };
 R4D_WIN_C(cWinH128G1Bf16, 128, 1, "bf16", 0) R4D_WIN_C(cWinH128G1I8, 128, 1, "i8", 0)
+R4D_WIN_C(cWinH128G4Bf16, 128, 4, "bf16", 0) R4D_WIN_C(cWinH128G4I8, 128, 4, "i8", 0)
 R4D_WIN_C(cWinH128G8Bf16, 128, 8, "bf16", 0) R4D_WIN_C(cWinH128G8I8, 128, 8, "i8", 0)
 R4D_WIN_C(cWinH128G16Bf16, 128, 16, "bf16", 0) R4D_WIN_C(cWinH128G16I8, 128, 16, "i8", 0)
 R4D_WIN_C(cWinH256G1Bf16, 256, 1, "bf16", 0) R4D_WIN_C(cWinH256G1I8, 256, 1, "i8", 0)
@@ -7436,7 +7439,8 @@ static const RadKernelInfo kKernels[] = {
 #define R4D_WIN_PAIR(HD, GQ)                                                                       \
     R4D_WIN_ROW(HD, GQ, bf16kv, bf16, cWinH##HD##G##GQ##Bf16, "bf16")                              \
     R4D_WIN_ROW(HD, GQ, i8kv, i8, cWinH##HD##G##GQ##I8, "int8 (an f16 scale of K and of V per token and head)")
-R4D_WIN_PAIR(128, 1) R4D_WIN_PAIR(128, 16)   /* Muse Glimmer's 32/2-head sliding layers */
+R4D_WIN_PAIR(128, 1) R4D_WIN_PAIR(128, 4)
+R4D_WIN_PAIR(128, 16)   /* Muse Glimmer's 32/2-head sliding layers */
 R4D_WIN_PAIR(256, 1) R4D_WIN_PAIR(256, 2) R4D_WIN_PAIR(256, 4) R4D_WIN_PAIR(256, 8)
 R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512, 8)
 R4D_WIN_PAIR(512, 16)

@@ -30681,6 +30681,17 @@ static void device_phase(const Plugin& pl) {
     attn_numeric_case(pl, "attn_window_h512_gqa16_i8kv",  512, 16,  1, "i8", 0, 700);
     attn_numeric_case(pl, "attn_window_h512_gqa16_bf16kv", 512, 16,  1, "bf16",     0, 700);
     attn_numeric_case(pl, "attn_window_h512_gqa16_bf16kv", 512, 16, 16, "bf16",     0, 300);
+    /* LFM3: 16 query heads over 4 kv heads at head_dim 128, full and with its 256-token window; the
+     * rows take what the decode leg's band (q_len <= 16) leaves. Launches, then numeric checks, the
+     * last two with a context past the window. The int8 row has numeric cases only: attn_case
+     * builds a bf16 or an fp8 cache. */
+    attn_case(pl, "attn_window_h128_gqa4_bf16kv", 128, 4, 32, "bf16",     1);
+    attn_case(pl, "attn_window_h128_gqa4_bf16kv", 128, 4, 32, "bf16",     1, 256);
+    attn_numeric_case(pl, "attn_window_h128_gqa4_i8kv",   128, 4, 32, "i8",       0);
+    attn_numeric_case(pl, "attn_window_h128_gqa4_bf16kv", 128, 4, 32, "bf16",     0);
+    attn_numeric_case(pl, "attn_window_h128_gqa4_bf16kv", 128, 4, 17, "bf16",     0, 300);
+    attn_numeric_case(pl, "attn_window_h128_gqa4_bf16kv", 128, 4, 64, "bf16",     256, 700);
+    attn_numeric_case(pl, "attn_window_h128_gqa4_i8kv",   128, 4, 64, "i8",       256, 700);
     /* The h256/gqa2 prefill numeric check with ctx 2048 > window 1024, so the window applies: for
      * query row 0, pos = 2048-64 = 1984 and the visible keys are [961..1984], so wlo0 = 961 and
      * tstart = 961/48 = 20. This exercises the window mask and the below-window tile skip (tiles
