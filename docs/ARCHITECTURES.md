@@ -1911,8 +1911,9 @@ fails. `partial_rotary_factor` is read per attention class, so either class may 
 
 Kernels: libref and libavx serve every op, and so does libr4d: attention at (128, 4 queries a
 kv head) takes `attn_decode_h128_gqa4` up to 16 query rows and `attn_window_h128_gqa4` past
-that, for the full layers (window 0) as for the sliding ones. libhalo has no `rope_rows` or
-`rmsnorm_rows`, so on gfx1151 those run on the host.
+that, for the full layers (window 0) as for the sliding ones. libhalo carries the same pair of
+attention rows, and `rope_rows` and `rmsnorm_rows` under their row-form names (launched as
+`rope` and `rmsnorm`).
 
 Checked against the reference's float32 forward on a tiny random LFM3 (conv, full, conv, sliding;
 window 8) at every position of the golden prompt (`tests/lfm3_golden.h`, made by
