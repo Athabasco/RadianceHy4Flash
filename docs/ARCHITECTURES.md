@@ -1862,6 +1862,65 @@ is one 800-token translation run four times).
 
 ---
 
+# `lfm3`: LiquidAI's LFM3
+
+`arch/lfm3_bf16` serves `Lfm3ForCausalLM`, text only, bf16 linears, one rank. It is `lfm2_bf16`'s
+graph (short gated convolutions between attention layers, SwiGLU, a tied head) with LFM3's
+differences. transformers has no LFM3 class; the reference is the modelling code LiquidAI ships
+with the checkpoint (`modeling_lfm3.py`, `lfm3_conv.py`).
+
+```
+LFM3-1.7B (LiquidAI/LFM3-1.7B)
+  24 layers, hidden 2048, vocab 128000 tied to the embedding, norm_eps 1e-5
+  layer_types: conv at 0, 1 and every odd layer; full_attention at 2, 6, .., 22;
+    sliding_attention at 4, 8, .., 20
+    conv     causal, 7 taps (conv_L_cache), no bias: in_proj -> B, C, x; C * conv(B * x) -> out_proj
+    full     16 heads / 4 kv x 128, rope theta 1e6 over the first 64 dimensions of each head
+             (partial_rotary_factor 0.5), the other 64 unrotated
+    sliding  16 heads / 4 kv x 128, rope theta 1e4 over the whole head, window 256 (q - k < 256)
+  q and k RMS-normed per head; after attention each query head is scaled by sigmoid(gate_proj(h))
+    before out_proj
+  sandwich norms: operator_norm -> mixer -> post_operator_norm -> add;
+    ffn_norm -> feed-forward -> post_ffn_norm -> add. RMSNorm, plain gain
+  feed-forward w1|w3 2 x 7680 (silu) -> w2
+  final norm; tied head; no embedding scale
+```
+
+Traps:
+
+- **The gate is sigmoid, not 2 x sigmoid.** `head_gate` computes `2 * sigmoid(g)` (the families it
+  was written for train the gate around 1), so it is not used here. The plugin maps each of
+  `gate_proj`'s 16 rows `head_dim` times (`RAD_MAP_ROWS`), which makes the gate a `gemm_nt` to the
+  hidden width, then `sigmoid` and `mul`: 91.6 MB more in the container (2.6%) and no new kernel.
+- **Two rotaries.** The full-attention layers rotate half of each head at theta 1e6
+  (`rope_rows` with `rotary_dim` 64 and the `head` ladder); the sliding layers rotate all of it at
+  1e4. Swapping the thetas, or rotating the whole head on the full layers, each still produces
+  fluent text on short prompts.
+- **The window is on the sliding layers only**, and is a mask over a full-length cache in the
+  reference; here those layers keep a `RAD_KV_WINDOW` group of their own and the full layers a
+  `RAD_KV_FULL` one. A document shorter than 256 tokens does not exercise the difference.
+- **Four norms a layer.** The post norms sit on the branch, before the residual add, not on the
+  stream. Leaving them out changes every logit; putting them after the add does too.
+- **Three states roll back under speculation**: the convolution's last six inputs and both KV
+  groups.
+
+Refused at declare, not ignored: `conv_bias`, `use_sandwich_norm: false`, a `rope_type` other than
+`default`, a layer kind other than the three, a `conv_L_cache` outside 2..8, sliding layers
+without a `sliding_window`, and more than one rank. A step that asks for an encoder or media rows
+fails. `partial_rotary_factor` is read per attention class, so either class may carry one.
+
+Kernels: libref and libavx serve every op, and so does libr4d: attention at (128, 4 queries a
+kv head) takes `attn_decode_h128_gqa4` up to 16 query rows and `attn_window_h128_gqa4` past
+that, for the full layers (window 0) as for the sliding ones. libhalo has no `rope_rows` or
+`rmsnorm_rows`, so on gfx1151 those run on the host.
+
+Checked against the reference's float32 forward on a tiny random LFM3 (conv, full, conv, sliding;
+window 8) at every position of the golden prompt (`tests/lfm3_golden.h`, made by
+`tests/mklfm3golden.py`), and in the family tests for chunking, batching, decode against prefill,
+concurrent requests and speculation.
+
+---
+
 # `museglimmer`: Meta Muse Glimmer 30B
 
 `arch/museglimmer` serves the text trunk and the vision tower of a
