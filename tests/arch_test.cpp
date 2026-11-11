@@ -25,6 +25,8 @@
 #include "../arch/llama_fp8/llama_fp8.cpp"
 /* LFM2, for its own layer schedule and short convolution. */
 #include "../arch/lfm2_bf16/lfm2_bf16.cpp"
+/* LFM3: LFM2's schedule with sliding-window layers, sandwich norms and gated attention. */
+#include "../arch/lfm3_bf16/lfm3_bf16.cpp"
 /* Gemma 4 dense: two attention classes (sliding-window + proportional-RoPE global) on one stream. */
 #include "../arch/gemma4_bf16/gemma4_bf16.cpp"
 /* The bf16 / fp8-expert Gemma 4 plugin: the 26B-A4B's dense and routed arms side by side. */
@@ -4413,6 +4415,249 @@ TEST(lfm2_issues_the_convolution_once_per_half_of_a_mixed_step) {
         }
     }
     CHECK_EQ(convs, 6);   /* three conv layers, two halves each */
+}
+
+/* ==================================================================== LFM3 */
+namespace {
+
+/* 1.7B's graph cut to four layers, one of each kind after a leading conv: conv, full, sliding,
+ * conv. The rotary lives under rope_parameters.<layer type> only. */
+const char* k_lfm3_keys[] = { "layer_types", "conv_L_cache", "tie_word_embeddings",
+                              "sliding_window",
+                              "rope_parameters.full_attention.rope_theta",
+                              "rope_parameters.full_attention.partial_rotary_factor",
+                              "rope_parameters.sliding_attention.rope_theta" };
+const char* k_lfm3_vals[] = { "conv full_attention sliding_attention conv", "7", "true", "256",
+                              "1000000.0", "0.5", "10000" };
+
+RadModelMeta lfm3_meta() {
+    RadModelMeta m{};
+    m.arch_id = "lfm3"; m.name = "test-lfm3"; m.quant = "";
+    m.n_layers = 4; m.n_embd = 64; m.n_head = 4; m.n_head_kv = 1; m.head_dim = 16;
+    m.n_ff = 128; m.n_vocab = 512; m.n_ctx_train = 32768;
+    /* the typed theta is the converter's fallback for a config without a top-level one: not read */
+    m.rms_eps = 1e-5f; m.rope_theta = 1e4f; m.rope_scale = 1.0f;
+    m.n_kv = 7; m.kv_key = k_lfm3_keys; m.kv_val = k_lfm3_vals;
+    return m;
+}
+
+/* A layer's ops: the mixer between its two norms, then the feed-forward between its two. */
+std::vector<std::string> lfm3_layer_ops(bool attention) {
+    std::vector<std::string> v = { "rmsnorm" };
+    if (attention) {
+        for (const char* s : { "gemm_nt", "gemm_nt", "gemm_nt", "gemm_nt", "rmsnorm_rows",
+                               "rmsnorm_rows", "rope_rows", "rope_rows", "attn_paged", "kv_store",
+                               "sigmoid", "mul", "gemm_nt" })
+            v.push_back(s);
+    } else {
+        for (const char* s : { "gemm_nt", "mul", "causal_conv1d", "mul", "gemm_nt" })
+            v.push_back(s);
+    }
+    for (const char* s : { "rmsnorm", "add", "rmsnorm", "gemm_nt", "silu_mul", "gemm_nt", "rmsnorm",
+                           "add" })
+        v.push_back(s);
+    return v;
+}
+
+}  /* namespace */
+
+TEST(lfm3_declares_three_layer_kinds_with_their_own_rotary_and_window) {
+    RadBuilder b;
+    RadModelMeta meta = lfm3_meta();
+    RadBuildCtx ctx = build_ctx();
+    CHECK_OK(lfm3_bf16::declare(&b, &meta, &ctx));
+
+    std::vector<std::string> want = { "embed_lookup" };
+    for (bool att : { false, true, true, false }) append(want, lfm3_layer_ops(att));
+    for (const char* s : { "gather_rows", "rmsnorm", "logits_gemm" }) want.push_back(s);
+    CHECK_EQ(join(op_names(b)), join(want));
+
+    /* Three state groups: paged KV for the full layer, the same bounded by the window for the
+     * sliding one, and the conv window at the checkpoint's width. */
+    REQUIRE(b.kv_groups.size() == 3);
+    CHECK_EQ(b.kv_groups[0].d.kind, (int)RAD_KV_FULL);
+    CHECK_EQ(b.kv_groups[1].d.kind, (int)RAD_KV_WINDOW);
+    CHECK_EQ(b.kv_groups[1].d.window, (int64_t)256);
+    CHECK_EQ(b.kv_groups[2].d.kind, (int)RAD_KV_CONV);
+    CHECK_EQ(b.kv_groups[2].d.conv_width, (int64_t)7);
+    REQUIRE(b.binds.size() == 4);
+    for (const auto& bd : b.binds)
+        CHECK_EQ(bd.second, bd.first == 1 ? (rad_kvgroup)1 : bd.first == 2 ? (rad_kvgroup)2
+                                                                           : (rad_kvgroup)3);
+
+    /* The full layer: half the head rotates, on the head ladder, at its theta, and attention has
+     * no window. q and k are rotated by one op each. */
+    for (int i : { 0, 1 }) {
+        const RecOp* r = find_op(b, "rope_rows", i);
+        REQUIRE(r != nullptr);
+        CHECK_EQ(pint(r, "rotary_dim"), 8);
+        CHECK_EQ(pstr(r, "ladder"), "head");
+        CHECK_EQ(pstr(r, "mode"), "neox");
+        CHECK_NEAR(pflt(r, "theta"), 1e6, 1e-3);
+    }
+    CHECK_EQ(pint(find_op(b, "attn_paged", 0), "window"), 0);
+    /* The sliding layer: the whole head at its own theta (the ladders coincide, so none is
+     * named), and the window on the op as on the group. */
+    for (int i : { 2, 3 }) {
+        const RecOp* r = find_op(b, "rope_rows", i);
+        REQUIRE(r != nullptr);
+        CHECK_EQ(pint(r, "rotary_dim"), 16);
+        CHECK(param(r, "ladder") == nullptr);
+        CHECK_NEAR(pflt(r, "theta"), 1e4, 1e-6);
+    }
+    CHECK_EQ(pint(find_op(b, "attn_paged", 1), "window"), 256);
+    for (int i : { 0, 1 }) {
+        CHECK_EQ(pint(find_op(b, "attn_paged", i), "gqa"), 4);
+        CHECK_EQ(pint(find_op(b, "attn_paged", i), "causal"), 1);
+        CHECK(param(find_op(b, "attn_paged", i), "scale") == nullptr);   /* 1/sqrt(head_dim) */
+    }
+
+    /* Plain RMSNorms at the checkpoint's epsilon, four a layer and the final one. */
+    CHECK_EQ(count_op(b, "rmsnorm"), 4 * 4 + 1);
+    const RecOp* norm = find_op(b, "rmsnorm");
+    CHECK_NEAR(pflt(norm, "eps"), 1e-5, 1e-9);
+    CHECK_EQ(param(norm, "wadd") ? pflt(norm, "wadd") : 0.0, 0.0);
+    CHECK_EQ(pint(find_op(b, "causal_conv1d"), "width"), 7);
+
+    /* The names: under `model`, the post norms beside the pre norms, o_proj and the head norms
+     * under their LFM3 names, a tied head read from the embedding. */
+    for (const auto& [declared, src] : std::vector<std::pair<const char*, const char*>>{
+             { "blk.0.attn_norm.weight", "model.layers.0.operator_norm.weight" },
+             { "blk.0.attn_post_norm.weight", "model.layers.0.post_operator_norm.weight" },
+             { "blk.0.ffn_post_norm.weight", "model.layers.0.post_ffn_norm.weight" },
+             { "blk.0.conv_in.weight", "model.layers.0.conv.in_proj.weight" },
+             { "blk.1.attn_output.weight", "model.layers.1.self_attn.o_proj.weight" },
+             { "blk.1.attn_q_norm.weight", "model.layers.1.self_attn.q_norm.weight" },
+             { "blk.2.attn_k_norm.weight", "model.layers.2.self_attn.k_norm.weight" } }) {
+        const RecMap* mp = find_map(b, declared);
+        REQUIRE(mp != nullptr);
+        CHECK_EQ(mp->src[0], src);
+    }
+    const RecMap* head = find_map(b, "output.weight");
+    REQUIRE(head != nullptr && head->src.size() == 2);
+    CHECK_EQ(head->src[0], "lm_head.weight");
+    CHECK_EQ(head->src[1], "model.embed_tokens.weight");
+
+    /* The gate at the attention output's width: gate_proj's row h, head_dim times, for each head
+     * in turn, so the weight is [n_head * head_dim, n_embd] and channel c reads row c / head_dim. */
+    std::vector<int> rows;
+    for (const auto& mp : b.maps) {
+        if (mp.declared != "blk.1.attn_gate.weight") continue;
+        CHECK_EQ(mp.mode, (int)RAD_MAP_ROWS);
+        for (size_t i = 0; i < mp.src.size(); ++i) {
+            CHECK_EQ(mp.src[i], "model.layers.1.self_attn.gate_proj.weight");
+            rows.push_back(mp.src_index[i]);
+        }
+    }
+    REQUIRE_EQ(rows.size(), (size_t)64);
+    for (size_t c = 0; c < rows.size(); ++c) CHECK_EQ(rows[c], (int)(c / 16));
+    const RecWeight* gate = find_w(b, "blk.1.attn_gate.weight");
+    REQUIRE(gate != nullptr);
+}
+
+TEST(lfm3_refuses_what_it_does_not_serve) {
+    auto declare_with = [](std::vector<const char*> keys, std::vector<const char*> vals,
+                           int world = 1) {
+        RadBuilder b;
+        RadModelMeta meta = lfm3_meta();
+        meta.n_kv = (int)keys.size(); meta.kv_key = keys.data(); meta.kv_val = vals.data();
+        RadBuildCtx ctx = build_ctx(0, world);
+        return lfm3_bf16::declare(&b, &meta, &ctx);
+    };
+    const std::vector<const char*> k(std::begin(k_lfm3_keys), std::end(k_lfm3_keys));
+    const std::vector<const char*> v(std::begin(k_lfm3_vals), std::end(k_lfm3_vals));
+    auto with = [&](const char* key, const char* val) {
+        std::vector<const char*> kk = k, vv = v;
+        bool found = false;
+        for (size_t i = 0; i < kk.size(); ++i)
+            if (!std::strcmp(kk[i], key)) { vv[i] = val; found = true; }
+        if (!found) { kk.push_back(key); vv.push_back(val); }
+        return declare_with(kk, vv);
+    };
+    auto without = [&](const char* key) {
+        std::vector<const char*> kk, vv;
+        for (size_t i = 0; i < k.size(); ++i)
+            if (std::strcmp(k[i], key)) { kk.push_back(k[i]); vv.push_back(v[i]); }
+        return declare_with(kk, vv);
+    };
+    CHECK_OK(declare_with(k, v));
+    CHECK_EQ(declare_with(k, v, 2), RAD_E_UNSUPPORTED);                 /* two ranks */
+    CHECK_EQ(without("layer_types"), RAD_E_FORMAT);
+    CHECK_EQ(with("layer_types", "conv full_attention conv"), RAD_E_FORMAT);        /* 3 of 4 */
+    CHECK_EQ(with("layer_types", "conv full_attention recurrent conv"), RAD_E_UNSUPPORTED);
+    CHECK_EQ(with("conv_bias", "true"), RAD_E_UNSUPPORTED);
+    CHECK_EQ(with("use_sandwich_norm", "false"), RAD_E_UNSUPPORTED);
+    CHECK_EQ(with("conv_L_cache", "9"), RAD_E_UNSUPPORTED);
+    /* A sliding layer needs its window and each attention class its own theta: the typed
+     * rope_theta is not a stand-in. */
+    CHECK_EQ(without("sliding_window"), RAD_E_INVAL);
+    CHECK_EQ(without("rope_parameters.full_attention.rope_theta"), RAD_E_INVAL);
+    CHECK_EQ(without("rope_parameters.sliding_attention.rope_theta"), RAD_E_INVAL);
+    CHECK_EQ(with("rope_parameters.full_attention.rope_type", "yarn"), RAD_E_UNSUPPORTED);
+    CHECK_EQ(with("rope_parameters.full_attention.partial_rotary_factor", "0"), RAD_E_INVAL);
+    CHECK_EQ(with("rope_parameters.full_attention.partial_rotary_factor", "1.5"), RAD_E_INVAL);
+    /* A schedule without sliding layers needs neither the window nor their theta. */
+    {
+        std::vector<const char*> kk = { "layer_types", "conv_L_cache",
+                                        "rope_parameters.full_attention.rope_theta" };
+        std::vector<const char*> vv = { "conv full_attention conv conv", "7", "1000000.0" };
+        CHECK_OK(declare_with(kk, vv));
+    }
+}
+
+TEST(lfm3_issues_a_mixed_step_through_both_attention_groups) {
+    RadBuilder b;
+    RadModelMeta meta = lfm3_meta();
+    RadBuildCtx ctx = build_ctx();
+    CHECK_OK(lfm3_bf16::declare(&b, &meta, &ctx));
+
+    /* Two decode rows (a verify of 3 and a plain decode) and one prefill chunk of 5. */
+    static const int32_t tok[9]  = { 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    static const int32_t pos[9]  = { 40, 41, 42, 30, 0, 1, 2, 3, 4 };
+    static const int32_t cu[4]   = { 0, 3, 4, 9 };
+    static const int32_t ctxl[3] = { 40, 30, 0 };
+    static const int32_t nacc[3] = { 2, 1, 1 };
+    static const int32_t out[3]  = { 2, 3, 8 };
+    static int32_t cv_idx[3] = { 4, 5, 6 };
+    const lfm3_bf16::Model& m = lfm3_bf16::g_model[0];
+    RadKVGroupBatch kv[3]{};
+    kv[0].group = m.full.kv;
+    kv[1].group = m.sliding.kv;
+    kv[2].group = m.kv_conv; kv[2].state_index = cv_idx;
+    RadBatch mixed{};
+    mixed.phase = RAD_PHASE_MIXED;
+    mixed.n_tok = 9; mixed.n_seq = 3; mixed.max_q_len = 5;
+    mixed.n_seq_decode = 2; mixed.n_tok_decode = 4;
+    mixed.token_ids = tok; mixed.positions = pos; mixed.cu_seqlens = cu; mixed.ctx_lens = ctxl;
+    mixed.num_accepted = nacc; mixed.n_out = 3; mixed.out_ids = out;
+    mixed.n_kv_groups = 3; mixed.kv = kv;
+
+    RadCtx c{ .b = &b, .batch = &mixed };
+    lfm3_bf16::step(&c, &mixed);
+    CHECK_LINT(b, &c);
+    CHECK(c.step_fail.empty());
+
+    /* Each conv layer issues its convolution once per half of the step; each attention layer
+     * stores and attends through its own group, and gates the output before the projection. */
+    int convs = 0, attns = 0, gates = 0;
+    for (const auto& i : c.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (!o) continue;
+        convs += o->op == "causal_conv1d";
+        attns += o->op == "attn_paged";
+        gates += o->op == "sigmoid";
+        if (o->op == "attn_paged") CHECK_EQ(i.n, (int64_t)5);
+    }
+    CHECK_EQ(convs, 2 * 2);
+    CHECK_EQ(attns, 2);
+    CHECK_EQ(gates, 2);
+
+    /* A draft pass or media rows are refused by name. */
+    RadBatch draft = mixed;
+    draft.draft_pass = 1;
+    RadCtx c2{ .b = &b, .batch = &draft };
+    lfm3_bf16::step(&c2, &draft);
+    CHECK(!c2.step_fail.empty());
 }
 
 /* ==================================================================== LFM2-VL's tower */

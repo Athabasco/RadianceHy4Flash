@@ -317,6 +317,7 @@ and runs.
 | `museglimmer` | Meta Muse Glimmer 30B: gated attention alternating sliding-window (rotary) and NoPE full layers, Gemma-2 double norms, a 50-block windowed ViT; bf16 |
 | `museglimmer_ct` | the same trunk as an int4 container (`--set quantization_config.quant_method=compressed-tensors`) |
 | `lfm2_bf16` | LiquidAI LFM2 and LFM2-VL in bf16, including d1 (§5.13) |
+| `lfm3_bf16` | LiquidAI LFM3 in bf16 (LFM3-1.7B) |
 | `embgemma2` | EmbeddingGemma 2, an embedding model (§5.6) |
 | `nomicbert` | nomic-embed-text-v2-moe, an embedding model (§5.6) |
 | `nemotron35_embed` | Nemotron 3.5 Embed 1B/8B and Rerank 8B, BF16 text/image retrieval at TP1 (§5.6) |
