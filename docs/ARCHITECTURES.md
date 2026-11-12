@@ -1903,6 +1903,13 @@ Traps:
   stream. Leaving them out changes every logit; putting them after the add does too.
 - **Three states roll back under speculation**: the convolution's last six inputs and both KV
   groups.
+- **A raw prompt gets no BOS unless the container says so.** The checkpoint's tokenizer states no
+  `add_bos_token` and its post-processor adds none, so `/v1/completions` runs a raw prompt as
+  written (the chat template writes `<|startoftext|>` itself). Without it some first tokens (`//`
+  is one) start the forward in a regime of small activations where bf16 arithmetic, the
+  reference's own code in bf16 included, departs from float32 by far more than it does behind
+  BOS. Start a raw prompt with `<|startoftext|>`, or set `"add_bos_token": true` in
+  `tokenizer_config.json` before `rad-convert`: the server then puts exactly one BOS in front.
 
 Refused at declare, not ignored: `conv_bias`, `use_sandwich_norm: false`, a `rope_type` other than
 `default`, a layer kind other than the three, a `conv_L_cache` outside 2..8, sliding layers
