@@ -389,29 +389,6 @@ extern "C" int r4d_shape_gemm_nt_bias(const RadParam* p, int n_p, int operand, R
     R4D_PICK(l);
 }
 
-extern "C" int r4d_shape_moe_mxfp4(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
-    const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
-    const int64_t N1 = rad_param_geti(p, n_p, "N_odd", N), K1 = rad_param_geti(p, n_p, "K_odd", K);
-    const int64_t ne = pi(p, n_p, "n_expert"), top = pi(p, n_p, "top_k");
-    const char* order = rad_param_gets(p, n_p, "a_order", "");
-    const int64_t ar = !std::strcmp(order, "sorted") ? M * top : M;
-    const int64_t nk = std::max(K, K1), nn = std::max(N, N1);
-    RadOpdDesc s0 = opd((uint32_t)RAD_U8, (ne + 1) / 2, N, K / 32);
-    RadOpdDesc s1 = opd((uint32_t)RAD_U8, ne / 2, N1, K1 / 32);
-    s0.fill = s1.fill = RAD_FILL_INDEX;
-    s0.idx_const = s1.idx_const = 127;
-    const RadOpdDesc l[] = { opd((uint32_t)RAD_F8E4M3, ar, nk),
-                             opd((uint32_t)RAD_F32, ar, nk / 128),
-                             opd((uint32_t)RAD_FP4E2M1, (ne + 1) / 2, N, K),
-                             s0,
-                             opd_idx(M * top, 0, M * top),
-                             opd_idx(ne + 1, 0, M * top + 1),
-                             opd((uint32_t)RAD_FP4E2M1, ne / 2, N1, K1),
-                             s1,
-                             opd((uint32_t)RAD_BF16, M * top, nn) };
-    R4D_PICK(l);
-}
-
 extern "C" int r4d_shape_kda_update(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const char* form = rad_param_gets(p, n_p, "state_form", "");
     if (!std::strcmp(form, "anchor")) return RAD_E_UNSUPPORTED;
@@ -1382,7 +1359,7 @@ extern "C" int r4d_shape_ar_rmsnorm_had_quant_i8g(const RadParam* p, int n_p, in
     const int64_t M = pi(p, n_p, "M");
     const int64_t n = pi(p, n_p, "n");
     const int64_t g = pi(p, n_p, "group", R4D_FP8_BLOCK);
-    if (g != R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
+    if (g != R4D_FP8_BLOCK && g != R4D_I8_GROUP_WIDE) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
         opd((uint32_t)RAD_BF16, M, n),      /* inout: the message and the input */
         opd((uint32_t)RAD_BF16, M, n),
@@ -1443,55 +1420,6 @@ extern "C" int r4d_shape_gemm_nt_q(const RadParam* p, int n_p, int operand,
         /* `a_sum` belongs to the asymmetric integer grids and `b_ref` to mxfp4; fp8 has neither. */
         opd_none(),
         opd_none(),
-    };
-    R4D_PICK(l);
-}
-
-/* gemm_nt_q_bias at fp8a8: gemm_nt_q's fp8 operands, a bf16 bias per output column, then y. The
- * libref description matches it (ref_gemm_nt_q_bias_shape). */
-extern "C" int r4d_shape_gemm_nt_q_bias(const RadParam* p, int n_p, int operand,
-                                        RadOpdDesc* out) {
-    const int64_t M = pi(p, n_p, "M");
-    const int64_t N = pi(p, n_p, "N");
-    const int64_t K = pi(p, n_p, "K");
-    const int64_t g = pi(p, n_p, "group", R4D_FP8_BLOCK);
-    const char* q = r4d_pgets(p, n_p, "dtype");
-    if (!q || std::strcmp(q, "fp8a8") || g != R4D_FP8_BLOCK || K <= 0 || N <= 0)
-        return RAD_E_UNSUPPORTED;
-    const int64_t kb = (K + g - 1) / g, nb = (N + g - 1) / g;
-    const RadOpdDesc l[] = {
-        opd((uint32_t)RAD_F8E4M3, M, K),
-        opd((uint32_t)RAD_F32, M, kb),
-        opd((uint32_t)RAD_F8E4M3, N, K),
-        opd((uint32_t)RAD_BF16, nb, kb),
-        opd((uint32_t)RAD_BF16, N),
-        opd((uint32_t)RAD_BF16, M, N),
-    };
-    R4D_PICK(l);
-}
-
-/* The same GEMM with the SwiGLU and the quantiser in its epilogue. `N` is the weight's rows, gate
- * then up, so the quantiser's outputs are N/2 wide (hence a schema of its own). */
-extern "C" int r4d_shape_gemm_nt_q_gated(const RadParam* p, int n_p, int operand,
-                                         RadOpdDesc* out) {
-
-    const int64_t M = pi(p, n_p, "M");
-    const int64_t N = pi(p, n_p, "N");
-    const int64_t K = pi(p, n_p, "K");
-    const int64_t g = pi(p, n_p, "group", R4D_FP8_BLOCK);
-    const char* q = r4d_pgets(p, n_p, "dtype");
-    if (!q || std::strcmp(q, "fp8a8") || g != R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
-    if (N <= 0 || N % 2 || K <= 0) return RAD_E_UNSUPPORTED;
-    const int64_t nout = N / 2;
-    const int64_t kb = (K + g - 1) / g;
-    const RadOpdDesc l[] = {
-        opd((uint32_t)RAD_F8E4M3, M, K),
-        opd((uint32_t)RAD_F32, M, kb),
-        opd((uint32_t)RAD_F8E4M3, N, K),
-        opd((uint32_t)RAD_BF16, (N + g - 1) / g, kb),
-        opd((uint32_t)RAD_F8E4M3, M, nout),
-        opd((uint32_t)RAD_F32, M, (nout + g - 1) / g),
-        opd((uint32_t)RAD_BF16, M, nout),
     };
     R4D_PICK(l);
 }
@@ -1644,7 +1572,9 @@ extern "C" int r4d_shape_moe_scatter_inv(const RadParam* p, int n_p, int operand
     R4D_PICK(l);
 }
 
-extern "C" int r4d_shape_moe_gemm_q(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+/* `i8`: moe_gemm_i8a8's operands, int8 codes on both sides and the weight's scale per (row, group
+ * of K). */
+static int moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out, bool i8) {
     const int64_t M  = pi(p, n_p, "M");
     const int64_t N0 = pi(p, n_p, "N"), K0 = pi(p, n_p, "K");
     const int64_t N1 = pi(p, n_p, "N_odd", N0), K1 = pi(p, n_p, "K_odd", K0);
@@ -1661,27 +1591,34 @@ extern "C" int r4d_shape_moe_gemm_q(const RadParam* p, int n_p, int operand, Rad
      * in scatter order ("sorted"). */
     const char* ord = rad_param_gets(p, n_p, "a_order", nullptr);
     const int64_t AR = (ord && !std::strcmp(ord, "sorted")) ? M * k : M;
+    const uint32_t C = i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
+    auto srows = [&](int64_t n) { return i8 ? n : (n + g - 1) / g; };
+    const int64_t ag = pi(p, n_p, "a_group", g) > 0 ? pi(p, n_p, "a_group", g) : g;
     const RadOpdDesc l[] = {
-        opd((uint32_t)RAD_F8E4M3, AR, K),                 /* a -- see `a_order` */
-        opd((uint32_t)RAD_F32, AR, (K + g - 1) / g),      /* a_scale */
+        opd(C, AR, K),                 /* a -- see `a_order` */
+        opd((uint32_t)RAD_F32, AR, (K + ag - 1) / ag),    /* a_scale */
         /* The weight operands are tables when issued, described here as one stacked plane; a
          * fixture cannot hold a pointer array, and the kernel reads both forms (r4d_moe.hip,
          * wtab_at). */
-        opd((uint32_t)RAD_F8E4M3, ne0, N0, K0),           /* w -- the even experts */
-        opd((uint32_t)RAD_BF16, ne0, (N0 + g - 1) / g, (K0 + g - 1) / g),   /* w_scale */
+        opd(C, ne0, N0, K0),           /* w -- the even experts */
+        opd((uint32_t)RAD_BF16, ne0, srows(N0), (K0 + g - 1) / g),   /* w_scale */
         opd_idx(M * k, 0, M * k, -1),                     /* sorted_tok */
         opd_idx(ne + 1, 0, M * k + 1, -1),                /* expert_offset -- see the note above */
-        opd((uint32_t)RAD_F8E4M3, ne1, N1, K1),           /* w_odd -- the odd experts */
-        opd((uint32_t)RAD_BF16, ne1, (N1 + g - 1) / g, (K1 + g - 1) / g),   /* w_odd_scale */
+        opd(C, ne1, N1, K1),           /* w_odd -- the odd experts */
+        opd((uint32_t)RAD_BF16, ne1, srows(N1), (K1 + g - 1) / g),   /* w_odd_scale */
         opd(D, M * k, N),                                 /* y, in sorted order */
     };
     R4D_PICK(l);
 }
 
+extern "C" int r4d_shape_moe_gemm_i8(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return moe_gemm_q_shape(p, n_p, operand, out, true);
+}
+
 /* The four-class form: class q holds the experts e with e % 4 == q at [N_q, K_q], defaulting to
  * class 0's, ceil((n - q) / 4) of them; `y` follows the last class. */
-extern "C" int r4d_shape_moe_gemm_q_mod4(const RadParam* p, int n_p, int operand,
-                                         RadOpdDesc* out) {
+static int moe_gemm_q_mod4_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out,
+                                 bool i8) {
     const int64_t M  = pi(p, n_p, "M");
     int64_t Nc[4], Kc[4];
     Nc[0] = pi(p, n_p, "N");
@@ -1705,13 +1642,16 @@ extern "C" int r4d_shape_moe_gemm_q_mod4(const RadParam* p, int n_p, int operand
     const uint32_t D = dt_act(p, n_p, "dtype");
     const char* ord = rad_param_gets(p, n_p, "a_order", nullptr);
     const int64_t AR = (ord && !std::strcmp(ord, "sorted")) ? M * k : M;
-    auto wq = [&](int q) { return opd((uint32_t)RAD_F8E4M3, nq[q], Nc[q], Kc[q]); };
+    const uint32_t C = i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
+    auto wq = [&](int q) { return opd(C, nq[q], Nc[q], Kc[q]); };
+    const int64_t ag = pi(p, n_p, "a_group", g) > 0 ? pi(p, n_p, "a_group", g) : g;
     auto sq = [&](int q) {
-        return opd((uint32_t)RAD_BF16, nq[q], (Nc[q] + g - 1) / g, (Kc[q] + g - 1) / g);
+        return opd((uint32_t)RAD_BF16, nq[q], i8 ? Nc[q] : (Nc[q] + g - 1) / g,
+                   (Kc[q] + g - 1) / g);
     };
     const RadOpdDesc l[] = {
-        opd((uint32_t)RAD_F8E4M3, AR, K),                 /* a -- see `a_order` */
-        opd((uint32_t)RAD_F32, AR, (K + g - 1) / g),      /* a_scale */
+        opd(C, AR, K),                                    /* a -- see `a_order` */
+        opd((uint32_t)RAD_F32, AR, (K + ag - 1) / ag),    /* a_scale */
         wq(0), sq(0),                                     /* w, w_scale -- class 0 */
         opd_idx(M * k, 0, M * k, -1),                     /* sorted_tok */
         opd_idx(ne + 1, 0, M * k + 1, -1),                /* expert_offset */
@@ -1719,6 +1659,10 @@ extern "C" int r4d_shape_moe_gemm_q_mod4(const RadParam* p, int n_p, int operand
         opd(D, M * k, N),                                 /* y -- in SORTED order */
     };
     R4D_PICK(l);
+}
+extern "C" int r4d_shape_moe_gemm_i8_mod4(const RadParam* p, int n_p, int operand,
+                                          RadOpdDesc* out) {
+    return moe_gemm_q_mod4_shape(p, n_p, operand, out, true);
 }
 
 extern "C" int r4d_shape_moe_gather(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
@@ -2183,7 +2127,7 @@ extern "C" int r4d_shape_rmsnorm_had_quant_i8g(const RadParam* p, int n_p, int o
     const int64_t n = pi(p, n_p, "n");
     const int64_t g = pi(p, n_p, "group", R4D_FP8_BLOCK);
     const uint32_t D = dt_act(p, n_p, "dtype");
-    if (g != R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
+    if (g != R4D_FP8_BLOCK && g != R4D_I8_GROUP_WIDE) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
         opd(D, M, n),
         opd(D, M, n),
@@ -2202,7 +2146,7 @@ extern "C" int r4d_shape_gated_had_quant_i8g(const RadParam* p, int n_p, int ope
     const int64_t n = pi(p, n_p, "n");
     const int64_t g = pi(p, n_p, "group", R4D_FP8_BLOCK);
     const uint32_t D = dt_act(p, n_p, "dtype");
-    if (g != R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
+    if (g != R4D_FP8_BLOCK && g != R4D_I8_GROUP_WIDE) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
         opd(D, M, 2 * n),                   /* gate then up in one buffer */
         opd((uint32_t)RAD_I8, M, n),
@@ -2219,7 +2163,7 @@ extern "C" int r4d_shape_gate_quant_fp8(const RadParam* p, int n_p, int operand,
     const int64_t n = pi(p, n_p, "n");
     const int64_t g = pi(p, n_p, "group", R4D_FP8_BLOCK);
     const uint32_t D = dt_act(p, n_p, "dtype");
-    if (g != R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
+    if (g != R4D_FP8_BLOCK && g != R4D_I8_GROUP_WIDE) return RAD_E_UNSUPPORTED;
     /* A row is a (token, head) pair: `M` is tokens * n_head and `n` is head_dim, so the gate is a
      * fixed stride inside the [q|gate] projection and the scale plane lands where the out
      * projection reads it. In the engine the gate is a column slice; described flat. */

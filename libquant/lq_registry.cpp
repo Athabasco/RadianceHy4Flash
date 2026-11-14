@@ -176,6 +176,11 @@ int gptq_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* sr
     if (tord) uf = gptq_factor_ordered(dir, w->name, K, g.fwht, damp, &perm);
     else if (act) perm = gptq_act_order(dir, w->name, K, g.fwht);
     if (act || tord) {
+        /* A weight with no recording has no order to take: its columns stay in their own. */
+        if ((int64_t)perm.size() != K) {
+            perm.resize((size_t)K);
+            for (int64_t j = 0; j < K; ++j) perm[(size_t)j] = (int32_t)j;
+        }
         permute(src, false);
         if (imp) {
             imp_p.resize((size_t)K);

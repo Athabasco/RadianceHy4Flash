@@ -10,8 +10,7 @@
  */
 #pragma once
 #include "rad_core.h"
-
-#include <nlohmann/json_fwd.hpp>
+#include "util/json.h"
 
 #include <map>
 #include <memory>
@@ -27,9 +26,10 @@ namespace gen { struct Request; struct AudioRequest; class AudioTicket; struct V
 namespace mm { struct Frame; struct Item; }
 namespace server {
 
-/* ordered_json, not json: a tool's parameter schema is rendered into the prompt in the caller's
- * order, and property order in a schema changes what the model emits. */
-using json = nlohmann::ordered_json;
+/* The ordered DOM (util/json.h), not a sorted one: a tool's parameter schema is rendered into
+ * the prompt in the caller's order, and property order in a schema changes what the model
+ * emits. */
+using json = Json;
 
 /* ================================================================== the scheduler
  *
@@ -93,6 +93,9 @@ struct SchedMetrics {
     double  linear_hit_rate = 0.0;
     int64_t attn_cached_tokens = 0;
     int64_t linear_cached_tokens = 0;
+    /* Prompt tokens of every admitted request: what the two cached counts above are out of, counted
+     * at the admission as they are. */
+    int64_t prefix_queries = 0;
     int64_t checkpoints_written = 0;
     double  prefill_tps = 0.0;
     double  decode_tps = 0.0;
@@ -431,6 +434,8 @@ public:
 
     virtual bool supports_tools() const = 0;
     virtual bool supports_reasoning() const = 0;
+    /* What the template's tool capability probe threw (ChatCaps::probe_error), or "". */
+    virtual std::string tools_probe_error() const { return std::string(); }
 
     /* Why this model's tool calls cannot be read, or "" when they can. A template may support
      * tools in a format the reply parser does not know; the model still chats, and a request that

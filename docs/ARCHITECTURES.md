@@ -7,40 +7,46 @@ plugin claims.
 
 | plugin | id | quantisation | what it serves |
 |---|---|---|---|
-| `arch/llama_fp8` | `llama` | `fp8_e4m3` | the plain LLaMA decoder, from a checkpoint that holds E4M3 codes and a `weight_scale_inv` plane |
-| `arch/llama_dense_fp8` | `llama` | *(empty)* | the same graph from a bf16 checkpoint, linears made block fp8 by a recipe or kept bf16. MiniCPM5-2B |
+| `arch/llama_fp8` | `llama` | `fp8_e4m3` | the plain LLaMA decoder under the `fp8_e4m3` descriptor; its linears go through `LinearFP8` (`arch/common/rad_fp8.h`), which refuses a block-fp8 weight at load |
+| `arch/llama_dense_fp8` | `llama` | *(empty)* | the same graph from a bf16 checkpoint, linears made IQ8R by a recipe (`data/recipes/minicpm5-2b-iq8r.recipe`) or kept bf16. MiniCPM5-2B |
 | `arch/qwen35_bf16` | `qwen35` | *(empty)* | the Qwen3.5/3.6/3.8 dense hybrid, served bf16 |
-| `arch/qwen35_fp8` | `qwen35` | `fp8_e4m3` | the same, block-scaled FP8 weights and activations |
-| `arch/hyv3_bf16` | `hyv3` | *(empty)* | Tencent Hy-Memory-30B-A3B BF16 safetensors; BF16, W4, W8A8, block-FP8 or MXFP4 weights by recipe; TP1/2, BF16 KV |
-| `arch/hyv3_fp8` | `hyv3` | `fp8` | Tencent Hy-Memory-30B-A3B-FP8; imported per-tensor E4M3 weights, one dense layer then sigmoid-routed MoE; TP1/2, BF16 or static-scaled E4M3 KV |
+| `arch/qwen35_fp8` | `qwen35` | `fp8_e4m3` | the same under the `fp8_e4m3` descriptor, and the imported quantisations (an int4 W4A16 release, `data/recipes/q38-27b-w4a16.recipe`); a block-fp8 weight is refused at load |
+| `arch/hyv3_bf16` | `hyv3` | *(empty)* | Tencent Hy-Memory-30B-A3B BF16 safetensors; BF16, W4 or W8A8 weights by recipe; TP1/2, BF16 KV |
+| `arch/hyv3_fp8` | `hyv3` | `fp8` | Tencent Hy-Memory-30B-A3B-FP8's descriptor: the same graph, one dense layer then sigmoid-routed MoE; its per-tensor E4M3 linears are a form this build does not serve; TP1/2, bf16 or int8 KV |
 | `arch/hyv3_gguf` | `hyv3` | `gguf_ftype_15` | llama.cpp Hy-Memory Q4_K_M GGUF, dequantized and recipe-converted to native Radiance weights; TP1/2 |
-| `arch/qwen35_w8a8` | `qwen35` | `w8a8_fwht128` | `qwen35_fp8` with an int8 trunk: i8 weights with a bf16 scale per 128 of K, rotated by a 128-wide Hadamard, against int8 activations under the same rotation (`data/recipes/q38-27b-w8a8-df2.recipe`) |
+| `arch/qwen35_w8a8` | `qwen35` | `w8a8_fwht128` | `qwen35_fp8` with an int8 trunk: i8 weights with a bf16 scale per 128 of K, rotated by a 128-wide Hadamard, against int8 activations under the same rotation: IQ8R and IQR-V4 (`data/recipes/q38-27b-iq8r.recipe`, `q38-27b-iq4r-s-v4.recipe`) |
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
-| `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert, or Qwen's FP8 release as it ships |
-| `arch/glm5next` | `glm5next` | *(empty)* | GLM-5.3-Flash from AMD's Quark MXFP4 export: four mHC residual streams over 34 KDA and 11 sparse latent-attention (MLA) layers with a DSA indexer, 288 MXFP4 experts at top-8 under sigmoid routing, block-FP8 attention and dense layers at f32 scales, each weight served as stored; its MTP layer is a serial drafter. Pictures through its vision tower (`arch/common/rad_block_glm_vision.h`); bf16 KV |
+| `arch/qwen35moe_w8a8` | `qwen35moe` | `w8a8_fwht128` | `qwen35moe_fp8` with `qwen35_w8a8`'s int8 trunk and rotated int8 experts, the routed arm reading the trunk's own int8 codes (`data/recipes/q36-35b-a3b-iq8r.recipe`) |
+| `arch/clef_bf16` | `clef` | *(empty)* | Cloudflare's clef and clef-flash decision models: `qwen35_bf16`'s trunk with the joint schema head on the card (`arch/common/rad_block_clef.h`), served on `/v1/systemone`; a container selects it with `rad-convert --arch clef` |
+| `arch/clef_fp8` | `clef` | `fp8_e4m3` | the same over `qwen35_fp8`'s trunk |
+| `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert (`data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe`) or an AutoRound int4 release (`qwen4exp-autoround-i8-hc8m.recipe`) |
+| `arch/glm5next` | `glm5next` | *(empty)* | GLM-5.3-Flash: four mHC residual streams over 34 KDA and 11 sparse latent-attention (MLA) layers with a DSA indexer, 288 experts at top-8 under sigmoid routing, attention and dense layers as the container stores them; its MTP layer is a serial drafter. Pictures through its vision tower (`arch/common/rad_block_glm_vision.h`); bf16 KV |
 | `arch/bailing_hybrid` | `bailinghybrid` | *(empty)* | Ling-3.0-flash and its fine-tunes (Ling-3.0-flash-Sante) from the bf16 checkpoint: 35 KDA and 7 dense latent-attention (MLA) layers with a rotary part and a head-wise gate, 512 experts at top-8 under group-limited sigmoid routing with an ungated shared expert, the routed experts as the recipe stores them (`data/recipes/ling3-w4a8-rtn.recipe`); its MTP layer is a serial drafter; bf16 KV |
-| `arch/nemotronh` | `nemotronh` | *(empty)* | Nemotron-3.5-Bolt-74B-A9B (`nemotron_h_omni` around `nemotron_h_puzzle`), its language model from the bf16 checkpoint: 40 Mamba-2, 40 latent-MoE and 8 NoPE attention blocks in the order `layers_block_type` gives, 240 to 496 ungated relu^2 experts a layer in a 1024-wide latent with a relu^2 shared expert; linears and experts as the recipe stores them (`data/recipes/nemotron74-fp8.recipe`, `nemotron74-w4nl64-gptq.recipe`); pictures and video through its C-RADIO tower (`arch/nemotronh/radio.h`); bf16 KV |
-| `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16, one rank |
+| `arch/nemotronh` | `nemotronh` | *(empty)* | Nemotron-3.5-Bolt-74B-A9B (`nemotron_h_omni` around `nemotron_h_puzzle`), its language model from the bf16 checkpoint: 40 Mamba-2, 40 latent-MoE and 8 NoPE attention blocks in the order `layers_block_type` gives, 240 to 496 ungated relu^2 experts a layer in a 1024-wide latent with a relu^2 shared expert; linears and experts as the recipe stores them; pictures and video through its C-RADIO tower (`arch/nemotronh/radio.h`); bf16 KV |
+| `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16 or IQ8R, one rank |
 | `arch/spark25_bf16` | `spark25` | *(empty)* | Spark X2.6, bf16 checkpoint, mixed sliding/full attention, TP1 or TP with exact collectives ([geometry](#spark25-spark-x26)). Optional DSpark drafter when the container already holds `draft.*` tensors, TP1 only. |
+| `arch/spark25_w8a8` | `spark25` | `w8a8_fwht128` | the same with rotated int8 weights and activations (`data/recipes/spark-x26-4b-iq8r.recipe`); an optional DSpark drafter stays bf16 |
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
 | `arch/nomicbert` | `nomicbert` | *(empty)* | nomic-embed-text-v2-moe: a bidirectional post-norm encoder, 12 layers with 8 experts at top 2 on every second layer, mean-pooled to one vector an input |
+| `arch/laya` | `laya` | *(empty)* | Convai Innovations' Laya decision models (laya, laya-typed-decisions, laya-multilingual): a ModernBERT encoder and a small decision head scoring each option of a question, bf16, served on `/v1/systemone` |
+| `arch/unlimitedocr_bf16` | `unlimitedocr` | *(empty)* | baidu's Unlimited-OCR: a small Llama-MoE decoder with the DeepEncoder vision tower (SAM ViT-B/16, CLIP ViT-L/14 and a projector), bf16 |
 | `arch/nemotron35_embed` | `mistral3` | *(empty)* | Nemotron 3.5 Embed 1B/8B and Rerank 8B: native BF16 bidirectional text/image retrieval with a Pixtral tower, TP1 ([geometry and contracts](#nemotron35_embed-embedding-models)) |
 | `arch/gemma4_bf16` | `gemma4` | `compressed-tensors` | Gemma 4 31B dense, the E2B/E4B form at one rank, and the 12B (`gemma4_unified`, its image and audio embedders in place of a tower), with its vision tower: sliding-window and proportional-RoPE global (`attention_k_eq_v`) attention, GELU ffn, softcapped logits; int4 codes with an f16 scale per 128 from Google's CT-INT4 (QAT) release or from bf16, served w4a8, or int8 codes on the same grid from bf16 (w8a8, the Q8 container). Optional draft model (`rad-convert --draft-model`): Google's assistant, with no cache of its own (`rad_drafter_shared_kv`), or z-lab's DFlash drafter, the block `arch/gemma4` serves (`arch/common/rad_gemma4_dflash.h`), or RedHatAI's DFlash2 speculator (`arch/common/rad_block_dflash2.h`) |
 | `arch/gemma3` | `gemma3` | *(empty)* | Gemma 3 dense text (TranslateGemma 27B) from the bf16 checkpoint: sliding-window and global attention at one head geometry, GemmaRMSNorm, GELU ffn; linears bf16, or int8, MXFP4 or asymmetric int4 over an activation scaled per (row, 128), as the recipe stores them. Optional DFlash2 drafter (`rad-convert --draft-model`) |
-| `arch/gemma4` | `gemma4` | *(empty)* | Gemma 4 text from Google's bf16 checkpoint (the 26B-A4B MoE and the dense sizes without per-layer embeddings) with z-lab's DFlash drafter; routed experts bf16 or block fp8 |
-| `arch/qwenimage21` | `qwenimage21` | *(empty)* | Qwen-Image 2.1 and 2.1-Turbo, an image generator, from the diffusers pipeline directory; DiT and text encoder bf16 or block fp8 |
-| `arch/krea2` | `krea2` | *(empty)* | Krea 2 Raw and Turbo, an image generator: Qwen3-VL-4B's tapped layers through a text-fusion transformer, a 12.9B single-stream DiT and Wan 2.1's VAE, from the diffusers pipeline directory; bf16 or block fp8 |
+| `arch/gemma4` | `gemma4` | *(empty)* | Gemma 4 text from Google's bf16 checkpoint (the 26B-A4B MoE and the dense sizes without per-layer embeddings) with z-lab's DFlash drafter; routed experts bf16, or their gate_up rotated int8 (`data/recipes/gemma4-26b-a4b-df-i8.recipe`) |
+| `arch/qwenimage21` | `qwenimage21` | *(empty)* | Qwen-Image 2.1 and 2.1-Turbo, an image generator, from the diffusers pipeline directory; DiT and text encoder bf16 or IQ8R |
+| `arch/krea2` | `krea2` | *(empty)* | Krea 2 Raw and Turbo, an image generator: Qwen3-VL-4B's tapped layers through a text-fusion transformer, a 12.9B single-stream DiT and Wan 2.1's VAE, from the diffusers pipeline directory; bf16 or IQ8R |
 | `arch/sdxl` | `sdxl` | *(empty)* | Stable Diffusion XL and its finetunes (Illustrious, NoobAI, Pony), an image generator: CLIP ViT-L and OpenCLIP bigG text encoders, the 2.6B UNet sampled by k-diffusion's Euler, Euler ancestral or DPM++ 2M on ComfyUI's schedules, the SDXL VAE; from the single-file checkpoint, bf16, one card |
-| `arch/flux3` | `flux3` | *(empty)* | FLUX.3 [klein] and its base, an image generator and editor: Qwen3-VL-4B's tapped layers, a 5.6B three-mode DiT over the text, up to ten reference pictures and the image, FLUX.2's VAE; bf16 or block fp8 |
-| `arch/anima` | `anima` | *(empty)* | Anima (Base, Aesthetic, Turbo), an image generator: Qwen3-0.6B-Base through the LLM adapter over the prompt's T5 tokens, Cosmos-Predict2's 2B cross-attention DiT and the Qwen-Image VAE, from the release's single files; bf16 or block fp8, one card |
+| `arch/flux3` | `flux3` | *(empty)* | FLUX.3 [klein] and its base, an image generator and editor: Qwen3-VL-4B's tapped layers, a 5.6B three-mode DiT over the text, up to ten reference pictures and the image, FLUX.2's VAE; bf16 or IQ8R |
+| `arch/anima` | `anima` | *(empty)* | Anima (Base, Aesthetic, Turbo), an image generator: Qwen3-0.6B-Base through the LLM adapter over the prompt's T5 tokens, Cosmos-Predict2's 2B cross-attention DiT and the Qwen-Image VAE, from the release's single files; bf16, one card |
 | `arch/flux3distilled` | `flux3distilled` | *(empty)* | the same plugin under the name FLUX.3 [klein]'s step-distilled release gives itself (`Flux3DistilledModularPipeline`; its base is a `Flux3ModularPipeline`) |
 | `arch/qwen3asr_bf16` | `qwen3asr` | *(empty)* | Qwen3-ASR: a Whisper-style audio encoder over a dense Qwen3 decoder, speech to text |
 | `arch/minimaxmusic3` | `minimaxmusic3` | *(empty)* | MiniMax-Music3, songs from a description and lyrics: a Qwen3-8B frame model, a depth decoder, a flow-matching DiT and a DAC vocoder, from the diffusers pipeline directory, bf16 |
 | `arch/breeze` | `breeze` | *(empty)* | Breeze-TTS-2, speech from text and a description of the voice: a T5Gemma 2 text encoder, a Qwen3 backbone with a 16-codebook depth decoder and the Qwen3-TTS 12 Hz codec, from the release directory, bf16, one card |
-| `arch/fishomni` | `fishomni` | `bsgemm-moe` | Fish Audio drama-3, speech from text with speaker tags and inline direction, its voices cloned from reference clips: the Qwen3.5-35B-A3B backbone with its routed experts block fp8 at f32 scales and everything else bf16, a 13-layer codebook tower over the backbone's full-attention cache, and Fish S2's modified DAC, encoder and decoder (`codec.pth`, read as data); from the release directory, two cards |
+| `arch/fishomni` | `fishomni` | `bsgemm-moe` | Fish Audio drama-3, speech from text with speaker tags and inline direction, its voices cloned from reference clips: the Qwen3.5-35B-A3B backbone with its routed experts as the container stores them and everything else bf16, a 13-layer codebook tower over the backbone's full-attention cache, and Fish S2's modified DAC, encoder and decoder (`codec.pth`, read as data); from the release directory, two cards |
 | `arch/hunyuan3d2` | `hunyuan3d2` | *(empty)* | Hunyuan3D-2's shape model (hunyuan3d-dit-v2-0), an untextured 3-D shape from one picture: DINOv2-giant over the picture, a FLUX-shaped flow-matching DiT (16 double-stream and 32 single-stream blocks of 1024) over a set of 3072 latents, and the shape VAE's geometry decoder, whose occupancy field the core samples on a grid and meshes; from the release folder (config.yaml and one safetensors), its fp16 weights cast to bf16 (`data/recipes/hunyuan3d-2-bf16.recipe`) |
-| `arch/minimaxh3` | `minimaxh3` | *(empty)* | MiniMax-H3, a video with its stereo soundtrack from text, between keyframes or from reference media: Qwen3-VL-32B's language model as the text encoder, a 33B single-stream diffusion transformer, a tiled ViT video decoder and a BigVGAN audio decoder, from the diffusers pipeline directory; linears block fp8 (`data/recipes/minimax-h3-fp8.recipe`), or the DiT's per-token linears int8, served w8a8 (`minimax-h3-w8a8.recipe`); a curve-form checkpoint, whose timestep embeddings ship as a table, by the `minimax-h3-curve-*` recipes |
-| `arch/ltx2` | `ltx2` | *(empty)* | LTX-2.5 (base and distilled), a video with its stereo soundtrack from text or from text and a first frame: Gemma 4's language model and two text connectors, the duration head, a dual-stream audio-video DiT with four-way guidance, the causal video VAE (tiled past the default canvas) or the diffusion decoder, the audio VAE with a BigVGAN vocoder and bandwidth extension, the x2 latent upsampler; bf16 or block fp8, one card |
+| `arch/minimaxh3` | `minimaxh3` | *(empty)* | MiniMax-H3, a video with its stereo soundtrack from text, between keyframes or from reference media: Qwen3-VL-32B's language model as the text encoder, a 33B single-stream diffusion transformer, a tiled ViT video decoder and a BigVGAN audio decoder, from the diffusers pipeline directory; every quantised linear int8, the text encoder's, the refiner's and the modulation projections' rotated (`data/recipes/minimax-h3-i8.recipe`) |
+| `arch/ltx2` | `ltx2` | *(empty)* | LTX-2.5 (base and distilled), a video with its stereo soundtrack from text or from text and a first frame: Gemma 4's language model and two text connectors, the duration head, a dual-stream audio-video DiT with four-way guidance, the causal video VAE (tiled past the default canvas) or the diffusion decoder, the audio VAE with a BigVGAN vocoder and bandwidth extension, the x2 latent upsampler; bf16 or IQ8R, one card |
 
 The traps below are readings that are wrong without any error: the model produces fluent output.
 
@@ -129,23 +135,29 @@ quantiser. The output head may be BF16 or a separately quantised int8 table. The
 `w8a8_fwht128`; the container must set `quantization_config.quant_method=w8a8` and
 `quantization_config.fmt=fwht128`.
 
-The full recipe, `data/recipes/spark-x26-4b-iq8r.recipe`, is an explicit speed/size tradeoff, not a
-quality-preferred default. `data/recipes/spark-x26-4b-iq8r-keep12.recipe` leaves layers 0–11 in
-BF16 and is the tested quality-preferred allocation (6.09 GB / 5.67 GiB). The full IQ8R container
-is 4.52 GiB; BF16 is 8.29 GiB. The measured comparison used top-128-plus-tail KL, with the full
-variant's maximum 11.883 and keep12's maximum 0.247 over 31,391 held-out positions. These are
-coarsened distribution-parity measurements, not full-vocabulary KL or task-benchmark scores. The
-source revision and replay commands, tail details, hashes, calibration/evaluation provenance, and
-limits are in [`SPARK25-IQ8R.md`](SPARK25-IQ8R.md). The cited numbers require the shared prefill
-softmax fix #362 (`7480da3d46b0475d9d77966e31284cc19072759`); they are not evidence for standalone
-#363 without that prerequisite.
+Two recipes, neither applied by default:
+
+| recipe | size | top-1 agreement | KL mean / p99 / max | speed |
+|---|---|---|---|---|
+| `spark-x26-4b-iq8r-keep12.recipe` (layers 0-11 stay bf16) | 5.67 GiB | 99.11% | 0.00068 / 0.0092 / 0.247 | about 12% less prefill and 17% less decode than full IQ8R |
+| `spark-x26-4b-iq8r.recipe` (every layer) | 4.52 GiB | 98.60% | 0.0041 / 0.050 / 11.9 (13 positions over 1 nat) | prefill 11.8k tok/s, decode 93.7 tok/s at short context, one card |
+| no recipe (bf16) | 8.29 GiB | reference | | |
+
+The KL is the KL mode's `kld-top: 128` form (the reference's top 128 probabilities plus one bucket
+for the rest), not full-vocabulary KL, over 31,391 positions of a 32-document held-out set (8 each
+of tools, math, prose and code), TP1, bf16 KV, no speculation, no prefix cache. Perplexity ratios
+were 1.0018 (keep12) and 1.0041 (full). In both recipes the output head is RTN and unmatched
+tensors keep their source encoding. `tests/spark25_quality.py` reproduces the comparison against a
+bf16 reference, `tests/spark25_kld_tail.py` replays a candidate's worst rows, and
+`tests/spark25_qos.py` runs a fixed-work latency smoke; each hashes its inputs and plugins into a
+`run.json` receipt.
 
 The BF16 plugin records the calibration Grams with `RADIANCE_CALIB_DIR`, `RADIANCE_CALIB_TOKENS`,
 and `RADIANCE_SPARK_CALIB_LAYERS=lo:hi`; use TP=1 to retain off-diagonal cross-rank terms. Drive
 a representative corpus through prefill with prefix caching and speculation disabled. Each layer
-slice writes six RADGRAM2 files. The published calibration manifest and dataset revision are
-recorded in [`SPARK25-IQ8R.md`](SPARK25-IQ8R.md); calibration completeness is not a measure of
-quality.
+slice writes six RADGRAM2 files. The published Grams are the Hugging Face dataset
+`gostar77/spark-x2.6-4b-iq8r-calibration` (216 files over 65,660 tokens of 100 document beginnings,
+every fourth in the chat format).
 
 A column-sharded input must have a 128-column-aligned offset and width. When possible, FFN sharding
 partitions whole 128-channel groups with a ragged remainder-first split. Spark's 10,240-channel FFN
@@ -170,7 +182,7 @@ declares.
 
 `arch/common/rad_block_dspark_bf16.h` is the drafter's graph, declared by both Spark plugins after
 the trunk when the container carries `draft.markov_w1.weight`. It is its own block: the MiniCPM5
-DSpark block (`rad_block_dspark.h`) has Q/K norms, SiLU and an fp8 activation grid, and Spark's has
+DSpark block (`rad_block_dspark.h`) has Q/K norms, SiLU and an int8 activation grid, and Spark's has
 none of those. Per pass it encodes the taps the trunk copied into `dflash_src` (each tap RMS-normed
 by its own `fc_norm_t<i>`, concatenated, projected by `fc`, normed by `output_norm_enc`), embeds the
 anchor token, runs the five bf16 sliding-window layers over the drafter's own KV group, then scores
@@ -195,7 +207,7 @@ runtime validation. Both new operations have distinct names, so an older device 
 does not implement these semantics refuses the graph rather than resolving a similar-looking op.
 
 The drafter is declared only at one rank: its `fc` is unsharded and its head scores the full
-vocabulary, so a `--tp` above 1 is refused at declaration rather than served half-sharded.
+vocabulary, so a `tp` above 1 is refused at declaration rather than served half-sharded.
 
 DSpark's acceptance, latency and throughput on this exact graph are not measured yet (figures taken
 with an approximate window and a candidate-pruned walk do not carry over); run the QoS harness below
@@ -206,9 +218,8 @@ serving schedule.
 `scripts/dspark_qos_regression.py` is an unvalidated two-server QoS harness, not evidence that
 runtime gates pass. In particular, it treats missing metrics as zero, aggregate proposed versus
 accepted counts cannot prove a partial rejection, and a stop finish reason does not prove an
-explicit stop sequence was encountered. `--prefix-cache-mib 0` does not disable the VRAM prefix
-cache; use `--no-prefix-cache` for that. See `docs/DSPARK-370-DEVICE-FOLLOWUP.md` for the
-limitations and serial diagnostic receipts. Controlled KV rollback/eviction, acceptance quality,
+explicit stop sequence was encountered. `prefix-cache-mib: 0` does not disable the VRAM prefix
+cache; use `no-prefix-cache: true` for that. Controlled KV rollback/eviction, acceptance quality,
 and QoS measurements remain open; CPU tests and matching sample text cannot establish them.
 
 For a CPU differential against the reference implementation's `configuration_spark.py` and
@@ -238,17 +249,20 @@ there is no gated delta net, layer schedule, output gate or per-head q/k norm.
 MiniCPM5-2B: 42 layers, hidden 2048, 16 query heads over 2 KV heads at `head_dim` 128, SwiGLU at
 6144, RMS norms, full rotary at theta 5e6, an untied 130560-row head, no biases.
 
-**Two checkpoint formats, one graph.** OpenBMB publishes MiniCPM5-2B only in bf16, so
-`llama_dense_fp8` declares the empty quantisation descriptor and the recipe
-`data/recipes/minicpm5-2b-dspark.recipe` quantises at convert (libquant's `rtn`, one amax per
-128x128 block, `scale = amax/448` rounded to bf16). The container then holds what an fp8 release
-would, both plugins declare the same ops over it, and nothing downstream can tell which one ran. A
-container whose linears are left bf16 (`minicpm5-2b-bf16-dspark.recipe`) is read by `gemm_nt`.
+**One graph over a bf16 checkpoint.** OpenBMB publishes MiniCPM5-2B only in bf16, so
+`llama_dense_fp8` declares the empty quantisation descriptor and the recipe quantises at convert.
+`data/recipes/minicpm5-2b-iq8r.recipe` makes the linears, and the DSpark drafter's, IQ8R: rotated
+int8 codes with a u8 scale per `[1 x 256]` of K under a bf16 scale a row. `llama_dense_fp8` learns
+that from the first layer's q|k|v and declares int8 activation pairs, written by the norms, the
+gated product and the attention output's quantiser; `kv-cache-dtype: i8` then leaves no E4M3 in the
+model. On one R9700 a decode step is 5.17 ms at one sequence and 5.71 at eight; with the drafter
+6.87 at one and 7.92 at four. A container whose own linears are left bf16
+(`minicpm5-2b-bf16-dspark.recipe`, the drafter IQ8R) is read by `gemm_nt`.
 
-fp8: `self_attn.{q,k,v,o}_proj` and `mlp.{gate,up,down}_proj`, each with a bf16 `[N/128][K/128]`
-scale plane. Not fp8: every norm and the embedding. The lm_head is declared at whatever the source
-holds (bf16 from a checkpoint, fp8 where the recipe made it so), and the GEMM that reads that
-encoding is selected. Both vocabulary edges are row-sharded.
+Quantised: `self_attn.{q,k,v,o}_proj` and `mlp.{gate,up,down}_proj`. Not quantised: every norm and
+the embedding. The lm_head is declared at whatever the container holds (bf16 from a checkpoint,
+int8 where the recipe made it so), and the GEMM that reads that encoding is selected. Both
+vocabulary edges are row-sharded.
 
 ---
 
@@ -388,7 +402,7 @@ Three groups, which is why hybrid KV groups are first-class:
 
 | group | kind | geometry |
 |---|---|---|
-| full attention | `RAD_KV_FULL` | 16 layers, head_dim 256, 4 KV heads; block size from the resolved kernel. `--kv-cache-dtype fp8_v4` / `k6_v4` (`qwen35_fp8`; `qwen4exp_fp8` too) declare it at head_dim 200 / 176, the bytes of a token's quantised row over two (docs/OPS.md) |
+| full attention | `RAD_KV_FULL` | 16 layers, head_dim 256, 4 KV heads; block size from the resolved kernel. `kv-cache-dtype: i8` declares it as an int8 group at the same head_dim (docs/OPS.md) |
 | GDN recurrent state | `RAD_KV_LINEAR` | 48 layers, 48 states of 128 x 128 |
 | GDN conv state | `RAD_KV_CONV` | 48 layers, 2*16 + 48 = 80 heads x 128 = 10240 channels, a rolling `conv_width - 1 + n_spec` window |
 
@@ -396,29 +410,23 @@ Three groups, which is why hybrid KV groups are first-class:
 across the 48 linear layers, and it is what the prefix-cache checkpoint of `spec.md` §7.3
 snapshots. Its reads and writes dominate the two GDN kernels. libr4d also compiles an f16 form
 (elements are O(0.1); the f16 round trip is about 5e-4 relative) that would halve that traffic,
-but the plugins declare f32 because f16 changes the generated text; `--state-cache-dtype f16`
+but the plugins declare f32 because f16 changes the generated text; `state-cache-dtype: f16`
 declares f16 for a deployment that accepts the loss (GUIDE §4.4: on Qwen3.8-27B MXFP4, mean KL
 +0.9..+2.2 %, decode +10 % at sixteen streams without speculation). How a speculative step keeps a
 state it can roll back is `docs/OPS.md`'s `state_form`.
 
 ## FP8
 
-`quant_method: fp8`, `fmt: e4m3`, `activation_scheme: dynamic`, and a `weight_scale_inv` beside
-every quantised weight: DeepSeek-style 128x128 block scaling. Activations are quantised at runtime
-("dynamic"), so the activation quantiser is an op. The vision tower's first several blocks are in
-`modules_to_not_convert` and stay bf16.
+Qwen's FP8 release states `quant_method: fp8`, `fmt: e4m3`, `activation_scheme: dynamic`, and a
+`weight_scale_inv` beside every quantised weight: DeepSeek-style 128x128 block scaling. The vision
+tower's first several blocks are in `modules_to_not_convert` and stay bf16. `rad-convert` reads
+those codes as stored, and `LinearFP8` refuses a block-fp8 weight at load
+(`linear_retired`), so the release is served after a recipe re-quantises its linears from their
+exact values; the bf16 release converts to the same int8 containers (`qwen35_w8a8`, below).
 
-**libr4d reads those bytes directly, so `rad-convert` copies them**: no permutation, repacking or
-dequantisation, and a `.rad` costs what the checkpoint does. Widening a 27B FP8 checkpoint to bf16
-would double the weight bytes; `qwen35_bf16` is for checkpoints that are bf16 to begin with. The
-rows are `gemm_fp8a16_nt_m1`, `gemm_fp8a8_nt_m16`, `gemm_fp8a8_gated_nt_m16` and
-`gemm_fp8a8_tiled`.
-
-**The shipped path is `fp8a8`.** `dtype` is one string per declared op, so a linear is `fp8a16` or
-`fp8a8`, not both. `fp8a16` reads the bf16 activation directly with no quantise launch, but its
-kernel serves only `M <= 1` (single-sequence decode). `fp8a8`'s two kernels cover every M, at the
-price of one `quant_act_fp8` launch per activation that feeds a GEMM. That cost is per activation,
-not per linear, which is why the quantiser is its own struct rather than a step inside the linear.
+Activations are quantised at runtime, so the activation quantiser is an op. That cost is per
+activation, not per linear, which is why the quantiser is its own struct (`ActFP8`) rather than a
+step inside the linear.
 
 **The scale plane is a weight operand**: `gemm_nt_q` takes `a, a_scale, b, b_scale`, and `b` and
 `b_scale` are two declarations over the planes of one logical weight (`RadWeightDecl::planes`).
@@ -434,9 +442,9 @@ unit rather than a branch on `n_expert` because the id is half the selection key
 cannot claim both ids.
 
 The routed experts are served in the format the container stores, read from layer 0's first
-expert (`MoeFP8::probe`, as `qwen4exp` does): block FP8, the four-bit forms of
-[`docs/MOE-W4.md`](MOE-W4.md), whose rotated ones add a rotated copy of the block input (`moe_hr`),
-or OCP MXFP4 (`fp4_e2m1*e8m0[1x32]`, `data/recipes/sage-a1.5-mxfp4-df2.recipe`).
+expert (`MoeFP8::probe`, as `qwen4exp` does): the four-bit forms of
+[`docs/MOE-W4.md`](MOE-W4.md), whose rotated ones add a rotated copy of the block input (`moe_hr`).
+Block-fp8 and MXFP4 experts are refused at load by the name of the first such weight.
 Experts stored stacked or one by one are both read (`moe_expert_sources`). Plain bf16 experts are
 refused, since this plugin has no bf16 expert path. Tensor parallelism splits each expert's
 width, so the GPTQ calibration tap (`RADIANCE_CALIB_DIR`) runs at one rank only.
@@ -445,18 +453,14 @@ width, so the GPTQ calibration tap (`RADIANCE_CALIB_DIR`) runs at one rank only.
 replace it with a DFlash2 block drafter. The shared source selects the drafter from the container's
 `draft.architectures` (a DFlash2 model), declares it (`declare_dflash2`) and then does not declare
 the MTP head, so the routed trunk carries a dense drafter without further work.
-`sage-a1.5-fp8-df2.rad` is such a container: Sage-A1.5's routed trunk with
-`incoai/Qwen3.6-35B-A3B-DFlash2`, whose six 2048-wide layers read eight taps
-(`target_layer_ids` 1 6 11 16 22 27 32 37) and propose a block of seven tokens in one pass. At
-depth 7 it accepts ~49% of the proposals and decodes 1.40x faster than the same trunk with its MTP
-head (393 against 282 tok/s on two R9700s). `sage-a1.5-mxfp4-df2.rad` is the same with the trunk,
-the experts and the drafter's linears at MXFP4. `--num-speculative-tokens auto` takes the depth the
-drafter states.
+`incoai/Qwen3.6-35B-A3B-DFlash2` is such a drafter: six 2048-wide layers read eight taps
+(`target_layer_ids` 1 6 11 16 22 27 32 37) and propose a block of seven tokens in one pass.
+`num-speculative-tokens: auto` takes the depth the drafter states.
 
 ## `hyv3`
 
-`arch/hyv3_bf16` supports the Tencent BF16 safetensors checkpoint, and `arch/hyv3_fp8` supports
-Tencent's FP8 checkpoint. Both use the same graph: 48 layers, with a dense first
+`arch/hyv3_bf16` supports the Tencent BF16 safetensors checkpoint, and `arch/hyv3_fp8` claims
+the descriptor of Tencent's FP8 checkpoint. Both use the same graph: 48 layers, with a dense first
 MLP followed by 47 layers routing top-8 of 128 experts. The routed and shared MLP widths are both
 768 in the checkpoint tensors. Attention applies per-head Q/K RMSNorm before NeoX RoPE. Routing selects
 with sigmoid scores plus the correction bias, but normalizes the selected unbiased scores and
@@ -466,26 +470,18 @@ preserves those two arm roundings and folds their addition; the plugin prepares 
 plane for the whole step. Each residual add except the final one folds into the following norm,
 which normalizes the BF16-rounded sum. The final norm still reads a materialized residual stream.
 
-Convert the public FP8 checkpoint with
-`data/recipes/hy-memory-30b-a3b-fp8.recipe`; it preserves the E4M3 codes and expands the checkpoint's
-scalar F32 scales to the 128x128 F32 scale planes the GEMMs read. Norms and the router projection
-are widened to F32. Linear activations use Radiance's dynamic FP8 quantization; the checkpoint's
-static `.input_scale` calibration scalars are ignored, so numerical parity with vendor quantization
-is not established. The checkpoint index includes scalar per-layer K/V descales from
-`kv_cache_scales.safetensors`; conversion carries them into metadata for `kv_store` and paged
-attention. Use `--kv-cache-dtype fp8` for the checkpoint's static-scaled E4M3 cache, or `bf16` for a
-higher-precision cache. The plugin refuses the unrelated `fp8_v4` and `k6_v4` cache layouts.
-The vendor FP8-source import and static-scaled FP8 KV path have structural/unit coverage only;
-an end-to-end conversion and serving run of Tencent's FP8 checkpoint is not yet validated.
-This is distinct from the BF16-derived block-FP8 artifact tested below.
+The public FP8 checkpoint's index includes scalar per-layer K/V descales from
+`kv_cache_scales.safetensors`; conversion carries them into metadata and the plugin does not read
+them. Its E4M3 linears are a form this build does not serve (`LinearFP8` reads no per-tensor or
+per-row FP8 and refuses block fp8), so the BF16 checkpoint is the source to convert. `kv-cache-dtype: i8` is the int8 cache with its own
+scale per token and head, `bf16` the 16-bit one.
 
 The BF16 checkpoint can be converted without quantizing any weights, or with
 `data/recipes/hy-memory-30b-a3b-bf16-w4.recipe`, which quantizes attention projections, the first
 dense MLP and routed experts to INT4. Shared MLPs, router, norms, embeddings and the output head stay
 BF16. At decode the asymmetric linear W4 kernel narrows BF16 activations to F16 on load;
 above 64 rows its tiled path uses dynamic INT8 activations. The signed-I4 expert path uses
-block-scaled E4M3 activations. BF16-source block-FP8 and MXFP4 recipes quantize experts and regular
-linears; the W8 recipe quantizes regular linears and the output head while routed experts remain
+block-scaled E4M3 activations. The W8 recipe (`data/recipes/hy-memory-30b-a3b-bf16-w8.recipe`) quantizes regular linears and the output head while routed experts remain
 BF16. Use TP2 at serve time if one device cannot hold the model and cache.
 
 The local llama.cpp Q4_K_M source is supported by `arch/hyv3_gguf` and
@@ -494,7 +490,7 @@ re-quantizes them to native Radiance encodings; this adds loss to an already-qua
 The GGUF's `hunyuan-dense` pre-tokenizer name is not in Radiance's tokenizer table, so pass the
 matching BF16 repository's `tokenizer.json` with `--tokenizer`. Prefer the BF16 source recipe when
 available. Both the BF16 W4 and GGUF-to-W4 artifacts passed a short TP2 generation smoke test; the
-BF16-source W8, block-FP8 and MXFP4 variants did too. These checks establish basic loading and
+BF16-source W8 variant did too. These checks establish basic loading and
 inference only, not numerical parity or broad quality.
 
 The plugins declare the native OpenAI tool-call format: an outer `<tool_calls>` section,
@@ -516,16 +512,15 @@ and on an eight-document teacher-forced corpus the two builds agree at every top
 
 ## `qwen35_w8a8`
 
-The dense build again, behind `#if QWEN35_W8A8`, for a container `data/recipes/q38-27b-w8a8-df2.recipe`
-converts from the bf16 checkpoint: the trunk's linears (the set Qwen's FP8 release quantises) as
+The dense build again, behind `#if QWEN35_W8A8`, for a container `data/recipes/q38-27b-iq8r.recipe`
+(or `q38-27b-w8a8-df2.recipe`) converts from the bf16 checkpoint: the trunk's linears (the set Qwen's FP8 release quantises) as
 `i8*bf16[1x128]/fwht128`, each 128 of K rotated by the unnormalised Hadamard before rounding, served
 by `gemm_nt_q` at `i8a8h`. The descriptor `w8a8_fwht128` is what the convert's `--set` keys state;
 a probe of the first delta-net input projection holds the weights to it before the activations are
 declared, since only an int8 trunk gives them an int8 code pair. The descriptor names the rotation, so
 a plain int8 trunk is refused.
 
-- **The 1/128 is the weight's.** `had_quant_act_i8g` rotates the activation and folds nothing, as
-  `had_quant_act_fp8` does; the per-row `had_*_i8` forms fold 1/sqrt(128) into the activation's
+- **The 1/128 is the weight's.** `had_quant_act_i8g` rotates the activation and folds nothing; the per-row `had_*_i8` forms fold 1/sqrt(128) into the activation's
   scale and against this weight give an output sqrt(128) too small.
 - **The encoding is the only guard.** Rotated and plain int8 have the same bytes and extents, and
   the rotated weight against the plain quantiser measures rel_l2 ~1.0 (r4d_selftest, `i8a8h_rot`),
@@ -535,8 +530,8 @@ a plain int8 trunk is refused.
   (`gated_had_quant_i8g`) write `had_quant_act_i8g`'s bytes into the int8 pair (`ActFP8::q8_rot`),
   so q, k and v share one quantiser and down has none. The attention and delta-net outputs still
   take `had_quant_act_i8g` from the bf16 plane, and so does every linear where the ops are not
-  declared (libref and libavx). The MLP's gated fold is an fp8a8 tile over E4M3 codes, so an int8
-  gate_up runs the pair.
+  declared (libref and libavx). The MLP's gated fold (`gemm_nt_q_gated`) is libr4d's
+  `gemm_iqr_gated`, over an IQR gate_up at up to 16 rows; any other int8 gate_up runs the pair.
 - **Narrower codes on the same grid.** A trunk linear stored as uN with a zero point, uN indexing
   an int8 scalar codebook or a vector codebook of int8 codewords, or a bitshift trellis's codes,
   each under a scale per (row, 128) and fwht128, or a computed trellis (libquant's `tcq_code=mad`,
@@ -546,8 +541,44 @@ a plain int8 trunk is refused.
   same for such an embedding and head. The IQR recipes (`data/recipes/q38-27b-iq{2..8}r*.recipe`,
   [`docs/IQR.md`](IQR.md)) store 2.5 to 8 bits a weight on the int8 trunk's activation path.
 - **It declines imported checkpoints** (`RAD_ARCH_SERVES_IMPORTS(0)`). An imported quantisation
-  goes to the family's one quantised plugin, and a second one would refuse every Quark, ParoQuant,
-  GPTQ or NVFP4 Qwen3.8 release; they stay with `qwen35_fp8`.
+  goes to the family's one quantised plugin, `qwen35_fp8`.
+- **The delta net's decode fold writes its output's codes at either group.** At a scale a 128 a
+  (token, head) row is one group and its workgroup quantises it; at IQ8R's 256 a scale covers two
+  value heads, and the second workgroup of a pair to arrive quantises both heads' rows
+  (`gdn_conv_recurrent_update_had`, `group` 256), byte for byte `had_quant_act_i8g` over `o`.
+
+## `qwen35moe_w8a8`
+
+Both switches of `qwen35_fp8.cpp` at once: the routed feed-forward on the int8 trunk, for a
+container `data/recipes/q36-35b-a3b-iq8r.recipe` converts from Qwen3.6-35B-A3B's bf16 checkpoint.
+The trunk is `qwen35_w8a8`'s. What the routed arm adds:
+
+- **The experts are rotated int8**, `i8*bf16[1x128]/fwht128`: codes row-major with a bf16 scale
+  per (row, 128 of K), which `moe_gemm_q` reads at `i8a8h` (libr4d's `moe_gemm_i8a8`) against int8
+  activations through the iu8 WMMA. The 128 is the group every rank's share of an expert's width
+  leaves whole (512 columns are 256 a rank on two cards and 128 on four).
+- **gate_up reads the block input's own codes.** Where the norms write `had_quant_act_i8g`'s
+  rotated codes, the experts read them at the trunk's group (`a_group` 256 for IQ8R against the
+  experts' 128), so the routed arm adds no quantiser and no rotated copy of the input. Where they
+  do not (the CPU kernels), `had_quant_act_i8g` writes a copy a layer at a 128.
+- **The gated product is `gated_had_quant_i8g`**, at a scale a 128, for the routed arm and the
+  shared one.
+- **The shared expert is a trunk linear pair**: its gate/up projection reads the block input's
+  codes and so takes the trunk's group, and its down projection, whose K is the expert's width,
+  the group its own weight is stored at, which the plugin reads from layer 0's before it declares
+  that product's codes.
+
+The rotated four-bit expert forms (`w4a8h`, and the codebook at E4M3 scales a 64 or 32 of K) are
+served under the same trunk through `moe_gemm_w4a8i8`; block-fp8 experts read E4M3 activations and
+are refused by name. Chained launches stay off on this build (its grouped GEMMs, router and
+gather have no chained form, and the step measured slower with them).
+
+Qwen3.6-35B-A3B on two R9700s, int8 KV cache, against the FP8 container (`qwen35moe_fp8`),
+interleaved: without the MTP head a decode step is 10.25 / 11.58 / 12.25 ms at 1 / 4 / 8 sequences
+against 10.20 / 11.55 / 12.21, and 13.2 / 17.6 ms at 16 / 32 against 13.3 / 17.8. With the MTP
+head, over 24 chat prompts four at a time, it accepts 10.39 tokens a step against 10.20 to 10.31
+and delivers 442 to 443 tokens a second against 446 to 454: the draft passes are the slower part,
+and why is open.
 
 ---
 
@@ -580,30 +611,57 @@ so give up two fusions: the residual add and the all-reduce folded into the next
 plugin reads each weight's encoding from the container and declares the op that reads it:
 
 - block linears (`self_attn.{q,k,v,o}_proj`, `linear_attn.{in_proj_qkv, in_proj_z, out_proj}`,
-  the shared expert's three): fp8 or int8 (served W8A8);
-- routed experts' gate_up and down: fp8, bf16, or one of the four- and five-bit forms of
-  `docs/MOE-W4.md`;
+  the shared expert's three): int8 (served W8A8) or bf16;
+- routed experts' gate_up and down: bf16, or one of the four- and five-bit forms of
+  `docs/MOE-W4.md`, rotated int8 or IQR (`docs/IQR.md`); block fp8 and MXFP4 are refused at load;
 - each connection's two mixing matrices and the MTP head's `fc_hidden` / `fc_embedding`: E4M3 rows
   or bf16. The low-rank width is 320, 2.5 scale blocks, so they are scaled a row group at a time;
 - the lm_head: whatever a `logits_gemm` kernel reads;
 - bf16: every norm gain, `A_log`, `dt_bias`, `conv1d`, `in_proj_a` and `in_proj_b` (48 rows is not
   a whole scale block), the router, `shared_expert_gate` and `embed_tokens`.
 
-Qwen's own `Qwen3.8-Flash-Next-FP8` converts without a recipe too. Its `quantization_config`
-(`quant_method: fp8`, no `fmt`) is block-scaled E4M3, descriptor `fp8_e4m3`; no `qwen4exp` plugin
-claims it, so each weight is read as it ships and this plugin serves it: the routed experts (MTP
-head's included) at block FP8 with their bf16 `weight_scale_inv`, the n-gram table's 128 FP8
-shards under its one `ngram_embedding.weight_scale`, and every other weight bf16. A recipe applies
-to it as to the bf16 checkpoint, with each FP8 weight read through its scales.
+Qwen's own `Qwen3.8-Flash-Next-FP8` states `quant_method: fp8` with no `fmt`: block-scaled E4M3,
+descriptor `fp8_e4m3`; no `qwen4exp` plugin claims it, so each weight is read as it ships. Its
+routed experts are block fp8, which this build refuses, so it takes a recipe as the bf16 checkpoint
+does, each FP8 weight read through its scales.
 
-**The attention cache takes `--kv-cache-dtype fp8_v4` or `k6_v4`.** The QSA layers' cache (and the
-MTP head's layer, which shares it) is then declared at head_dim 200 or 176, a token's quantised row
-over two, and read by the gqa12 rows (gqa6 with 4-token pages at four ranks) of those layouts
-(docs/OPS.md). The indexer's key cache and tail keep their widths.
+**The attention cache takes `kv-cache-dtype: i8`.** The QSA layers' cache (and the MTP head's
+layer, which shares it) is then an int8 group at head_dim 256, read by the gqa12 rows (gqa6 with
+4-token pages at four ranks) and written by the prologue's store fold (docs/OPS.md); with
+`kv-resident` the streamed store writes the same row. The indexer's key cache and tail keep their
+widths.
 
 `data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe` is the served choice: four-bit codebook experts with
 ten protected experts left bf16, int8 block linears and lm_head, E4M3 mixing and MTP fc matrices,
 and the n-gram table at one fixed E4M3 scale.
+
+**Under int8 block linears the routed arm is int8 too.** A connection's read writes its plain
+codes for the block's linears and a rotated copy for the experts, both at one dtype. With int8
+block linears and experts of a form `moe_gemm_q` reads against int8 (the rotated four-bit plane,
+the codebook at E4M3 scales a 64 or 32 of K, rotated int8 experts) the copy is
+`had_quant_act_i8g`'s codes, the gated product is `gated_had_quant_i8g`'s, and the experts run at
+the `a8i8` dtypes (`docs/OPS.md`). The codebook at a bf16 scale a 128 and the five-bit one have no
+int8 form: under them the connections keep E4M3 codes and the int8 linears quantise for
+themselves.
+
+**Under an int8 routed arm each layer and projection takes its own experts' encoding.** The forms
+with an int8 row read one input (the rotated int8 codes at a scale a 128 of K), so a container
+may mix them by layer and by projection: the rotated four-bit plane, the codebook at a 64 or 32
+of K, rotated int8, and IQR weights (`docs/IQR.md`: the rotated computed trellis under one f32
+scale a row, two to six bits, `moe_gemm_iqr`). A layer's first quantised expert decides each
+projection's form and, for a trellis, its code width; every other expert of the layer matches it
+or is one of the few kept plain bf16. So a recipe may give each layer and projection its own
+width.
+
+**A trunk stored rotated shares one pair with the experts.** When the block linears are rotated
+int8 or IQR weights (`i8a8h`: read from the first delta-net input projection, one scale a 128 of
+K), every reader of a block's input takes `had_quant_act_i8g`'s codes: the connection's read
+writes them as the block input's own int8 pair (`x.q8`), its plain codes go to a pair of the
+connection's that nothing reads, and the routed experts' gate_up reads `x.q8` directly, with no
+second copy. The attention gate, the delta net's output and the shared expert's gated product
+write the rotated codes from their own kernels (`gate_had_quant_i8g`,
+`gdn_conv_recurrent_update_had`, `gated_had_quant_i8g`). The trellis GEMM rows take K in whole
+256s, so the shared expert's down projection (K = 640) stays rotated int8.
 
 **Tensor parallelism splits every expert's width.** `moe_intermediate_size` is 640 = 5 x 128, and
 the fp8 scale block, the four-bit scale group and the rotation all sit on 128-column blocks, so an
@@ -641,9 +699,9 @@ uneven delta-net head split.
 `ar_hc_write_4rank` (the 4-rank one-shot with the gated-residual write as its epilogue) and
 `ar_gather_hc_write_4rank` (the same with `moe_gather` as its prologue, taken by the MoE
 connections when the step is one MoE pass). Both are declared over the rows of a decode or verify
-step, `--max-num-seqs` x (1 + `--num-speculative-tokens`), and used whenever a step within that
-bound sends its message exact: always with `--tp-wire exact`, and with `--tp-wire wht6` under
-`--tp-wire-min-kb`. They run on an all-reduce instance keyed by that bound. A prefill chunk, and
+step, `max-num-seqs` x (1 + `num-speculative-tokens`), and used whenever a step within that
+bound sends its message exact: always with `tp-wire: exact`, and with `tp-wire: wht6` under
+`tp-wire-min-kb`. They run on an all-reduce instance keyed by that bound. A prefill chunk, and
 every lossy message, uses the standalone sequence: `moe_gather`, `all_reduce` (4-rank one-shot or
 two-shot by size, or ti8 on the lossy wire), then `hc_write_bf16`. The unfused sequence is
 declared beside the fused one, so nothing is unresolved at boot. The sparse decode's fused output
@@ -656,7 +714,7 @@ an `all_gather`. libr4d serves it at 2 ranks (`r4d_ar_gather_2rank.hip`) and at 
 row resolves, only libref's host gather does, and the serve is refused.
 
 **Four-bit experts are what make it fit.** 512 experts of 640 over 48 layers is 112.5 GiB of expert
-weight at E4M3 and twice that at bf16. `--weights-disk-tier` serves what fits neither VRAM nor the
+weight at E4M3 and twice that at bf16. `weights-disk-tier: true` serves what fits neither VRAM nor the
 host pool from the container file, but then a routed expert is read a layer at a time and a step is
 paced by the drive. At four bits an expert unit is 2.42 MiB instead of 4.69, and the per-rank share
 fits VRAM plus a few GiB of pinned host. `docs/MOE-W4.md` is the format.
@@ -671,15 +729,15 @@ of context every complete block is selected and QSA equals dense causal attentio
 a prefill below the bound runs the cheaper dense attention, and every change is tested against
 that equality. `docs/QSA.md` is the decomposition.
 
-The vision tower is declared when the container carries one and `--mm-max-patches` is not 0
+The vision tower is declared when the container carries one and `mm-max-patches` is not 0
 (`arch/common/rad_block_vit.h`, `spec.md` §11).
 
 ---
 
 # `glm5next`: GLM-5.3-Flash
 
-`arch/glm5next` serves the language model of GLM-5.3-Flash (`model_type: glm5_next`) from AMD's
-Quark export, `amd/GLM-5.3-Flash-Quark-MXFP4`. Quark is an import path, not an execution format:
+`arch/glm5next` is the language model of GLM-5.3-Flash (`model_type: glm5_next`) as AMD's
+Quark export, `amd/GLM-5.3-Flash-Quark-MXFP4`, lays it out. Quark is an import path, not an execution format:
 the plugin claims the empty descriptor and reads each weight's encoding from the container
 (`data/recipes/glm53-mxfp4.recipe` changes one weight a layer, below). Its vision tower is
 declared beside it when the container carries the tower and the deployment asks for an encoder
@@ -747,7 +805,7 @@ Traps:
 - **Quark's excluded layers are block FP8, not bf16.** The export is MXFP4 globally and names
   the attention and MTP layers in `layer_quant_config` as E4M3 with an f32 `weight_scale` per
   128 x 128, multiplicative. Read as bf16-scaled `fp8a8`, a scale bf16 cannot hold would round;
-  they are served `fp8a8f32`. The importer accepts an override only if it is MXFP4 or this
+  the plugin declares them at `fp8a8f32`. The importer accepts an override only if it is MXFP4 or this
   block FP8 and refuses any other, a null or empty one included, by name.
 - **`head_dim` is 0 in the config.** The KDA and MLA widths come from their own keys; the
   plugin fixes 128 and 256 and refuses a checkpoint whose hidden size, layer, vocabulary,
@@ -755,9 +813,9 @@ Traps:
 - **MTP concatenates the normalized embedding first,** the normalized previous hidden second.
 - **No RoPE anywhere** (`qk_rope_head_dim` 0); the indexer's only rotation is the Hadamard.
 
-**KV groups.** Five. `--kv-cache-dtype fp8` narrows `kv_latent` alone to E4M3, stored at
+**KV groups.** Five. `kv-cache-dtype: fp8` narrows `kv_latent` alone to E4M3, stored at
 `kv_store`'s default descale of 1 and read by the `mla_attn` fp8kv rows (docs/OPS.md); the other
-four keep the dtypes below whatever the flag, and a cache dtype other than bf16 or fp8 is refused
+four keep the dtypes below whatever the key, and a cache dtype other than bf16 or fp8 is refused
 at declare.
 
 | group | kind | per layer | layers |
@@ -769,16 +827,17 @@ at declare.
 | `kv_kda_conv` | `RAD_KV_CONV`, bf16, width 4 | the convolution history, 3 x 8192 / tp channels a rank | 34 KDA |
 
 The latent and the index are replicated: every rank keeps the whole latent cache, and the plugin
-declares both so (`rad_kv_group_replicated`), which lets the host tier (`--prefix-cache-mib`) hold
+declares both so (`rad_kv_group_replicated`), which lets the host tier (`prefix-cache-mib`) hold
 each once a slot: 49.59 KiB a 4-token block at any rank count (`kv_latent` 48.00 KiB over its 12
 layers, `kv_dsa_index` 1.59 KiB), 12.4 KiB a token, where a copy per rank would make a slot
 396.75 KiB at eight. Under fp8 `kv_latent` is 24.00 KiB a block, 6.4 KiB a token in all. The model is a hybrid, so a prefix-cache hit is usable only from a state
-checkpoint at or below it, and `--checkpoint-interval` decides how much of a shared system prompt
+checkpoint at or below it, and `checkpoint-interval` decides how much of a shared system prompt
 is reused.
 
-**Linears.** Each weight is served as the export stores it:
+**Linears.** The plugin declares each weight at the form the export stores; libr4d has no
+`mxfp4a8` or `fp8a8f32` row for `moe_gemm_q` or `gemm_nt_q` in this build:
 
-| weights | stored | served |
+| weights | stored | declared |
 |---|---|---|
 | routed and shared experts, layers 3-44 | MXFP4: E2M1, an E8M0 scale per 32 | `moe_gemm_q` mxfp4a8, an E4M3 activation scaled per (row, 128) |
 | MLA q_a, kv_a, q_b, o (trunk and MTP); dense feed-forward, layers 0-2 | E4M3, an f32 scale per 128 x 128 | `gemm_nt_q` fp8a8f32 |
@@ -792,7 +851,7 @@ The text container holds 25845 weights, 171.32 GiB, the one with the tower 26143
 at eight ranks each card holds 22.06 GiB of them, 19.67 GiB the routed experts.
 
 **MTP.** The plugin declares checkpoint layer 45 as a serial drafter (`RAD_DRAFT_SERIAL`), depth
-3 unless `--num-speculative-tokens` says otherwise (at most 31). Its history pass writes the draft
+3 unless `num-speculative-tokens` says otherwise (at most 31). Its history pass writes the draft
 layer's latent, index and tail for every row and runs its MoE on the proposal rows only.
 
 **Tensor parallelism.** At 1, 2, 4 or 8 ranks; declare refuses any other. `tests/glm5next_test.cpp`
@@ -816,7 +875,7 @@ costs more than it saves and every rank runs the replicated or head-split form.
   rank at eight; each rank computes its slice of every expert, and the block's all-reduce sums
   them. The dense feed-forward splits its 12288 the same way.
 - MLA splits by whole heads: the rows of q_b and kv_b (8 heads a rank at eight) and the columns
-  of o. q_a, kv_a and the latent are replicated. Under `--tp-attn-split rows`
+  of o. q_a, kv_a and the latent are replicated. Under `tp-attn-split: rows`
   (RadBuildCtx::tp_attn_rows, docs/GUIDE.md §4.7), from the threshold, it splits by rows instead
   (`GlmMla::Form::rows`): each rank takes its run under the row rule, the last run shorter,
   through q_b, absorption, attention with all 64 heads (`mla_attn_rows_bf16`, docs/OPS.md),
@@ -887,8 +946,8 @@ in multiples of 28 and 16 to `max_image_tokens` tokens; the picture keeps its as
 resized only when it is under the floor or over the budget (torchvision's bicubic), and the rest
 of the canvas, right and bottom, is black. It is spelled `<|begin_of_image|>`, one `<|image|>` a
 token, `<|end_of_image|>`. The checkpoint allows 8000 tokens (32000 patches); one encoder pass
-bounds it, so `--mm-max-patches auto` (16384) serves at most 4096, and `--mm-max-patches 32000`
-the checkpoint's budget. `--image-tokens` lowers it. Video is refused.
+bounds it, so `mm-max-patches: auto` (16384) serves at most 4096, and `mm-max-patches: 32000`
+the checkpoint's budget. `image-tokens` lowers it. Video is refused.
 
 Traps:
 
@@ -928,13 +987,12 @@ tokens) the engine reaches 0.9940 to 0.9947 against f32, transformers in bf16 0.
 16384 patches 0.49 s and 32000 1.5 s, with an activation arena of 0.56 and 1.10 GiB, beside the
 tower's 1.05 GiB of weights on every card.
 
-**MoE decode fusions.** Three, each byte-identical to the launches it replaces, declared
+**MoE decode fusions.** Two, each byte-identical to the launches it replaces, declared
 wherever a loaded library serves the fused op (the separate launches otherwise):
 
 | fusion | one launch for | where it applies |
 |---|---|---|
 | router | `router_sigmoid_topk`, `moe_scatter` and the shared gate's `fill`: `router_sigmoid_topk_scatter` | passes of up to 128 rows (`M * top_k` <= 1024, one workgroup's sort); 84 launches fewer a trunk decode step, 2 a draft pass |
-| SwiGLU | `swiglu_clamped` and `quant_act_fp8`: `swiglu_clamped_quant_fp8` | the routed and shared arms and the three dense layers; 87 fewer a trunk step, 2 a draft pass |
 | gather inverse | none: the sort writes each slot's row (`moe_scatter_inv`) and the gather reads it (`moe_gather_inv`) instead of searching `sorted` | every MoE pass |
 
 `glm53_moe_decode_fusions_replace_their_launches_where_they_fit` counts the launches. Paired on
@@ -943,22 +1001,19 @@ them, and eight agent streams decode 456 tok/s against 452, one 144 against 140.
 
 **Decode at a few rows.** A verify pass of one stream carries two to six rows (the draft window
 and one), a draft pass one; there a step is a chain of short launches, each bound by its own
-latency rather than by bandwidth. Five changes serve those rows, each byte-identical to what it
+latency rather than by bandwidth. Three changes serve those rows, each byte-identical to what it
 replaces. Kernel times on one R9700 at the TP8 slices (r4d_selftest's perf modes, `--cold 256`):
 
 | change | where it applies | before / after, us |
 |---|---|---|
-| `moe_gemm_q` mxfp4a8 takes the small-M form (`moe_mxfp4_small_kernel`): blocks walk the touched experts only, weight codes stay packed in LDS, gate_up stages 512 of K, down reads its rows whole | gate_up to 384 routed rows, down to 32 | gate_up at 1 / 4 / 6 / 16 / 48 tokens: 36.8 / 31.4, 90.0 / 79.7, 120.5 / 101.4, 230.3 / 206.8, 416.7 / 390.0; down at 1 / 2 / 4: 21.2 / 16.4, 26.0 / 22.5, 39.5 / 37.9 |
-| `moe_gemm_q` fp8a8f32 takes the same form (`fp8_f32scale_small`) for the MTP layer's gate_up | to 384 routed rows | at 1 / 2 / 8 tokens: 73.6 / 36.7, 83.6 / 65.8, 214.0 / 203.9 |
 | `gemm_nt_f32` keeps 16 steps of k in flight a lane (8 from 17 rows at the router's width) | below 64 rows | router (N 288) at 1 / 4 / 8 / 24 rows: 28.1 / 14.4, 36.0 / 14.5, 36.3 / 15.0, 45.4 / 21.6; index head gates (N 32) at 1 / 24: 27.3 / 9.8, 36.2 / 10.0 |
 | `logits_gemm` takes `logits_gemm_bf16_cols`, a wave per four vocabulary columns | n_embd 4096 | at 1 / 6 / 8 / 24 / 48 rows: 239.1 / 235.5, 303.2 / 247.5, 378.2 / 250.4, 1133.2 / 635.6, 2354.5 / 1220.1 |
 | KDA issues both low-rank down-projections before either up-projection, so a recorded pass orders the four readers of the layer input once and the two up-projections once | every KDA layer | one ordered point fewer a layer |
 
-`r4d_emu` holds both expert forms and the f32 tiles to the host restatement of their per-element
-sequence, and `r4d_selftest` compares the head's column form with the block row byte for byte.
+`r4d_emu` holds the f32 tiles to the host restatement of their per-element sequence, and `r4d_selftest` compares the head's column form with the block row byte for byte.
 
 **Measured** on eight R9700s (gfx1201, 32 GB; four on PCIe Gen5 x16, four on Gen5 x8) at TP8 with
-the flags of `deploy/compose/glm53-flash.yaml` (32768 tokens of context, eight sequences, MTP with
+`placement: all_vram` (32768 tokens of context, eight sequences, MTP with
 an adaptive window up to 5, reasoning effort low). BetterBench quick, temperature 0.7, cold
 prefix cache, and a load generator of agent turns (3.3k-token prompts, 400 tokens out):
 
@@ -1057,7 +1112,7 @@ experts. The shared expert splits the same way, unrotated. A calibration run
 Top-1 agreement between two numeric formats is one Bernoulli trial per prompt, so at p ≈ 0.93 its
 standard error is 2.8 points at N = 80 and 2.0 at N = 160: formats that differ by less than that
 rank in any order. Rank with a graded statistic that has thousands of samples (the mean |delta|
-over the logits row, or the per-position KL of `radiance --kld-ref`), and confirm any ordering at
+over the logits row, or the per-position KL of the server's `kld-ref` mode), and confirm any ordering at
 N ≥ 160 before acting on it.
 
 ---
@@ -1067,7 +1122,7 @@ N ≥ 160 before acting on it.
 `arch/embgemma2` declares a pooled output (`rad_declare_pooled`) and no logits, which makes the
 program an embedding program: the engine runs it with no sampler and no KV cache, carries every
 input whole in one step, and returns each sequence's pooled row on `/v1/embeddings`
-([GUIDE §5.6](GUIDE.md)). One card (`--tp 1`).
+([GUIDE §5.6](GUIDE.md)). One card (`tp: 1`).
 
 ```
 text      24 layers, hidden 512, ffn 2048 (gelu-tanh, gated), vocab 262144
@@ -1222,7 +1277,7 @@ RMSE <=.02, individual/batched difference <=1e-5 and preserved ranking for nativ
 
 `arch/nomicbert` declares a pooled output (`rad_declare_pooled`) and no logits, so it is an
 embedding program like `embgemma2`: no sampler, no KV cache, one step per input, and the pooled
-row on `/v1/embeddings` ([GUIDE §5.6](GUIDE.md)). One card (`--tp 1`).
+row on `/v1/embeddings` ([GUIDE §5.6](GUIDE.md)). One card (`tp: 1`).
 
 ```
 text      12 layers, hidden 768, ffn 3072, vocab 250048, 12 heads of 64, type vocab 1
@@ -1293,11 +1348,11 @@ parallel (the model is served on one card).
 # `gemma4`: Gemma 4 text and its DFlash drafter
 
 `arch/gemma4` serves a container converted from Google's bf16 checkpoint
-(`Gemma4ForConditionalGeneration` or `Gemma4ForCausalLM`), the recipe choosing what is fp8:
+(`Gemma4ForConditionalGeneration` or `Gemma4ForCausalLM`), the recipe choosing what is int8:
 gemma-4-26B-A4B-it, and the dense sizes without per-layer embeddings. The CT-INT4 31B release is
 `arch/gemma4_bf16`'s, and so is the 31B quantised from bf16 at w4a8 or w8a8, which takes the same
 DFlash drafter (see "The 31B" below). A z-lab DFlash drafter is merged at convert time
-(`--draft-model`); the recipes are `data/recipes/gemma4-26b-a4b-df*.recipe` and
+(`--draft-model`); the recipes are `data/recipes/gemma4-26b-a4b-df-i8.recipe` and
 `data/recipes/gemma4-31b-dense-bf16-*-df.recipe`. The reference is transformers'
 `modeling_gemma4`.
 
@@ -1360,29 +1415,27 @@ trunk's all-reduces ride the runtime's second lane beside the other slice's comp
 attention reduction under slice B's output projection, and so on). Attention runs whole, since it
 reads every row's keys. The slices issue the same kernels over the same rows, so the output equals
 the whole step's bit for bit. On 4x R9700 the reductions are 47% of a 20K-token prefill under
-`--profile-ops`, and the overlap is modelled at up to a quarter off; `--profile-ops` syncs every op
+`profile-ops: true`, and the overlap is modelled at up to a quarter off; `profile-ops` syncs every op
 and cannot show it, so time a prefill without it. A step that runs whole (every decode and verify
 step) puts the dense arm on the second lane instead, beside the routed arm, with its reductions on
 lane 0. The startup notes say which form each step takes.
 
 **The draft head in 8 bits.** The drafter's head is the widest read on the draft path: the target's
 bf16 table, 352 MiB per rank at tp 4, every draft pass. A container converted with the line
-`dflash.draft_head.weight rtn codes=fp8_e4m3 block=128x128 scale=bf16` (the 26B `-df` recipes and
-the 31B w4a8 one carry it) stores a block-fp8 copy under that name, and the head reads it at fp8a8
-instead: half the bytes, for 176 MiB per rank more. With `codes=i8 group=128 scale=f16 clamp=sym`
-(the 31B Q8 recipe) the copy is int8, read at w8a8. Drafts are verified, so the coarser logits can
+`dflash.draft_head.weight rtn codes=i8 group=128 scale=f16 clamp=sym` (the 31B w4a8 and Q8
+recipes carry it) stores an int8 copy under that name, and the head reads it at w8a8 instead: half
+the bytes, for 176 MiB per rank more. Drafts are verified, so the coarser logits can
 change what is proposed, never what is accepted; `draft_n_accepted` shows whether they propose
 worse. Without the copy the head reads the bf16 table, and the startup note names which head is in
 use.
 
 **The drafter's linears on either 8-bit grid.** The seven linears (fc and six per layer) are on the
-E4M3 grid (block fp8 or MXFP4, at fp8a8 / mxfp4a8 over an E4M3 activation with a scale per (row,
-128)) or on the int8 one (`codes=i8 group=128 scale=f16`, at w8a8 over `quant_act_i8`'s activation
-with a scale per row, and `rmsnorm_quant_i8` folding each residual add, norm and quantiser as
-`rmsnorm_quant_fp8` does on the other). `fc`'s encoding picks the grid. One quantised activation
-feeds several linears, so a linear on the other grid is refused by name. The gate_up|silu|quant
-fold (`gemm_nt_q_gated`) is fp8a8 only, so the int8 grid keeps `silu_mul` and the quantiser, one
-launch per layer more. Above 64 rows the w8a8 GEMM is the tiled one, which takes N in 256s; the
+E4M3 grid (MXFP4, at mxfp4a8 over an E4M3 activation with a scale per (row, 128)) or on the int8
+one (`codes=i8 group=128 scale=f16`, at w8a8 over `quant_act_i8`'s activation with a scale per row,
+and `rmsnorm_quant_i8` folding each residual add, norm and quantiser as `rmsnorm_quant_fp8` does on
+the other). `fc`'s encoding picks the grid. One quantised activation feeds several linears, so a
+linear on the other grid is refused by name. The int8 grid runs `silu_mul` and the quantiser
+after the gate_up GEMM. Above 64 rows the w8a8 GEMM is the tiled one, which takes N in 256s; the
 31B drafter's k and v are 256 rows per rank at tp 4, the narrowest that still fits.
 
 **The 31B.** z-lab's `gemma-4-31B-it-DFlash` is the same block at 5376 (64 heads / 8 kv x 128,
@@ -1396,7 +1449,7 @@ drafter runs on, causal over a window or not) takes 4 queries per kv head at a b
 cache holds each kv head twice, written by a head-wide copy of k and v after the projection, and
 the attention runs at gqa 4. It is exact: query head q reads a copy of kv head q / 8. A container carries the
 assistant head or the drafter under `draft.`, not both. The recipes are
-`gemma4-31b-dense-bf16-w4a8-df.recipe` (int4 trunk, int8 lm_head, block-fp8 drafter, ~20 GiB)
+`gemma4-31b-dense-bf16-w4a8-df.recipe` (int4 trunk, int8 lm_head, int8 drafter, ~20 GiB)
 and `gemma4-31b-dense-bf16-q8-df.recipe` (Q8_0's grid at libr4d's group of 128 for the trunk, its
 lm_head and the drafter, ~33 GiB). Both start from bf16, because the drafter reads the trunk's
 hidden states and was trained beside the bf16 trunk. Both plugins scale the embedding by
@@ -1419,7 +1472,7 @@ GEMMs' skinny band at 64, since the prefill kernel takes each row's K in order w
 r4d_act_threads' last width change at 120 rows for these widths), and a slice's attention rows see
 exactly the keys they see in the whole step, so on the exact wire the output equals the whole
 step's bit for bit. The overlap is a fixed rule: it runs wherever every junction is fused (as the
-w4a8 and w8a8 containers' are) and the all-reduce wire is exact; a bf16 trunk, or `--tp-wire
+w4a8 and w8a8 containers' are) and the all-reduce wire is exact; a bf16 trunk, or `tp-wire:
 wht6`, runs every step whole, and the startup notes say which.
 
 **The 31B's q, k and v as one linear.** Converted with a recipe that names `blk.*.attn_qkv.weight`
@@ -1465,11 +1518,10 @@ attention is the sliding layers' h256 gqa-2 split-KV decode, non-causal. Where l
 each layer's norm, rotary and cache-store chain is one `qkv_norm_rope_kv_store` launch in either
 pass (`v_norm` 0; `n_head` 0 in the context pass, which writes keys and values only), and each
 residual add is folded into the norm after it (`add_rmsnorm`), all byte-identical to the chains;
-Qwen3.8's head-128 DFlash2 drafter keeps the prologue chains and folds only the adds. At two ranks
-or more a block-fp8 `fc` is split by rows (`rad_block_dflash2.h`, SHARDING), each rank computing
-the whole 128-row scale blocks that cover its share of the columns and an `all_gather` assembling
-them, with `gemm_nt_q`'s `split_n` keeping every output the unsplit fc's to the bit. The recipe is
-`gemma4-31b-dense-bf16-w4a8-df2.recipe`.
+Qwen3.8's head-128 DFlash2 drafter keeps the prologue chains and folds only the adds. The recipe
+is `gemma4-31b-dense-bf16-w4a8-df2.recipe`, the drafter's linears rotated int8; its `fc` is read
+whole on every rank (the row split of `rad_block_dflash2.h`'s SHARDING applies to a block-fp8 `fc`
+only).
 
 **The 31B by GPTQ.** `arch/gemma4_bf16`'s linears read int8 activations, which the Gram tap
 (`gram_accum`) does not take, so the 31B's Hessians come from this plugin serving the bf16
@@ -1480,7 +1532,43 @@ down's inputs as `<stem>.part`, all under the names `gemma4_bf16`'s container gi
 `data/recipes/gemma4-31b-dense-bf16-w4a8g-df2.recipe` reads them as written. The prefill overlap
 and the fused arms are off while it runs. `RADIANCE_G4_CALIB_LAYERS=lo:hi` takes a slice of layers:
 the 31B's four taps a layer are ~364 MiB a rank at four ranks, and its 60 layers do not fit beside
-the weights in one pass. docs/GEMMA4-31B-GPTQ.md has the corpus, the run and what it changes.
+the weights in one pass.
+
+Why it matters: round-to-nearest int4 moves the distribution most where a reply is most
+constrained. After `sku:<|"|>MS-110` inside a tool call's string argument the bf16 model closes the
+string (`<|"|>`, ~1.0); the RTN container prefers `**,` (58% against 41%), so a streamed call
+stalls inside the string. With GPTQ the close is 99.8%, and BetterBench's streamed order requests
+stalled 0 of 20 times against 10 of 20.
+
+The corpus is 2.47M tokens of whole conversations rendered with the model's chat template,
+thinking off: glaive-function-calling-v2 tool calls (834K), UltraChat prompts (695K),
+self-oss-instruct-sc2 (417K), OpenMathInstruct-2 (417K) and rStar-Coder (417K), the non-tool
+prompts answered by the served 31B. A tenth more is held out. The run, on four R9700s:
+
+```sh
+# calib.yaml serves gemma-4-31B-it at tp: 4, bf16 KV, no prefix cache, no speculation,
+# max-num-batched-tokens 8192. One run per 20-layer slice, about 25 minutes each, 45 GB of Grams.
+for sl in 0:20 20:40 40:60; do
+  RADIANCE_CALIB_DIR=/calib RADIANCE_CALIB_TOKENS=2300000 RADIANCE_G4_CALIB_LAYERS=$sl \
+    radiance --config calib.yaml
+  # feed the corpus at max_tokens 1 until every rank prints that it wrote its layers
+done
+CALIB=/calib rad-convert gemma-4-31B-it --draft-model gemma-4-31B-it-speculator.dflash2 \
+    --recipe data/recipes/gemma4-31b-dense-bf16-w4a8g-df2.recipe \
+    --set quantization_config.quant_method=compressed-tensors -o gemma4-31b-dense-w4a8g-df2-qkv.rad
+```
+
+The convert takes about 75 minutes on a 48-thread EPYC with OpenBLAS (libquant's own loops take
+hours per down projection). Against the bf16 model on 44.5K held-out positions (the model's own
+turns; system and user positions carry most of any container's mean and are left out here):
+
+| container | size | mean KL | p99 | top-1 | DFlash2 tokens a step |
+|---|---|---|---|---|---|
+| RTN (`-df2`) | 24.9 GB | 0.341 | 7.49 | 90.5% | 3.96 |
+| GPTQ (`-df2` with `g`) | 24.9 GB | 0.251 | 5.46 | 91.3% | 4.11 |
+| Q8 (w8a8) | 38.2 GB | 0.226 | 5.28 | 92.3% | |
+
+GPTQ closes 78% of the distance from RTN to Q8 at the same size and speed.
 
 **The 31B's junctions at four ranks.** At two ranks every junction carries the all-reduce in front
 of it (`ar_rmsnorm_quant_i8`). At four it does too, in steps of up to 16 rows (decode, and a DFlash
@@ -1526,7 +1614,7 @@ reads change no value; on 4x R9700 the 31B with DFlash2 decoded 15% faster with 
 a drafter about 2%.
 
 **The E2B/E4B form.** `arch/gemma4_bf16` serves Gemma 4's small dense form (tested on
-NVIDIA-Nemotron-3.5-Bolt-E4B, `deploy/compose/nemotron-3.5-bolt-e4b-bf16.yaml`, and on Google's
+NVIDIA-Nemotron-3.5-Bolt-E4B, whose keys are a row of the README's table, and on Google's
 gemma-4-E2B-it) at one rank:
 - KV-shared layers: from layer `n_layer - num_kv_shared_layers` on, a layer projects q only and
   attends over the cache of the last earlier layer of its class that keeps one (E4B: sliding layers
@@ -1553,7 +1641,7 @@ tower and no audio encoder; `rad_block_gemma4_unified.h` holds what replaces the
   projection. The LayerNorms take nn.LayerNorm's eps of 1e-5, which no config states. The position
   table `[1120, 2, width]` is read as its two taps of dimension 1, computed at convert, so a
   container needs a recipe rule to store them (`gemma4-12b-bf16`, `gemma4-12b-i8g`). One patch is
-  one row: `--mm-max-patches` counts rows here, and 1120 holds the largest picture.
+  one row: `mm-max-patches` counts rows here, and 1120 holds the largest picture.
 - An audio clip is frames of 640 samples (40 ms at 16 kHz) as they are, the last zero-padded, one
   token each: a weightless RMS norm and a 640 -> width projection. A clip is cut at
   `audio_seq_length` (750 frames, 30 s).
@@ -1572,25 +1660,23 @@ tower and no audio encoder; `rad_block_gemma4_unified.h` holds what replaces the
 
 NVIDIA's DFlash drafter states `dflash_config.causal: false`, with every layer sliding; that flag
 sets the sliding layers' causality. The recipes are `gemma4-e4b-bf16-df`, `-w8a8-df`, `-w4a8` and
-`-w4a8-df`. The bf16 container's KL to HF bf16 is 0.0015 with bf16 KV and 0.014 with fp8 KV, so
-the compose file serves bf16 KV.
+`-w4a8-df`. The bf16 container's KL to HF bf16 is 0.0015 with bf16 KV, which the README's row for
+it serves.
 
-**FP8 experts.** The experts are ~90% of the weight bytes, so each projection is served as the
-container holds it, per layer: bf16 by `moe_gemm`, block fp8 by `moe_gemm_q`. gate_up
-`[1408, 2816]` is whole 64-row tiles and 128-blocks. down `[2816, 704]` is not (the fp8 grouped
-GEMM reads K in whole 128-column blocks), so it stays bf16 unless the checkpoint's experts were
-padded to 768 before conversion (zero rows of gate and up, zero columns of down: exact;
-`gemma4-26b-a4b-df-pad768.recipe`). The fp8 tables are split by expert parity, so a rank holds an
-even number of experts.
+**Int8 experts.** The experts are ~90% of the weight bytes, so each projection is served as the
+container holds it, per layer: bf16 by `moe_gemm`, rotated int8 by `moe_gemm_q` at `i8a8h`
+(`gemma4-26b-a4b-df-i8.recipe`). gate_up `[1408, 2816]` is whole 64-row tiles and 128-blocks.
+down `[2816, 704]` is not (the grouped GEMM reads K in whole 128-column scale groups), so it stays
+bf16. The quantised tables are split by expert parity, so a rank holds an even number of experts.
 
 **Kernels.** libr4d serves all of the trunk's attention on its windowed kernels (the sliding layers
 at h256, gqa 2, and the full layers at gqa 8, 4 and 2 for one or two, four and eight ranks), plus
 `pair_argmax` and the fusions:
 
 - the two sandwich-norm joins (`norm_add_norm`, `join_add_scale`);
-- `norm_add_norm_route`: on a layer whose gate_up is block fp8, the attention join also writes the
-  router's input and the experts' fp8 codes from the norm it already takes, in place of an
-  `rmsnorm` and an `rmsnorm_quant_fp8`;
+- `norm_add_norm_route_i8g`: on a layer whose gate_up is rotated int8, the attention join also
+  writes the router's input and the experts' rotated int8 codes from the norm it already takes, in
+  place of an `rmsnorm` and an `rmsnorm_had_quant_i8g`;
 - `expert_scale`;
 - `attn_paged_qrow`, the sliding layers' attention reading q where the fused qkv projection left it.
 
@@ -1614,7 +1700,7 @@ let the planner share `dflash_src` with `moe_edn`, which every MoE layer writes,
 would collapse silently. arch_test holds the two live ranges to overlap.
 
 **Not declared.** The vision tower (`arch/gemma4_bf16` and `arch/embgemma2` declare Gemma 4's): a
-container that carries one is served with `--mm-max-patches 0`. An fp8 attention or dense arm:
+container that carries one is served with `mm-max-patches: 0`. An fp8 attention or dense arm:
 under a tenth of the weight bytes, and the dense arm's 2112 is not whole 128-blocks either.
 
 ---
@@ -1680,26 +1766,17 @@ above), which matters little for translation prompts, whose shared prefix is a l
 A linear reading the same activation as the one before it (k and v after q, up after gate) reuses
 its codes. On every trunk the q and k norms and both rotaries are one `qkv_norm_rope` at `v_norm` 0.
 On an MXFP4 trunk each junction (the branch's post-norm, the residual add, the next norm and the
-next linear's E4M3 quantiser) is one `ar_rmsnorm_post_quant_fp8` at two ranks, the branch's
-all-reduce in the same launch, or a post-norm and `rmsnorm_quant_fp8` otherwise; a w4a8 / w8a8
-trunk takes `gemma4_bf16`'s fused junctions; an i8a8 or asymmetric-int4 trunk runs the chain.
+next linear's E4M3 quantiser) is a post-norm and `rmsnorm_quant_fp8`; a w4a8 / w8a8 trunk takes
+`gemma4_bf16`'s fused junctions; an i8a8 or asymmetric-int4 trunk runs the chain.
 Where a row is missing the plugin declares the chain, and the startup notes say which form each
 took. Under calibration no junction is fused (below).
 
-The two fused all-reduce junctions (`ar_rmsnorm_post_quant_fp8`, and `ar_rmsnorm_quant_i8` on a
-w4a8 / w8a8 trunk's int8 junction) send the exact wire only, and are byte-identical to
-`all_reduce` followed by the chain. Under `--tp-wire wht6` they are declared all the same and taken
+The fused all-reduce junction (`ar_rmsnorm_quant_i8`, on a w4a8 / w8a8 trunk's int8 junction)
+sends the exact wire only, and is byte-identical to `all_reduce` followed by the chain. Under `tp-wire: wht6` it is declared all the same and taken
 per step where the message goes out exact anyway (`ar_wire_is_exact`: a decode step of a few rows,
-under `--tp-wire-min-kb`); a wider step keeps the lossy all-reduce, unfused, so a lossy-wire
+under `tp-wire-min-kb`); a wider step keeps the lossy all-reduce, unfused, so a lossy-wire
 deployment's decode takes one launch a junction instead of three (all-reduce, post-norm,
 junction). A fused step is the unfused exact step bit for bit.
-
-**Pipelined prefill.** At two ranks an MXFP4 trunk with the fused fp8 junctions prefills a prompt
-of 1024 tokens or more in two pieces, the junctions and all-reduces of one beside the other's
-compute (GUIDE §4.5). The window KV group's `seqused` counts from its
-rebased first block, so the first piece's bound is computed on the card (`sub_i32`: the group's
-`seqused` less the second piece's rows), not taken from its position. The gain needs 1024-row
-pieces: serve at `--max-num-batched-tokens 2048`.
 
 **Calibration.** Serve a calibration container (int8, `translategemma-27b-i8a8.recipe`: KL 0.003
 against bf16, and it fits two 32 GB cards) with `RADIANCE_CALIB_DIR` set, push a corpus of the
@@ -1741,8 +1818,14 @@ is one 800-token translation run four times).
 three-pass one the engine drives through `core/gen`: COND once per request (the text encoder over
 the prompt and its pictures, then the DiT over that prefix into the KV cache), DENOISE once per step
 (the image's latent rows against the cached prefix), DECODE once per image (the VAE). It is served
-on `/v1/images/generations` and `/v1/images/edits` ([GUIDE §5.6](GUIDE.md)); fp8 on one or two
-cards, bf16 on two. The checkpoint is the diffusers pipeline directory, read as one.
+on `/v1/images/generations` and `/v1/images/edits` ([GUIDE §5.6](GUIDE.md)); IQ8R on one or
+two cards, bf16 on two. The checkpoint is the diffusers pipeline directory, read as one.
+
+IQ8R (`data/recipes/qwen-image-2.1-iq8r.recipe`) stores the same linears as rotated int8 and reads
+them against int8 activations; the DiT's fused norm is then `ln_mod_had_quant_i8g`. Four 1024 x
+1024 pictures at 20 steps, against the bf16 container's from the same seeds: a mean PSNR of 32.6 dB
+on one card and 34.1 on two, where block fp8 measured 28.1 and 28.6. A picture takes 10.5 s on
+one R9700 and 6.8 on two.
 
 ```
 text      Qwen3-VL-8B-Instruct as released: 36 layers of 4096 (32 x 128, 8 kv heads), interleaved
@@ -1798,6 +1881,14 @@ each lane's text rows (after the text fusion and `txt_in`) in its store, and eve
 runs them with the image, since every row is modulated by the step's timestep and nothing can be
 cached as keys. Served on `/v1/images/generations` ([GUIDE §5.6](GUIDE.md)); it takes no reference
 pictures, so `/v1/images/edits` answers 501.
+
+The linears are IQ8R (`data/recipes/krea-2-iq8r.recipe`: rotated int8 read against int8 activations, each modulated norm followed by the rotating quantiser and the
+attention's output gate taken apart before the out projection's) or bf16 (`krea-2-bf16.recipe`).
+The IQ8R recipe keeps the text fusion's down projection at one scale a 128 of K, because a rank's
+half of its 6912 columns is not whole 256s. Krea 2 Turbo's four 1024 x 1024 pictures on its own
+schedule, against the bf16 container's from the same seeds: a mean PSNR of 29.3 dB for IQ8R on one
+R9700 and 30.0 on two, 22.8 and 23.2 for block fp8. A picture takes 7.2 s on one card and 4.4 on
+two; bf16 takes 6.4 on two.
 
 ```
 text      Qwen3-VL-4B's language model over the prompt in Qwen-Image's template, the template's
@@ -1918,6 +2009,12 @@ latents and the image. The conditioning pass leaves each lane's text rows (after
 `context_embedder`) and reference rows (VAE-encoded by the generator's own encoder and embedded) in
 its store; every step runs the three modes' early blocks and then the joint blocks. Served on
 `/v1/images/generations` and `/v1/images/edits` with up to ten reference pictures.
+
+The linears are IQ8R (`data/recipes/flux-3-klein-iq8r.recipe`: rotated int8 read against int8 activations, a block's modulated norm
+followed by the rotating quantiser) or the release's bf16 (`flux-3-klein-bf16.recipe`). [klein]'s
+four 1024 x 1024 pictures on its own 16 steps, against the bf16 container's from the same seeds: a
+mean PSNR of 38.7 dB for IQ8R on one R9700 and 40.8 on two, 28.0 and 30.7 for block fp8. A
+picture takes 5.6 s on one card and 3.4 on two; bf16 takes 8.3 on one.
 
 ```
 text      Qwen3-VL-4B-Instruct's language model over the prompt in its chat template, right-padded
@@ -2348,7 +2445,7 @@ The passes, which shift the tower by a row against the reference's loop:
 Traps (each still speaks, wrongly):
 
 - **The experts' scale planes are f32**, not the bf16 of Qwen3.6-35B-A3B-FP8: the expert format is
-  read per layer (`MoeFP8::probe`), served as fp8a8f32.
+  read per layer (`MoeFP8::probe`), and a block-fp8 expert is refused at load.
 - **The tower's wqkv is blocked, `[Q | G | K | V]`**, not the backbone's per-head `[q_h | gate_h]`
   pairs; its rotary is GPT-J's adjacent pairs, not the backbone's halves; its q/k norms run with
   `(1 + w)` although its config says `attention_qk_norm: false` (the exporter never wrote it).
@@ -2430,8 +2527,8 @@ the refiner over the prompt and computes every step's modulation, VSTEP is one d
 one request's packed sequence, ADECODE plays the soundtrack, VDECODE decodes one temporal chunk of
 frames; with keyframes or reference media, VENCODE and AENCODE first run each through the video or
 the audio VAE's encoder into the lane. A request is a lane; two hold state at once (one denoising,
-one conditioned and waiting). It is served on `/v1/videos` ([GUIDE §5.16](GUIDE.md)), block fp8 or
-int8 on two cards with `--vision-tower-placement ram`. The checkpoint is the diffusers pipeline
+one conditioned and waiting). It is served on `/v1/videos` ([GUIDE §5.16](GUIDE.md)), int8 on two
+cards with `vision-tower-placement: ram`. The checkpoint is the diffusers pipeline
 directory, read as one; the workflows t2va, i2va, l2va, fl2va and ref2va are served.
 
 ```
@@ -2503,7 +2600,7 @@ Tensor parallel: the text encoder, refiner and DiT blocks split by heads and fee
 A block's three modulation projections split by rows, three of the six vectors a rank, and
 VCOND writes every step's modulation into the lane once a request, so the 13B modulation
 parameters and the text encoder (RAD_ACCESS_PER_REQUEST) live in pinned host memory under
-`--vision-tower-placement ram`. Each step gathers its row of the table across the ranks. The video
+`vision-tower-placement: ram`. Each step gathers its row of the table across the ranks. The video
 decoder is replicated and splits its tiles between the ranks, gathering the decoded pixels; the
 audio decoder runs whole on each.
 
@@ -2591,7 +2688,11 @@ passes of `core/gen/video_driver.h`: VCOND once per request (the text encoder ov
 the negative prompt, the connectors into the lane's text rows, the first frame encoded for image to
 video), VSTEP once per evaluation, VDECODE and ADECODE once per video, VUPSCALE between the two
 stages of the distilled recipe. Served on `/v1/videos` ([GUIDE §5.16](GUIDE.md)), one card, bf16 or
-block fp8. The checkpoint is the diffusers `LTX2Pipeline` directory, with `latent_upsampler/`,
+rotated int8 (IQ8R, `data/recipes/ltx-2.5-iq8r.recipe`: the first DiT projection's
+encoding decides every large linear, and each activation a linear reads then carries
+`had_quant_act_i8g`'s int8 codes at one scale a 256 columns; the
+latents' 128-wide projections in stay bf16). The checkpoint is the diffusers `LTX2Pipeline`
+directory, with `latent_upsampler/`,
 `duration_head/` and `diffusion_decoder/` read when they are there.
 
 ```

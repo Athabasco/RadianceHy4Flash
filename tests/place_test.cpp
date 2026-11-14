@@ -2609,6 +2609,56 @@ TEST(a_second_lender_is_recalled_without_touching_the_first) {
     CHECK(again > 0);
 }
 
+/* The fleet lends free VRAM it backs into a range the engine reserved (Engine::xflex_tick).
+ * lendable_bytes sizes that range so every pooled unit gets a slot; the loan is the backed top of
+ * it, and a recall leaves nothing in it, so the range can be unbacked after. */
+TEST(the_fleets_loan_gives_every_pooled_unit_a_slot_and_comes_back_whole) {
+    if (!VMem::supported()) SKIP("the backend has no elastic memory");
+    LoanRig r;
+    CHECK_OK(r.build());
+    const int64_t b = r.m.lendable_bytes();
+    CHECK(b > 0);
+    const int64_t g = VMem::granularity();
+    VMem vm;
+    CHECK_OK(vm.reserve((b + g - 1) / g * g));
+    const int64_t before = r.m.flex_capacity();
+    LoanStrip st;
+    st.top = (char*)vm.base() + vm.size();
+    st.bytes = vm.size();
+    st.unit_bytes = 1;
+    st.unit_tokens = 1;
+    CHECK_OK(r.m.lend_from(Mover::kLendFleet, { st }));
+    const int64_t stride = r.hf.plan.classes[0].stride;
+    CHECK_EQ((r.m.flex_capacity() - before) / stride, (int64_t)r.pooled());
+    const int64_t ceil = r.m.loan_ceiling(Mover::kLendFleet);
+    CHECK(ceil > 0 && ceil <= vm.size());
+
+    /* Backed from the top, then lent: the fill reaches only the fleet's slots. */
+    const int64_t lend = (ceil + g - 1) / g * g;
+    CHECK_OK(vm.commit(vm.size() - lend, lend));
+    CHECK_OK(r.m.set_loan(Mover::kLendFleet, lend));
+    for (Deadline dl; (r.m.flex_used_bytes() == 0 || any_busy(r.h, r.hf.plan)) && !dl.passed();)
+        CHECK_OK(r.dispatch());
+    auto in_range = [&](const void* p) {
+        return (const char*)p >= (const char*)vm.base() && (const char*)p < (const char*)vm.base() + vm.size();
+    };
+    int32_t in = 0;
+    for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u) {
+        CHECK(!r.loan.inside(r.addr(u)));
+        in += in_range(r.addr(u));
+    }
+    CHECK(in > 0);
+    CHECK(r.m.loan_held(Mover::kLendFleet) > 0);
+
+    /* The recall empties the range before it returns; unbacking it after is safe. */
+    CHECK_OK(r.m.reclaim(Mover::kLendFleet, 0, &r.h));
+    CHECK_EQ(r.m.loan_held(Mover::kLendFleet), (int64_t)0);
+    CHECK_EQ(resident_count(r.h, r.hf.plan), r.planned);
+    for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u) CHECK(!in_range(r.addr(u)));
+    CHECK_OK(vm.decommit(0, vm.size()));
+    CHECK_EQ(vm.committed(), (int64_t)0);
+}
+
 TEST(slot_pool_segments_have_their_own_targets) {
     SlotPool s;
     s.init(2, 1);

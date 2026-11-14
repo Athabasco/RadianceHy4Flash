@@ -220,9 +220,12 @@ public:
      * afterwards the old tables are dead bytes. finish() leaves `<path>.pre-append` (the old
      * header and length) to restore it.
      *
-     * New expert weights are refused: a layer's experts sit at a fixed stride and cannot be
-     * extended. The caller must be the file's only user, since a process mapping it would see the
-     * header change under it. */
+     * A layer's experts sit at a fixed stride, so a layer whose experts are kept (add_existing)
+     * takes no further one. A layer none of whose experts is kept takes its whole table, written
+     * as in a new file: experts 0..n-1 in order, each one's slots in order -- a layer `old` holds
+     * none of, or one whose old table the caller leaves behind as dead bytes. An old weight the
+     * caller neither keeps nor writes again is dead bytes too. The caller must be the file's only
+     * user, since a process mapping it would see the header change under it. */
     int  begin_append(const char* path, const RadFile& old);
     /* A weight `old` already holds, recorded at the offsets it has there. Its encoding and planes
      * are the old entry's; its name, provenance and movement group are `w`'s. */
@@ -288,6 +291,9 @@ private:
     uint64_t old_data_off_ = 0;
     RadFileHeader old_hdr_{};
     std::vector<uint8_t> dir_abs_;
+    /* While extending in place: the layers an expert was kept in (add_existing) and the layers a
+     * new expert was reserved in. A layer is in one of them only. */
+    std::unordered_set<int32_t> kept_expert_layers_, new_expert_layers_;
 
     std::string arch_, model_, quant_, recipe_, created_by_;
 

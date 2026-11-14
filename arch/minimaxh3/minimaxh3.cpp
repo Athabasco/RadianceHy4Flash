@@ -288,10 +288,11 @@ struct DitBlock {
     rad_op     op_kq = 0;          /* the keys to int8 codes for the attention's scores */
     rad_op     op_vq = 0;          /* the values to E4M3 codes for the attention's P.V */
     /* The three modulation projections, one a modality, this rank's share of their rows; a
-     * curve-form checkpoint's are bf16 (ada_w). */
+     * curve-form checkpoint's are bf16 (ada_w). A rotated int8 one adds its bias after the GEMM
+     * (op_ada_b). */
     DenseFP8   ada[3];
     rad_weight ada_w[3] = {}, ada_b[3] = {};
-    rad_op     op_ada[3] = {};
+    rad_op     op_ada[3] = {}, op_ada_b[3] = {};
 };
 
 /* A video decoder block. */
@@ -423,6 +424,7 @@ struct Model {
     /* ---- the lanes (PERSIST) */
     rad_buf b_text = 0;          /* [lanes * kMaxText, D] bf16: the refined prompt */
     rad_buf b_ada = 0;           /* [lanes * S, 150 * Ws] bf16: the modulation table */
+    rad_buf b_adat = 0;          /* [S, Ws] bf16: a rotated int8 projection's rows before its bias */
     rad_buf b_nout = 0;          /* [lanes * S, 3 * 2D] bf16: norm_out's, by segment */
     rad_buf b_vstate = 0;        /* [lanes * maxV, 96] f32 */
     rad_buf b_astate = 0;        /* [lanes * maxA, 32] f32 */
@@ -450,6 +452,12 @@ struct Model {
     ActFP8  a_hm{}, a_attn{}, a_ffn{};
     /* The DiT's linears are int8 (W8A8): their activations are int8 codes as well. */
     bool    dit_i8 = false;
+    /* The text encoder's, the refiner's and the modulation projections' linears are rotated int8
+     * (IQ8R, or the 128-group form where K is not whole 256s), each read off its first weight:
+     * their activations then carry int8 pairs at that weight's scale group in place of the E4M3
+     * ones (ActFP8::declare_pair). */
+    bool    te_i8 = false, ref_i8 = false, ada_i8 = false;
+    int64_t te_g8 = RAD_FP8_BLOCK, ref_g8 = RAD_FP8_BLOCK, ada_g8 = RAD_FP8_BLOCK;
     std::vector<DitBlock> dit;
     rad_weight w_no_n = 0, w_vout = 0, b_vout = 0, w_aout = 0, b_aout = 0;
     rad_op  op_nout = 0, op_hcast = 0, op_vout = 0, op_aout = 0, op_ev = 0, op_ea = 0;
@@ -561,7 +569,7 @@ struct Model {
     rad_buf b_enca = 0;              /* [kEncSlotsA * kEncSlotRowsA, kAudioC] f32 PERSIST */
 };
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 /* A space-separated list off the container (rad-convert flattens arrays that way). */
 static std::vector<double> meta_list(const RadModelMeta* m, const char* key) {
@@ -704,16 +712,35 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                           nm.ckpt("model.language_model.embed_tokens.weight")));
     m.w_tok = decl_w(b, nm.f("te.token_embd.weight"), RAD_BF16, { g.n_vocab_all, g.n_embd },
                      RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
+    /* The linears' format, from layer 0's projection, before the activations' codes are declared:
+     * rotated int8 ones read int8 pairs. */
+    m.te.resize((size_t)g.n_layer);
+    {
+        const char* pre = "model.language_model.layers";
+        RAD_ARCH_TRY(m.te[0].qkv.probe(b, nm, g, "te.blk.0.attn_qkv",
+                                       { nm.ckpt("%s.0.self_attn.q_proj.weight", pre),
+                                         nm.ckpt("%s.0.self_attn.k_proj.weight", pre),
+                                         nm.ckpt("%s.0.self_attn.v_proj.weight", pre) }));
+        RadEncoding e{};
+        if (weight_enc(b, nm.f("te.blk.0.attn_qkv.weight"), &e) &&
+            (linear_is_w8h(e) || linear_is_wnh(e))) {
+            m.te_i8 = true;
+            m.te_g8 = linear_w8h_group(e);
+        }
+    }
     m.b_tx   = decl_b(b, nm.f("te.x"), RAD_BF16, { T, g.n_embd });
     m.a_th.x = decl_b(b, nm.f("te.h"), RAD_BF16, { T, g.n_embd });
-    RAD_ARCH_TRY(m.a_th.declare_qs(b, nm, g, "te.h", g.n_embd));
+    RAD_ARCH_TRY(m.a_th.declare_pair(b, nm, g, "te.h", g.n_embd, 0, m.te_i8, m.te_g8,
+                                     "had_quant_act_i8g"));
     m.b_tkv  = decl_b(b, nm.f("te.qkv"), RAD_BF16, { T, q_dim + 2 * kv_dim });
     m.a_tattn.x = decl_b(b, nm.f("te.attn"), RAD_BF16, { T, q_dim });
-    RAD_ARCH_TRY(m.a_tattn.declare_qs(b, nm, g, "te.attn", q_dim));
+    RAD_ARCH_TRY(m.a_tattn.declare_pair(b, nm, g, "te.attn", q_dim, 0, m.te_i8, m.te_g8,
+                                        "had_quant_act_i8g"));
     m.b_th2  = decl_b(b, nm.f("te.h2"), RAD_BF16, { T, g.n_embd });
     m.b_tgu  = decl_b(b, nm.f("te.gate_up"), RAD_BF16, { T, 2 * g.n_ff });
     m.a_tffn.x = decl_b(b, nm.f("te.ffn"), RAD_BF16, { T, g.n_ff });
-    RAD_ARCH_TRY(m.a_tffn.declare_qs(b, nm, g, "te.ffn", g.n_ff));
+    RAD_ARCH_TRY(m.a_tffn.declare_pair(b, nm, g, "te.ffn", g.n_ff, 0, m.te_i8, m.te_g8,
+                                       "gated_had_quant_i8g"));
 
     m.op_embed = rw(b, RAD_OP(b, "embed_lookup",
                               RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n_embd", g.n_embd),
@@ -887,15 +914,32 @@ static int declare_refiner(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     m.b_rh = decl_b(b, nm.f("ref.h"), RAD_BF16, { T, D });
     m.op_ce = dense_bias(b, nm, "ref.ctx", "transformer.context_embedder", RAD_BF16, "bf16", D,
                          tdim, T, m.b_tx, m.b_rh, &m.w_ce, &m.b_ce, acc, gx);
+    /* The refiner's linears' format, from block 0's projection (declare_te's note). */
+    {
+        const char* pre = nm.ckpt("transformer.token_refiner.refiner_blocks.0");
+        RAD_ARCH_TRY(m.rb[0].qkv.probe(b, nm, g, "ref.blk.0.attn_qkv",
+                                       { nm.ckpt("%s.attn.to_q.weight", pre),
+                                         nm.ckpt("%s.attn.to_k.weight", pre),
+                                         nm.ckpt("%s.attn.to_v.weight", pre) }));
+        RadEncoding e{};
+        if (weight_enc(b, nm.f("ref.blk.0.attn_qkv.weight"), &e) &&
+            (linear_is_w8h(e) || linear_is_wnh(e))) {
+            m.ref_i8 = true;
+            m.ref_g8 = linear_w8h_group(e);
+        }
+    }
     m.a_rh.x = decl_b(b, nm.f("ref.hn"), RAD_BF16, { T, D });
-    RAD_ARCH_TRY(m.a_rh.declare_qs(b, nm, g, "ref.hn", D));
+    RAD_ARCH_TRY(m.a_rh.declare_pair(b, nm, g, "ref.hn", D, 0, m.ref_i8, m.ref_g8,
+                                     "had_quant_act_i8g"));
     m.b_rqkv = decl_b(b, nm.f("ref.qkv"), RAD_BF16, { T, 3 * qd });
     m.a_rattn.x = decl_b(b, nm.f("ref.attn"), RAD_BF16, { T, qd });
-    RAD_ARCH_TRY(m.a_rattn.declare_qs(b, nm, g, "ref.attn", qd));
+    RAD_ARCH_TRY(m.a_rattn.declare_pair(b, nm, g, "ref.attn", qd, 0, m.ref_i8, m.ref_g8,
+                                        "had_quant_act_i8g"));
     m.b_rao = decl_b(b, nm.f("ref.ao"), RAD_BF16, { T, D });
     m.b_rgu = decl_b(b, nm.f("ref.gate_up"), RAD_BF16, { T, 2 * g.n_ff });
     m.a_rffn.x = decl_b(b, nm.f("ref.ffn"), RAD_BF16, { T, g.n_ff });
-    RAD_ARCH_TRY(m.a_rffn.declare_qs(b, nm, g, "ref.ffn", g.n_ff));
+    RAD_ARCH_TRY(m.a_rffn.declare_pair(b, nm, g, "ref.ffn", g.n_ff, 0, m.ref_i8, m.ref_g8,
+                                       "gated_had_quant_i8g"));
     const int64_t ff_all = g.n_ff_all;
 
     for (int l = 0; l < 2; ++l) {
@@ -1063,13 +1107,10 @@ static int declare_tables(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         m.op_ts = unary(b, "silu", TT, hd1, "f32", m.b_te1, m.b_te1s);
         m.op_t2 = dense_bias(b, nm, "tmb.l2", "transformer.time_embedder.linear_2", RAD_F32, "f32",
                              td, hd1, TT, m.b_te1s, m.b_temb, &m.w_t2, &m.b_t2, acc, gx);
-        /* silu(temb) in f32, rounded once to the bf16 the projections take. */
-        Geom gs = g;
-        gs.max_tok = TT;
+        /* silu(temb) in f32, rounded once to the bf16 the projections take. Its codes are
+         * declared below, once the first projection's encoding says which they are. */
         m.a_temb.x = decl_b(b, nm.f("tmb.act"), RAD_BF16, { TT, td });
         m.op_ts2 = unary(b, "silu", TT, td, "f32", m.b_temb, m.a_temb.x);
-        RAD_ARCH_TRY(m.a_temb.declare_qs(b, nm, gs, "tmb.act", td, TT));
-        RAD_ARCH_TRY(m.q_temb.declare(b, gs, m.a_temb, td));
         if (!m.op_temb || !m.op_temb_pv || !m.op_temb_pa || !m.op_t1 || !m.op_ts || !m.op_t2
             || !m.op_ts2) return RAD_E_INVAL;
     }
@@ -1106,16 +1147,58 @@ static int declare_tables(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                             RAD_WEIGHTS(B.ada_w[md], B.ada_b[md])),
                                   { m.a_temb.x }, { m.b_ada });
             } else {
+                /* The embedding's codes, from the first projection's encoding: E4M3, or for
+                 * rotated int8 projections the int8 pair at their scale group. */
+                if (l == 0 && md == 0) {
+                    RadEncoding e{};
+                    if (weight_enc(b, wn, &e) && linear_is_w8h(e)) {
+                        m.ada_i8 = true;
+                        m.ada_g8 = linear_w8h_group(e);
+                    }
+                    Geom gs = g;
+                    gs.max_tok = TT;
+                    RAD_ARCH_TRY(m.a_temb.declare_pair(b, nm, gs, "tmb.act", td, TT, m.ada_i8,
+                                                       m.ada_g8, "had_quant_act_i8g"));
+                    if (m.ada_i8 && !m.a_temb.q8_fed) {
+                        fprintf(stderr, "radiance: minimaxh3: rotated int8 modulation projections "
+                                        "need had_quant_act_i8g, which no loaded library serves\n");
+                        return RAD_E_UNSUPPORTED;
+                    }
+                    RAD_ARCH_TRY(m.q_temb.declare(b, gs, m.a_temb, td));
+                }
                 /* The row slice is mapped above (DenseFP8 takes that as its argument). */
+                B.ada[md].w8h_ok = m.ada_i8;
                 RAD_ARCH_TRY(B.ada[md].declare(b, nm, base, m.Ws, td, acc, RAD_SHARD_ROW,
                                                grp_layer(grp), { src_w }, {}, true));
-                B.op_ada[md] = rw(b, RAD_OP(b, "gemm_nt_q_bias",
-                                            RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("N", m.Ws),
-                                                       RAD_INT("K", td),
-                                                       RAD_INT("group", RAD_FP8_BLOCK),
-                                                       RAD_STR("dtype", "fp8a8")),
-                                            RAD_WEIGHTS(B.ada[md].w, B.ada[md].s, B.ada_b[md])),
-                                  { m.a_temb.q, m.a_temb.s }, { m.b_ada });
+                if (B.ada[md].w8h != m.ada_i8) {
+                    fprintf(stderr, "radiance: minimaxh3: '%s' is not encoded as the first "
+                                    "modulation projection is\n", wn);
+                    return RAD_E_DTYPE;
+                }
+                if (m.ada_i8) {
+                    /* i8a8h has no biased row and writes whole rows: the GEMM goes to its own
+                     * rows, and the bias is added on the way into the table's cell. */
+                    if (!m.b_adat) m.b_adat = decl_b(b, nm.f("tmb.ada"), RAD_BF16, { S, m.Ws });
+                    if (!m.b_adat) return RAD_E_INVAL;
+                    B.op_ada[md] = B.ada[md].gemm(b, S, m.Ws, td,
+                                                  { m.a_temb.cq(), m.a_temb.cs() }, { m.b_adat });
+                    B.op_ada_b[md] = rw(b, RAD_OP(b, "table_add",
+                                                  RAD_PARAMS(RAD_RANGE("M", 1, S),
+                                                             RAD_INT("n", m.Ws), RAD_INT("L", 1),
+                                                             RAD_STR("dtype", "bf16")),
+                                                  RAD_WEIGHTS(B.ada_b[md])),
+                                        { m.b_adat }, { m.b_ada });
+                    if (!B.op_ada_b[md]) return RAD_E_INVAL;
+                } else {
+                    B.op_ada[md] = rw(b, RAD_OP(b, "gemm_nt_q_bias",
+                                                RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("N", m.Ws),
+                                                           RAD_INT("K", td),
+                                                           RAD_INT("group", RAD_FP8_BLOCK),
+                                                           RAD_STR("dtype", "fp8a8")),
+                                                RAD_WEIGHTS(B.ada[md].w, B.ada[md].s,
+                                                            B.ada_b[md])),
+                                      { m.a_temb.q, m.a_temb.s }, { m.b_ada });
+                }
             }
             if (!B.op_ada[md]) return RAD_E_INVAL;
         }
@@ -2798,8 +2881,9 @@ static int declare_aenc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
 /* ================================================================== declare */
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
-    Model& m = g_model[ctx->rank];
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
+    Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     Names& nm = m.nm;
@@ -2923,8 +3007,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(declare_dit(b, meta, m));
     if (m.dit[0].qkv.bf16) {
         fprintf(stderr, "radiance: minimaxh3: the DiT's linears are bf16; this plugin serves the "
-                        "block-fp8 container (data/recipes/minimax-h3-fp8.recipe) or the int8 one "
-                        "(data/recipes/minimax-h3-w8a8.recipe)\n");
+                        "int8 container (data/recipes/minimax-h3-i8.recipe)\n");
         return RAD_E_UNSUPPORTED;
     }
     RAD_ARCH_TRY(declare_ups(b, meta, m));
@@ -3203,10 +3286,15 @@ static void step_cond(RadCtx* c, const RadBatch* batch, const Model& m) {
             const int64_t r0 = cell[(size_t)e].second;
             const RadOperand out =
                 bcol_at(m.b_ada, base, L * kMaxSegs * m.Ws, (l * kMaxSegs + e) * m.Ws, m.Ws, S);
-            if (m.curve > 0)
+            if (m.curve > 0) {
                 RAD_ISSUE_N(c, B.op_ada[md], S, brow_slice(m.a_temb.x, r0, S, td),
                             RAD_W(B.ada_w[md]), RAD_W(B.ada_b[md]), RAD_NONE, out);
-            else
+            } else if (m.ada_i8) {
+                RAD_ISSUE_N(c, B.op_ada[md], S, brow_slice(m.a_temb.q8, r0, S, td),
+                            brow_slice(m.a_temb.s8, r0, S, td / m.ada_g8), RAD_W(B.ada[md].w),
+                            RAD_W(B.ada[md].s), brows(m.b_adat, S), RAD_NONE, RAD_NONE);
+                RAD_ISSUE_N(c, B.op_ada_b[md], S, brows(m.b_adat, S), RAD_W(B.ada_b[md]), out);
+            } else
                 RAD_ISSUE_N(c, B.op_ada[md], S, brow_slice(m.a_temb.q, r0, S, td),
                             brow_slice(m.a_temb.s, r0, S, td / RAD_FP8_BLOCK), RAD_W(B.ada[md].w),
                             RAD_W(B.ada[md].s), RAD_W(B.ada_b[md]), out);
@@ -3934,7 +4022,7 @@ static void step_aenc(RadCtx* c, const RadBatch* batch, const Model& m) {
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    const Model& m = g_model[rad_rank(c)];
+    const Model& m = g_model[rad_slot(c)];
     if (!batch->gen || !batch->vgen_b) {
         rad_step_fail(c, "minimaxh3 is a video generator and runs its generator passes only");
         return;
@@ -3987,6 +4075,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
 
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PROBE(minimaxh3)
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(minimaxh3, "minimaxh3", "", "0.1.0",
                 "MiniMax-H3 (t2va, i2va, l2va, fl2va, ref2va): Qwen3-VL-32B conditioning, a 33B "
                 "single-stream diffusion transformer over text, soundtrack and video, a tiled ViT "

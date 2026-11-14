@@ -134,8 +134,6 @@ enum class Tier { VRAM = 0, HostPinned = 1, HostPageable = 2, SSD = 3, Mapped = 
  *          embedding takes Ram or Vram. */
 enum class TablePlacement { Auto = 0, Vram = 1, Ram = 2, Disk = 3 };
 const char* table_placement_name(TablePlacement p);
-/* --attn-prefill-fp8's spelling of RAD_ATTN_FP8_* bits: off, qk, pv or both. */
-const char* attn_prefill_fp8_name(int bits);
 /* --draft-window: how many drafts a step verifies per sequence (core/sched/draft.h).
  *   Fixed     every sequence drafts --num-speculative-tokens.
  *   Adaptive  that is the ceiling; head depth per step and each sequence's stop follow measured
@@ -416,6 +414,10 @@ public:
      * proposal's parent node, at the proposal's pitch. False and 0 for a chain drafter. */
     bool           drafter_tree = false;
     rad_buf        drafter_parents = 0;
+
+    /* The plugin's buffer for the routing counts (rad_route_table), [layers, n_expert] i32 in the
+     * arena's fixed region; 0 when the core keeps the rows itself. */
+    rad_buf        route_table = 0;
 
     /* The declared media encoder (rad_declare_encoder). `modalities == 0` when none: every
      * text-only program, and every deployment with RadBuildCtx::max_enc_patches 0.
@@ -872,18 +874,14 @@ struct Config {
     /* --gpu-memory-mib: claim this much of every card; 0 uses gpu_headroom_mib. Inverse of
      * headroom: N + headroom = the card, in MiB. Not with --gpu-headroom-mib. */
     int64_t gpu_memory_mib = 0;
-    /* --kv-cache-dtype bf16|fp8|fp8_v4|k6_v4. fp8 is an E4M3 cache with per-(sequence, head)
-     * descales; it halves the per-token cost, most of the KV pool at production context. fp8_v4
-     * keeps K as E4M3 and V as int4 in groups of 32, k6_v4 also K as int6 (RadBuildCtx::kv_quant),
-     * served only where the plugin says so. Each changes the model's output slightly, so it is
-     * explicit and bf16 is the default. No "auto": it would always resolve to bf16 and only add
-     * another name. */
+    /* --kv-cache-dtype bf16|i8|fp8. i8 keeps K and V as int8 codes with one f16 scale each per
+     * (token, head) (abi/rad_builder.h); it halves the per-token cost, most of the KV pool at
+     * production context. fp8 is an E4M3 cache, served only where the plugin's probe says so
+     * (RadArchProbe::kv_fp8_ok: GLM-5.3's latent attention). Each changes the model's output
+     * slightly, so it is explicit and bf16 is the default. No "auto": it would always resolve to
+     * bf16 and only add another name. */
     std::string kv_cache_dtype = "bf16";
     std::string state_cache_dtype = "f32";   /* --state-cache-dtype: f32 | f16 */
-    /* --attn-prefill-fp8 off|qk|pv|both: RAD_ATTN_FP8_* bits, the prefill attention's products
-     * accepted in e4m3 (RadBuildCtx::attn_prefill_fp8). Lossy, so off is the default.
-     * attn_prefill_fp8_name() spells it as the flag does. */
-    int attn_prefill_fp8 = 0;
     /* --kv-resident N: tokens of the sparse attention group's context its VRAM ring holds
      * (docs/KV-STREAMING.md). 0 is off; a ring that covers `max_seqs x max_ctx` streams nothing; a
      * ring below kStreamFloorTokens or one decode step's selection is raised to it. */
@@ -891,6 +889,8 @@ struct Config {
     /* Derived: whether a group streams, set by kvstream_cap_probe before the pool is sized (a
      * streamed group's ceiling is its ring and stage, not its cache); the KV MiB rounding reads it. */
     bool kv_streams = false;
+    /* A rank's pinned host pool for weights. --host-pool-mib states all the ranks' together and
+     * config_parse divides it by --tp. */
     int64_t host_pool_mib = 0;
     int64_t host_headroom_mib = 4096; /* --host-headroom-mib: RAM left free for the system at startup */
     /* File tier for weights: what fits in neither the VRAM slab nor the pinned host pool is read
@@ -1093,6 +1093,20 @@ struct Config {
      * and the metrics carry. Empty takes the container's own name. A request may still name any
      * model: one model is loaded and every request is served by it. */
     std::string served_model_name;
+    /* The cards this engine's ranks run on, rank i on devices[i]: chosen by the fleet
+     * (docs/MULTIMODEL.md §8.4), not by a key. Empty takes the usable cards from the first. */
+    std::vector<int> devices;
+    /* Bytes of each card the fleet granted this engine (docs/MULTIMODEL.md §6.3), set by the
+     * engine from its VramBroker before the split: the split treats the grant as the card, with
+     * nothing already held and no headroom. 0 splits the card as a process of one model does. */
+    int64_t vram_claim = 0;
+    /* Bytes of address space the KV pool reserves when its cache is flex (docs/MULTIMODEL.md §6):
+     * the most it may grow to, of which only vram_kv_mib is backed at start. 0: the pool is
+     * vram_kv_mib, backed whole. Set by the engine from its broker. */
+    int64_t kv_reserve = 0;
+    /* A model the fleet loads again: its startup report printed at its first load, so a load
+     * after an eviction prints only its ready line. Set by the fleet. */
+    bool    report_once = false;
 
     /* Sampler defaults for a request that sends none. Unset, they resolve from the container and
      * the `generation_config.json` beside it (resolve_sampling_defaults in engine.cpp), since a
@@ -1221,4 +1235,15 @@ struct Config {
 namespace rad {
 int  config_parse(int argc, char** argv, Config* c);
 void config_usage(const char* argv0);
+
+/* One entry of the option table: the flag with its dashes, the argument's placeholder (null for a
+ * switch) and the help text. The YAML loader (fleet/config.h) reads the table for its key names,
+ * so a key exists exactly when its flag does. */
+struct ConfigFlag {
+    const char* name;
+    const char* arg;
+    const char* help;
+};
+/* The table in order; *n is its length. */
+const ConfigFlag* config_flags(size_t* n);
 }

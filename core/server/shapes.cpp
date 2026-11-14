@@ -21,6 +21,7 @@
  * field is refused by name. A finished background shape is kept for as long as a video, as many
  * as videos.
  */
+#include "front.h"
 #include "server.h"
 #include "oai.h"
 
@@ -28,7 +29,7 @@
 #include "mm/media.h"
 #include "rad_internal.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <chrono>
 #include <cmath>
@@ -237,6 +238,31 @@ void Server::shape_work(std::shared_ptr<ShapeJob> j) {
     } else {
         j->file = std::move(file);
     }
+    /* A finished shape can be read without this server, which may be gone when its client asks. */
+    if (deps_.front)
+        deps_.front->keep_job(j->uid, j->done_at + opt_.video_ttl_s, opt_.max_videos,
+                              [j](const HttpRequest&) -> HttpResponse {
+            return HttpResponse::json_body(200, json_dump(shape_status(*j)));
+        });
+}
+
+json Server::shape_status(const ShapeJob& j) {
+    json o;
+    if (!j.finished) {
+        o["status"] = "processing";
+        int32_t steps = 0, points = 0;
+        j.ticket->progress_of(&steps, &points);
+        o["steps_done"] = steps;
+        o["steps"] = j.ticket->steps;
+    } else if (j.failed) {
+        o["status"] = "error";
+        o["message"] = j.message;
+    } else {
+        o["status"] = "completed";
+        o["type"] = j.type;
+        o["model_base64"] = base64_encode(j.file.data(), j.file.size());
+    }
+    return o;
 }
 
 void Server::sweep_shapes_locked(int64_t now) {
@@ -292,7 +318,11 @@ HttpResponse Server::handle_shape_send(const HttpRequest& req) {
         sweep_shapes_locked(unix_now());
         shapes_.push_back(j);
     }
-    j->worker = std::thread([this, j] { shape_work(j); });
+    if (deps_.background) deps_.background->fetch_add(1);
+    j->worker = std::thread([this, j] {
+        shape_work(j);
+        if (deps_.background) deps_.background->fetch_sub(1);
+    });
     json o;
     o["uid"] = j->uid;
     return HttpResponse::json_body(200, json_dump(o));
@@ -307,22 +337,7 @@ HttpResponse Server::handle_shape_status(const HttpRequest& req) {
     sweep_shapes_locked(unix_now());
     for (const auto& j : shapes_) {
         if (j->uid != uid) continue;
-        json o;
-        if (!j->finished) {
-            o["status"] = "processing";
-            int32_t steps = 0, points = 0;
-            j->ticket->progress_of(&steps, &points);
-            o["steps_done"] = steps;
-            o["steps"] = j->ticket->steps;
-        } else if (j->failed) {
-            o["status"] = "error";
-            o["message"] = j->message;
-        } else {
-            o["status"] = "completed";
-            o["type"] = j->type;
-            o["model_base64"] = base64_encode(j->file.data(), j->file.size());
-        }
-        return HttpResponse::json_body(200, json_dump(o));
+        return HttpResponse::json_body(200, json_dump(shape_status(*j)));
     }
     ApiError e = err_bad("uid", "no shape '" + uid + "'; it may have expired");
     e.status = 404;

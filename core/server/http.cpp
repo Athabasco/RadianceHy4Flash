@@ -295,11 +295,11 @@ const char* anthropic_error_type(int status) {
 }
 
 /* A refusal the transport or the router writes itself. `type` is OpenAI's; on an Anthropic path
- * the status picks Anthropic's instead. Hand-rolled, not nlohmann: this error path must work even
+ * the status picks Anthropic's instead. Hand-rolled, no DOM: this error path must work even
  * if the JSON layer failed. The message can quote a request's decoded path, so bytes that are not
  * UTF-8 become U+FFFD; a JSON body must be UTF-8 for a client to parse it. */
-static std::string error_body(const std::string& path, int status, const char* type,
-                              const std::string& msg) {
+std::string error_body(const std::string& path, int status, const char* type,
+                       const std::string& msg) {
     std::string esc;
     for (char c : utf8_sanitize(msg)) {
         if (c == '"' || c == '\\') { esc.push_back('\\'); esc.push_back(c); }
@@ -626,6 +626,10 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
     svr.set_write_timeout(o.write_timeout_s, 0);
     svr.set_keep_alive_timeout(o.keep_alive_timeout_s);
     svr.set_payload_max_length(o.max_body_bytes);
+    /* Streamed replies are one small write per token; Nagle would hold a chunk (the final one
+     * included) for a delayed ACK, which is latency on every token for no throughput gain at
+     * these write sizes. */
+    svr.set_tcp_nodelay(true);
 
     const int nt = idle_workers(o.n_threads);
     const size_t most = (size_t)std::max<int64_t>(o.max_threads, nt);

@@ -197,6 +197,10 @@ private:
  * "message"}}`, so every refusal on one of its paths (/v1/messages and below) is written in it,
  * the transport's own included; every other path gets OpenAI's. */
 bool        anthropic_path(const std::string& path);
+/* A refusal's JSON body in the envelope `path` calls for (OpenAI's, or Anthropic's on its paths),
+ * written without the JSON library so the error path cannot itself fail. */
+std::string error_body(const std::string& path, int status, const char* type,
+                       const std::string& msg);
 /* Anthropic's error `type` for an HTTP status. */
 const char* anthropic_error_type(int status);
 

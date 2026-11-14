@@ -296,16 +296,42 @@ void Scheduler::fini() {
 
 /* ------------------------------------------------------------------ arrival */
 int Scheduler::add(std::unique_ptr<Request> r) {
-    std::lock_guard<std::mutex> lk(mu_);
-    return add_locked(std::move(r));
+    int rc;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        rc = add_locked(std::move(r));
+    }
+    wake();
+    return rc;
 }
 
 /* One lock for all of them, so the step that admits the first finds them all waiting. Otherwise a
  * step could start between two adds and admit a timing-dependent subset, and the batch (and its
  * tie-level rounding) would vary between identical runs. */
 void Scheduler::add_all(std::unique_ptr<Request>* rs, size_t n, int* rc) {
-    std::lock_guard<std::mutex> lk(mu_);
-    for (size_t i = 0; i < n; ++i) rc[i] = add_locked(std::move(rs[i]));
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (size_t i = 0; i < n; ++i) rc[i] = add_locked(std::move(rs[i]));
+    }
+    wake();
+}
+
+uint64_t Scheduler::wake_seq() {
+    std::lock_guard<std::mutex> lk(wake_mu_);
+    return wake_n_;
+}
+
+void Scheduler::wait_idle(uint64_t seen, std::chrono::microseconds max) {
+    std::unique_lock<std::mutex> lk(wake_mu_);
+    wake_cv_.wait_for(lk, max, [&] { return wake_n_ != seen; });
+}
+
+void Scheduler::wake() {
+    {
+        std::lock_guard<std::mutex> lk(wake_mu_);
+        ++wake_n_;
+    }
+    wake_cv_.notify_all();
 }
 
 int Scheduler::add_locked(std::unique_ptr<Request> r) {
@@ -535,6 +561,35 @@ int64_t Scheduler::reset_prefix_cache() {
     return dropped;
 }
 
+int64_t Scheduler::evict_prefix_until(const std::function<bool()>& enough) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!pc_ || !cfg_.prefix_cache) return 0;
+    int64_t total = 0;
+    /* Doubling, since the blocks that free the top of the pool may be anywhere in the LRU order. */
+    for (int64_t n = 64; !enough(); n *= 2) {
+        const int64_t done = pc_->trim(n);
+        if (done <= 0) break;
+        total += done;
+    }
+    /* What is left has no host copy to fall back on, or one still on its way. */
+    if (!enough()) {
+        const int64_t dropped = pc_->reset();
+        RAD_INFO("prefix cache: reset for room, %lld entries dropped", (long long)dropped);
+        total += dropped;
+    }
+    return total;
+}
+
+int Scheduler::preempt_until(const std::function<bool()>& enough) {
+    std::lock_guard<std::mutex> lk(mu_);
+    int n = 0;
+    while (!running_.empty() && !enough()) {
+        preempt_back();
+        ++n;
+    }
+    return n;
+}
+
 int Scheduler::release_session(const std::string& label, uint64_t id, int64_t keep_tokens,
                                SessionRelease* out) {
     std::lock_guard<std::mutex> lk(mu_);
@@ -748,6 +803,8 @@ int Scheduler::cancel(uint64_t id) {
      * the request; then commit or sweep_deferred releases them (SchedReq::pending_free). */
     const bool in_flight = in_step(s) || block_holds(id);
     close_request(s, ReqState::Cancelled, "cancelled", in_flight);
+    /* The idle loop drains what a cancel releases. */
+    wake();
     return RAD_OK;
 }
 
@@ -1357,12 +1414,14 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
                 ++rounds;
             /* Nothing else is running, so a missing state slot will not come back by waiting.
              * Put leaked slots back, then admit. A recompute the empty pool cannot hold is
-             * failed below (spec §17) rather than left in kAdmitWait, which parks the engine. */
-            if (!preempted_can_prefill(s) && running_.empty())
+             * failed below (spec §17) rather than left in kAdmitWait, which parks the engine.
+             * A request this pass has just admitted is not in running_ yet, and it runs. */
+            if (!preempted_can_prefill(s) && running_.empty() && took_.empty())
                 (void)kv_->release_idle_states();
         }
         if (!preempted_can_prefill(s)) {
-            if (!(running_.empty() && preempt_wait_overdue(s) && kv_->can_ever_fit(s.seq_len())))
+            if (!(running_.empty() && took_.empty() && preempt_wait_overdue(s) &&
+                  kv_->can_ever_fit(s.seq_len())))
                 return kAdmitWait;
         }
     }
@@ -2021,8 +2080,13 @@ const RadBatch* Scheduler::step() {
             preempted_here = true;
             if (last) { yielded = true; break; }
         }
-        /* close_request or preempt_back removed it from running_; i now indexes the next. */
-        if (failed || yielded) continue;
+        /* close_request or preempt_back removed it from running_; i now indexes the next. A chunk
+         * marked as held back has no entry after all, and the mark would name whichever comes next
+         * or none. */
+        if (failed || yielded) {
+            if (capped_at == (int32_t)plan_.e.size()) capped_at = -1;
+            continue;
+        }
 
         StepEntry e;
         e.req = &r;
@@ -2128,8 +2192,9 @@ const RadBatch* Scheduler::step() {
              * the refusal is a restore waiting a step for deferred releases: both clear by the
              * next step, and failing them lost two of ten preempted requests under KV pressure
              * once their prompts were published at the preemption (1. 11. 2026). */
-            if (as < 0 && running_.empty() && plan_.e.empty() && !admit_next_step_ && s.req &&
-                s.req->state == ReqState::Preempted && preempt_wait_overdue(s)) {
+            if (as < 0 && running_.empty() && took_.empty() && plan_.e.empty() &&
+                !admit_next_step_ && s.req && s.req->state == ReqState::Preempted &&
+                preempt_wait_overdue(s)) {
                 RAD_WARN("request %llu failed: overdue preempted prefill could not be admitted "
                          "with nothing running (%s)",
                          (unsigned long long)s.req->id, rad_strerror(as));
@@ -2578,6 +2643,8 @@ void Scheduler::promote_next() {
 int Scheduler::commit(StepResult& res) {
     std::lock_guard<std::mutex> lk(mu_);
     if (!step_open_) return RAD_E_STATE;
+    /* The step's tokens are pushed at one time (Sink::push). */
+    const int64_t pushed_ns = server::sink_now_ns();
     /* StepResult's counts describe this step only. */
     step_finished_ = 0;
     last_prefill_ids_.clear();
@@ -2660,7 +2727,7 @@ int Scheduler::commit(StepResult& res) {
                     res.lp && res.first_row[i] >= 0 && r.sp.n_probs >= 0
                         ? &res.lp[res.first_row[i]] : nullptr;
                 if (lp && lp->token < 0) lp_failed = true;
-                else overflowed = !server::sink_push(r.sink, res.token[i], lp);
+                else overflowed = !server::sink_push(r.sink, res.token[i], lp, pushed_ns);
                 /* The conv window absorbed this chunk; the cursor advances one committed
                  * position, as in decode. */
                 s.conv_cursor = (int32_t)((s.conv_cursor + 1) % (W ? W : 1));
@@ -2719,7 +2786,7 @@ int Scheduler::commit(StepResult& res) {
                     res.lp && res.first_row[i] >= 0 && r.sp.n_probs >= 0
                         ? &res.lp[res.first_row[i] + j] : nullptr;
                 if (lp_failed || (lp && lp->token < 0)) { lp_failed = true; return; }
-                if (!server::sink_push(r.sink, t, lp)) overflowed = true;
+                if (!server::sink_push(r.sink, t, lp, pushed_ns)) overflowed = true;
             };
             /* On a tree step the accepted drafts are the path's nodes, in path order. */
             const int32_t* path = res.path ? res.path + (size_t)i * RAD_SCHED_MAX_SPEC : nullptr;
@@ -2892,14 +2959,13 @@ void Scheduler::step_finished() {
         for (const StepEntry& e : plan_.e) rows += e.is_prefill ? 0 : e.n_tokens;
         if (rows > 0) lookup_.step_time(rows, wall * 1e3);
     }
-    /* The step's cost at its depth, for the adaptive window (draft.h): the same wall time,
-     * including the draft rounds after it, with a step issued ahead counted once. Decode steps
-     * only. Keyed by the deepest window the step verified, which is the head depth it ran at
-     * whenever D held from the step before. */
+    /* The step's cost by query rows, for the adaptive window (draft.h): the same wall time,
+     * including the draft rounds after it, with a step issued ahead counted once. Drafting decode
+     * steps only: a step that verified nothing ran no head round. */
     if (draft_.adaptive() && plan_.phase == RAD_PHASE_DECODE && plan_.n_spec > 0 && wall > 0) {
-        int rows = 0;
-        for (const StepEntry& e : plan_.e) rows += (e.produces_token && !e.is_prefill) ? 1 : 0;
-        draft_.step_time((int)plan_.n_spec, rows, wall * 1e3);
+        int64_t rows = 0;
+        for (const StepEntry& e : plan_.e) rows += e.is_prefill ? 0 : e.n_tokens;
+        if (rows > 0) draft_.step_time((int)rows, wall * 1e3);
     }
     last_step_at_ = step_end;
     /* So a second call, or one on a loop iteration that ran no step, charges nothing. */

@@ -26,7 +26,7 @@
 #include <arch/rad_arch.h>
 #include <arch/rad_fp8.h>
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <cmath>
 #include <cstdio>
@@ -46,7 +46,7 @@
 
 using namespace rad;
 namespace AR = rad::arch;
-using ojson = nlohmann::ordered_json;
+using ojson = Json;
 
 namespace {
 

@@ -138,6 +138,12 @@ int vram_budget_resolve(Config& cfg, const std::vector<VramFacts>& per_rank, Vra
  * two programs before resolving one (Engine::plan's table placement). */
 int vram_budget_trial(const Config& cfg, const std::vector<VramFacts>& per_rank, VramBudget* out);
 
+/* Bytes a card must give this program, as vram_budget_resolve charges them: `need` holds the fixed
+ * terms, the static weights, the experts the host pool cannot hold and one full-length sequence's
+ * cache; `want` the whole expert plane and the cache at its ceiling instead. A fleet grants a
+ * claim between the two (Config::vram_claim, docs/MULTIMODEL.md §6.3). */
+void vram_budget_need(const std::vector<VramFacts>& per_rank, int64_t* need, int64_t* want);
+
 /* Re-split for an uneven world's cheaper rank. The resolver derives the most expensive rank's
  * split, and one block table serves every rank, so a rank whose cache costs less per token (e.g.
  * one with no attention cache) would over-reserve KV. Given the common split, the MiB this rank

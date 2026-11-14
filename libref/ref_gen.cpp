@@ -107,61 +107,6 @@ int ref_gate_add(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
-/* ------------------------------------------------------------------ ln_mod_quant_fp8 */
-/* gate_add (with `gated` 1), ln_mod and quant_act_fp8 over each row, each step's output rounded
- * to its stored dtype as the three ops would store it: the residual to x's, the norm to bf16, and
- * the codes as ref_quant_act_fp8 writes them over that bf16 row. */
-int ref_ln_mod_quant_fp8(const RadArgs* a, RadStream) {
-    if (a->n_t < 8) return RAD_E_INVAL;
-    const RadTensor *y = t_in(a, 0), *g = t_in(a, 1), *s = &a->t[2], *cu = &a->t[3];
-    const RadTensor *x = &a->t[4], *q = &a->t[5], *sc = &a->t[6], *z = t_in(a, 7);
-    const int64_t n = p_int(a, "n", 0), grp = p_int(a, "group", 0);
-    const bool gated = p_int(a, "gated", 0) != 0;
-    const float eps = p_f32(a, "eps", 1e-6f);
-    if (n <= 0 || grp <= 0 || n % grp || (gated && (!y || !g))) return RAD_E_SHAPE;
-    const int64_t rows = rows_of(q, n), n_seq = numel(cu) - 1, ngrp = n / grp;
-    if (rows <= 0 || n_seq <= 0 || rows_of(x, n) < rows || numel(sc) < rows * ngrp)
-        return RAD_E_SHAPE;
-    const int64_t s_rs = row_stride(s, n), s_cs = laststride(s);
-    const int64_t g_rs = gated ? row_stride(g, n) : 0, g_cs = gated ? laststride(g) : 0;
-    REF_PAR_FOR(rows * n)
-    for (int64_t r = 0; r < rows; ++r) {
-        const int64_t e = seq_of(cu, n_seq, r);
-        const int64_t xb = rowoff(x, r, n), xs = laststride(x);
-        std::vector<float> v((size_t)n), o((size_t)n);
-        for (int64_t i = 0; i < n; ++i) {
-            float xv = ldt(x, xb + i * xs);
-            if (gated) {
-                const float t = round_dt(x->dtype, ref_tanh(ldt(g, e * g_rs + i * g_cs)));
-                const float d = ldt(y, rowoff(y, r, n) + i * laststride(y));
-                xv = round_dt(x->dtype, xv + round_dt(x->dtype, t * d));
-                stt(x, xb + i * xs, xv);
-            }
-            v[(size_t)i] = xv;
-        }
-        float sum = 0.0f;
-        for (int64_t i = 0; i < n; ++i) sum += v[(size_t)i];
-        const float mean = sum / (float)n;
-        float var = 0.0f;
-        for (int64_t i = 0; i < n; ++i) { const float d = v[(size_t)i] - mean; var += d * d; }
-        const float rs = 1.0f / std::sqrt(var / (float)n + eps);
-        for (int64_t i = 0; i < n; ++i) {
-            const float ln = round_dt(RAD_BF16, (v[(size_t)i] - mean) * rs);
-            const float sm = round_dt(RAD_BF16, 1.0f + ldt(s, e * s_rs + i * s_cs));
-            o[(size_t)i] = round_dt(RAD_BF16, ln * sm);
-            if (z) stt(z, rowoff(z, r, n) + i * laststride(z), o[(size_t)i]);
-        }
-        const int64_t qb = rowoff(q, r, n), qs = laststride(q);
-        for (int64_t gi = 0; gi < ngrp; ++gi) {
-            const float* og = o.data() + gi * grp;
-            const float scl = q8_group([&](int64_t i) { return og[i]; }, grp, 448.0f, q,
-                                        qb + gi * grp * qs, qs);
-            stt(sc, rowoff(sc, r, ngrp) + gi * laststride(sc), scl);
-        }
-    }
-    return RAD_OK;
-}
-
 /* ------------------------------------------------------------------ rms_mod / rms_mod_quant_fp8 */
 /* The checks both forms share: `s` holds [shift | scale] in each of its n_seq rows, `g` a gate
  * row per sequence when `gated`, and every row operand at least `rows` rows. With `mapped`, the
@@ -261,47 +206,6 @@ int ref_rms_mod(const RadArgs* a, RadStream) {
         rms_mod_row(y, g, s, w, x, r, e, n, eps, gated, z->dtype, o.data(), wadd, once, layer, none);
         const int64_t zb = rowoff(z, r, n), zs = laststride(z);
         for (int64_t i = 0; i < n; ++i) stt(z, zb + i * zs, o[(size_t)i]);
-    }
-    return RAD_OK;
-}
-
-/* rms_mod in front of a quantised linear: the norm chain in bf16, then the codes and scales as
- * ref_quant_act_fp8 writes them over that bf16 row (ln_mod_quant_fp8's rule), z written when
- * bound. */
-int ref_rms_mod_quant_fp8(const RadArgs* a, RadStream) {
-    if (a->n_t < 9) return RAD_E_INVAL;
-    const RadTensor *y = t_in(a, 0), *g = t_in(a, 1), *s = &a->t[2], *w = t_in(a, 3);
-    const RadTensor *cu = &a->t[4], *x = &a->t[5], *q = &a->t[6], *sc = &a->t[7], *z = t_in(a, 8);
-    const RadTensor *cm = t_in(a, 9);
-    const int64_t n = p_int(a, "n", 0), grp = p_int(a, "group", 0);
-    const bool gated = p_int(a, "gated", 0) != 0;
-    const float eps = p_f32(a, "eps", 1e-6f);
-    const float wadd = p_f32(a, "wadd", 0.0f);
-    const bool once = p_int(a, "norm_once", 0) != 0;
-    const char* nk = p_str(a, "norm", "rms");
-    const bool layer = std::strcmp(nk, "layer") == 0, none = std::strcmp(nk, "none") == 0;
-    if (!layer && !none && std::strcmp(nk, "rms") != 0) return RAD_E_INVAL;
-    if (none && t_in(a, 3)) return RAD_E_INVAL;
-    if (n <= 0 || grp <= 0 || n % grp || (gated && (!y || !g))) return RAD_E_SHAPE;
-    const int64_t rows = rows_of(q, n), n_seq = numel(cu) - 1, ngrp = n / grp;
-    if (cm && (cm->dtype != RAD_I32 || numel(cm) < n_seq)) return RAD_E_SHAPE;
-    RAD_REF_TRY(rms_mod_check(y, g, s, w, x, n, n_seq, rows, gated, cm != nullptr));
-    if (numel(sc) < rows * ngrp || (z && rows_of(z, n) < rows)) return RAD_E_SHAPE;
-    REF_PAR_FOR(rows * n)
-    for (int64_t r = 0; r < rows; ++r) {
-        std::vector<float> o((size_t)n);
-        int64_t e = seq_of(cu, n_seq, r);
-        if (cm) e = (int64_t)ldt(cm, e);
-        rms_mod_row(y, g, s, w, x, r, e, n, eps, gated, RAD_BF16, o.data(), wadd, once, layer, none);
-        const int64_t zb = z ? rowoff(z, r, n) : 0, zs = z ? laststride(z) : 0;
-        for (int64_t i = 0; z && i < n; ++i) stt(z, zb + i * zs, o[(size_t)i]);
-        const int64_t qb = rowoff(q, r, n), qs = laststride(q);
-        for (int64_t gi = 0; gi < ngrp; ++gi) {
-            const float* og = o.data() + gi * grp;
-            const float scl = q8_group([&](int64_t i) { return og[i]; }, grp, 448.0f, q,
-                                        qb + gi * grp * qs, qs);
-            stt(sc, rowoff(sc, r, ngrp) + gi * laststride(sc), scl);
-        }
     }
     return RAD_OK;
 }

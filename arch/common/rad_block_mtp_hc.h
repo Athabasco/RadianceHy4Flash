@@ -282,7 +282,11 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
     /* The connection's read also writes the rotated expert input, as on the trunk. */
     HyperConn::Config mcfg = hc;
     HyperConn::Wire   mwire{w.hw, w.x, w.inj};
-    if (src.mlp.cfg.expert_rot) { mcfg.rotate = 1; mwire.rq = w.mlp.hr.q; mwire.rs = w.mlp.hr.s; }
+    if (src.mlp.cfg.expert_rot && !w.x.q8_rot) {
+        mcfg.rotate = 1;
+        mwire.rq = w.mlp.hr.cq();
+        mwire.rs = w.mlp.hr.cs();
+    }
     RAD_ARCH_TRY(hc_mlp.declare(b, nm, g, nm.f("mtp.ffn_hc"), mcfg, mwire, src.hc_mlp));
     mlp.ar_out_take = hc_mlp.ar_take();
     mlp.hr_in = mcfg.rotate != 0;

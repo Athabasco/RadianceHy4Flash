@@ -23,7 +23,7 @@
 #include <string>
 #include <vector>
 
-#include <nlohmann/json_fwd.hpp>
+#include "util/json.h"
 
 namespace rad {
 
@@ -41,6 +41,10 @@ struct ChatCaps {
     bool string_content = true;
     bool typed_content = false;
     bool object_arguments = false;
+    /* What the first probe render with tools threw, empty when none did. The probe ignores
+     * exceptions, so a template that calls something the engine lacks reports `tools` false as a
+     * template without tool support does; this is the difference. */
+    std::string probe_error;
 };
 
 struct ChatOptions {
@@ -111,7 +115,7 @@ public:
      * Returns RAD_OK, RAD_E_INVAL when the request does not parse, or RAD_E_UNSUPPORTED when the
      * template refuses it (e.g. a system message without a system role, or tools without tool
      * support). */
-    int apply(const nlohmann::ordered_json& messages, const nlohmann::ordered_json& tools,
+    int apply(const Json& messages, const Json& tools,
               const ChatOptions& opt, ChatPrompt* out) const;
 
     /* The ChatML fallback, named so the server can report which template it runs. */

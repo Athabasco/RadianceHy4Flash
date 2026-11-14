@@ -5,7 +5,7 @@
 #include "../format/share.h"
 #include "rad_plugin.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <cmath>
@@ -24,7 +24,7 @@ namespace lora {
 
 namespace {
 
-using ojson = nlohmann::ordered_json;
+using ojson = Json;
 
 std::string fmt(const char* f, ...) __attribute__((format(printf, 1, 2)));
 std::string fmt(const char* f, ...) {

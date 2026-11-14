@@ -11,7 +11,7 @@
 #include "rad_test.h"
 #include "rad_planes.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include "build/rad_build.h"
 #include "build/startup.h"
@@ -27,7 +27,7 @@
 #include <unistd.h>
 
 using namespace rad;
-using json = nlohmann::ordered_json;
+using json = Json;
 
 namespace {
 
@@ -1168,6 +1168,27 @@ TEST(a_tree_drafter_takes_a_short_block) {
     CHECK_OK(rad_drafter_tree(&b7, par7));
     CHECK_OK(rad_drafter_short_block(&b7, 8));
     CHECK_EQ(b7.program().drafter_short_block, 8);
+}
+
+/* The routing table (rad_route_table) is an i32 persistent device buffer, named once: the core
+ * reads its rows between passes, where a transient's bytes may be another buffer's. */
+TEST(a_routing_table_is_a_persistent_i32_buffer) {
+    Registry reg;
+    Builder b(reg, make_meta(), make_ctx());
+    RadBufDecl bd{};
+    bd.dtype = RAD_I32; bd.rank = 2; bd.shape[0] = 4; bd.shape[1] = 8;
+    const rad_buf transient = rad_decl_buffer(&b, "t", &bd);
+    bd.kind = RAD_BUF_PERSIST;
+    const rad_buf tab = rad_decl_buffer(&b, "tab", &bd);
+    const rad_buf tab2 = rad_decl_buffer(&b, "tab2", &bd);
+    bd.dtype = RAD_BF16;
+    const rad_buf half = rad_decl_buffer(&b, "half", &bd);
+    CHECK_EQ(rad_route_table(&b, 0), RAD_E_INVAL);
+    CHECK_EQ(rad_route_table(&b, transient), RAD_E_INVAL);
+    CHECK_EQ(rad_route_table(&b, half), RAD_E_DTYPE);
+    CHECK_OK(rad_route_table(&b, tab));
+    CHECK_EQ(b.program().route_table, tab);
+    CHECK_EQ(rad_route_table(&b, tab2), RAD_E_STATE);
 }
 
 /* A block drafter's proposal pitch is its row pitch, which the engine reads row s at: left at 0 it

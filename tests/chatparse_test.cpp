@@ -34,7 +34,7 @@
 
 #include <arch/rad_deepseek41_chat.h>
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <chrono>
@@ -52,7 +52,7 @@
 
 using namespace rad;
 using namespace rad::chatdiff;
-using json = nlohmann::ordered_json;
+using json = Json;
 
 /* ================================================================== fixtures */
 
@@ -1326,7 +1326,7 @@ TEST(a_tool_name_holding_the_format_delimiter_is_refused_at_admission) {
  *
  * What a streaming client assembles from the SSE chunks (content, reasoning, each call's id, name
  * and arguments) equals the buffered answer, for every reply cut a byte at a time. Delta chunks
- * are written directly rather than through a JSON tree, and must match nlohmann's bytes. */
+ * are written directly rather than through a JSON tree, and must match the DOM writer's bytes. */
 TEST(what_a_streaming_client_assembles_is_the_buffered_answer) {
     for (const Model& m : models()) {
         Bench* b = bench(m, ChatRequest{});
@@ -1420,7 +1420,8 @@ static server::ChatRender bridge_render(const server::ChatTemplateBridge& br, co
     server::ChatRender out;
     std::string w;
     const json msgs = json::array({ { { "role", "user" }, { "content", "Fix the failing test in /work." } } });
-    if (br.apply(msgs, tools, opt, &out, why ? why : &w) < 0) out.prompt.clear();
+    if (br.apply(msgs, tools, opt, &out, why ? why : &w) < 0)
+        out.prompt.clear();
     return out;
 }
 
@@ -1522,7 +1523,8 @@ TEST(hyv3_plugin_format_splits_requested_reasoning_before_native_tools) {
     opt.template_kwargs["reasoning_effort"] = json("high").dump();
     server::ChatRender out;
     std::string why;
-    CHECK_OK(br.apply(msgs, agent_tools(), opt, &out, &why));
+    CHECK_OK(br.apply(msgs, agent_tools(), opt, &out,
+                      &why));
     REQUIRE(out.parser != nullptr);
     CHECK(out.generation_prompt.ends_with("<think>"));
     auto rd = out.parser->open();
@@ -2579,8 +2581,11 @@ static double stream_bytes(const ReplyParser& p, const std::string& text, size_t
     return seconds_to([&] {
         std::unique_ptr<ReplyStream> s = p.open();
         std::vector<ReplyEvent> ev;
+        /* The clock only when a call's time is asked for: on a host whose clocksource is HPET
+         * (the TSC marked unstable) a read is a system call of about a microsecond, as much as
+         * the feed it would time. */
         for (size_t at = 0; at < text.size(); at += piece) {
-            const auto t0 = std::chrono::steady_clock::now();
+            const auto t0 = per_call ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             s->feed(std::string_view(text).substr(at, std::min(piece, text.size() - at)), &ev);
             if (per_call)
                 per_call->push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());

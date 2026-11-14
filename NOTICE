@@ -27,7 +27,12 @@ Written by Deadcode, with contributions from:
   a serial drafter) with mla_attn_paged, its w4a8 recipes and compose files, possessive quantifiers
   in the tokenizer's patterns, the Grafana dashboard's first screen, and Gemma 4 12B (its picture
   and audio embedders, a picture's placeholders read both ways on the sliding layers, the windowed
-  attention at head_dim 512, suppress_tokens) with its compose files
+  attention at head_dim 512, suppress_tokens) with its compose files, and
+  NVIDIA-Nemotron-3.5-Bolt-74B-A9B (nemotronh: Mamba-2 with ssd_update and ple_conv_bias, the
+  latent MoE's ungated relu^2 experts, NoPE attention with KV heads replicated over ranks, the
+  paged attention at head_dim 128 and gqa 16, attention sinks) with NVIDIA's LiLiCorr drafter
+  (RadBatch::anchor_rows, the candidate correlator), the C-RADIO vision tower and video tubelets,
+  calibration in layer ranges, its recipes and compose files, and the kernel report's fixture
 - mechkbfan: the token embedding in the pinned host pool
 - Code000: the n-gram gather on the card and the MTP head's history-pass skip, and the MTP draft
   coupling with its cooperative verify (--draft-coupling), the W4A8 prefill's tail scale read, the
@@ -36,7 +41,8 @@ Written by Deadcode, with contributions from:
   the rows forms of rmsnorm and rope, LFM2's 8-bit trunk with the d1-3B recipe, the file tier's
   routed reads with their own router's counts and its deposit wait, the stop-string hold-back, and
   the sampler's planes by the step's token bound, its n-gram ban beside a drafter and no candidate
-  cut over a top-1 row
+  cut over a top-1 row, and --prefill-interleave auto[:SHARE], sized from measured step times and
+  served by default
 - baKon: three-rank tensor parallelism, serving any world size from the shipped container, the
   request log, an uneven world's per-rank KV and weights split, --rope-scaling, the model entry's
   context length, root and capabilities, /props, the three-rank two-shot all-reduce and tiered-int8
@@ -53,7 +59,7 @@ Written by Deadcode, with contributions from:
   whole recompute and the running sequences' next blocks free and the bound on its wait
   (--preempt-wait-ms), prompt lookup alone (--spec-ngram) with each sequence's n-gram index and
   the gate that verifies a proposal only when it pays, and DeepSeek-V4.1's reply format with its
-  DSML tool calls
+  DSML tool calls, and expert_stats_report.py
 - hazyumps: static YaRN for the Qwen rotary paths
 - malic: ParoQuant, with its MXFP4, int5 and int4 checkpoints imported and served, the Givens
   rotation as stages and as dense per-group matrices on the matrix cores, and the 5- and 4-bit
@@ -97,7 +103,9 @@ Written by Deadcode, with contributions from:
   feed-forward's gated fold up to 16 rows, the three-wave verify floor bounded by the batch's
   workgroups, the split-KV row sum read with fetch-inactive, KLATE again for the head-256 gqa6
   paged prefill, the preempted-prefill gate past a KV group that holds no blocks, and the norms'
-  lane sum issuing its reads eight at a time
+  lane sum issuing its reads eight at a time, chained forms for every kernel of
+  Qwen3.8-Flash-Next's decode step with hc_read's forms G, S and B3, and a preempted request
+  publishing its prefix with an overdue one keeping its place
 - eddie168168: the rotated int8 trunk (i8a8h) and the qwen35_w8a8 plugin serving it, and the
   out-of-tree test at the tree's VOPD setting, and its norm and SiLU producers writing the int8
   linears' operands directly
@@ -153,7 +161,8 @@ Written by Deadcode, with contributions from:
   and its gated three-tile form at 8 waves
 - RikshaDriver: libr3d, the RDNA3 (gfx11) kernel library, and its wave-matrix rewrite: the GEMMs
   retiled to 16x128 blocks, the grouped MoE GEMMs, the norms and quantisers, and the QSA and MoE
-  router rows
+  router rows, its MoE GEMMs at w4a8 and w4a4 with dequant_w4, row_topk_merge, ngram_ids and
+  the biased and short GEMMs, and w4a4's reference implementation
 - fl0l0u: every request entry point bounded, gated and sanitised (JSON parses bounded in depth,
   errors safe on invalid UTF-8, control bytes kept off the log, the dashboard's CSP, cross-origin
   browsers refused on the loopback-only routes, method-scoped API-key exemptions), prompt ids that
@@ -171,6 +180,15 @@ Written by Deadcode, with contributions from:
   the DMA lane's lists fenced so a stalled read pointer no longer fills its ring
 - pokesjw: the n-gram reader refilling its reads as they land, and a decode gather waiting on the
   other rank's read of a row instead of reading it again
+- AnimusNull: GLM-5.3-Flash on four cards -- its experts split by width, the small-M MXFP4 expert
+  form at the TP4 slices, the indexer's take-all steps -- its E4M3 latent cache (mla_attn's fp8kv
+  rows), and the DMA lane's room check over a reused fence slot
+- neuromanMD: libr3d's MXFP4 GEMM leaving VRAM exponent planes unscanned from the host, and its
+  branch-free e4m3_to_f32
+- everplays: the paged attention at seven queries a KV head, head_dim 128 (Nanbeige4.3-33B)
+- Kezi: the decode tile arms of the int4 and int5 x int8 GEMM
+- dschmitz: the two-rank fused writes' host-mailbox twins taking their chained forms
+- eniga: the diagnosis of GLM-5.3-Flash's template refused for tools (jinja's unique filter)
 
 This product includes software from the following projects, each under the MIT License. The
 license text is in the file named beside each.
@@ -179,8 +197,15 @@ license text is in the file named beside each.
                   vendor/llama/, and the code lifted or ported from it: core/sample/gbnf.*, the
                   host samplers in core/sample/host_ref.*, the tokenisers in core/text/, and
                   libquant/lq_ggml_*
-  nlohmann/json   Copyright (c) 2013-2025 Niels Lohmann             vendor/nlohmann/LICENSE.MIT
+  yyjson          Copyright (c) 2020 YaoYuan                       vendor/yyjson/LICENSE
   cpp-httplib     Copyright (c) 2017 yhirose                        vendor/cpp-httplib/LICENSE
+
+The dashboard's page, compiled into the server from core/server/dashboard_page.h, carries
+third-party software built into it: React, Base UI and Floating UI, uPlot, shadcn/ui's components
+and helpers, Tailwind CSS's generated style and tw-animate-css (MIT), class-variance-authority
+(Apache-2.0), the Lucide icons (ISC), and the Geist and Geist Mono typefaces (SIL Open Font License
+1.1, Copyright the Geist Project Authors). dashboard/THIRD-PARTY-LICENSES.txt lists every package
+with its version and license text, as the page's build wrote it.
 
 tests/data/chat/hyv3/chat_template.jinja is Tencent's Hy-Memory-30B-A3B chat template,
 copied unchanged from tencent/Hy-Memory-30B-A3B on Hugging Face.

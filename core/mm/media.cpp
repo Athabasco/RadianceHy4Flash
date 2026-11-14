@@ -78,6 +78,55 @@ constexpr const char* kFormats =
     "jpeg_pipe,jpegls_pipe,jpegxl_pipe,webp_pipe,bmp_pipe,tiff_pipe,qoi_pipe,pgm_pipe,ppm_pipe,"
     "pbm_pipe,pam_pipe,gif_pipe,avif,heif";
 
+/* The size a PNG or JPEG states in its header, read from the bytes: such a picture needs no
+ * stream probe. avformat_find_stream_info decodes the whole picture once to learn its size and the
+ * decode then runs it again (a 1024x1024 PNG 8.8 -> 19.9 ms). False for any other format, or a
+ * header it cannot read, which are probed as before. */
+uint32_t be16(const uint8_t* p) { return (uint32_t)p[0] << 8 | p[1]; }
+uint32_t be32(const uint8_t* p) { return be16(p) << 16 | be16(p + 2); }
+
+bool still_size(const AVInputFormat* f, const uint8_t* p, size_t n, int* w, int* h) {
+    if (!f || !f->name) return false;
+    if (std::strcmp(f->name, "png_pipe") == 0) {
+        /* Signature, then IHDR first: length 13, type, width, height. */
+        static const uint8_t kSig[8] = { 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
+        if (n < 24 || std::memcmp(p, kSig, 8) != 0 || be32(p + 8) != 13 ||
+            std::memcmp(p + 12, "IHDR", 4) != 0)
+            return false;
+        const uint32_t pw = be32(p + 16), ph = be32(p + 20);
+        if (pw == 0 || ph == 0 || pw > INT32_MAX || ph > INT32_MAX) return false;
+        *w = (int)pw;
+        *h = (int)ph;
+        return true;
+    }
+    if (std::strcmp(f->name, "jpeg_pipe") == 0) {
+        /* Segments from SOI to the first start of frame (SOF0..SOF15 bar DHT, JPG and DAC):
+         * precision, then height, then width. */
+        if (n < 4 || p[0] != 0xff || p[1] != 0xd8) return false;
+        size_t at = 2;
+        while (at + 4 <= n) {
+            if (p[at] != 0xff) return false;
+            const uint8_t m = p[at + 1];
+            if (m == 0xff) { ++at; continue; }                       /* fill byte */
+            if (m == 0x01 || (m >= 0xd0 && m <= 0xd7)) { at += 2; continue; }   /* no length */
+            if (m == 0xd9 || m == 0xda) return false;               /* EOI or scan before a frame */
+            const uint32_t len = be16(p + at + 2);
+            if (len < 2) return false;
+            if (m >= 0xc0 && m <= 0xcf && m != 0xc4 && m != 0xc8 && m != 0xcc) {
+                if (len < 7 || at + 9 > n) return false;
+                const uint32_t ph = be16(p + at + 5), pw = be16(p + at + 7);
+                if (pw == 0 || ph == 0) return false;
+                *w = (int)pw;
+                *h = (int)ph;
+                return true;
+            }
+            at += 2 + len;
+        }
+        return false;
+    }
+    return false;
+}
+
 struct MemIO {
     const uint8_t* p = nullptr;
     size_t         n = 0;
@@ -124,6 +173,10 @@ struct Input {
     AVFormatContext* fmt = nullptr;
     AVCodecContext*  dec = nullptr;
     int              stream = -1;
+    /* A PNG or JPEG opened for decoding: the stream was not probed, and these are the size its
+     * header states (still_size). */
+    bool             still = false;
+    int              still_w = 0, still_h = 0;
 
     ~Input() {
         if (dec) avcodec_free_context(&dec);
@@ -134,7 +187,9 @@ struct Input {
         }
     }
 
-    int open(const uint8_t* data, size_t n, bool want_decoder, std::string* why) {
+    /* `max_pixels` > 0 makes the decoder refuse a larger picture itself. */
+    int open(const uint8_t* data, size_t n, bool want_decoder, std::string* why,
+             int64_t max_pixels = 0) {
         io.p = data; io.n = n; io.at = 0;
         constexpr int kBuf = 64 * 1024;
         uint8_t* buf = static_cast<uint8_t*>(av_malloc(kBuf));
@@ -155,8 +210,11 @@ struct Input {
             *why = "not a recognised image or video format (" + averr(e) + ")";
             return RAD_E_INVAL;
         }
-        e = avformat_find_stream_info(fmt, nullptr);
-        if (e < 0) { *why = "could not read the stream headers (" + averr(e) + ")"; return RAD_E_INVAL; }
+        still = want_decoder && still_size(fmt->iformat, data, n, &still_w, &still_h);
+        if (!still) {
+            e = avformat_find_stream_info(fmt, nullptr);
+            if (e < 0) { *why = "could not read the stream headers (" + averr(e) + ")"; return RAD_E_INVAL; }
+        }
         const AVCodec* codec = nullptr;
         stream = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
         if (stream < 0 || !codec) { *why = "no picture in it: the media holds no video stream"; return RAD_E_INVAL; }
@@ -166,8 +224,10 @@ struct Input {
         e = avcodec_parameters_to_context(dec, fmt->streams[stream]->codecpar);
         if (e < 0) { *why = "decoder setup failed (" + averr(e) + ")"; return RAD_E_INVAL; }
         /* Decodes run on server workers, one per request in flight; a few threads each avoids
-         * oversubscribing the machine. */
-        dec->thread_count = 4;
+         * oversubscribing the machine. One picture gains nothing from frame threads, whose start
+         * and exit are all they would add. */
+        dec->thread_count = still ? 1 : 4;
+        if (max_pixels > 0) dec->max_pixels = max_pixels;
         e = avcodec_open2(dec, codec, nullptr);
         if (e < 0) { *why = std::string("no decoder for ") + codec->name + " (" + averr(e) + ")"; return RAD_E_UNSUPPORTED; }
         return RAD_OK;
@@ -316,11 +376,12 @@ int decode_image(const uint8_t* data, size_t n, int64_t max_pixels, Frame* out, 
     if (!why) why = &w;
     if (!data || n == 0) { *why = "empty"; return RAD_E_INVAL; }
     Input in;
-    RAD_TRY(in.open(data, n, true, why));
+    RAD_TRY(in.open(data, n, true, why, max_pixels));
     const AVCodecParameters* cp = in.fmt->streams[in.stream]->codecpar;
-    if (cp->width <= 0 || cp->height <= 0) { *why = "the image has no size"; return RAD_E_INVAL; }
-    if ((int64_t)cp->width * cp->height > max_pixels) {
-        *why = "the image is " + std::to_string(cp->width) + "x" + std::to_string(cp->height) +
+    const int hw = in.still ? in.still_w : cp->width, hh = in.still ? in.still_h : cp->height;
+    if (hw <= 0 || hh <= 0) { *why = "the image has no size"; return RAD_E_INVAL; }
+    if ((int64_t)hw * hh > max_pixels) {
+        *why = "the image is " + std::to_string(hw) + "x" + std::to_string(hh) +
                ", over the server's " + std::to_string(max_pixels) + "-pixel limit for a source";
         return RAD_E_INVAL;
     }
@@ -350,11 +411,12 @@ int decode_image_rgba(const uint8_t* data, size_t n, int64_t max_pixels, FrameRG
     if (!why) why = &w;
     if (!data || n == 0) { *why = "empty"; return RAD_E_INVAL; }
     Input in;
-    RAD_TRY(in.open(data, n, true, why));
+    RAD_TRY(in.open(data, n, true, why, max_pixels));
     const AVCodecParameters* cp = in.fmt->streams[in.stream]->codecpar;
-    if (cp->width <= 0 || cp->height <= 0) { *why = "the image has no size"; return RAD_E_INVAL; }
-    if ((int64_t)cp->width * cp->height > max_pixels) {
-        *why = "the image is " + std::to_string(cp->width) + "x" + std::to_string(cp->height) +
+    const int hw = in.still ? in.still_w : cp->width, hh = in.still ? in.still_h : cp->height;
+    if (hw <= 0 || hh <= 0) { *why = "the image has no size"; return RAD_E_INVAL; }
+    if ((int64_t)hw * hh > max_pixels) {
+        *why = "the image is " + std::to_string(hw) + "x" + std::to_string(hh) +
                ", over the server's " + std::to_string(max_pixels) + "-pixel limit for a source";
         return RAD_E_INVAL;
     }

@@ -44,6 +44,9 @@
  * The prompt is the model's template with `{prompt}` filled; the template is tokenised with its
  * special tokens and the prompt without, so a caller cannot write control tokens into it.
  */
+#include <atomic>
+
+#include "front.h"
 #include "server.h"
 #include "loras.h"
 #include "oai.h"
@@ -54,7 +57,7 @@
 #include "mm/mp4.h"
 #include "rad_internal.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <chrono>
@@ -107,6 +110,8 @@ struct Server::VideoJob {
     std::string decoder;          /* a decoder the request named other than the default */
     int32_t     w = 0, h = 0;
     bool        worker_done = false;   /* its thread has nothing left to do but return */
+    /* Deleted, by the server or through the Front: nothing answers for it from here on. */
+    std::atomic<bool> deleted{false};
 };
 
 namespace {
@@ -1014,7 +1019,11 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     std::lock_guard<std::mutex> lk(videos_m_);
     sweep_videos_locked(unix_now());
     videos_.push_back(j);
-    j->worker = std::thread([this, j] { video_work(j); });
+    if (deps_.background) deps_.background->fetch_add(1);
+    j->worker = std::thread([this, j] {
+        video_work(j);
+        if (deps_.background) deps_.background->fetch_sub(1);
+    });
     return HttpResponse::json_body(200, json_dump(video_json(*j)));
 }
 
@@ -1111,7 +1120,7 @@ void Server::video_work(std::shared_ptr<VideoJob> j) {
             j->err_message = "the video could not be written: " + why;
         } else if (aborted || t.status() == RAD_E_CANCELLED) {
             j->err_code = "cancelled";
-            j->err_message = aborted ? "the server is shutting down" : "the video was cancelled";
+            j->err_message = aborted ? "this model is stopping" : "the video was cancelled";
         } else {
             j->err_code = t.status() == RAD_E_INVAL ? "invalid_request" : "generation_failed";
             j->err_message = t.why().empty() ? std::string(rad_strerror(t.status())) : t.why();
@@ -1119,6 +1128,23 @@ void Server::video_work(std::shared_ptr<VideoJob> j) {
         RAD_WARN("video %s: failed: %s", j->id.c_str(), j->err_message.c_str());
     }
     j->worker_done = true;
+    /* A finished job no longer changes, so it can be read without this server, which may be gone
+     * by the time its client comes for it. */
+    if (deps_.front && !j->deleted.load())
+        deps_.front->keep_job(j->id, j->expires_at ? j->expires_at : now + opt_.video_ttl_s,
+                              opt_.max_videos, [j](const HttpRequest& q) -> HttpResponse {
+            if (q.method == "DELETE") {
+                j->deleted.store(true);
+                return video_deleted(j->id);
+            }
+            if (q.path.size() > 8 && q.path.compare(q.path.size() - 8, 8, "/content") == 0) {
+                HttpResponse res;
+                ApiError e;
+                if (video_content(*j, q, &res, &e)) return res;
+                return HttpResponse::json_body(e.status, error_body(q.path, e.status, e.type.c_str(), e.message));
+            }
+            return HttpResponse::json_body(200, json_dump(video_json(*j)));
+        });
 }
 
 void Server::sweep_videos_locked(int64_t now) {
@@ -1137,7 +1163,8 @@ void Server::sweep_videos_locked(int64_t now) {
     for (size_t i = 0; i < videos_.size();) {
         const VideoJob& j = *videos_[i];
         const bool done = j.status == "completed" || j.status == "failed";
-        if (done && j.expires_at > 0 && j.expires_at <= now) drop(i);
+        if (done && j.deleted.load()) drop(i);
+        else if (done && j.expires_at > 0 && j.expires_at <= now) drop(i);
         else if (done && j.failed && j.completed_at + opt_.video_ttl_s <= now) drop(i);
         else ++i;
     }
@@ -1227,7 +1254,8 @@ HttpResponse Server::handle_video_get(const HttpRequest& req) {
     const std::string id = req.param("id");
     std::lock_guard<std::mutex> lk(videos_m_);
     for (const auto& j : videos_)
-        if (j->id == id) return HttpResponse::json_body(200, json_dump(video_json(*j)));
+        if (j->id == id && !j->deleted.load())
+            return HttpResponse::json_body(200, json_dump(video_json(*j)));
     ApiError e = err_bad("id", "no video '" + id + "'; it may have expired");
     e.status = 404;
     e.type = "not_found_error";
@@ -1295,8 +1323,13 @@ HttpResponse Server::handle_video_delete(const HttpRequest& req) {
     /* A running job is cancelled, and its thread ends once the driver has seen that (at its next
      * pass, which may be seconds away); it is joined then. */
     j->ticket->cancel.store(true);
+    j->deleted.store(true);
     videos_gone_.push_back(j);
     sweep_videos_locked(unix_now());
+    return video_deleted(id);
+}
+
+HttpResponse Server::video_deleted(const std::string& id) {
     json o;
     o["id"] = id;
     o["object"] = "video.deleted";
@@ -1304,44 +1337,51 @@ HttpResponse Server::handle_video_delete(const HttpRequest& req) {
     return HttpResponse::json_body(200, json_dump(o));
 }
 
+bool Server::video_content(const VideoJob& j, const HttpRequest& req, HttpResponse* res, ApiError* err) {
+    std::string variant = "video";
+    if (auto it = req.query.find("variant"); it != req.query.end()) variant = it->second;
+    if (variant != "video" && variant != "thumbnail") {
+        *err = err_unsupported("variant", "this server gives the video or its thumbnail");
+        err->supported = { "video", "thumbnail" };
+        return false;
+    }
+    if (variant == "thumbnail") {
+        if (j.first.empty()) {
+            *err = err_bad("id", "video '" + j.id + "' has no frames yet");
+            return false;
+        }
+        std::vector<uint8_t> file;
+        std::string why;
+        if (mm::encode_image(j.first.data(), j.w, j.h, 3, "webp", 90, &file, &why) < 0) {
+            *err = err_internal("the thumbnail could not be encoded: " + why);
+            return false;
+        }
+        res->content_type = "image/webp";
+        res->body.assign((const char*)file.data(), file.size());
+        return true;
+    }
+    if (j.status != "completed") {
+        *err = err_bad("id", "video '" + j.id + "' is " + j.status +
+                                 (j.failed ? ": " + j.err_message : ""));
+        return false;
+    }
+    res->content_type = "video/mp4";
+    res->body = j.mp4;
+    return true;
+}
+
 HttpResponse Server::handle_video_content(const HttpRequest& req) {
     if (!deps_.videos)
         return error_response(err_not_implemented("/v1/videos requires a video generation model"),
                               req.peer);
     const std::string id = req.param("id");
-    std::string variant = "video";
-    if (auto it = req.query.find("variant"); it != req.query.end()) variant = it->second;
-    if (variant != "video" && variant != "thumbnail") {
-        ApiError e = err_unsupported("variant", "this server gives the video or its thumbnail");
-        e.supported = { "video", "thumbnail" };
-        return error_response(e, req.peer);
-    }
     std::lock_guard<std::mutex> lk(videos_m_);
-    for (const auto& j : videos_) {
-        if (j->id != id) continue;
-        if (variant == "thumbnail") {
-            if (j->first.empty())
-                return error_response(err_bad("id", "video '" + id + "' has no frames yet"),
-                                      req.peer);
-            std::vector<uint8_t> file;
-            std::string why;
-            if (mm::encode_image(j->first.data(), j->w, j->h, 3, "webp", 90, &file, &why) < 0)
-                return error_response(err_internal("the thumbnail could not be encoded: " + why),
-                                      req.peer);
+    for (const auto& j : videos_)
+        if (j->id == id && !j->deleted.load()) {
             HttpResponse res;
-            res.content_type = "image/webp";
-            res.body.assign((const char*)file.data(), file.size());
-            return res;
+            ApiError e;
+            return video_content(*j, req, &res, &e) ? res : error_response(e, req.peer);
         }
-        if (j->status != "completed")
-            return error_response(err_bad("id", "video '" + id + "' is " + j->status +
-                                                    (j->failed ? ": " + j->err_message : "")),
-                                  req.peer);
-        HttpResponse res;
-        res.content_type = "video/mp4";
-        res.body = j->mp4;
-        return res;
-    }
     ApiError e = err_bad("id", "no video '" + id + "'; it may have expired");
     e.status = 404;
     e.type = "not_found_error";

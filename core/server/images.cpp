@@ -31,7 +31,7 @@
 #include "rad_internal.h"
 #include "rad_plugin.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <chrono>

@@ -35,6 +35,12 @@ namespace server {
 
 struct Deps {
     IScheduler*       sched   = nullptr;   /* required */
+    /* Counts the jobs running with no open request (a video, an async shape), which the holder of
+     * this model's memory must see: they would otherwise look like an idle model. May be null. */
+    std::atomic<int64_t>* background = nullptr;
+    /* The listener this server sits behind, which keeps finished jobs past the server's end. May
+     * be null: a server that owns its socket lives as long as the process. */
+    class Front*      front   = nullptr;
     ITokenizer*       tok     = nullptr;   /* required */
     IChatTemplate*    chat    = nullptr;   /* absent -> /v1/chat/completions is 501 */
     IGrammarCompiler* grammar = nullptr;   /* absent -> response_format is 501 */
@@ -124,6 +130,12 @@ struct ServerOptions {
     int         retry_after_s = 1;
 
     int64_t     max_ctx = 0;
+    /* The KV cache's settings, for /metrics (vllm:cache_config_info): its dtype (empty: no such
+     * line, as for a generator), the paged groups' block size, and the prefix cache. */
+    std::string kv_cache_dtype;
+    int64_t     kv_block_size = 0;
+    bool        prefix_cache = false;
+    int64_t     prefix_cache_mib = 0;
     int64_t     default_max_tokens = 0;     /* 0: what the context leaves (OaiLimits) */
     int64_t     max_tokens_cap = 0;         /* 0: none */
     int         max_n = 8;
@@ -206,6 +218,10 @@ struct ServerOptions {
     size_t      max_inflight_body_bytes = 0;
 };
 
+/* The dashboard's page: fixed markup that asks this origin for everything it shows, so it needs no
+ * model. A process serving several models answers `/` with it directly (Front). */
+HttpResponse dashboard_page();
+
 class Server {
 public:
     Server(const Deps& d, const ServerOptions& o);
@@ -250,9 +266,18 @@ public:
      * attacker at the console of this machine is a local user either way, and stays admitted. */
     bool local_operator(const HttpRequest& req) const;
     void stop();
+    /* stop() without the transport: for a server behind a Front (front.h), which owns the socket.
+     * Ends video and shape jobs and drains finished generations. */
+    void retire();
+    /* Ends every stream and long poll in flight (they see the server stopping) while `on`; off
+     * again, the server takes requests as before. For a model being parked (Engine::park), whose
+     * server lives on. Video and shape jobs are left alone. */
+    void end_streams(bool on) { stopping_.store(on); }
     int  port() const { return transport_.port(); }   /* 0 until run() is accepting */
 
     int64_t  in_flight() const { return in_flight_.load(std::memory_order_relaxed); }
+    /* What this model does, as /server_info reports it, in JSON. */
+    std::string capabilities_json() const;
     /* The admission ceiling as resolved: ServerOptions::queue_depth, or 8 x max_seqs for 0. */
     int64_t  queue_cap() const { return queue_depth_; }
 
@@ -347,6 +372,9 @@ private:
     /* Cancels every job and joins its thread; at stop(). */
     void stop_videos();
     static json video_json(const VideoJob& j);
+    /* A finished or running job's file: *res, or false with *err. */
+    static bool video_content(const VideoJob& j, const HttpRequest& req, HttpResponse* res, ApiError* err);
+    static HttpResponse video_deleted(const std::string& id);
 
     /* ------------------------------------------------------------------ speech_stream.cpp */
     /* vLLM-Omni's realtime speech session over a WebSocket at /v1/audio/speech/stream: text
@@ -380,6 +408,7 @@ private:
     HttpResponse handle_shape_status(const HttpRequest& req);
     void shape_work(std::shared_ptr<ShapeJob> j);
     void sweep_shapes_locked(int64_t now);
+    static json shape_status(const ShapeJob& j);
     void stop_shapes();
     static void shape_caps(json& caps, const IShapeGen* gen);
 
@@ -449,6 +478,14 @@ private:
     HttpTransport  transport_;
 
     std::atomic<int64_t> in_flight_{0};
+    /* Generation jobs (an image, a shape, speech): they do not pass through the scheduler, so
+     * its figures say nothing about them. A job ends when its response has been sent. */
+    struct JobStats {
+        std::atomic<int64_t> running{0}, done{0}, failed{0}, total_ms{0}, last_ms{0};
+    } jobs_;
+    HttpResponse run_job(const HttpRequest& q, HttpResponse (Server::*fn)(const HttpRequest&));
+    HttpResponse handle_image_generate(const HttpRequest& q) { return handle_images(q, false); }
+    HttpResponse handle_image_edit(const HttpRequest& q) { return handle_images(q, true); }
     int64_t              queue_depth_ = 0;
     std::atomic<int64_t> realtime_sessions_{0};
     std::atomic<int64_t> speech_sessions_{0};

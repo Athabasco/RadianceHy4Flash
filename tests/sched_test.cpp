@@ -1841,6 +1841,39 @@ TEST(an_idle_overdue_prefill_reclaims_a_leaked_state_slot) {
     f.commit_plain();
 }
 
+/* Two overdue preempted requests on an idle engine, admitted in one pass, with no room for the
+ * second's whole recompute beside the first. A request the pass has just admitted is not in
+ * running_ yet, so the engine still looked idle to the second, whose reclaim took the first's state
+ * slots: its chunk ran with no recurrent state and the next from zeros, and the model no longer knew
+ * the start of its conversation. */
+TEST(an_overdue_prefill_leaves_the_state_of_one_admitted_beside_it) {
+    Fixture f;
+    f.build(/*blocks=*/30, /*states=*/4);   /* 30 x 16 = 480 tokens */
+    f.cfg.preempt_wait_ms = 0;
+    f.cfg.max_seqs = 3;
+    f.cfg.max_tok = 128;
+    CHECK_OK(f.start());
+
+    const uint64_t b = f.submit(200, 8, /*priority=*/0);
+    const uint64_t c = f.submit(440, 8, /*priority=*/0);
+    for (int i = 0; i < 8 && f.sch.find(c)->state != ReqState::Running; ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    REQUIRE_EQ((int)f.sch.find(c)->state, (int)ReqState::Running);
+    CHECK_EQ(f.sch.preempt_until([] { return false; }), 2);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Preempted);
+
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
+    for (size_t g = 0; g < f.kv.gs.size(); ++g)
+        if (!f.kv.geom.g[g].paged) CHECK(f.kv.state_slot(b, (int32_t)g) >= 0);
+    /* The second waits for the room it asked for. */
+    CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Preempted);
+    f.commit_plain();
+}
+
 /* can_grow on an id the manager has forgotten is false. That must not park an idle engine:
  * admit adds the sequence. */
 TEST(an_idle_overdue_prefill_is_admitted_when_its_kv_sequence_is_gone) {
@@ -3091,6 +3124,40 @@ TEST(off_a_long_prefill_keeps_a_new_request_out_of_every_step) {
     CHECK_EQ(f.sch.metrics().prefill_chunks_capped, 0);
 }
 
+/* A prefill chunk held back for others and then refused KV is preempted with no entry in the plan.
+ * The growth pass at the end of the step must not take the next entry, or the slot past the last,
+ * for it: the slot past the last holds a stale entry from an earlier step, and growing it left the
+ * plan's token count above its entries, so the whole step was thrown away. */
+TEST(a_held_back_chunk_refused_kv_leaves_no_mark_on_the_plan) {
+    /* Decode rows ahead of long prefills on a pool too small for them all, across pool sizes and
+     * arrival orders, so a chunk is held back for the rows and then refused its blocks. */
+    for (int64_t blocks = 8; blocks <= 160; ++blocks)
+        for (int shape = 0; shape < 4; ++shape) {
+            Fixture f;
+            f.build(blocks, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/4096);
+            f.cfg.busy_prefill_chunk = -1;
+            CHECK_OK(f.start());
+            std::vector<uint64_t> ids;
+            for (int r = 0; r < 2 + shape; ++r) ids.push_back(f.submit(32 + 16 * r, 2000, 0, true));
+            for (int k = 0; k < 400; ++k) {
+                if (k % 6 == 5 && ids.size() < 12) ids.push_back(f.submit(400 + 96 * ((k + shape) % 7), 64));
+                const RadBatch* b = f.sch.step();
+                if (!b) {
+                    /* An empty step only ever means nothing could run. */
+                    bool running = false;
+                    for (uint64_t id : ids)
+                        if (const Request* q = f.sch.find(id)) running = running || q->state == ReqState::Running;
+                    CHECK(!running);
+                    break;
+                }
+                int64_t sum = 0;
+                for (const StepEntry& e : f.sch.plan().e) sum += e.n_tokens;
+                CHECK_EQ(b->n_tok, sum);
+                f.commit_plain();
+            }
+        }
+}
+
 /* auto: the same arrival is admitted in the next step, and its prompt finishes in two. */
 TEST(auto_a_request_arriving_during_a_long_prefill_is_admitted_at_once) {
     Fixture f;
@@ -3654,65 +3721,62 @@ TEST(the_adaptive_window_moves_only_past_its_hold_and_never_below_one_draft) {
     CHECK_EQ(w.depth, 0);
     off.observe(5, 2);
     CHECK_EQ(off.verified_at(5), (int64_t)0);
-    off.step_time(3, 1, 12.0);                                  /* and no step is timed */
-    CHECK_EQ(off.cost_samples(3, 1), (int64_t)0);
+    off.step_time(4, 12.0);                                     /* and no step is timed */
+    CHECK_EQ(off.cost_samples(4), (int64_t)0);
 
     /* Adaptive with no speculation is no policy at all. */
     DraftController zero = adaptive_controller(0);
     CHECK(!zero.adaptive());
 }
 
-/* The step cost is measured. A key (the step's deepest window, its class of running sequences)
- * with samples is its own mean; one without borrows the nearest measured key's, scaled by the
- * prior's shape; with nothing measured it is the prior. Same times, same choice. */
+/* The step cost is measured by query rows (StepCost). A timed row count is its own mean; one
+ * between two timed counts lies on their line; one outside them is the nearest scaled by the
+ * prior's shape; with nothing timed it is the prior. Same times, same choice. */
 TEST(the_adaptive_window_prices_a_step_from_measured_step_times) {
     DraftController c = adaptive_controller(6);
-    CHECK_NEAR(c.step_cost(1, 1), 1.06, 1e-12);                /* the prior */
-    CHECK_NEAR(c.step_cost(6, 1), 1.36, 1e-12);
+    const double k = DraftController::kRowCost;
+    CHECK_NEAR(c.step_cost(1), 1.0, 1e-12);                    /* the prior */
+    CHECK_NEAR(c.step_cost(7), 1.0 + 6 * k, 1e-12);
 
-    for (int i = 0; i < 10; ++i) c.step_time(3, 1, 12.0);
-    CHECK_EQ(c.cost_samples(3, 1), (int64_t)10);
-    CHECK_NEAR(c.step_cost(3, 1), 12.0, 1e-9);
-    CHECK_NEAR(c.step_cost(5, 1), 12.0 * 1.30 / 1.18, 1e-9);   /* borrowed, the prior's shape */
-    CHECK_NEAR(c.step_cost(3, 9), 12.0, 1e-9);                 /* the nearest class */
-    CHECK_EQ(c.cost_samples(3, 9), (int64_t)0);
-    /* The classes: 1, 2-3, 4-7, 8-15, 16 and up. */
-    c.step_time(3, 2, 20.0);
-    CHECK_NEAR(c.step_cost(3, 3), 20.0, 1e-9);
-    CHECK_NEAR(c.step_cost(3, 4), 20.0, 1e-9);                 /* 4-7 borrows from 2-3 */
-    c.step_time(3, 16, 40.0);
-    CHECK_NEAR(c.step_cost(3, 1000), 40.0, 1e-9);
-    CHECK_NEAR(c.step_cost(3, 9), 40.0, 1e-9);                 /* 8-15: the nearest, 16 and up */
+    for (int i = 0; i < 10; ++i) c.step_time(4, 12.0);
+    CHECK_EQ(c.cost_samples(4), (int64_t)10);
+    CHECK_NEAR(c.step_cost(4), 12.0, 1e-9);
+    CHECK_NEAR(c.step_cost(6), 12.0 * (1 + 5 * k) / (1 + 3 * k), 1e-9);   /* outside: the shape */
+    CHECK_EQ(c.cost_samples(6), (int64_t)0);
+    for (int i = 0; i < 10; ++i) c.step_time(8, 16.0);
+    CHECK_NEAR(c.step_cost(6), 14.0, 1e-9);                    /* between: the line */
+    CHECK_NEAR(c.step_cost(3), 12.0 * (1 + 2 * k) / (1 + 3 * k), 1e-9);
+    CHECK_NEAR(c.step_cost(10), 16.0 * (1 + 9 * k) / (1 + 7 * k), 1e-9);
 
     /* A step that waited on something else counts for at most four times the mean. */
-    const double before = c.step_cost(3, 1);
-    c.step_time(3, 1, 1.0e6);
-    CHECK(c.step_cost(3, 1) <= before * 4.0);
-    CHECK(c.step_cost(3, 1) > before);
+    const double before = c.step_cost(4);
+    c.step_time(4, 1.0e6);
+    CHECK(c.step_cost(4) <= before * 4.0);
+    CHECK(c.step_cost(4) > before);
 
     /* Nonsense is not a sample. */
-    c.step_time(0, 1, 5.0);
-    c.step_time(7, 1, 5.0);
-    c.step_time(2, 1, -1.0);
-    c.step_time(2, 0, 5.0);
-    CHECK_EQ(c.cost_samples(2, 1), (int64_t)0);
+    c.step_time(0, 5.0);
+    c.step_time(2, -1.0);
+    CHECK_EQ(c.cost_samples(2), (int64_t)0);
+    CHECK_EQ(c.cost_samples(0), (int64_t)0);
 
     /* One sequence that accepts nearly everything: on the prior the whole window pays... */
     DraftController p = adaptive_controller(6);
     DraftAdapt s = estimate(p, 0.9, 0.9);
     DraftAdapt* one[1] = { &s };
     CHECK_EQ(p.plan_step(one, 1, 1), 6);
-    /* ...and where the steps past three were measured dear, three is what pays. */
+    /* ...and where the steps past three drafts (four rows) were measured dear, three is what
+     * pays. */
     DraftController m = adaptive_controller(6);
     const double t[7] = { 0, 10.0, 11.0, 12.0, 30.0, 30.0, 30.0 };
-    for (int d = 1; d <= 6; ++d) m.step_time(d, 1, t[d]);
+    for (int d = 1; d <= 6; ++d) m.step_time(1 + d, t[d]);
     DraftAdapt u = estimate(m, 0.9, 0.9);
     DraftAdapt* mu[1] = { &u };
     CHECK_EQ(m.plan_step(mu, 1, 1), 3);
     CHECK_EQ(m.window_for(u), 3);
     /* Deterministic: the same times and the same estimate give the same depth. */
     DraftController m2 = adaptive_controller(6);
-    for (int d = 1; d <= 6; ++d) m2.step_time(d, 1, t[d]);
+    for (int d = 1; d <= 6; ++d) m2.step_time(1 + d, t[d]);
     DraftAdapt u2 = estimate(m2, 0.9, 0.9);
     DraftAdapt* mu2[1] = { &u2 };
     CHECK_EQ(m2.plan_step(mu2, 1, 1), 3);
@@ -3735,36 +3799,37 @@ TEST(the_adaptive_window_chooses_the_head_depth_over_the_whole_batch) {
     CHECK_EQ(c.window_for(deep), 6);
     CHECK_EQ(c.window_for(shallow), 1);
 
-    /* The same deep sequence among seven shallow ones, at a class whose steps were measured to
-     * grow by three units per round: eight rows pay for the rounds, and the one that gains does not
-     * repay it. Every window comes down to one. */
+    /* The same deep sequence among seven shallow ones, where steps were measured to grow by
+     * three units per row past the fifteen the eight carry at one draft each: the one that gains
+     * does not repay its rows and rounds. Every window comes down to one. */
     DraftController b = adaptive_controller(6);
-    for (int d = 1; d <= 6; ++d) b.step_time(d, 8, 10.0 + 3.0 * d);
+    for (int d = 1; d <= 6; ++d) b.step_time(15 + d, 10.0 + 3.0 * d);
     DraftAdapt bd = estimate(b, 0.95, 0.95);
     DraftAdapt bs[7];
     DraftAdapt* eight[8] = { &bd };
     for (int i = 0; i < 7; ++i) { bs[i] = estimate(b, 0.5, 0.15); eight[i + 1] = &bs[i]; }
     CHECK_EQ(b.plan_step(eight, 8, 8), 1);
     CHECK_EQ(b.window_for(bd), 1);
-    /* Alone at its own class, unmeasured, the same sequence takes the whole window. */
+    /* Alone, at row counts far under any timed one (priced on the prior's shape), the same
+     * sequence drafts deeper. */
     DraftController a = adaptive_controller(6);
-    for (int d = 1; d <= 6; ++d) a.step_time(d, 8, 10.0 + 3.0 * d);
+    for (int d = 1; d <= 6; ++d) a.step_time(15 + d, 10.0 + 3.0 * d);
     DraftAdapt ad = estimate(a, 0.95, 0.95);
     DraftAdapt* lone[1] = { &ad };
     CHECK(a.plan_step(lone, 1, 1) > 1);
 
     /* Rows that do not draft are part of the step: they emit a token whatever D is and pay for
-     * every round. Here three plain rows beside one drafting row at the same measured class. */
+     * every round. Here three plain rows beside one drafting row, at the same measured times. */
     DraftController r = adaptive_controller(6);
-    for (int d = 1; d <= 6; ++d) r.step_time(d, 4, 10.0 + 3.0 * d);
+    for (int d = 1; d <= 6; ++d) r.step_time(4 + d, 10.0 + 3.0 * d);
     DraftAdapt rd = estimate(r, 0.95, 0.95);
     DraftAdapt* rone[1] = { &rd };
     const int with_plain = r.plan_step(rone, 1, 4);
     DraftController r2 = adaptive_controller(6);
-    for (int d = 1; d <= 6; ++d) r2.step_time(d, 4, 10.0 + 3.0 * d);
+    for (int d = 1; d <= 6; ++d) r2.step_time(4 + d, 10.0 + 3.0 * d);
     DraftAdapt rd2 = estimate(r2, 0.95, 0.95);
     DraftAdapt* rone2[1] = { &rd2 };
-    const int alone = r2.plan_step(rone2, 1, 1);    /* class 1 unmeasured: borrows class 4-7 */
+    const int alone = r2.plan_step(rone2, 1, 1);    /* two to seven rows: partly timed */
     CHECK(with_plain <= alone);
 
     /* D moves past a hold and a hysteresis. The first step that drafts takes the best outright;
@@ -3773,7 +3838,7 @@ TEST(the_adaptive_window_chooses_the_head_depth_over_the_whole_batch) {
     DraftAdapt hs = estimate(h, 0.95, 0.95);
     DraftAdapt* hone[1] = { &hs };
     CHECK_EQ(h.plan_step(hone, 1, 1), 6);
-    for (int d = 1; d <= 6; ++d) h.step_time(d, 1, d <= 2 ? 10.0 : 40.0);
+    for (int d = 1; d <= 6; ++d) h.step_time(1 + d, d <= 2 ? 10.0 : 40.0);
     for (int t = 0; t < DraftController::kHold - 1; ++t) CHECK_EQ(h.plan_step(hone, 1, 1), 6);
     CHECK_EQ(h.plan_step(hone, 1, 1), 2);
     /* No drafting sequence: D stays where it is. */
@@ -4472,9 +4537,9 @@ TEST(prompt_lookup_does_not_scan_the_context) {
     CHECK_EQ(ix.indexed(), (int64_t)seq.size() - 1);
 }
 
-/* The scheduler's half of the cost: a decode step that verified drafts is timed at its deepest
- * window and row count, and the next cycle's head depth reads it. Measured dear past one round at
- * two rows, both windows (and the rounds) come down to one. */
+/* The scheduler's half of the cost: a decode step that verified drafts is timed at its query
+ * rows, and the next cycle's head depth reads it. Measured dear past one draft a sequence, both
+ * windows (and the rounds) come down to one. */
 TEST(the_adaptive_window_times_its_steps_and_the_next_cycle_reads_them) {
     Fixture f;
     adaptive_fixture(f, 4);
@@ -4490,7 +4555,7 @@ TEST(the_adaptive_window_times_its_steps_and_the_next_cycle_reads_them) {
     REQUIRE(f.sch.step() != nullptr);                  /* both prompts */
     commit_all();
     f.sch.step_finished();                             /* a prefill step: not a sample */
-    for (int d = 1; d <= 4; ++d) CHECK_EQ(f.sch.draft().cost_samples(d, 2), (int64_t)0);
+    for (int d = 1; d <= 4; ++d) CHECK_EQ(f.sch.draft().cost_samples(2 + 2 * d), (int64_t)0);
 
     int32_t draft[4] = { 21, 22, 23, 24 };
     CHECK_OK(f.sch.set_draft(a, draft, 4));
@@ -4499,11 +4564,11 @@ TEST(the_adaptive_window_times_its_steps_and_the_next_cycle_reads_them) {
     CHECK_EQ(f.sch.plan().n_spec, 4);
     commit_all();
     f.sch.step_finished();
-    CHECK_EQ(f.sch.draft().cost_samples(4, 2), (int64_t)1);
+    CHECK_EQ(f.sch.draft().cost_samples(10), (int64_t)1);          /* two sequences, five rows each */
 
     /* The hold, then a cycle that reads steps past one round as four times dearer. */
     for (int d = 1; d <= 4; ++d)
-        for (int i = 0; i < 64; ++i) f.sch.draft().step_time(d, 2, d == 1 ? 10.0 : 40.0);
+        for (int i = 0; i < 64; ++i) f.sch.draft().step_time(2 + 2 * d, d == 1 ? 10.0 : 40.0);
     for (int t = 0; t < DraftController::kHold + 1; ++t) {
         CHECK_OK(f.sch.set_draft(a, draft, 4));
         CHECK_OK(f.sch.set_draft(b, draft, 4));

@@ -11,7 +11,7 @@
 #include "rad_internal.h"
 #include "text/tokenizer.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <cctype>
@@ -27,6 +27,9 @@ namespace server {
 Server::Server(const Deps& d, const ServerOptions& o)
     : deps_(d), opt_(o),
       metrics_(o.model_id, o.max_ctx > 0 ? o.max_ctx : 32768) {
+    if (!opt_.kv_cache_dtype.empty())
+        metrics_.set_cache_config(opt_.kv_cache_dtype, opt_.kv_block_size, opt_.prefix_cache,
+                                  opt_.prefix_cache_mib);
     lim_.model_id = opt_.model_id;
     lim_.version = opt_.version;
     lim_.max_ctx = opt_.max_ctx;
@@ -120,13 +123,13 @@ void Server::register_routes() {
     router_.post("/v1/embeddings",       [this](const HttpRequest& q) { return handle_embeddings(q); });
     router_.post("/rerank", [this](const HttpRequest& q) { return handle_rerank(q); });
     router_.post("/v1/rerank", [this](const HttpRequest& q) { return handle_rerank(q); });
-    router_.post("/v1/images/generations", [this](const HttpRequest& q) { return handle_images(q, false); });
-    router_.post("/v1/images/edits",     [this](const HttpRequest& q) { return handle_images(q, true); });
+    router_.post("/v1/images/generations", [this](const HttpRequest& q) { return run_job(q, &Server::handle_image_generate); });
+    router_.post("/v1/images/edits",     [this](const HttpRequest& q) { return run_job(q, &Server::handle_image_edit); });
     router_.post("/v1/systemone",        [this](const HttpRequest& q) { return handle_systemone(q); });
     /* LiteLLM's name for the same endpoint. */
     router_.post("/v1/decisions",        [this](const HttpRequest& q) { return handle_systemone(q); });
     /* Speech to text, for a model whose plugin says how it transcribes (RadAudioFormat). */
-    router_.post("/v1/audio/speech", [this](const HttpRequest& q) { return handle_speech(q); });
+    router_.post("/v1/audio/speech", [this](const HttpRequest& q) { return run_job(q, &Server::handle_speech); });
     router_.post("/v1/videos",       [this](const HttpRequest& q) { return handle_video_create(q); });
     router_.get ("/v1/videos",       [this](const HttpRequest& q) { return handle_video_list(q); });
     router_.get ("/v1/videos/:id",   [this](const HttpRequest& q) { return handle_video_get(q); });
@@ -135,7 +138,7 @@ void Server::register_routes() {
     router_.get ("/v1/videos/:id/content",
                  [this](const HttpRequest& q) { return handle_video_content(q); });
     /* Hunyuan3D-2's API server: a shape from a picture. */
-    router_.post("/generate",        [this](const HttpRequest& q) { return handle_shape_generate(q); });
+    router_.post("/generate",        [this](const HttpRequest& q) { return run_job(q, &Server::handle_shape_generate); });
     router_.post("/send",            [this](const HttpRequest& q) { return handle_shape_send(q); });
     router_.get ("/status/:uid",     [this](const HttpRequest& q) { return handle_shape_status(q); });
     router_.post("/v1/audio/transcriptions",
@@ -179,10 +182,10 @@ void Server::register_routes() {
     router_.post("/completions",         [this](const HttpRequest& q) { return handle_native_completion(q); });
     router_.post("/infill",              [this](const HttpRequest& q) { return handle_infill(q); });
     router_.post("/embeddings",          [this](const HttpRequest& q) { return handle_embeddings(q); });
-    router_.post("/images/generations",  [this](const HttpRequest& q) { return handle_images(q, false); });
-    router_.post("/images/edits",        [this](const HttpRequest& q) { return handle_images(q, true); });
+    router_.post("/images/generations",  [this](const HttpRequest& q) { return run_job(q, &Server::handle_image_generate); });
+    router_.post("/images/edits",        [this](const HttpRequest& q) { return run_job(q, &Server::handle_image_edit); });
     router_.post("/audio/transcriptions", [this](const HttpRequest& q) { return handle_transcription(q); });
-    router_.post("/audio/speech",        [this](const HttpRequest& q) { return handle_speech(q); });
+    router_.post("/audio/speech",        [this](const HttpRequest& q) { return run_job(q, &Server::handle_speech); });
     router_.get ("/models",              [this](const HttpRequest& q) { return handle_models(q); });
     /* llama-server's: the prompt a chat request renders to, and how many tokens it is. */
     router_.post("/apply-template",      [this](const HttpRequest& q) { return handle_apply_template(q); });
@@ -258,6 +261,9 @@ void Server::register_routes() {
  * keeps probes, the dashboard, 429 answers and idle keep-alive connections serviceable. The same
  * number bounds the connections that may wait once the reserve is busy too. */
 static const int64_t kSpareWorkers = 64;
+/* What a request hears when its model stops or goes off its cards while it runs. The rest of the
+ * process serves on, and the model comes back for the next request. */
+static const char* const kLeaving = "this model is stopping or leaving its cards; send the request again";
 
 void Server::note_ready(uint64_t begin_ns) {
     if (begin_ns == 0) return;
@@ -375,8 +381,12 @@ std::string Server::check_thinking_budget() const {
 }
 
 void Server::stop() {
-    stopping_.store(true);
     transport_.stop();
+    retire();
+}
+
+void Server::retire() {
+    stopping_.store(true);
     stop_videos();
     stop_shapes();
     drain_graveyard(2000);
@@ -606,8 +616,7 @@ std::optional<HttpResponse> Server::abandoned(const HttpRequest& req,
     if (r) record(*r, gens, Finish::Cancelled);
     retire(gens);
     release(n);
-    if (!gone)
-        return error_response(err_overloaded("the server is shutting down"), req.peer, shape);
+    if (!gone) return error_response(err_overloaded(kLeaving), req.peer, shape);
     metrics_.observe_http(499);
     return HttpResponse::text(499, "client closed request\n");
 }
@@ -924,9 +933,14 @@ void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Fi
     for (const auto& p : r.prompts) n_prompt += (int64_t)p.tokens.size();
 
     int64_t n_gen = 0;
-    double ttft = -1.0, tpot = -1.0, decode = -1.0, e2e = 0.0;
+    double ttft = -1.0, tpot = -1.0, decode = -1.0, e2e = 0.0, queue = -1.0;
     for (const auto& g : gens) {
         int64_t produced = g.sink->n_produced();
+        /* Arrival to the first admission among the request's choices. */
+        if (const int64_t ta = g.sink->t_admitted_ns(); ta >= 0) {
+            const double t = (double)ta * 1e-9;
+            queue = queue < 0 ? t : std::min(queue, t);
+        }
         n_gen += produced;
         e2e = std::max(e2e, (double)g.sink->age_ns() * 1e-9);
         int64_t tf = g.sink->t_first_token_ns(), tl = g.sink->t_last_token_ns();
@@ -941,7 +955,7 @@ void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Fi
             }
         }
     }
-    metrics_.observe_request(n_prompt, n_gen, ttft, tpot, e2e, decode,
+    metrics_.observe_request(n_prompt, n_gen, ttft, tpot, e2e, decode, queue,
                              r.n, r.max_tokens, to_reason(overall));
 
     /* The request log's closing line: this request's share of what /metrics aggregates (finish,
@@ -1068,9 +1082,9 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
 /* ------------------------------------------------------------------ llama-server's native shape */
 
 /* What a request was served with, under llama-server's names: its `generation_settings`. */
-static nlohmann::ordered_json native_settings(const OaiRequest& r) {
+static json native_settings(const OaiRequest& r) {
     const SamplingParams& sp = r.sp;
-    nlohmann::ordered_json p;
+    json p;
     p["seed"]               = sp.seed;
     p["temperature"]        = sp.temp;
     p["top_k"]              = sp.top_k;
@@ -1119,7 +1133,7 @@ json Server::native_result(const OaiRequest& r, const Generation& g, const std::
     const Sink* one = g.sink.get();
     const TimingsOut t = timings_of(&one, 1, r.t_received_ns);
     const int64_t n_prompt = (int64_t)r.prompts[(size_t)g.prompt_index].tokens.size();
-    nlohmann::ordered_json o;
+    json o;
     o["index"]   = g.index;
     o["content"] = content;
     o["tokens"]  = r.return_tokens ? g.tokens : std::vector<int32_t>{};
@@ -1141,7 +1155,7 @@ json Server::native_result(const OaiRequest& r, const Generation& g, const std::
     if (r.want_logprobs && !r.stream) {
         const std::vector<LogprobEntry> kept = kept_logprobs(g.logprobs, g.stop_cut);
         o["completion_probabilities"] =
-            nlohmann::ordered_json::parse("[" + logprobs_content(kept.data(), kept.size()) + "]");
+            json::parse("[" + logprobs_content(kept.data(), kept.size()) + "]");
     }
     return o;
 }
@@ -1151,19 +1165,19 @@ json Server::native_result(const OaiRequest& r, const Generation& g, const std::
 static std::string text_chunk(const OaiRequest& r, int index, const std::string& delta,
                               const char* finish_reason, const TimingsOut* t = nullptr,
                               const std::string& logprobs = std::string()) {
-    nlohmann::ordered_json ch;
+    json ch;
     ch["text"] = delta;
     ch["index"] = index;
-    if (!logprobs.empty()) ch["logprobs"] = nlohmann::ordered_json::parse(logprobs);
+    if (!logprobs.empty()) ch["logprobs"] = json::parse(logprobs);
     else ch["logprobs"] = nullptr;
     if (finish_reason) ch["finish_reason"] = finish_reason; else ch["finish_reason"] = nullptr;
-    nlohmann::ordered_json o;
+    json o;
     o["id"] = r.id;
     o["object"] = "text_completion";
     o["created"] = r.created;
     o["model"] = r.model;
     if (!r.system_fingerprint.empty()) o["system_fingerprint"] = r.system_fingerprint;
-    o["choices"] = nlohmann::ordered_json::array({ch});
+    o["choices"] = json::array({ch});
     if (t && t->valid) o["timings"] = timings_json(*t);
     return sse_event(o.dump());
 }
@@ -1173,22 +1187,22 @@ static std::string text_chunk(const OaiRequest& r, int index, const std::string&
  * supplied, and the time since the prompt phase began. */
 static std::string progress_chunk(const OaiRequest& r, int index, const Sink& s) {
     const int64_t ta = s.t_admitted_ns();
-    nlohmann::ordered_json pp;
+    json pp;
     pp["total"]     = s.progress_total();
     pp["cache"]     = s.progress_cached();
     pp["processed"] = s.progress_processed();
     pp["time_ms"]   = ta >= 0 ? (s.age_ns() - ta) / 1000000 : 0;
     if (r.shape == ApiShape::LlamaNative) {
         /* llama-server's native chunk carries the progress at its top level. */
-        nlohmann::ordered_json o;
+        json o;
         o["index"] = index;
         o["content"] = "";
-        o["tokens"] = nlohmann::ordered_json::array();
+        o["tokens"] = json::array();
         o["stop"] = false;
         o["prompt_progress"] = std::move(pp);
         return sse_event(o.dump());
     }
-    nlohmann::ordered_json ch;
+    json ch;
     if (r.endpoint == Endpoint::Chat) {
         ch["index"] = index;
         ch["delta"] = { { "role", "assistant" }, { "content", nullptr } };
@@ -1198,13 +1212,13 @@ static std::string progress_chunk(const OaiRequest& r, int index, const Sink& s)
         ch["logprobs"] = nullptr;
     }
     ch["finish_reason"] = nullptr;
-    nlohmann::ordered_json o;
+    json o;
     o["id"] = r.id;
     o["object"] = r.endpoint == Endpoint::Chat ? "chat.completion.chunk" : "text_completion";
     o["created"] = r.created;
     o["model"] = r.model;
     if (!r.system_fingerprint.empty()) o["system_fingerprint"] = r.system_fingerprint;
-    o["choices"] = nlohmann::ordered_json::array({ch});
+    o["choices"] = json::array({ch});
     o["prompt_progress"] = std::move(pp);
     return sse_event(o.dump());
 }
@@ -1261,6 +1275,27 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
         }
 
         if (st->peer_closed && st->peer_closed()) {
+            return false;
+        }
+
+        /* The model is leaving (end_streams, retire). The stream ends here whether or not the
+         * step loop still answers, since the response's lease is what keeps this server alive, and
+         * with an error event: a silent end would pass a truncated answer as complete. */
+        if (self->stopping_.load()) {
+            self->cancel_all(st->gens, false);
+            const UsageOut u = usage_of(st->r, st->gens);
+            const ApiError e = err_overloaded(kLeaving);
+            for (auto& g : st->gens) {
+                const Sink* one = g.sink.get();
+                const TimingsOut gt = timings_of(&one, 1, st->r.t_received_ns);
+                if (st->r.endpoint == Endpoint::Chat) out += g.delta->error_chunk(e, gt, u);
+                else out += sse_error(e);
+            }
+            if (st->r.shape == ApiShape::OpenAI) out += SSE_DONE;
+            st->done_sent = true;
+            self->record(st->r, st->gens, Finish::Cancelled);
+            self->retire(st->gens);
+            if (!st->released) { st->released = true; self->release(st->r.n_choices()); }
             return false;
         }
 
@@ -1323,7 +1358,7 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
             } else if (st->r.shape == ApiShape::LlamaNative) {
                 /* llama-server's native chunk: the new text, the ids that made it, the counts. */
                 if (safe > g.emitted || g.tokens.size() > g.tokens_sent || lp_n) {
-                    nlohmann::ordered_json o;
+                    json o;
                     o["index"] = g.index;
                     o["content"] = g.text.substr(g.emitted, safe - g.emitted);
                     o["tokens"] = std::vector<int32_t>(g.tokens.begin() + (long)g.tokens_sent,
@@ -1335,7 +1370,7 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
                         (int64_t)st->r.prompts[(size_t)g.prompt_index].tokens.size();
                     if (st->r.timings_per_token && now.valid) o["timings"] = timings_json(now);
                     if (lp_n)
-                        o["completion_probabilities"] = nlohmann::ordered_json::parse(
+                        o["completion_probabilities"] = json::parse(
                             "[" + logprobs_content(lp_at, lp_n) + "]");
                     out += sse_event(o.dump());
                     g.tokens_sent = g.tokens.size();
@@ -2314,7 +2349,6 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
  * ask, the rule /diagnostics follows. */
 /* A generator's adapter files: what `loras` and <lora:...> tags may name. */
 HttpResponse Server::handle_loras(const HttpRequest& req) {
-    using json = nlohmann::json;
     if (!opt_.gen_lora_names) {
         ApiError e;
         e.status = 404;

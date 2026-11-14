@@ -2,7 +2,7 @@
  *
  * The binary runs as a child on the host backend; the containers it writes are read back with
  * core's reader and decoder. The checkpoint is a two-layer LLaMA served by llama_dense_fp8, whose
- * recipe makes every linear block fp8 and keeps the norms, the embedding and the head as the
+ * recipe makes every linear rotated int8 and keeps the norms, the embedding and the head as the
  * checkpoint holds them, so one conversion writes a quantised and a copied weight of every kind.
  */
 #include "rad_test.h"
@@ -64,10 +64,10 @@ struct World {
     World() {
         if (!dir.ok()) return;
         ckpt = dir / "llama";
-        recipe = dir / "fp8.recipe";
+        recipe = dir / "i8.recipe";
         base = dir / "base.rad";
         if (mkdir(ckpt.c_str(), 0755) != 0 || !tiny::write_llama(ckpt, {}) ||
-            !tiny::write_text(recipe, tiny::kLlamaFp8Recipe))
+            !tiny::write_text(recipe, tiny::kLlamaI8Recipe))
             return;
         for (tiny::Tensor& t : tiny::read_safetensors(ckpt + "/model.safetensors"))
             src[t.name] = std::move(t);
@@ -120,11 +120,11 @@ std::vector<std::string> differing_weights(const RadFile& a, const RadFile& b) {
 
 /* ================================================================== what a conversion writes */
 
-/* A recipe weight is block fp8 over the rows its name map joins, in the map's order: attn_qkv is
- * q, then k, then v, and ffn_gate_up is gate then up. Each element decodes to its source within
- * E4M3's half step (2^-4 relative) plus one subnormal step of its block's scale (amax / 448 /
- * 2^9). A part out of order, or a block's scale applied to another block's rows, is off by the
- * source's own magnitude. */
+/* A recipe weight is rotated int8 over the rows its name map joins, in the map's order: attn_qkv
+ * is q, then k, then v, and ffn_gate_up is gate then up. A row's 128 columns under one scale
+ * decode to their source within a twentieth of the source's RMS there: the codes' step is the
+ * rotated group's largest magnitude over 127, about a hundredth of its RMS in error. A part out of
+ * order, or a group's scale applied to another group, is off by the source's own magnitude. */
 TEST(a_recipe_weight_decodes_to_its_source_rows_in_name_map_order) {
     World& w = world();
     REQUIRE(w.ok);
@@ -142,7 +142,7 @@ TEST(a_recipe_weight_decodes_to_its_source_rows_in_name_map_order) {
     for (const auto& j : kJoins) {
         const RadFileEntry* e = f.find(j.weight);
         REQUIRE(e != nullptr);
-        CHECK_EQ(enc_name(f.encoding(*e)), std::string("fp8_e4m3*bf16[128x128]"));
+        CHECK_EQ(enc_name(f.encoding(*e)), std::string("i8*bf16[1x128]/fwht128"));
         CHECK_EQ(std::string(f.str(e->quantizer)), std::string("rtn"));
         const std::vector<float> got = decode(f, *e);
         REQUIRE(!got.empty());
@@ -159,21 +159,19 @@ TEST(a_recipe_weight_decodes_to_its_source_rows_in_name_map_order) {
         }
         REQUIRE_EQ((int64_t)want.size(), rows * cols);
         int64_t bad = 0;
-        for (int64_t r0 = 0; r0 < rows; r0 += 128)
+        for (int64_t r = 0; r < rows; ++r)
             for (int64_t c0 = 0; c0 < cols; c0 += 128) {
-                float amax = 0;
-                for (int64_t r = r0; r < std::min(rows, r0 + 128); ++r)
-                    for (int64_t c = c0; c < std::min(cols, c0 + 128); ++c)
-                        amax = std::max(amax, std::fabs(want[(size_t)(r * cols + c)]));
-                for (int64_t r = r0; r < std::min(rows, r0 + 128); ++r)
-                    for (int64_t c = c0; c < std::min(cols, c0 + 128); ++c) {
-                        const size_t i = (size_t)(r * cols + c);
-                        const float tol = 0.0625f * std::fabs(want[i]) + amax / 448.0f / 512.0f;
-                        if (!(std::fabs(got[i] - want[i]) <= tol)) ++bad;
-                    }
+                double sw = 0, se = 0;
+                for (int64_t c = c0; c < std::min(cols, c0 + 128); ++c) {
+                    const size_t i = (size_t)(r * cols + c);
+                    sw += (double)want[i] * want[i];
+                    se += ((double)got[i] - want[i]) * ((double)got[i] - want[i]);
+                }
+                if (!(std::sqrt(se) <= 0.05 * std::sqrt(sw) + 1e-6)) ++bad;
             }
         if (bad)
-            fprintf(stderr, "    %s: %lld elements outside the bound\n", j.weight, (long long)bad);
+            fprintf(stderr, "    %s: %lld scale groups outside the bound\n", j.weight,
+                    (long long)bad);
         CHECK_EQ(bad, (int64_t)0);
     }
 }
@@ -713,9 +711,9 @@ TEST(in_place_keeps_a_weight_the_plugin_has_regrouped) {
     CHECK_EQ(e->offset, off);
 }
 
-/* In place, a weight cannot be replaced: a rule that would write one differently is refused and
- * the file is left as it was. Without --in-place, -o may not name the --reuse container, whose
- * weights the run reads while it truncates the output. */
+/* In place, a rule that would write a weight differently is refused unless --replace names the
+ * weight, and the file is left as it was. Without --in-place, -o may not name the --reuse
+ * container, whose weights the run reads while it truncates the output. */
 TEST(in_place_refuses_to_change_a_weight_and_reuse_never_truncates_its_source) {
     World& w = world();
     REQUIRE(w.ok);
@@ -723,15 +721,68 @@ TEST(in_place_refuses_to_change_a_weight_and_reuse_never_truncates_its_source) {
     const std::string ip = d / "ip.rad";
     REQUIRE(copy_file(w.base, ip));
     REQUIRE(tiny::write_text(d / "search.recipe",
-                             std::string("blk.0.attn_qkv.weight rtn codes=fp8_e4m3 block=128x128 "
-                                         "scale=bf16 rule=search\n") + tiny::kLlamaFp8Recipe));
+                             std::string("blk.0.attn_qkv.weight rtn codes=i8 group=128 scale=bf16 "
+                                         "transform=fwht128 clamp=sym rule=search\n") +
+                                 tiny::kLlamaI8Recipe));
     std::string log;
     CHECK(convert(w.ckpt, { "--recipe", d / "search.recipe", "--reuse", ip, "--in-place" },
                   &log) != 0);
-    CHECK(has(log, "cannot be replaced in place"));
+    CHECK(has(log, "Name it with --replace"));
     CHECK(tiny::read_text(ip) == tiny::read_text(w.base));
     CHECK_EQ(convert(w.ckpt, { "-o", ip, "--recipe", w.recipe, "--reuse", ip }, &log), 2);
     CHECK(tiny::read_text(ip) == tiny::read_text(w.base));
+}
+
+/* --replace: the named weight is written again past the container's end under its new rule, equal
+ * to a conversion to a new file; every other weight stays at its offset, and the old planes are
+ * reported as unreachable. A glob no weight matches, or --replace without --in-place, is refused. */
+TEST(in_place_replace_writes_the_named_weight_again_past_the_end) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("convert_ipx");
+    const std::string ip = d / "ip.rad", fresh = d / "fresh.rad";
+    REQUIRE(copy_file(w.base, ip));
+    const char* kName = "blk.0.attn_qkv.weight";
+    REQUIRE(tiny::write_text(d / "search.recipe",
+                             std::string(kName) + " rtn codes=i8 group=128 scale=bf16 "
+                                                  "transform=fwht128 clamp=sym rule=search\n" +
+                                 tiny::kLlamaI8Recipe));
+    std::string log;
+    CHECK(convert(w.ckpt, { "--recipe", w.recipe, "--reuse", ip, "--in-place",
+                            "--replace", "blk.9.nope" }, &log) != 0);
+    CHECK(has(log, "matches no weight"));
+    CHECK(tiny::read_text(ip) == tiny::read_text(w.base));
+    CHECK_EQ(convert(w.ckpt, { "-o", fresh, "--recipe", d / "search.recipe", "--reuse", w.base,
+                               "--replace", kName }, &log), 2);
+
+    REQUIRE_EQ(convert(w.ckpt, { "--recipe", d / "search.recipe", "--reuse", ip, "--in-place",
+                                 "--replace", kName }, &log), 0);
+    CHECK(has(log, "1 of the added weight(s) replace"));
+    REQUIRE_EQ(convert(w.ckpt, { "-o", fresh, "--recipe", d / "search.recipe" }, &log), 0);
+    RadFile a, b, c;
+    REQUIRE_EQ(a.open(w.base.c_str()), RAD_OK);
+    REQUIRE_EQ(b.open(ip.c_str()), RAD_OK);
+    REQUIRE_EQ(c.open(fresh.c_str()), RAD_OK);
+    REQUIRE_EQ(a.entry_count(), b.entry_count());
+    for (int64_t i = 0; i < a.entry_count(); ++i) {
+        const std::string name = a.str(a.entry(i).name);
+        const RadFileEntry* e = b.find(name.c_str());
+        const RadFileEntry* f = c.find(name.c_str());
+        REQUIRE(e != nullptr);
+        REQUIRE(f != nullptr);
+        if (name == kName) {
+            CHECK(e->offset >= (uint64_t)a.size());
+            CHECK(has(b.str(e->options), "rule=search"));
+        } else {
+            CHECK_EQ(e->offset, a.entry(i).offset);
+        }
+        REQUIRE_EQ(e->n_planes, f->n_planes);
+        for (uint32_t k = 0; k < e->n_planes; ++k) {
+            const RadFilePlane &pe = b.plane(*e, (int)k), &pf = c.plane(*f, (int)k);
+            REQUIRE_EQ(pe.bytes, pf.bytes);
+            CHECK(std::memcmp(b.data(pe), c.data(pf), (size_t)pe.bytes) == 0);
+        }
+    }
 }
 
 /* ================================================================== refusals and options */
@@ -928,7 +979,7 @@ TEST(a_rule_that_matches_no_weight_is_warned_about) {
     tiny::TempDir d("convert_w");
     REQUIRE(tiny::write_text(d / "r", std::string("blk.*.attn_qvk.weight rtn codes=fp8_e4m3 "
                                                   "block=128x128 scale=bf16\n") +
-                                          tiny::kLlamaFp8Recipe));
+                                          tiny::kLlamaI8Recipe));
     std::string log;
     CHECK_EQ(convert(w.ckpt, { "-o", d / "w.rad", "--recipe", d / "r" }, &log), 0);
     CHECK(has(log, "'blk.*.attn_qvk.weight rtn' matches no weight"));
@@ -986,12 +1037,13 @@ TEST(generation_config_travels_as_generation_keys) {
     CHECK_NEAR(g.top_p, 0.95, 1e-6);
 }
 
-/* Declare runs at the KV dtype the engine will use; fp8 resolves on the host kernels too. */
-TEST(an_fp8_kv_cache_declares) {
+/* Declare runs at the KV dtype the engine will use; the int8 cache resolves on the host kernels
+ * too. */
+TEST(an_int8_kv_cache_declares) {
     World& w = world();
     REQUIRE(w.ok);
     tiny::TempDir d("convert_k");
-    CHECK_EQ(convert(w.ckpt, { "-o", d / "k.rad", "--recipe", w.recipe, "--kv-cache-dtype", "fp8" },
+    CHECK_EQ(convert(w.ckpt, { "-o", d / "k.rad", "--recipe", w.recipe, "--kv-cache-dtype", "i8" },
                      nullptr), 0);
     CHECK(exists(d / "k.rad"));
 }

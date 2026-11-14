@@ -102,9 +102,9 @@ int         avx_par_force(int threads);
     X(embed_attn)           X(ministral_rope)        X(pixtral_rope)         X(pixtral_merge)      \
     /* ---- quantisation and rotation */                                                          \
     X(quant_act_i8)         X(quant_act_i8g)        X(had_quant_act_i8)     X(quant_act_fp8)      \
-    X(had_quant_act_fp8)    X(gram_accum)           X(rmsnorm_had_quant_i8) X(gated_had_quant_i8) \
-    X(dequant)              X(quant_cols_fp8)       X(had_quant_act_i8g)                          \
-    X(rmsnorm_quant_fp8)    X(gated_quant_fp8)      X(givens_rotate)        X(givens_dense_quant) \
+    X(gram_accum)           X(rmsnorm_had_quant_i8) X(gated_had_quant_i8) \
+    X(dequant)              X(quant_cols_fp8)       X(had_quant_act_i8g)    X(dequant_w4)         \
+    X(rmsnorm_quant_fp8)    X(gated_quant_fp8)      \
     /* ---- gemm and the vocabulary edges */                                                      \
     X(gemm_nt)              X(gemm_nt_bias)         X(gemm_nt_q)            X(gemm_nt_q_bias)     \
     X(gemm_nt_q_gated)      X(embed_lookup)         X(embed_lookup_q)       X(logits_gemm)        \
@@ -125,14 +125,14 @@ int         avx_par_force(int threads);
     /* ---- collectives */                                                                        \
     X(all_reduce)           X(all_gather)                                                         \
     /* ---- image generation */                                                                   \
-    X(ln_mod)               X(gate_add)             X(ln_mod_quant_fp8)     X(timestep_embed)     \
+    X(ln_mod)               X(gate_add)             X(timestep_embed)     \
     X(gather_rows2)         X(lane_gather)          X(lane_store)           X(randn_lanes)        \
     X(flow_euler)           X(chan_affine)          X(conv2d_nhwc)          X(l2norm_chan)        \
     X(d2s_add)              X(s2d_avg_add)          X(to_rgba8)             X(gelu_tanh)          \
     X(scatter_add_rows)     X(attn_prefix_self)     X(kd_input)             X(kd_step)            \
     X(gelu_quick)           X(im2col_nhwc)                                                        \
     /* ---- video generation */                                                                   \
-    X(rms_mod)              X(rms_mod_quant_fp8)    X(flow_x0_step)         X(patch_unfold)       \
+    X(rms_mod)              X(flow_x0_step)         X(patch_unfold)       \
     X(vtile_gather)         X(vtile_stitch)         X(grid_pos3)            X(vsa_select)         \
     X(attn_vsa)             X(conv3d_ndhwc)         X(group_norm)           X(tconv_dw)           \
     X(resize_bilinear)      X(patch_fold)           X(flow_renoise)         X(flow_res_multistep) \

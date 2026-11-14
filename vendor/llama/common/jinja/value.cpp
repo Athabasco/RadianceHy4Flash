@@ -3,7 +3,7 @@
 #include "value.h"
 
 // for converting from JSON to jinja values
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <sstream>
 #include <string>
@@ -297,6 +297,58 @@ static value minmax_fn(const func_args & args) {
         }
     }
     return best;
+}
+
+/* jinja2's unique() over a sequence: the first occurrence of each item, in order, compared by
+ * `attribute` where one is given. Strings compare lowercased unless `case_sensitive` is true
+ * (jinja2's default is false). A tuple stays a tuple. */
+static value unique_fn(const func_args & args) {
+    args.ensure_count(1, 3);
+    if (!is_val<value_array>(args.get_pos(0))) {
+        throw raised_exception("unique: first argument must be an array");
+    }
+    value val       = args.get_pos(0);
+    value cs        = args.get_kwarg_or_pos("case_sensitive", 1);
+    value attribute = args.get_kwarg_or_pos("attribute", 2);
+    const bool case_sensitive = !cs->is_undefined() && cs->as_bool();
+    const bool attr_is_int = is_val<value_int>(attribute);
+    const int64_t attr_int = attr_is_int ? attribute->as_int() : 0;
+    const std::vector<value> & arr = val->as_array();
+    auto key = [&](const value & v) -> value {
+        value k = v;
+        if (!attribute->is_undefined()) {
+            if (attr_is_int && is_val<value_array>(v)) {
+                k = v->at(attr_int);
+            } else if (!attr_is_int && is_val<value_object>(v)) {
+                k = v->at(attribute);
+            } else {
+                throw raised_exception("unique: unsupported object attribute comparison on " + v->type());
+            }
+        }
+        if (!case_sensitive && is_val<value_string>(k)) {
+            jinja::string low = k->as_string().lowercase();
+            return mk_val<value_string>(low);
+        }
+        return k;
+    };
+    std::vector<value> keys, out;
+    for (const auto & item : arr) {
+        value k = key(item);
+        bool seen = false;
+        for (const auto & have : keys) {
+            /* value_compare reads a number against a string as text; jinja2 keeps 1 and "1" apart */
+            if (is_val<value_string>(k) == is_val<value_string>(have) &&
+                value_compare(k, have, value_compare_op::eq)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            keys.push_back(std::move(k));
+            out.push_back(item);
+        }
+    }
+    return is_val<value_tuple>(val) ? mk_val<value_tuple>(std::move(out)) : mk_val<value_array>(std::move(out));
 }
 
 template<bool is_reject>
@@ -924,10 +976,6 @@ const func_builtins & value_bool_t::get_builtins() const {
     return builtins;
 }
 
-[[noreturn]] static value array_unique_not_implemented(const func_args &) {
-    throw not_implemented_exception("Array unique builtin not implemented");
-}
-
 const func_builtins & value_array_t::get_builtins() const {
     static const func_builtins builtins = {
         {"default", default_value},
@@ -1133,7 +1181,10 @@ const func_builtins & value_array_t::get_builtins() const {
             std::reverse(arr.begin(), arr.end());
             return is_val<value_tuple>(val) ? mk_val<value_tuple>(std::move(arr)) : mk_val<value_array>(std::move(arr));
         }},
-        {"unique", array_unique_not_implemented},
+        /* RADIANCE: upstream leaves `unique` a stub that throws, with the same result as a
+         * missing min or max above: GLM-5.3-Flash's template checks its tool-call ids with it,
+         * and the model was reported as having no tool support. */
+        {"unique", unique_fn},
     };
     return builtins;
 }
@@ -1297,7 +1348,7 @@ const func_builtins & value_undefined_t::get_builtins() const {
 //////////////////////////////////
 
 
-static value from_json(const nlohmann::ordered_json & j, bool mark_input) {
+static value from_json(const rad::Json & j, bool mark_input) {
     if (j.is_null()) {
         return mk_val<value_none>();
     } else if (j.is_boolean()) {
@@ -1307,7 +1358,7 @@ static value from_json(const nlohmann::ordered_json & j, bool mark_input) {
     } else if (j.is_number_float()) {
         return mk_val<value_float>(j.get<double>());
     } else if (j.is_string()) {
-        auto str = mk_val<value_string>(j.get<std::string>());
+        auto str = mk_val<value_string>(j.get_ref<const std::string &>());
         if (mark_input) {
             str->mark_input();
         }
@@ -1394,7 +1445,7 @@ bool value_compare(const value & a, const value & b, value_compare_op op) {
 }
 
 template<>
-void global_from_json(context & ctx, const nlohmann::ordered_json & json_obj, bool mark_input) {
+void global_from_json(context & ctx, const rad::Json & json_obj, bool mark_input) {
     // printf("global_from_json: %s\n" , json_obj.dump(2).c_str());
     if (json_obj.is_null() || !json_obj.is_object()) {
         throw std::runtime_error("global_from_json: input JSON value must be an object");
@@ -1403,6 +1454,11 @@ void global_from_json(context & ctx, const nlohmann::ordered_json & json_obj, bo
         JJ_DEBUG("global_from_json: setting key '%s'", it.key().c_str());
         ctx.set_val(it.key(), from_json(it.value(), mark_input));
     }
+}
+
+void global_set_from_json(context & ctx, const std::string & key,
+                          const rad::Json & j, bool mark_input) {
+    ctx.set_val(key, from_json(j, mark_input));
 }
 
 // recursively convert value to JSON string

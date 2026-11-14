@@ -22,7 +22,7 @@
 #include "text/chatfmt.h"
 #include "text/chatparse.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -31,7 +31,7 @@
 #include <string>
 
 using namespace rad;
-using json = nlohmann::ordered_json;
+using json = Json;
 
 /* ------------------------------------------------------------------ the template under test */
 
@@ -164,6 +164,91 @@ TEST(hyv3_template_renders_openai_tool_schemas_and_replayed_history) {
     CHECK(prompt.prompt.find("Summarize the results.") != std::string::npos);
 }
 
+/* A template whose assistant prefix is built from the messages gets each request's own prefix,
+ * never an earlier request's. */
+TEST(a_message_dependent_generation_prompt_is_not_served_from_cache) {
+    ChatTemplate t;
+    REQUIRE(t.load(
+        "{% for m in messages %}{{ m.role + ': ' + m.content + '\\n' }}{% endfor %}"
+        "{% if add_generation_prompt %}assistant-to-{{ messages[-1].content }}:{% endif %}",
+        "", "") >= 0);
+    auto ask = [&](const char* word) -> ChatPrompt {
+        ChatPrompt p;
+        json msgs = json::array({ { { "role", "user" }, { "content", word } } });
+        CHECK(t.apply(msgs, json(), ChatOptions(), &p) >= 0);
+        return p;
+    };
+    const ChatPrompt a = ask("alpha");
+    CHECK_EQ(a.generation_prompt, std::string("assistant-to-alpha:"));
+    CHECK(a.prompt.ends_with(a.generation_prompt));
+    const ChatPrompt b = ask("beta");
+    CHECK_EQ(b.generation_prompt, std::string("assistant-to-beta:"));
+    CHECK(b.prompt.ends_with(b.generation_prompt));
+    const ChatPrompt a2 = ask("alpha");
+    CHECK_EQ(a2.generation_prompt, std::string("assistant-to-alpha:"));
+    CHECK_EQ(a2.prompt, a.prompt);
+}
+
+/* A generation prompt that depends on how many messages there are, ahead of a fixed tail: each
+ * request's is its own, whatever an earlier request with fewer messages rendered. */
+TEST(a_generation_prompt_counted_from_the_messages_follows_each_request) {
+    ChatTemplate t;
+    REQUIRE(t.load(
+        "{% for m in messages %}{{ m.role + ': ' + m.content + '\\n' }}{% endfor %}"
+        "{% if add_generation_prompt %}{% if messages|length > 4 %}[short]{% endif %}"
+        "assistant:{% endif %}",
+        "", "") >= 0);
+    auto ask = [&](int n) -> ChatPrompt {
+        ChatPrompt p;
+        json msgs = json::array();
+        for (int i = 0; i < n; ++i)
+            msgs.push_back({ { "role", i % 2 ? "assistant" : "user" }, { "content", "m" } });
+        CHECK(t.apply(msgs, json(), ChatOptions(), &p) >= 0);
+        return p;
+    };
+    CHECK_EQ(ask(1).generation_prompt, std::string("assistant:"));
+    CHECK_EQ(ask(5).generation_prompt, std::string("[short]assistant:"));
+    CHECK_EQ(ask(1).generation_prompt, std::string("assistant:"));
+}
+
+/* Strings built by concatenation compare, look up and test membership by their text, whatever
+ * pieces they were built from (an empty piece included). */
+TEST(a_concatenated_string_equals_its_text) {
+    ChatTemplate t;
+    REQUIRE(t.load(
+        "{% set k = 'x' ~ '' %}{% set e = '' ~ '' %}"
+        "{{ 'eq' if k == 'x' else 'ne' }} {{ 'eq' if e == '' else 'ne' }} "
+        "{{ {'x': 1}[k] }} {{ 'in' if k in {'x': 1} else 'out' }}"
+        "{% for m in messages %}{% endfor %}",
+        "", "") >= 0);
+    ChatPrompt p;
+    json msgs = json::array({ { { "role", "user" }, { "content", "hi" } } });
+    CHECK(t.apply(msgs, json(), ChatOptions(), &p) >= 0);
+    CHECK(p.prompt.find("eq eq 1 in") != std::string::npos);
+}
+
+/* Tool-call arguments sent as an object reach a template that only takes them as text as their
+ * compact JSON, as when the request sent that text. */
+TEST(object_arguments_reach_a_string_only_template_as_compact_json) {
+    ChatTemplate t;
+    REQUIRE(t.load(
+        "{% for m in messages %}{% if m.tool_calls %}"
+        "{{ '[' + m.tool_calls[0].function.arguments + ']' }}"
+        "{% else %}{{ m.role + ': ' + m.content }}{% endif %}{% endfor %}",
+        "", "") >= 0);
+    json call = { { "id", "c1" }, { "type", "function" },
+                  { "function", { { "name", "f" },
+                                  { "arguments", { { "z", 1 }, { "a", 100000.0 } } } } } };
+    json msgs = json::array({ { { "role", "user" }, { "content", "go" } },
+                              { { "role", "assistant" }, { "content", "" },
+                                { "tool_calls", json::array({ call }) } } });
+    ChatPrompt p;
+    ChatOptions opt;
+    opt.add_generation_prompt = false;
+    CHECK(t.apply(msgs, json(), opt, &p) >= 0);
+    CHECK(p.prompt.find("[{\"z\":1,\"a\":100000.0}]") != std::string::npos);
+}
+
 /* Render one turn, passing `effort` as the template's reasoning_effort when set. */
 static int render_turn(ChatPrompt* p, bool with_tools, const char* effort) {
     json msgs = json::array();
@@ -265,6 +350,21 @@ TEST(replayed_tool_call_arguments_render_as_parameter_xml) {
     /* The raw JSON string must not survive. The needle is the exact string sent, spaces
      * included, because the tool schema in the preamble legitimately contains `"path":`. */
     CHECK(p.prompt.find("{\"path\": \"/work/a.py\"") == std::string::npos);
+
+    /* The same call replayed flat -- no `function` wrapper, no `type` -- renders the same
+     * prompt, as a call whose arguments were never sent renders with an empty object. */
+    json flat = msgs;
+    flat[1]["tool_calls"] = json::array({ json{
+        { "id", "c1" }, { "name", "read" },
+        { "arguments", "{\"path\": \"/work/a.py\", \"limit\": 40}" } } });
+    ChatPrompt pf;
+    CHECK_OK(qwen().t->apply(flat, tools_json(), opt, &pf));
+    CHECK_EQ(pf.prompt, p.prompt);
+    json bare = msgs;
+    bare[1]["tool_calls"] = json::array({ json{ { "id", "c1" }, { "name", "read" } } });
+    ChatPrompt pb;
+    CHECK_OK(qwen().t->apply(bare, tools_json(), opt, &pb));
+    CHECK(pb.prompt.find("<function=read>") != std::string::npos);
 }
 
 /* ------------------------------------------------------------------ golden renders
@@ -1004,6 +1104,105 @@ TEST(chatml_renders_every_turn_in_order_and_marks_the_assistant_prefix) {
                               p.generation_prompt.size(), p.generation_prompt), 0);
 }
 
+/* `reasoning` is the field name vLLM and its router use for an assistant turn's reasoning;
+ * `reasoning_content` is the llama.cpp spelling the templates read. A request replayed
+ * through such a router arrives with only `reasoning`, and the reasoning must still reach
+ * the template: without it the rendered history differs from the tokens that were
+ * generated, so no prefix cache can match it and the model loses its own earlier reasoning. */
+TEST(a_replayed_reasoning_field_reaches_the_template_as_reasoning_content) {
+    ChatTemplate t;
+    REQUIRE(t.load(
+        "{% for m in messages %}{{ m.role + '<' + "
+        "(m.reasoning_content if m.reasoning_content is string else '') + '>' + m.content + ';' }}"
+        "{% endfor %}",
+        "", "") >= 0);
+    auto ask = [&](const json& assistant) -> ChatPrompt {
+        ChatPrompt p;
+        json msgs = json::array({
+            { { "role", "user" }, { "content", "q" } },
+            assistant,
+            { { "role", "user" }, { "content", "next" } },
+        });
+        CHECK(t.apply(msgs, json(), ChatOptions(), &p) >= 0);
+        return p;
+    };
+    const ChatPrompt canonical = ask(json{
+        { "role", "assistant" }, { "content", "a" }, { "reasoning_content", "thought" } });
+    CHECK_EQ(canonical.prompt, std::string("user<>q;assistant<thought>a;user<>next;"));
+
+    /* The alias renders exactly as the canonical spelling does. */
+    const ChatPrompt aliased = ask(json{
+        { "role", "assistant" }, { "content", "a" }, { "reasoning", "thought" } });
+    CHECK_EQ(aliased.prompt, canonical.prompt);
+
+    /* Both spellings present: the canonical one the template reads wins. */
+    const ChatPrompt both = ask(json{
+        { "role", "assistant" }, { "content", "a" },
+        { "reasoning_content", "thought" }, { "reasoning", "other" } });
+    CHECK_EQ(both.prompt, canonical.prompt);
+
+    /* A non-string `reasoning` (a flag or an effort object in other APIs) is not reasoning
+     * text: it renders as none rather than refusing the request. */
+    const ChatPrompt flag = ask(json{
+        { "role", "assistant" }, { "content", "a" }, { "reasoning", true } });
+    CHECK_EQ(flag.prompt, std::string("user<>q;assistant<>a;user<>next;"));
+    const ChatPrompt effort = ask(json{
+        { "role", "assistant" }, { "content", "a" },
+        { "reasoning", { { "effort", "low" } } } });
+    CHECK_EQ(effort.prompt, flag.prompt);
+
+    /* Null or empty canonical fields are the serializers beside a router at work, not a
+     * refusal: the alias fills them, and a lone null renders as no reasoning. */
+    const ChatPrompt null_alias = ask(json{
+        { "role", "assistant" }, { "content", "a" },
+        { "reasoning_content", nullptr }, { "reasoning", "thought" } });
+    CHECK_EQ(null_alias.prompt, canonical.prompt);
+    const ChatPrompt null_only = ask(json{
+        { "role", "assistant" }, { "content", "a" }, { "reasoning_content", nullptr } });
+    CHECK_EQ(null_only.prompt, flag.prompt);
+    const ChatPrompt empty_alias = ask(json{
+        { "role", "assistant" }, { "content", "a" },
+        { "reasoning_content", "" }, { "reasoning", "thought" } });
+    CHECK_EQ(empty_alias.prompt, canonical.prompt);
+
+    /* The other carriers: a `thinking` field, OpenRouter's details (their text, never the
+     * text and its summary both), and a thinking content part. */
+    const ChatPrompt thinking = ask(json{
+        { "role", "assistant" }, { "content", "a" }, { "thinking", "thought" } });
+    CHECK_EQ(thinking.prompt, canonical.prompt);
+    const ChatPrompt details = ask(json{
+        { "role", "assistant" }, { "content", "a" },
+        { "reasoning_details", json::array({
+              { { "type", "reasoning.summary" }, { "summary", "short" } },
+              { { "type", "reasoning.text" }, { "text", "thought" } },
+              { { "type", "reasoning.encrypted" }, { "data", "opaque" } } }) } });
+    CHECK_EQ(details.prompt, canonical.prompt);
+    const ChatPrompt summary_only = ask(json{
+        { "role", "assistant" }, { "content", "a" },
+        { "reasoning_details", json::array({
+              { { "type", "reasoning.summary" }, { "summary", "thought" } } }) } });
+    CHECK_EQ(summary_only.prompt, canonical.prompt);
+    const ChatPrompt part = ask(json{
+        { "role", "assistant" },
+        { "content", json::array({
+              { { "type", "thinking" }, { "thinking", "thought" } },
+              { { "type", "output_text" }, { "text", "a" } } }) } });
+    CHECK_EQ(part.prompt, canonical.prompt);
+
+    /* Two replayed turns keep their own reasoning, in order. */
+    ChatPrompt two;
+    json msgs = json::array({
+        { { "role", "user" }, { "content", "q" } },
+        { { "role", "assistant" }, { "content", "a" }, { "reasoning", "first" } },
+        { { "role", "user" }, { "content", "next" } },
+        { { "role", "assistant" }, { "content", "b" }, { "reasoning_content", "second" } },
+        { { "role", "user" }, { "content", "last" } },
+    });
+    CHECK(t.apply(msgs, json(), ChatOptions(), &two) >= 0);
+    CHECK_EQ(two.prompt,
+             std::string("user<>q;assistant<first>a;user<>next;assistant<second>b;user<>last;"));
+}
+
 TEST(without_a_generation_prompt_nothing_is_appended_for_the_assistant) {
     ChatTemplate t;
     CHECK_OK(t.load(ChatTemplate::chatml_source(), "", ""));
@@ -1112,6 +1311,68 @@ TEST(a_dotted_integer_is_an_index_as_in_jinja2) {
     CHECK_EQ(p.prompt, std::string("hi|assistant"));
 }
 
+/* jinja2's unique: first occurrences in order, strings folded unless case_sensitive, by attribute
+ * where one is given. GLM-5.3-Flash's template checks its tool-call ids with it; while the filter
+ * threw, the capability probe reported the model as having no tool support. */
+TEST(unique_keeps_first_occurrences_as_jinja2_does) {
+    auto render = [](const char* expr) {
+        ChatTemplate t;
+        CHECK_OK(t.load(std::string("{{ ") + expr + " }}", "", ""));
+        json msgs = json::array();
+        msgs.push_back({{"role", "user"}, {"content", "hi"}});
+        ChatPrompt p;
+        ChatOptions opt;
+        opt.add_generation_prompt = false;
+        CHECK_OK(t.apply(msgs, json(), opt, &p));
+        return p.prompt;
+    };
+    CHECK_EQ(render("['a','b','a','c','b'] | unique | list"), std::string("['a', 'b', 'c']"));
+    CHECK_EQ(render("['a','A','b'] | unique | list"), std::string("['a', 'b']"));
+    CHECK_EQ(render("['a','A','b'] | unique(case_sensitive=true) | list"),
+             std::string("['a', 'A', 'b']"));
+    CHECK_EQ(render("[3,1,3,2,1] | unique | list"), std::string("[3, 1, 2]"));
+    CHECK_EQ(render("[] | unique | list"), std::string("[]"));
+    CHECK_EQ(render("[{'n':'x','v':1},{'n':'X','v':2},{'n':'y','v':3}] | unique(attribute='n') "
+                    "| map(attribute='v') | list"),
+             std::string("[1, 3]"));
+    CHECK_EQ(render("[1,'1',1] | unique | list | length"), std::string("2"));
+
+    /* The duplicate-id check of GLM-5.3-Flash's template, in a template that declares tools. */
+    ChatTemplate glm;
+    CHECK_OK(glm.load(
+        "{%- if tools %}<tools>{% for t in tools %}{{ t.function.name }};{% endfor %}</tools>{% endif %}"
+        "{%- set ns = namespace(ids=[]) %}"
+        "{%- for m in messages %}"
+        "{%- if m.tool_calls %}{% for c in m.tool_calls %}{% set ns.ids = ns.ids + [c.id] %}"
+        "<call>{{ c.function.name }}:{{ c.function.arguments | tojson }}</call>{% endfor %}{% endif %}"
+        "<{{ m.role }}>{{ m.content }}</{{ m.role }}>"
+        "{%- endfor %}"
+        "{%- if ns.ids | unique(case_sensitive=true) | list | length != ns.ids | length %}"
+        "{{- raise_exception('duplicate tool call id') }}{%- endif %}"
+        "{%- if add_generation_prompt %}<assistant>{% endif %}", "", ""));
+    CHECK(glm.caps().tools);
+    CHECK(glm.caps().tool_calls);
+    CHECK(glm.caps().probe_error.empty());
+}
+
+/* A tool-bearing probe that throws is reported: the template below declares tools and calls a
+ * filter no Jinja has, which the probe alone would report as a model without tool support. */
+TEST(a_tool_probe_that_throws_says_what_it_threw) {
+    ChatTemplate t;
+    CHECK_OK(t.load(
+        "{%- if tools %}<tools>{{ tools | no_such_filter }}</tools>{% endif %}"
+        "{%- for m in messages %}<{{ m.role }}>{{ m.content }}</{{ m.role }}>{%- endfor %}"
+        "{%- if add_generation_prompt %}<assistant>{% endif %}", "", ""));
+    CHECK(!t.caps().tools);
+    CHECK(t.caps().probe_error.find("no_such_filter") != std::string::npos);
+
+    ChatTemplate plain;
+    CHECK_OK(plain.load(
+        "{%- for m in messages %}<{{ m.role }}>{{ m.content }}</{{ m.role }}>{%- endfor %}"
+        "{%- if add_generation_prompt %}<assistant>{% endif %}", "", ""));
+    CHECK(plain.caps().probe_error.empty());
+}
+
 /* A template that takes one system message, first, as many do, against conversations the Chat
  * Completions API allows: a system message after a user turn, and two at the head. They are
  * rendered with the system messages merged, in order, into one at the head. Any other
@@ -1140,6 +1401,28 @@ TEST(system_messages_a_template_takes_only_first_are_merged_at_the_head) {
                  &d) < 0);
     CHECK(d.error.find("no boom") != std::string::npos);
     CHECK(d.error.find("Unable to generate parser") == std::string::npos);
+
+    /* The merged retry renders the aliased messages: replayed reasoning under its other
+     * name survives the merge exactly as the canonical spelling does. */
+    ChatTemplate tr;
+    CHECK_OK(tr.load(
+        "{%- for m in messages %}"
+        "{%- if m.role == 'system' and not loop.first %}"
+        "{{- raise_exception('System message must be at the beginning.') }}{%- endif %}"
+        "<{{ m.role }}>{{ m.reasoning_content if m.reasoning_content is string else '' }}"
+        "{{ m.content }}</{{ m.role }}>"
+        "{%- endfor %}", "", ""));
+    ChatPrompt e, f;
+    CHECK_OK(tr.apply(json::parse(
+        R"([{"role":"user","content":"hi"},{"role":"system","content":"s"},)"
+        R"({"role":"assistant","content":"a","reasoning":"thought"},)"
+        R"({"role":"user","content":"next"}])"), json(), opt, &e));
+    CHECK_OK(tr.apply(json::parse(
+        R"([{"role":"user","content":"hi"},{"role":"system","content":"s"},)"
+        R"({"role":"assistant","content":"a","reasoning_content":"thought"},)"
+        R"({"role":"user","content":"next"}])"), json(), opt, &f));
+    CHECK_EQ(e.prompt, f.prompt);
+    CHECK(e.prompt.find("thought") != std::string::npos);
 }
 
 /* Unparseable Jinja (common in hand-built containers) is reported at load time as an error value;

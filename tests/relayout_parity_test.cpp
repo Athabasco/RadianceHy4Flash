@@ -17,6 +17,7 @@
 #include "r4d_plugin.h"
 #include "opshapes.h"
 
+#include <array>
 #include <dlfcn.h>
 #include <unistd.h>
 
@@ -171,11 +172,6 @@ std::vector<float> weight(int64_t R, int64_t C, uint64_t seed, int64_t br, int64
     return w;
 }
 
-const Hooks nFp8Frag   { r4d_rad_layout_fp8_block, r4d_rad_relayout_fp8_block,
-                       r4d_rad_unrelayout_fp8_block };
-const Hooks nFp8Rows   { r4d_rad_layout_fp8_rowmajor, nullptr, nullptr };
-const Hooks nFp8Lm     { r4d_rad_layout_fp8_logits, r4d_rad_relayout_fp8_logits,
-                       r4d_rad_unrelayout_fp8_logits };
 const Hooks nHc        { r4d_rad_layout_hc_e4m3, r4d_rad_relayout_hc_e4m3,
                        r4d_rad_unrelayout_hc_e4m3 };
 const Hooks nMtp       { r4d_rad_layout_mtp_e4m3, r4d_rad_relayout_mtp_e4m3,
@@ -202,39 +198,40 @@ Opts fp8_grid() {
 
 }  /* namespace */
 
-TEST(block_fp8_in_fragment_order_and_row_major) {
-    NEED_LIBQUANT();
-    {
-        const int64_t N = 272, K = 384;                  /* a short last row block */
-        const std::vector<float> w = weight(N, K, 11, 128, 128);
+TEST(a_convolution_weight_is_stored_tap_major_and_reads_back) {
+    for (const auto& [co, ci, k] : std::vector<std::array<long long, 3>>{ { 3, 5, 3 }, { 16, 64, 3 },
+                                                                         { 8, 40, 1 }, { 4, 7, 2 } }) {
         Opts kp;
-        kp.i("N", N).i("K", K);
-        golden("fp8 frag", stored("fp8 frag", nFp8Frag, kp, "rtn", fp8_grid(),
-                                  "blk.0.attn_q.weight", N, K, w,
-                                  { { B, { "codes" } }, { BSCALE, { "scale" } } }),
-               0xd60d2b6299d47a63ull);
+        kp.i("cout", co).i("cin", ci).i("k", k);
+        const long long kk = k * k;
+        std::vector<uint16_t> w((size_t)(co * ci * kk));
+        for (size_t i = 0; i < w.size(); ++i) w[i] = (uint16_t)(i * 40503u + 7);
+        RadTensor t{};
+        t.data = w.data();
+        t.dtype = RAD_BF16;
+        t.rank = 2;
+        t.shape[0] = co;
+        t.shape[1] = ci * kk;
+        t.stride[0] = ci * kk;
+        t.stride[1] = 1;
+        const RadEncoding enc = rad_enc_plain(RAD_BF16);
+        const int sel = 0;
+        RadLayout L{};
+        REQUIRE_EQ(r4d_rad_layout_conv_tap(kp.data(), kp.n(), 1, &enc, &sel, &t, 1, &L), RAD_OK);
+        std::vector<uint16_t> got((size_t)(L.bytes / 2), 0xA5A5);
+        REQUIRE_EQ(r4d_rad_relayout_conv_tap(kp.data(), kp.n(), 1, &enc, &sel, &t, 1, got.data(), L.bytes), RAD_OK);
+        int64_t bad = 0;
+        for (long long o = 0; o < co; ++o)
+            for (long long c = 0; c < ci; ++c)
+                for (long long tp = 0; tp < kk; ++tp)
+                    bad += got[(size_t)((o * kk + tp) * ci + c)] != w[(size_t)((o * ci + c) * kk + tp)];
+        CHECK_EQ(bad, (int64_t)0);
+        std::vector<uint16_t> back(w.size(), 0);
+        RadTensor tb = t;
+        tb.data = back.data();
+        REQUIRE_EQ(r4d_rad_unrelayout_conv_tap(kp.data(), kp.n(), 1, &enc, &sel, got.data(), L.bytes, &tb, 1), RAD_OK);
+        CHECK(back == w);
     }
-    {
-        const int64_t N = 400, K = 320;                  /* short blocks on both axes */
-        const std::vector<float> w = weight(N, K, 12, 128, 128);
-        Opts kp;
-        kp.i("N", N).i("K", K);
-        golden("fp8 rows", stored("fp8 rows", nFp8Rows, kp, "rtn", fp8_grid(),
-                                  "blk.0.attn_o.weight", N, K, w,
-                                  { { B, { "codes" } }, { BSCALE, { "scale" } } }),
-               0xe90f8e25169cc5e5ull);
-    }
-}
-
-TEST(the_fp8_lm_head_carries_its_block_scales_in_each_row) {
-    NEED_LIBQUANT();
-    const int64_t V = 300, E = 384;
-    const std::vector<float> w = weight(V, E, 13, 128, 128);
-    Opts kp;
-    kp.i("n_vocab", V).i("n_embd", E);
-    golden("fp8 lm", stored("fp8 lm", nFp8Lm, kp, "rtn", fp8_grid(), "output.weight", V, E,
-                            w, { { LM_W, { "codes", "scale" } } }),
-           0x4a710b4ca7fa4db0ull);
 }
 
 TEST(the_fp8_hyper_connection_and_mtp_rows) {
@@ -846,8 +843,6 @@ TEST(a_kernel_refuses_an_encoding_it_does_not_read) {
     rot.i("N", N).i("K", K).s("dtype", "w4a8h");
     sym.i("N", N).i("K", K).s("dtype", "w4a8");
     asym.i("N", N).i("K", K).s("dtype", "w4a8_asym");
-    /* an fp8 GEMM handed int4 */
-    CHECK_EQ(lay(r4d_rad_layout_fp8_block, dense, B, q_i4, { "codes" }), RAD_E_DTYPE);
     /* a rotated weight to the experts that do not rotate their activation, and the reverse */
     CHECK_EQ(lay(r4d_rad_layout_moe_w4, plain, B, q_i4r, { "codes" }), RAD_E_DTYPE);
     CHECK_EQ(lay(r4d_rad_layout_moe_w4, rot, B, q_i4, { "codes" }), RAD_E_DTYPE);
@@ -858,8 +853,6 @@ TEST(a_kernel_refuses_an_encoding_it_does_not_read) {
     CHECK_EQ(lay(r4d_rad_layout_w4, sym, B, q_i4, { "codes" }), RAD_E_DTYPE);
     /* a block-fp8 weight to the int8 kernel */
     CHECK_EQ(lay(r4d_rad_layout_w8a8, dense, B, q_f8, { "codes" }), RAD_E_DTYPE);
-    /* the right encoding with the wrong planes selected is a shape error, not a pass */
-    CHECK_EQ(lay(r4d_rad_layout_fp8_block, dense, B, q_f8, { "scale" }), RAD_E_SHAPE);
     /* a codebook to the two's complement experts, and -8..7 to the codebook's; the codebook's codes
      * without their table */
     Opts nlk;
@@ -927,80 +920,6 @@ TEST(a_dense_int_kernel_refuses_a_group_it_does_not_compute) {
     CHECK_EQ(lay(r4d_rad_layout_w4, "w4a8", 128, i4_128), RAD_OK);
     CHECK_EQ(lay(r4d_rad_layout_w8a16, "w8a16", 128, i8_128), RAD_OK);
     CHECK_EQ(lay(r4d_rad_layout_w2a8, "w2a8", 128, u2_128), RAD_OK);
-}
-
-/* ParoQuant's rotation pairs are stored as they are, and refused at load when a stage is not a
- * pairing within its own group's 128 columns, which the rotate kernels would index out of bounds. */
-TEST(givens_pairs_are_stored_as_they_are_and_checked) {
-    const int64_t K = 256, R = 2;                    /* two groups, two stages */
-    RadEncoding e = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
-    rad_enc_add_table(&e, "t.pairs", RAD_I32, R, K);
-    const int sel[1] = { rad_enc_find(&e, "t.pairs") };
-    std::vector<int32_t> pairs((size_t)(R * K));
-    for (int64_t r = 0; r < R; ++r)
-        for (int64_t c = 0; c < K; ++c)                /* stage 0 reverses each group, stage 1 not */
-            pairs[(size_t)(r * K + c)] = (int32_t)((c / 128) * 128 + (r ? c % 128 : 127 - c % 128));
-    RadTensor t{};
-    t.data = pairs.data();
-    t.dtype = RAD_I32;
-    t.rank = 2;
-    t.shape[0] = R;
-    t.shape[1] = K;
-    t.stride[0] = K;
-    t.stride[1] = 1;
-    Opts kp;
-    kp.i("n", K).i("stages", 1).i("parts", 2);
-    RadLayout L{};
-    CHECK_EQ(r4d_rad_layout_givens_pairs(kp.data(), kp.n(), 2, &e, sel, &t, 1, &L), RAD_E_UNSUPPORTED);
-    REQUIRE_EQ(r4d_rad_layout_givens_pairs(kp.data(), kp.n(), 1, &e, sel, &t, 1, &L), RAD_OK);
-    REQUIRE_EQ(L.bytes, (int64_t)(R * K * 4));
-    std::vector<uint8_t> dst((size_t)L.bytes);
-    REQUIRE_EQ(r4d_rad_relayout_givens_pairs(kp.data(), kp.n(), 1, &e, sel, &t, 1, dst.data(), L.bytes),
-               RAD_OK);
-    CHECK_EQ(std::memcmp(dst.data(), pairs.data(), dst.size()), 0);
-    std::vector<int32_t> back((size_t)(R * K), -1);
-    RadTensor tb = t;
-    tb.data = back.data();
-    REQUIRE_EQ(r4d_rad_unrelayout_givens_pairs(kp.data(), kp.n(), 1, &e, sel, dst.data(), L.bytes, &tb, 1),
-               RAD_OK);
-    CHECK(back == pairs);
-    /* a pair leaving its group, and a column paired twice in a stage */
-    std::vector<int32_t> out = pairs, dup = pairs;
-    out[(size_t)(K + 5)] = 130;
-    dup[3] = dup[4];
-    for (std::vector<int32_t>* bad : { &out, &dup }) {
-        t.data = bad->data();
-        CHECK_EQ(r4d_rad_relayout_givens_pairs(kp.data(), kp.n(), 1, &e, sel, &t, 1, dst.data(), L.bytes),
-                 RAD_E_FORMAT);
-    }
-}
-
-/* ParoQuant's dense rotation matrices are the "t.dense" table rad-convert composed (checkpoint_test
- * pins the composition by hash). The layout takes the table as stored, byte for byte, and refuses
- * a view of anything else, including the pairs and angles it would have to compose. */
-TEST(givens_dense_layout_is_the_stored_table) {
-    const int64_t K = 256, P = 2, G = 128;
-    RadEncoding e = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
-    rad_enc_add_table(&e, "t.pairs", RAD_I32, P * 3, K);
-    rad_enc_add_table(&e, "t.angle", RAD_F32, P * 3, K / 2);
-    rad_enc_add_table(&e, "t.dense", RAD_F16, P * K / G, G * G);
-    std::vector<uint16_t> dense((size_t)(P * K / G * G * G));
-    for (size_t i = 0; i < dense.size(); ++i) dense[i] = (uint16_t)(i * 2654435761u >> 7);
-    RadTensor t{};
-    t.data = dense.data(); t.dtype = RAD_F16; t.rank = 2;
-    t.shape[0] = P * K / G; t.shape[1] = G * G; t.stride[0] = G * G; t.stride[1] = 1;
-    Opts kp;
-    kp.i("n", K).i("parts", P);
-    const int sel[1] = { rad_enc_find(&e, "t.dense") };
-    RadLayout L{};
-    REQUIRE_EQ(r4d_rad_layout_gdense(kp.data(), kp.n(), 1, &e, sel, &t, 1, &L), RAD_OK);
-    REQUIRE_EQ(L.bytes, (int64_t)(P * K * G * 2));
-    std::vector<uint8_t> dst((size_t)L.bytes);
-    REQUIRE_EQ(r4d_rad_relayout_gdense(kp.data(), kp.n(), 1, &e, sel, &t, 1, dst.data(), L.bytes), RAD_OK);
-    CHECK_EQ(std::memcmp(dst.data(), dense.data(), dst.size()), 0);
-    const int sel2[2] = { rad_enc_find(&e, "t.pairs"), rad_enc_find(&e, "t.angle") };
-    RadTensor two[2] = { t, t };
-    CHECK(r4d_rad_layout_gdense(kp.data(), kp.n(), 1, &e, sel2, two, 2, &L) != RAD_OK);
 }
 
 RAD_TEST_MAIN()

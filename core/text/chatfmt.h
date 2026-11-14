@@ -47,7 +47,7 @@
 #pragma once
 #include "rad_internal.h"
 
-#include <nlohmann/json_fwd.hpp>
+#include "util/json.h"
 
 #include <cstdint>
 #include <string>
@@ -185,8 +185,8 @@ std::string chat_format_describe(const ChatFormat& f);
  * the whole reply. Rule names and structure follow the vendored generator, so both produce the
  * same grammar for a template-analysed format. */
 struct ChatGrammarRequest {
-    const nlohmann::ordered_json* tools = nullptr;        /* the request's tools, or null */
-    const nlohmann::ordered_json* json_schema = nullptr;  /* a response format's schema, or null */
+    const Json* tools = nullptr;        /* the request's tools, or null */
+    const Json* json_schema = nullptr;  /* a response format's schema, or null */
     std::string generation_prompt;
     bool        parallel_tool_calls = true;
     bool        extract_reasoning = true;  /* reasoning_format != "none" */
@@ -204,7 +204,7 @@ struct ChatGrammar {
 
 /* A tool the grammar and the reply parser both read, {"type":"function","function":{...}}; both
  * skip any other. */
-bool chat_function_tool(const nlohmann::ordered_json& tool);
+bool chat_function_tool(const Json& tool);
 
 /* RAD_OK, or RAD_E_INVAL with *why when a tool or schema cannot be expressed. */
 int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, ChatGrammar* out,

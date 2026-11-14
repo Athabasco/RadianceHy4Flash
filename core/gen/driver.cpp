@@ -399,9 +399,15 @@ int Driver::admit_locked() {
         }
         if (j.failed) continue;
         if (!ok) {
-            /* KV is short: release what this request took and wait. */
+            /* KV is short: release what this request took and wait, unless nothing is running
+             * that would free any. */
             release_kv_locked(j);
-            break;
+            bool running = false;
+            for (const auto& o : jobs_) running = running || o->admitted;
+            if (running) break;
+            fail_locked(j, RAD_E_FULL, "the KV cache cannot hold this prompt, and nothing is running "
+                                       "that would free it; try a shorter prompt");
+            continue;
         }
         if (discrete()) {
             j.sigmas = schedule_discrete(decl_, table_, r.scheduler, r.steps);

@@ -1,5 +1,6 @@
 #include "text/tokenizer.h"
 #include "text/tokenizer_bpe.h"
+#include "util/simd.h"
 #include "text/tokenizer_grapheme.h"
 #include "text/tokenizer_nfc.h"
 #include "text/tokenizer_regex.h"
@@ -956,6 +957,7 @@ struct EncodeScratch {
     std::string          canon;
     std::vector<TokSpan> next, found, match;
     std::vector<BpeSym>  syms;
+    BpeMergeScratch      merge;
 };
 
 /* One Split step over every piece. The output pieces are canonical UTF-8: a piece that is not is
@@ -1164,7 +1166,7 @@ void bpe_word(const TokEncoder& e, std::string_view w, std::vector<int32_t>& out
             i += len;
         }
     }
-    bpe_merge(syms, e.merges);
+    bpe_merge(syms, e.merges, sc.merge);
     if (whole >= 0 && known == 0) {
         const bool itself = syms.size() == 1 && syms[0].id == whole;
         e.self_merges[whole].store(itself ? 1 : 2, std::memory_order_relaxed);
@@ -1787,7 +1789,9 @@ std::string utf8_sanitize(std::string_view s) {
     auto flush_good = [&] { out.append(s.data() + good, i - good); good = i; };
 
     while (i < n) {
-        if ((unsigned char)s[i] < 0x80) { ++i; continue; }
+        /* ASCII is copied verbatim either way, so jump straight to the next non-ASCII byte
+         * (simd::first_non_ascii) instead of testing bytes one at a time. */
+        if ((unsigned char)s[i] < 0x80) { i += simd::first_non_ascii(s.data() + i, n - i); continue; }
         size_t part = 0;
         const size_t len = utf8_seq(s, i, &part);
         if (len) { i += len; continue; }
@@ -1804,7 +1808,7 @@ std::string utf8_sanitize(std::string_view s) {
 size_t utf8_valid_prefix(std::string_view s) {
     size_t i = 0, part = 0;
     while (i < s.size()) {
-        if ((unsigned char)s[i] < 0x80) { ++i; continue; }
+        if ((unsigned char)s[i] < 0x80) { i += simd::first_non_ascii(s.data() + i, s.size() - i); continue; }
         const size_t len = utf8_seq(s, i, &part);
         if (!len) break;
         i += len;

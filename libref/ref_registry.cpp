@@ -647,7 +647,7 @@ static const RadOperandSpec oMoeGemm[] = { OPD("a"), WTAB("w"), OPD("sorted_tok"
 static const RadParamSpec pMoeGemmQ[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"),
                                           P_INT("top_k"), P_INT("group"), P_STR("a_order"),
                                           P_STR("dtype"), P_INTO("N_odd"), P_INTO("K_odd"),
-                                          P_INTO("parts") };
+                                          P_INTO("parts"), P_INTO("a_group") };
 static const RadOperandSpec oMoeGemmQ[] = { OPD("a"), OPD_O("a_scale"), WTAB("w"), WTAB("w_scale"),
                                             OPD("sorted_tok"), OPD("expert_offset"),
                                             WTAB("w_odd"), WTAB("w_odd_scale"), OUT("y") };
@@ -658,7 +658,7 @@ static const RadParamSpec pMoeGemmQMod4[] = { P_INT("M"), P_INT("N"), P_INT("K")
                                               P_INT("top_k"), P_INT("group"), P_STR("a_order"),
                                               P_STR("dtype"), P_INTO("N_1"), P_INTO("K_1"),
                                               P_INTO("N_2"), P_INTO("K_2"), P_INTO("N_3"),
-                                              P_INTO("K_3"), P_INTO("parts") };
+                                              P_INTO("K_3"), P_INTO("parts"), P_INTO("a_group") };
 static const RadOperandSpec oMoeGemmQMod4[] = { OPD("a"), OPD_O("a_scale"), WTAB("w"),
                                                 WTAB("w_scale"), OPD("sorted_tok"),
                                                 OPD("expert_offset"), WTAB("w_1"),
@@ -1201,6 +1201,8 @@ static const RadOpSchema kSchemas[] = {
   "quantised from the NARROWED x and not from the accumulator. With `rotate` (and `group`), `rq` "
   "and `rscale` carry had_quant_act_fp8 of the same stored x: each scale group rotated by an "
   "unnormalised Hadamard before its absmax, for a consumer whose weight carries the rotation. "
+  "An int8 `q` or `rq` takes int8 codes instead (scale absmax / 127), quant_act_i8g's and "
+  "had_quant_act_i8g's. "
   "`mix` names the mixing matrices' STORED format, \"bf16\" or \"e4m3\"; the arithmetic is the "
   "same and an oracle reads either as the dense tensor its kernel's inverse returns." },
 { "hc_write", ARR(pHcWrite), ARR(oHcWrite),
@@ -1477,31 +1479,17 @@ static const RadOpSchema kSchemas[] = {
   "with log probability parent + log_softmax(score / temp) over them, and each round selects the "
   "unselected child with the largest (ties to the first pushed). tokens[j-1] and parents[j-1] are "
   "the j-th selected node and its parent's index (0 the anchor)." },
-{ "givens_dense_quant", ARR(pGivensDense), ARR(oGivensDense),
-  "ParoQuant's activation quantiser with the rotation as a dense per-group matrix: y = T (x / "
-  "rscale) for each of `parts` rotated copies, T the [128, 128] f16 matrix a (part, 128-column "
-  "group) that its Givens stages compose to, then the block-scaled quantiser `out` names "
-  "(\"i8\": scale amax / 127, round to nearest; \"fp8\": E4M3, amax / 448). q is [M, parts * n] "
-  "and scale [M, parts * n / group]; tdense is [parts * n, 128]. The same activation as "
-  "the sequential rotation, up to the f16 rounding of T." },
-{ "givens_rotate", ARR(pGivensRotate), ARR(oGivensRotate),
-  "ParoQuant's rotation without a quantiser: y = x / rscale rotated by `stages` rounds of Givens "
-  "pairs, `parts` copies side by side ([M, parts * n]) in y's own dtype. For a weight whose GEMM "
-  "reads a 16-bit activation. `group` is the width a pair stays inside." },
 /* The rotated fp8 twin. Unlike had_quant_act_i8, the group is both rotation width and scale
  * granularity, and the factor of `group` is left entirely to the paired w4a8h weight plane, where
  * the division is an exact exponent shift on a bf16 (libref/ref_quant.cpp). */
-{ "had_quant_act_fp8", ARR(pQuant), ARR(oQuantFp8),
-  "A Walsh-Hadamard rotation of width `group` along n, then symmetric E4M3 per group: scale = "
-  "amax(rotated) / 448, shaped [M, n/group] in f32. n must be a multiple of `group` -- a rotation "
-  "block cannot straddle the end of a row. NOT interchangeable with quant_act_fp8 in either "
-  "direction: the consumer must be a weight that was rotated the same way." },
 /* Its int8 twin, the activation of the i8a8h GEMMs; the factor of `group` is the weight's here
  * too. */
 { "had_quant_act_i8g", ARR(pQuant), ARR(oQuantFp8),
   "quant_act_i8g with a Walsh-Hadamard rotation of width `group` along n first: scale = "
   "amax(rotated) / 127 per group, [M, n/group] in f32, n a multiple of `group`. Pairs with an i8 "
-  "weight rotated the same way, its scale carrying the factor of `group` (dtype i8a8h)." },
+  "weight rotated the same way, its scale carrying the factor of `group` (dtype i8a8h). A `group` "
+  "above 128 is whole 128-wide rotations under one scale (IQ8R's 256), the weight's scale "
+  "carrying the factor of 128." },
 /* The calibration op, the only one no forward pass issues: it runs under a calibration flag and
  * its output is read at convert time, in another process, through a file. `dtype` is the input's:
  * fp8a8 where the tap is a quantiser's output, bf16 without `a_scale` for a plain activation. */
@@ -1883,10 +1871,6 @@ static const RadOpSchema kSchemas[] = {
   "For a row with RAD_SP_LOGPROBS: the raw logits' max, sum of exp(l - max) and k largest as (id, "
   "logit) pairs, descending, ties to the lower id. Other rows are not written." },
 /* ---- image generation -------------------------------------------------------------------- */
-{ "ln_mod_quant_fp8", ARR(pLnModQ), ARR(oLnModQ),
-  "the DiT block's norm in front of a quantised linear, in one pass: with `gated` 1 the branch "
-  "before it is added first, x = bf16(x + bf16(bf16(tanh(g[seq])) * y)); then z = ln_mod(x) and "
-  "(q, scale) = quant_act_fp8(z, group) -- written when bound, z." },
 { "ln_mod", ARR(pLnMod), ARR(oLnMod),
   "y = bf16(bf16(LN(x)) * bf16(1 + s[seq])): a layer norm with no gain or bias, then the row's "
   "sequence's modulation row of `s` ([n_seq, >= n] at its own pitch). A diffusion transformer's "
@@ -1969,9 +1953,6 @@ static const RadOpSchema kSchemas[] = {
   "(no tanh), stored; then n1 = bf16(x * rsqrt(mean(x^2) + eps)), n2 = bf16(n1 * w), "
   "m = bf16(n2 * bf16(1 + scale[seq])), z = bf16(m + shift[seq]), `s` [n_seq, >= 2n] holding "
   "[shift | scale] at its own pitch." },
-{ "rms_mod_quant_fp8", ARR(pRmsModQ), ARR(oRmsModQ),
-  "rms_mod with the norm chain in bf16, then (q, scale) = quant_act_fp8(z, group) as "
-  "ln_mod_quant_fp8 makes them; z written when bound." },
 { "flow_x0_step", ARR(pMnD), ARR(oFlowX0),
   "a sampler step toward a data-ward velocity's clean estimate, in f32: st = 1 - t, "
   "d = x + st v, r = sigma_next / sigma, x = r x + (1 - r) d, each product and sum rounded "
@@ -2193,10 +2174,6 @@ static const RadOpSchema kSchemas[] = {
   "rmsnorm, for rows a model declares in thousands (the head norms over head_dim)." },
 { "rope_rows", ARR(pRope), ARR(oRope),
   "rope, for a model that wants the per-(token, pair) angles form at prefill row counts." },
-{ "gemm_nt_q_short", ARR(pGemmQ), ARR(oGemmQ),
-  "gemm_nt_q, for the short-prompt split rule's rows." },
-{ "gemm_nt_q_gated_wide", ARR(pGemmQGated), ARR(oGemmQGated),
-  "gemm_nt_q_gated at any M." },
 };
 
 /* ================================================================== the kernel table */
@@ -2515,19 +2492,9 @@ SIMPLE("ref_dflash_markov_greedy_f32", "dflash_markov_greedy_f32", "draft",
 SIMPLE("ref_dflash_tree", "dflash_tree", "draft",
        "DFlash2's candidate lattice grown best-first into a tree",
        "i32 candidates, bf16 codebooks, i32 tokens and parents out", ref_dflash_tree),
-SIMPLE("ref_givens_rotate", "givens_rotate", "quant",
-       "channel scale and Givens rotations per part, in the output's dtype",
-       "float in, float out; int32 pairs, f32 angles and channel scales", ref_givens_rotate),
-SIMPLE("ref_givens_dense_quant", "givens_dense_quant", "quant",
-       "the rotation as a dense per-group matrix, then the block-scaled int8 or E4M3 quantiser",
-       "float in, int8 or fp8_e4m3 out, f32 scale per group; f16 matrices and f32 channel scales",
-       ref_givens_dense_quant),
-SIMPLE("ref_had_quant_act_fp8", "had_quant_act_fp8", "quant",
-       "width-`group` Hadamard, then the same symmetric block-scaled E4M3 quantiser",
-       "float in, fp8_e4m3 out, f32 scale per group; n a multiple of group",
-       ref_had_quant_act_fp8),
 SIMPLE("ref_had_quant_act_i8g", "had_quant_act_i8g", "quant",
-       "width-`group` Hadamard, then the symmetric int8 quantiser, one scale per group",
+       "width-`group` Hadamard (128-wide rotations where `group` is wider), then the symmetric "
+       "int8 quantiser, one scale per group",
        "float in, i8 out, f32 scale per group; n a multiple of group",
        ref_had_quant_act_i8g),
 SIMPLE("ref_gram_accum", "gram_accum", "quant",
@@ -2728,9 +2695,6 @@ SIMPLE("ref_ln_mod", "ln_mod", "norm", "gainless layer norm times (1 + a sequenc
        DT_FLOAT, ref_ln_mod),
 SIMPLE("ref_gate_add", "gate_add", "elem", "x += act(gate row) * y, act tanh or none", DT_FLOAT,
        ref_gate_add),
-SIMPLE("ref_ln_mod_quant_fp8", "ln_mod_quant_fp8", "norm",
-       "gated residual, gainless layer norm times (1 + scale row), block-scaled E4M3",
-       DT_FLOAT, ref_ln_mod_quant_fp8),
 SIMPLE("ref_timestep_embed", "timestep_embed", "elem", "sinusoidal timestep embedding",
        DT_FLOAT, ref_timestep_embed),
 SIMPLE("ref_gather_rows2", "gather_rows2", "elem", "rows from two sources by a signed index",
@@ -2769,8 +2733,6 @@ SIMPLE("ref_attn_prefix_self", "attn_prefix_self", "attn",
 SIMPLE("ref_rms_mod", "rms_mod", "norm",
        "gated residual, RMS norm with a gain times (1 + scale row) plus a shift row", DT_FLOAT,
        ref_rms_mod),
-SIMPLE("ref_rms_mod_quant_fp8", "rms_mod_quant_fp8", "norm",
-       "gated residual, modulated RMS norm, block-scaled E4M3", DT_FLOAT, ref_rms_mod_quant_fp8),
 SIMPLE("ref_flow_x0_step", "flow_x0_step", "elem", "a sampler step toward the clean estimate",
        DT_FLOAT, ref_flow_x0_step),
 SIMPLE("ref_flow_res_multistep", "flow_res_multistep", "elem",
@@ -2876,12 +2838,6 @@ SIMPLE("ref_sub_i32", "sub_i32", "elem", "a device int32 vector less a device sc
 SIMPLE("ref_rmsnorm_rows", "rmsnorm_rows", "norm", "rmsnorm under its row-form name", DT_FLOAT,
        ref_rmsnorm),
 SIMPLE("ref_rope_rows", "rope_rows", "attn", "rope under its row-form name", DT_FLOAT, ref_rope),
-ROWL_GQ("ref_gemm_nt_q_short", "gemm_nt_q_short", "gemm", "gemm_nt_q under its row-form name",
-     "as ref_gemm_nt_q", ref_check_gemm_q, ref_gemm_nt_q_m2, ref_layout_gemm_q_m2,
-     ref_relayout_gemm_q_m2, ref_unrelayout_gemm_q_m2),
-SIMPLE("ref_gemm_nt_q_gated_wide", "gemm_nt_q_gated_wide", "gemm",
-       "gemm_nt_q_gated under its row-form name", "fp8_e4m3 operands, fp8_e4m3 out, f32 scale",
-       ref_gemm_nt_q_gated),
 };
 
 /* ================================================================== plugin exports */

@@ -40,7 +40,7 @@
 #include "text/chatfmt.h"
 
 #include <arch/rad_gemma4_chat.h>
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <chrono>
@@ -54,7 +54,7 @@
 #include <vector>
 
 using namespace rad;
-using ojson = nlohmann::ordered_json;
+using ojson = Json;
 
 namespace {
 
@@ -1875,7 +1875,7 @@ TEST(json_schema_walks_write_only_valid_instances) {
         ++finished;
         bool ok = false;
         try {
-            const nlohmann::json j = nlohmann::json::parse(text);
+            const Json j = Json::parse(text);
             ok = j.is_object() && j.contains("n") && j.contains("s") && j["n"].is_number_integer() &&
                  j["n"].get<int64_t>() >= -20 && j["n"].get<int64_t>() <= 300 && j["s"].is_string();
             if (ok) {

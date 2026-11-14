@@ -354,10 +354,12 @@ static const RadOperandSpec oMoeGemmQ[] = { { "a", RAD_OPD_IN, 0 },
                                             { "w_odd", RAD_OPD_WTAB, 0 },
                                             { "w_odd_scale", RAD_OPD_WTAB, 0 },
                                             { "y", RAD_OPD_OUT, 0 } };
+/* `a_group` is an int8 activation's scale group, which no row here reads: the dtypes this library
+ * serves take E4M3 or int4 activations, and the op's schema is one for every library. */
 static const RadParamSpec pMoeGemmQ[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"),
                                           P_INT("top_k"), P_INT("group"), P_STR("a_order"),
                                           P_STR("dtype"), P_INTO("N_odd"), P_INTO("K_odd"),
-                                          P_INTO("parts") };
+                                          P_INTO("parts"), P_INTO("a_group") };
 
 /* moe_gemm_q dtype w4a8: the grouped int4 GEMM (r3d_moe_gemm_w4a8.hip) is a row of the moe_gemm_q
  * op above (two's-complement int4 experts, a bf16 scale per (row, 128 of K), bf16 out; the int8 or
@@ -589,7 +591,8 @@ static const RadParamSpec pMoeGemmQMod4[] = { P_INT("M"), P_INT("N"), P_INT("K")
                                               P_INT("n_expert"), P_INT("top_k"), P_INT("group"),
                                               P_STR("a_order"), P_STR("dtype"), P_INTO("N_1"),
                                               P_INTO("K_1"), P_INTO("N_2"), P_INTO("K_2"),
-                                              P_INTO("N_3"), P_INTO("K_3"), P_INTO("parts") };
+                                              P_INTO("N_3"), P_INTO("K_3"), P_INTO("parts"),
+                                              P_INTO("a_group") };
 static const RadOperandSpec oMoeGemmQMod4[] = { { "a", RAD_OPD_IN, 0 }, { "a_scale", RAD_OPD_IN, 1 },
                                                 { "w", RAD_OPD_WTAB, 0 }, { "w_scale", RAD_OPD_WTAB, 0 },
                                                 { "sorted_tok", RAD_OPD_IN, 0 }, { "expert_offset", RAD_OPD_IN, 0 },

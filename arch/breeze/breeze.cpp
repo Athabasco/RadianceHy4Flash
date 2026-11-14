@@ -225,7 +225,7 @@ struct Model {
     rad_buf b_vout = 0, b_audio = 0;
 };
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 /* ================================================================== declare helpers */
 static rad_op norm_op(RadBuilder* b, int64_t rows, int64_t n, double eps, rad_weight w, rad_buf x,
@@ -1185,8 +1185,9 @@ static int check_format(const RadModelMeta* meta) {
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
-    Model& m = g_model[ctx->rank];
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
+    Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     RAD_ARCH_TRY(check_format(meta));
@@ -1475,7 +1476,7 @@ static void step_vocode(RadCtx* c, const RadBatch* batch, const Model& m) {
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    const Model& m = g_model[rad_rank(c)];
+    const Model& m = g_model[rad_slot(c)];
     if (!batch->gen || !batch->agen_b) {
         rad_step_fail(c, "breeze is an audio generator and runs generator passes only");
         return;
@@ -1521,6 +1522,8 @@ RAD_ARCH_PROBE(breeze)
 extern "C" int64_t rad_arch_text_prepare(int field, const char* in, char* out, int64_t cap) {
     return breeze::text_prepare(field, in, out, cap);
 }
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(breeze, "breeze", "", "0.1.0",
                 "Breeze-TTS-2: a T5Gemma 2 text encoder over a Qwen3 backbone with a 16-codebook "
                 "depth decoder and the Qwen3-TTS 12 Hz codec; 24 kHz mono speech")

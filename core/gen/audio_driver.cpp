@@ -405,7 +405,13 @@ int AudioDriver::admit_locked() {
                     if (kv_->has_sequence(j.seq[b])) kv_->free_sequence(j.seq[b]);
                     j.seq[b] = 0;
                 }
-            break;
+            /* With nothing running to free blocks, waiting would never end. */
+            bool running = false;
+            for (const auto& o : jobs_) running = running || o->admitted;
+            if (running) break;
+            fail_locked(j, RAD_E_FULL, "the KV cache cannot hold this piece, and nothing is running "
+                                       "that would free it; ask for a shorter piece");
+            continue;
         }
         j.have_kv = true;
         j.lane = free_lanes_.back();

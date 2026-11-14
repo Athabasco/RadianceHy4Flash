@@ -10,7 +10,7 @@ Ryzen AI Max+ 395): specialised HIP kernels behind the same plain C ABI libr4d e
 libr3d serves the whole RDNA3 family (`^gfx11`), gfx1151 included; libhalo serves gfx1151 only.
 Both are built when `RAD_GPU_TARGETS` names gfx1151, and on a Strix Halo libhalo is the one used:
 
-- with no `--kernels` list the loader takes libraries in file-name order, so `libhalo.so` comes
+- with no `kernels` list the loader takes libraries in file-name order, so `libhalo.so` comes
   ahead of `libr3d.so`, and the first library with a row for an op supplies it (docs/PLUGIN.md).
   An op libhalo has no row for falls through to libr3d;
 - `rad_plugin_open` (`halo_rows.cpp`) declines every machine whose KFD topology lists no gfx1151,
@@ -20,7 +20,7 @@ Both are built when `RAD_GPU_TARGETS` names gfx1151, and on a Strix Halo libhalo
   without that check, from laying weights out for it. A process without `/dev/kfd` (a container
   given no card, a machine with no amdgpu) sees no gfx1151 and declines it too.
 
-An explicit `--kernels` list orders the libraries as given; name `libhalo` before `libr3d`.
+An explicit `kernels` list (`server.kernels`, or a tool's `--kernels`) orders the libraries as given; name `libhalo` before `libr3d`.
 
 ## What is shared with libr4d, and what is not
 

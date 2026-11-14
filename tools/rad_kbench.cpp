@@ -1588,8 +1588,13 @@ void Replay::run_one(size_t fi, const KfCase& c, const RadOpSchema* schema,
             }
         }
 
-        int s, sync = RAD_OK;
-        {
+        /* A row with per-instance state is set up as the engine sets it up (one rank here) and
+         * torn down once the launch has drained. */
+        void* inst = nullptr;
+        int s = row->info->init ? row->info->init(a.p, a.n_p, 0, 1, &inst) : RAD_OK;
+        int sync = RAD_OK;
+        if (s >= 0) {
+            a.instance = inst;
             const auto l0 = std::chrono::steady_clock::now();
             s = row->info->launch(&a, dom == RAD_DOMAIN_DEVICE ? stream : nullptr);
             sync = (s >= 0 && dom == RAD_DOMAIN_DEVICE) ? rad_stream_sync(stream) : RAD_OK;
@@ -1599,6 +1604,7 @@ void Replay::run_one(size_t fi, const KfCase& c, const RadOpSchema* schema,
             ph_.launch_by_lib[lib] += sec;
             checked_s = sec;
         }
+        if (row->info->init && row->info->fini) row->info->fini(inst);
         if (s < 0 || sync < 0) {
             /* A kernel refusing a geometry its own constraints accepted is a bug in the row
              * (spec §17). */
@@ -2280,7 +2286,7 @@ void usage() {
         "      --report FILE  write the markdown report: a summary of every loaded library, the\n"
         "                     op-by-library completeness matrix, every case and its error, the\n"
         "                     speed table, and every skip named\n"
-        "      --kv-cache-dtype T  bf16 | fp8, the cache width declare is run at, as it is on the\n"
+        "      --kv-cache-dtype T  bf16 | i8, the cache width declare is run at, as it is on the\n"
         "                     engine: an architecture whose attention kernels serve only one width\n"
         "                     declares no attention at the other. Default bf16\n"
         "      --num-speculative-tokens N\n"
@@ -2366,9 +2372,9 @@ int main(int argc, char** argv) {
         else if (a == "--mm-max-patches") mm_max_patches = std::atoll(next("--mm-max-patches"));
         else if (a == "--kv-cache-dtype") {
             const std::string v = next("--kv-cache-dtype");
-            if (v == "fp8")       kv_dtype = RAD_F8E4M3;
+            if (v == "i8")        kv_dtype = RAD_I8;
             else if (v != "bf16") { std::fprintf(stderr, "rad-kbench: --kv-cache-dtype takes bf16 "
-                                                         "or fp8, not '%s'\n", v.c_str());
+                                                         "or i8, not '%s'\n", v.c_str());
                                     return 2; }
         }
         else if (a == "--record")  record_path  = next("--record");
@@ -3195,9 +3201,17 @@ int main(int argc, char** argv) {
                             a.scratch_bytes = need;
                         }
                     }
-                    const int s = row->info->launch(&a, stream);
-                    if (s < 0) return s;
-                    return rad_stream_sync(stream);
+                    /* Per-instance state, as the replay sets it up (one rank). */
+                    void* inst = nullptr;
+                    if (row->info->init) {
+                        const int is = row->info->init(a.p, a.n_p, 0, 1, &inst);
+                        if (is < 0) return is;
+                        a.instance = inst;
+                    }
+                    int s = row->info->launch(&a, stream);
+                    if (s >= 0) s = rad_stream_sync(stream);
+                    if (row->info->init && row->info->fini) row->info->fini(inst);
+                    return s;
                 };
 
                 /* The oracle's launch counts toward its library's share of the launch phase. */

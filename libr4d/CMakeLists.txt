@@ -123,8 +123,6 @@ set(R4D_UNITS
   "r4d_kda|"
   # Mamba-2's selective state update (Nemotron-H), the KDA kernel's register layout.
   "r4d_ssd|"
-  "r4d_moe_mxfp4|"
-  "r4d_fp8_f32scale|"
   "r4d_ngram_ids|"
   "r4d_ple_gate_bf16|"
   "r4d_ple_conv_bf16|"
@@ -145,7 +143,6 @@ set(R4D_UNITS
   "r4d_gemm_w4a16_nt_m64|"
   "r4d_gemm_w5a16_nt_m64|"
   "r4d_gemm_wpa8i8_tiled|"
-  "r4d_givens_dense|"
   "r4d_gemm_w8a16_nt_m64|"
   "r4d_gemm_w2a8_nt|"
   "r4d_gemm_w4a8_nt_m64|"
@@ -157,19 +154,18 @@ set(R4D_UNITS
   "r4d_gemm_mxfp4a8_tiled|"
   "r4d_gemm_mxfp4a8_decode|"
   "r4d_gemm_mxfp4a8_gemv|"
-  # M2XFP4 (arXiv 2601.19213 §4.4.2): the decode and tiled rows at the m2xfp4 encoding, one meta
-  # plane more. Same bands and fold as the OCP rows; the meta multipliers ride r4d_m2xfp4.h's table.
-  "r4d_gemm_m2xfp4a8_tiled|"
-  "r4d_gemm_m2xfp4a8_decode|"
   # Block-scaled FP8 (the format Qwen3.8-27B-FP8 ships in). The 128x128 block is fixed by the
   # checkpoint, and the entry points reject a mismatch.
   "r4d_gemm_fp8a16_nt_m1|"
   "r4d_gemm_fp8a8|"
   "r4d_gemm_iqr|"
+  "r4d_gemm_iqr_p1|"
+  "r4d_gemm_iqr_p2|"
+  "r4d_gemm_iqr_p3|"
+  "r4d_moe_iqr|"
   "r4d_iqr_embed|"
   "r4d_logits_vocab|"
   "r4d_quant_act_fp8|"
-  "r4d_givens_rotate|"
   "r4d_fused_quant_fp8|"
   "r4d_gram_accum_fp8|"
   "r4d_qsa_block_key_bf16|"
@@ -216,6 +212,8 @@ set(R4D_UNITS
   # Routed MoE: router, scatter, the grouped block-scaled fp8 GEMM and gather, in one unit because
   # the other three only feed the GEMM.
   "r4d_moe|"
+  # Blocks a row keeps for an output buffer, freed with the memory they serve (r4d_keyed.h).
+  "r4d_keyed|"
 )
 
 set(R4D_SRC "")
@@ -241,7 +239,12 @@ endforeach()
 # descriptions and fusion claims. They are pure host C++ that includes neither r4d.h nor
 # hip_runtime.h, so these tables compile and can be inspected without ROCm.
 set(R4D_DECLARATION r4d_rows.cpp r4d_layout.cpp r4d_fp8_layout.cpp r4d_iqr_layout.cpp r4d_shapes.cpp
-                    r4d_fuse.cpp)
+                    r4d_fuse.cpp r4d_hsimd.cpp)
+# The relayouts' hot loops, once per CPU level (r4d_hsimd.h); r4d_hsimd.cpp picks one at runtime.
+include(${CMAKE_CURRENT_LIST_DIR}/../cmake/RadSimdLevels.cmake)
+rad_simd_level_objects(r4d_hsimd ${CMAKE_CURRENT_SOURCE_DIR}/r4d_hsimd_kernels.cpp R4D_HSIMD_OBJS
+                       DEFINE R4D_HSIMD_LEVEL INCLUDES ${CMAKE_CURRENT_SOURCE_DIR})
+list(APPEND R4D_DECLARATION ${R4D_HSIMD_OBJS})
 
 rad_add_plugin(libr4d kernels
   SOURCES     ${R4D_DECLARATION}

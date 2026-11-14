@@ -1033,7 +1033,9 @@ static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
 
     const Mat ma = as_mat(A, K);
     const Scales SA = make_scales(as_, AR, K, false);
-    const int64_t gp = p_int(a, "group", 0);
+    /* The activation's scales are per `a_group` of K where the caller states one (an int8
+     * activation at one scale per 256 against experts scaled per 128), else per `group`. */
+    const int64_t gp = p_int(a, "a_group", p_int(a, "group", 0));
     if (quant && gp > 0 && SA.p && SA.group != gp) return RAD_E_SHAPE;
 
     const int64_t y_rs = row_stride(Y, N);

@@ -1018,6 +1018,9 @@ static const RadOperandSpec oMoeGemm[] = {
 static const RadParamSpec pMoeGemmQ[] = {
     P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"), P_INT("top_k"), P_INT("group"),
     P_STR("a_order"), P_STR("dtype"), P_INTO("N_odd"), P_INTO("K_odd"), P_INTO("parts"),
+    /* An int8 activation's scale group, which no row here reads: the op's schema is one for every
+     * library. */
+    P_INTO("a_group"),
 };
 static const RadOperandSpec oMoeGemmQ[] = {
     { "a",             RAD_OPD_IN,   0 },
@@ -1039,7 +1042,7 @@ static const RadOperandSpec oMoeGemmQ[] = {
 static const RadParamSpec pMoeGemmQMod4[] = {
     P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"), P_INT("top_k"), P_INT("group"),
     P_STR("a_order"), P_STR("dtype"), P_INTO("N_1"), P_INTO("K_1"), P_INTO("N_2"), P_INTO("K_2"),
-    P_INTO("N_3"), P_INTO("K_3"), P_INTO("parts"),
+    P_INTO("N_3"), P_INTO("K_3"), P_INTO("parts"), P_INTO("a_group"),
 };
 static const RadOperandSpec oMoeGemmQMod4[] = {
     { "a",             RAD_OPD_IN,   0 },
@@ -1830,9 +1833,11 @@ static const RadParamSpec pSwigluClampedQuant[] = { P_INT("M"), P_INT("n"), P_F6
                                                     P_INT("group"), P_STR("dtype") };
 static const RadParamSpec pDsaPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_STR("dtype"),
                                          P_INTO("block_size") };
+/* `kv_dtype` is the latent cache's, absent or bf16 for the rows here: the op's schema is one for
+ * every library, and the E4M3 cache has rows in libr4d alone. */
 static const RadParamSpec pMlaAttn[] = { P_INT("M"),      P_INT("latent_dim"), P_INT("heads"),
                                          P_INT("blocks"), P_INT("block_size"), P_F64("scale"),
-                                         P_STR("dtype") };
+                                         P_STR("dtype"),  P_STRO("kv_dtype") };
 static const RadParamSpec pMlaProject[] = { P_INT("M"),          P_INT("heads"), P_INT("head_dim"),
                                             P_INT("latent_dim"), P_STR("mode"),  P_STR("dtype") };
 static const RadOperandSpec oMlaAttn[] = { { "q", RAD_OPD_IN, 0 },
@@ -2345,7 +2350,7 @@ static const RadParamSpec pLogprobs[] = {
 };
 static const RadOperandSpec oLogprobs[] = {
     { "logits", RAD_OPD_IN,  0 },
-    { "params", RAD_OPD_IN,  0 },
+    { "params", RAD_OPD_IN,  1 },
     { "stats",  RAD_OPD_OUT, 0 },
 };
 static const RadOperandSpec oNarrow[] = {
@@ -6219,7 +6224,8 @@ static const RadKernelInfo kKernels[] = {
   "the raw distribution's summary for a logprobs row: max, sum of exp(l - max), the k largest",
   "any vocabulary; k <= 64, the LDS the sort runs in. sample_topk's radix select at the op's k, so "
   "the set and its tie rule are the top-k's; the maximum is its first entry and the sum one more "
-  "pass. A row without RAD_SP_LOGPROBS leaves before reading anything",
+  "pass. A row without RAD_SP_LOGPROBS leaves before reading anything (no params at all: every "
+  "row runs)",
   "f32 logits, f32 stats [M, 2 + 2k] with the ids as floats",
   RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
   ROW(cSampleLogprobs), NOTUNE,

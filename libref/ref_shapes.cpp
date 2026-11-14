@@ -64,6 +64,7 @@
 #include "ref_ops.h"
 
 /* rad_param_find / rad_param_getdim / rad_param_gets / rad_dtype_parse. */
+#include "rad_builder.h"   /* rad_kv_row_elems */
 #include "rad_plugin.h"
 #include "rad_runtime.h"   /* RAD_VGEOM_N */
 #include "rad_sample.h"
@@ -1249,30 +1250,6 @@ int ref_gram_accum_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("gram_accum", operand, out);
 }
 
-/* Declined: `pairs` must pair each group's columns (every column once per stage, partner in the
- * group), and a drawn index operand has repeats, so it would not be a rotation. r4d_selftest builds
- * real pairings. */
-int ref_givens_dense_quant_shape(const RadParam*, int, int, RadOpdDesc*) {
-    return RAD_E_UNSUPPORTED;               /* a composed rotation cannot be drawn: it is a weight, built from real pairings */
-}
-
-int ref_givens_rotate_shape(const RadParam*, int, int, RadOpdDesc*) {
-    return RAD_E_UNSUPPORTED;               /* a pairing cannot be drawn: a described operand can only be drawn, and an index draw has repeats */
-}
-
-/* The same extents as quant_act_fp8: `group` is both rotation width and scale granularity here,
- * unlike the int8 rotated forms, so the rotation changes the values, not the shapes. */
-int ref_had_quant_act_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
-    const uint32_t D = act_dt(p, n_p);
-    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
-    const int64_t ng = scale_groups(n, gi(p, n_p, "group", 0));
-    Opd o;
-    o.t(D, { M, n });                       /* x */
-    o.t((uint32_t)RAD_F8E4M3, { M, n });    /* q */
-    o.t((uint32_t)RAD_F32, { M, ng });      /* scale, a dequant multiplier (amax / 448) */
-    return o.finish("had_quant_act_fp8", operand, out);
-}
-
 /* quant_act_i8g's extents: the rotation changes the values, not the shapes. */
 int ref_had_quant_act_i8g_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
@@ -1540,11 +1517,13 @@ static int ref_attn_paged_shape_impl(const RadParam* p, int n_p, int operand, Ra
     if (ctx < M) ctx = M;
     const int64_t max_blocks = (ctx + bs - 1) / bs;
 
-    /* `q_dtype` and `kv_dtype` are read separately: the engine issues fp8 caches beside bf16
-     * queries. */
+    /* `q_dtype` and `kv_dtype` are read separately: the engine issues int8 caches beside bf16
+     * queries. An int8 cache is not described: a row's two f16 scales cannot be drawn at random
+     * (the hand cases build one). */
     const uint32_t Q  = act_dt(p, n_p);
     const uint32_t kv = dt_parse(gs(p, n_p, "kv_dtype"));
     const uint32_t KV = kv == (uint32_t)RAD_DT_INVALID ? Q : kv;
+    if (KV == (uint32_t)RAD_I8) return RAD_E_UNSUPPORTED;
 
     Opd o;
     o.t(Q,  { S * M, nh, hd });                      /* q */
@@ -1719,7 +1698,7 @@ int ref_kv_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     /* Two blocks of slack so the slot mapping is not a dense prefix and the block index matters. */
     const int64_t nb = (M + bs - 1) / bs + 2;
     /* Only the cache takes `kv_dtype`: k and v are bf16 activations whatever the cache stores
-     * (act_dt would fall back on kv_dtype and describe an fp8 k). */
+     * (act_dt would fall back on kv_dtype and describe an int8 k). */
     const uint32_t D  = (uint32_t)RAD_BF16;
     const uint32_t kv = dt_parse(gs(p, n_p, "kv_dtype"));
     const uint32_t KV = kv == (uint32_t)RAD_DT_INVALID ? D : kv;
@@ -1729,7 +1708,7 @@ int ref_kv_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     o.t(D, { M, kvh, hd });                          /* v */
     /* A scatter destination: distinct (see the file header), over the whole cache in slots. */
     o.t_idx({ M }, nb * bs, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* slot_mapping */
-    o.t(KV, { nb, kvh, bs, 2 * hd });                /* kv_cache, INOUT */
+    o.t(KV, { nb, kvh, bs, rad_kv_row_elems(KV, hd) });   /* kv_cache, INOUT */
     return o.finish("kv_store", operand, out);
 }
 
@@ -1745,14 +1724,15 @@ int ref_kv_store_streamed_shape(const RadParam* p, int n_p, int operand, RadOpdD
     const int64_t bs  = gi(p, n_p, "block_size", 0);
     if (M <= 0 || hd <= 0 || kvh <= 0 || bs <= 0 || M > bs) return RAD_E_UNSUPPORTED;
     const uint32_t kv = dt_parse(gs(p, n_p, "kv_dtype"));
-    const uint32_t KV = kv == (uint32_t)RAD_DT_INVALID ? (uint32_t)RAD_F8E4M3 : kv;
-    const int64_t row = kvh * bs * 2 * hd * (KV == (uint32_t)RAD_BF16 ? 2 : 1);
+    const uint32_t KV = kv == (uint32_t)RAD_DT_INVALID ? (uint32_t)RAD_I8 : kv;
+    const int64_t rowe = rad_kv_row_elems(KV, hd);
+    const int64_t row = kvh * bs * rowe * (KV == (uint32_t)RAD_BF16 ? 2 : 1);
 
     Opd o;
     o.t((uint32_t)RAD_BF16, { M, kvh, hd });                       /* k */
     o.t((uint32_t)RAD_BF16, { M, kvh, hd });                       /* v */
     o.t_idx({ M }, bs, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);        /* slot_mapping, one block */
-    o.t(KV, { 1, kvh, bs, 2 * hd });                               /* kv_cache, INOUT */
+    o.t(KV, { 1, kvh, bs, rowe });                                 /* kv_cache, INOUT */
     o.t_idx({ 1 }, 1, -1, 0);                                      /* res -- resident in slot 0 */
     o.t((uint32_t)RAD_U8, { 1, row });                             /* host, INOUT */
     return o.finish("kv_store_streamed", operand, out);
@@ -2105,8 +2085,10 @@ int ref_moe_gemm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
 /* The weight scale grid `dtype` names, as weight rows and K elements per scale. Block-fp8 experts
  * (fp8a8) carry the checkpoint's one scale per 128x128 tile (`group` = 128). The 4-bit formats
  * (docs/MOE-W4.md) carry one per row per K group: all of `group` for w4a8, w4a8h and w4nla8h, half
- * for w4nl64a8h and w5nl64a8h, a quarter for w4nl32a8h. These are the served format names
- * (arch/common/rad_block_moe_fp8.h, kServed). Any other dtype returns { 0, 0 } and the description
+ * for w4nl64a8h and w5nl64a8h, a quarter for w4nl32a8h. The `a8i8` names are the four-bit formats
+ * against an int8 activation and `i8a8` / `i8a8h` int8 experts against one, a scale per row per
+ * `group`. These are the served format names (arch/common/rad_block_moe_fp8.h, kServed and
+ * kServed8). Any other dtype returns { 0, 0 } and the description
  * declines rather than guess a grid.
  *
  * The grid matters beyond extents: re-laid weights are inverted into the tensor described here
@@ -2121,7 +2103,22 @@ static MoeScaleGrid moe_scale_grid(const RadParam* p, int n_p, int64_t g) {
     if (is("w4a8") || is("w4a8h") || is("w4nla8h")) return { 1, g };
     if (is("w4nl64a8h") || is("w5nl64a8h")) return { 1, g / 2 };
     if (is("w4nl32a8h")) return { 1, g / 4 };
+    if (is("i8a8") || is("i8a8h") || is("w4a8i8") || is("w4a8i8h")) return { 1, g };
+    if (is("w4nl64a8i8h")) return { 1, g / 2 };
+    if (is("w4nl32a8i8h")) return { 1, g / 4 };
     return { 0, 0 };
+}
+/* The operands' code dtypes `dtype` names: an int8 activation for the `a8i8` and `i8a8` names and
+ * int8 experts for the latter, E4M3 otherwise. A four-bit expert is described at the E4M3 its
+ * logical values are exact in, whichever activation it meets. */
+struct MoeCodes { uint32_t a, w; };
+static MoeCodes moe_codes(const RadParam* p, int n_p) {
+    const char* d = gs(p, n_p, "dtype");
+    auto is = [&](const char* s) { return d && std::strcmp(d, s) == 0; };
+    const bool w8 = is("i8a8") || is("i8a8h");
+    const bool a8 = w8 || is("w4a8i8") || is("w4a8i8h") || is("w4nl64a8i8h") || is("w4nl32a8i8h");
+    return { a8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3,
+             w8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3 };
 }
 
 /* The quantised arm: the same planes plus two scale streams, the activation's per row per K group
@@ -2154,16 +2151,19 @@ int ref_moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     const char* kind = gs(p, n_p, "dtype");
     const bool mx = kind && !std::strcmp(kind, "mxfp4a8");
     const auto SD = kind && !std::strcmp(kind, "fp8a8f32") ? (uint32_t)RAD_F32 : D;
-    o.t((uint32_t)RAD_F8E4M3, { AR, K });             /* a -- E4M3 codes, see `a_order` */
-    o.t((uint32_t)RAD_F32, { AR, (K + g - 1) / g });   /* a_scale */
+    const MoeCodes cd = moe_codes(p, n_p);
+    /* The K one activation scale covers: `a_group` where stated, else `group`. */
+    const int64_t ag = gi(p, n_p, "a_group", g) > 0 ? gi(p, n_p, "a_group", g) : g;
+    o.t(cd.a, { AR, K });                             /* a -- E4M3 or int8 codes, see `a_order` */
+    o.t((uint32_t)RAD_F32, { AR, (K + ag - 1) / ag }); /* a_scale */
     /* w -- the even experts; mxfp4a8 carries e2m1 codes with an E8M0 byte per (row, 32 of K) */
-    o.t(mx ? (uint32_t)RAD_FP4E2M1 : (uint32_t)RAD_F8E4M3, { ne0, N0, K0 });
+    o.t(mx ? (uint32_t)RAD_FP4E2M1 : cd.w, { ne0, N0, K0 });
     if (mx) o.t_idx_dt(RAD_U8, { ne0, N0, (K0 + 31) / 32 }, 0, 127, 0);    /* w_scale */
     else    o.t(SD, { ne0, (N0 + sg.rows - 1) / sg.rows, (K0 + sg.k - 1) / sg.k });
     o.t_idx({ M * k }, M * k, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* sorted_tok */
     o.t_idx({ ne + 1 }, M * k + 1, -1, (uint32_t)RAD_OPD_F_IDX_PREFIX);   /* expert_offset */
     /* w_odd -- the odd experts */
-    o.t(mx ? (uint32_t)RAD_FP4E2M1 : (uint32_t)RAD_F8E4M3, { ne1, N1, K1 });
+    o.t(mx ? (uint32_t)RAD_FP4E2M1 : cd.w, { ne1, N1, K1 });
     if (mx) o.t_idx_dt(RAD_U8, { ne1, N1, (K1 + 31) / 32 }, 0, 127, 0);    /* w_odd_scale */
     else    o.t(SD, { ne1, (N1 + sg.rows - 1) / sg.rows, (K1 + sg.k - 1) / sg.k });
     o.t(D, { M * k, N });                             /* y -- in sorted order */
@@ -2195,14 +2195,16 @@ int ref_moe_gemm_q_mod4_shape(const RadParam* p, int n_p, int operand, RadOpdDes
     const int64_t AR = sorted_a_order(p, n_p) ? M * k : M;
     const char* kind = gs(p, n_p, "dtype");
     const bool mx = kind && !std::strcmp(kind, "mxfp4a8");
+    const MoeCodes cd = moe_codes(p, n_p);
+    const int64_t ag = gi(p, n_p, "a_group", g) > 0 ? gi(p, n_p, "a_group", g) : g;
     auto cls = [&](int q) {
         const int64_t nq = (ne + 3 - q) / 4;
-        o.t(mx ? (uint32_t)RAD_FP4E2M1 : (uint32_t)RAD_F8E4M3, { nq, Nq[q], Kq[q] });
+        o.t(mx ? (uint32_t)RAD_FP4E2M1 : cd.w, { nq, Nq[q], Kq[q] });
         if (mx) o.t_idx_dt(RAD_U8, {nq, Nq[q], (Kq[q] + 31) / 32}, 0, 127, 0);
         else o.t(D, { nq, (Nq[q] + sg.rows - 1) / sg.rows, (Kq[q] + sg.k - 1) / sg.k });
     };
-    o.t((uint32_t)RAD_F8E4M3, { AR, K });             /* a -- E4M3 codes, see `a_order` */
-    o.t((uint32_t)RAD_F32, { AR, (K + g - 1) / g });   /* a_scale */
+    o.t(cd.a, { AR, K });                             /* a -- E4M3 or int8 codes, see `a_order` */
+    o.t((uint32_t)RAD_F32, { AR, (K + ag - 1) / ag }); /* a_scale */
     cls(0);                                           /* w, w_scale -- class 0 */
     o.t_idx({ M * k }, M * k, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* sorted_tok */
     o.t_idx({ ne + 1 }, M * k + 1, -1, (uint32_t)RAD_OPD_F_IDX_PREFIX);   /* expert_offset */
@@ -2989,21 +2991,6 @@ int ref_ln_mod_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     o.t(D, { M, n });                                         /* y */
     return o.finish("ln_mod", operand, out);
 }
-int ref_ln_mod_quant_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
-    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
-    const int64_t ng = scale_groups(n, gi(p, n_p, "group", 0));
-    const uint32_t D = act_dt(p, n_p);
-    Opd o;
-    o.t(D, { M, n });                                         /* y */
-    o.t(D, { 1, n });                                         /* g: one sequence */
-    o.t(D, { 1, n });                                         /* s */
-    o.t_idx({ 2 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu_seqlens */
-    o.t(D, { M, n });                                         /* x, INOUT */
-    o.t((uint32_t)RAD_F8E4M3, { M, n });                      /* q */
-    o.t((uint32_t)RAD_F32, { M, ng });                        /* scale */
-    o.t(D, { M, n });                                         /* z */
-    return o.finish("ln_mod_quant_fp8", operand, out);
-}
 /* rms_mod's branch and gate are passed when `gated`, and absent otherwise. */
 int ref_rms_mod_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
@@ -3026,30 +3013,6 @@ int ref_rms_mod_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) 
     o.t(D, { M, n });                                         /* z */
     o.skip();                                                 /* colmap: the sweep passes none */
     return o.finish("rms_mod", operand, out);
-}
-int ref_rms_mod_quant_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
-    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
-    const int64_t ng = scale_groups(n, gi(p, n_p, "group", 0));
-    const uint32_t D = act_dt(p, n_p);
-    Opd o;
-    if (gi(p, n_p, "gated", 0)) {
-        o.t(D, { M, n });                                     /* y */
-        o.t(D, { 1, n });                                     /* g */
-    } else {
-        o.skip();
-        o.skip();
-    }
-    o.t(D, { 1, 2 * n });                                     /* s */
-    const char* nk = gs(p, n_p, "norm");
-    if (nk && std::strcmp(nk, "layer") == 0) o.skip();       /* w: a LayerNorm without a gain */
-    else                                     o.t(D, { n });  /* w */
-    o.t_idx({ 2 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu_seqlens */
-    o.t(D, { M, n });                                         /* x, INOUT */
-    o.t((uint32_t)RAD_F8E4M3, { M, n });                      /* q */
-    o.t((uint32_t)RAD_F32, { M, ng });                        /* scale */
-    o.t(D, { M, n });                                         /* z */
-    o.skip();                                                 /* colmap: the sweep passes none */
-    return o.finish("rms_mod_quant_fp8", operand, out);
 }
 /* The sampler's three scalars in (0, 1), the state f32. */
 int ref_flow_x0_step_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

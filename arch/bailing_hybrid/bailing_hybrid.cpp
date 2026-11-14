@@ -324,7 +324,7 @@ struct Model {
     Layer draft{};
 };
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 static int64_t cfg(const RadModelMeta* m, const char* key, int64_t fallback) {
     return rad_meta_geti(m, key, fallback);
@@ -511,13 +511,14 @@ static int moe_buffers(RadBuilder* b, Model& m, const MoeFP8::Config& mc) {
 /* ============================== declare ============================== */
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
-    if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
+    if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS ||
+        rad_build_slot(ctx) >= MAX_SLOTS)
         return RAD_E_INVAL;
     const int world = ctx->world_size ? ctx->world_size : 1;
     /* A sizing declare writes scratch: the step reads g_model, filled by the real declare at the
      * real max_tok (RadBuildCtx::shape_probe). */
     static thread_local Model probe_model;
-    Model& m = ctx->shape_probe ? probe_model : g_model[ctx->rank];
+    Model& m = ctx->shape_probe ? probe_model : g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     auto& g = m.g;
@@ -831,7 +832,7 @@ static void draft_pass(RadCtx* c, Model& m, const RadBatch* batch) {
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    Model& m = g_model[rad_rank(c)];
+    Model& m = g_model[rad_slot(c)];
     const int64_t T = batch->n_tok, E = m.g.n_embd;
     if (batch->enc) {
         rad_step_fail(c, "bailing_hybrid serves text");
@@ -880,6 +881,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
 
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PROBE(bailing_hybrid)
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(bailing_hybrid, "bailinghybrid", "", "0.1.0",
                 "Ling-3.0 (bailing_hybrid): KDA and dense latent attention, group-routed experts")
 #endif

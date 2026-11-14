@@ -137,7 +137,8 @@ struct RouteSlot {
  * operand that is not rank 4 (paged) or rank 3 (conv), so it never arrives as a flat span.
  * Layouts, as libref/ref_ops.h defines them:
  *
- *     FULL / WINDOW  [n_blocks, n_head_kv, block_size, 2 * head_dim]   K then V inside a slot
+ *     FULL / WINDOW  [n_blocks, n_head_kv, block_size, 2 * head_dim]   K then V inside a slot;
+ *                    the int8 cache's last extent is 2 * head_dim + 4 (rad_kv_row_elems)
  *     LINEAR         [n_states, n_head_kv, state_dim[0], state_dim[1]]
  *     CONV           [n_states, n_head_kv * head_dim, conv_slots]      channel-major, then time
  */
@@ -187,6 +188,7 @@ int kvstage_run(Ctx* c, int group, int layer, bool after);
 struct CtxDesc {
     Program*        program     = nullptr;
     int             rank        = 0;
+    int             slot        = -1;       /* RadBuildCtx::slot_base + rank: rad_slot(); -1 is the rank */
     int             world_size  = 1;
     int             device      = 0;        /* the one device this rank owns */
     RadStream       stream      = nullptr;  /* null: the Ctx creates its own compute stream */
@@ -242,6 +244,7 @@ public:
     /* ---------------------------------------------------------- run-phase queries */
     const RadBatch* batch()      const { return batch_; }
     int             rank()       const { return rank_; }
+    int             slot()       const { return slot_; }
     /* Whether repeated passes are recorded and played back (prepare() says when they are not). */
     bool            records_passes() const { return tape_on_; }
     /* Whether the pass being issued is being recorded. */
@@ -391,6 +394,7 @@ public:
         return c;
     }
     void*       arena_base()   const { return arena_.base(); }
+    int64_t     arena_bytes()  const { return arena_.bytes(); }
     void*       scratch()      const { return arena_.scratch(); }
 
     /* ---- the arena's levels ------------------------------------------------------------------
@@ -451,6 +455,7 @@ private:
         int64_t    n     = 0;
         void**     host  = nullptr;
         void*      dev   = nullptr;
+        bool       carved = false;    /* host and dev lie in wtab_host_ and wtab_dev_ */
         /* Entries' dtype, rank, shape and stride are checked against entry 0 once, at the first
          * issue; they are declaration facts and cannot change. */
         bool       checked = false;
@@ -458,6 +463,12 @@ private:
         std::vector<int32_t> pend;    /* entries a residency change named since the last issue */
         bool                 full = false;   /* every entry: the templates were rebound */
     };
+    /* The block every table declared at prepare is carved from, at the same offset in both; a
+     * table resolved later has arrays of its own. */
+    static constexpr int64_t kWtabAlign = 64;
+    void*   wtab_host_ = nullptr;
+    void*   wtab_dev_ = nullptr;
+    int64_t wtab_bytes_ = 0, wtab_used_ = 0;
     /* Which tables hold a weight, as a linked list per weight: `wmemb_head_[w]` indexes `wmemb_`,
      * -1 means none. Two ops may share a run, so a weight can be in several tables. */
     struct WMemb { int32_t slot, entry, next; };
@@ -517,6 +528,9 @@ private:
         RadTensor        t[MAX_OPERANDS] = {};
         int64_t          n = 0;
         bool             drain = false;    /* an operand the arena does not track: drain instead */
+        /* The lanes with a host-arena touch pending when the op joined: the device ops this
+         * pass issued before it among them, which a play submits again without passing issue(). */
+        bool             touch[2] = { false, false };
     };
     struct PassTape {
         uint64_t key = 0;
@@ -594,6 +608,12 @@ private:
 
     std::vector<WeightTable>              wtabs_;
     std::unordered_map<uint64_t, size_t>  wtab_of_;
+    /* A direct-mapped slot cache in front of wtab_of_: a WTAB operand's (op, operand) key
+     * repeats every step, and the map lookup was paid per issue. An entry counts only on a full
+     * key match (key 0 is empty: op handles start at 1, so a real key is >= 2^32); a miss falls
+     * back to the map and refills the entry. Slots are wtabs_ indices, stable as it grows. */
+    struct WtabSlotCache { uint64_t key = 0; size_t slot = 0; };
+    WtabSlotCache                  wtab_cache_[256] = {};
 
     /* Resolves the run, refreshes the table if it moved, and fills `out` with the tensor the
      * kernel sees: entry 0's dtype and trailing extents, `shape[0]` = n, `stride[0]` = 0.
@@ -670,6 +690,7 @@ private:
     int  xp_step_run(int layer);
 
     int       rank_       = 0;
+    int       slot_       = 0;
     int       world_size_ = 1;
     int       device_     = 0;
     RadStream stream_     = nullptr;
@@ -755,6 +776,14 @@ private:
     std::vector<RadTensor> buf_tmpl_;
     std::vector<int32_t>   buf_bits_;
     std::vector<uint8_t>   buf_host_;   /* per handle: a RAD_DOMAIN_HOST buffer */
+    /* Per-handle element counts and planned lifetimes, snapshotted at bind (the builder writes
+     * first_def/last_use during planning only) so an issue's fit and lifetime checks read two
+     * compact arrays instead of recomputing the template's numel and chasing BufferInfo. A
+     * buffer's numel follows the active level's template; set_level refreshes it. */
+    std::vector<int64_t>   buf_numel_;
+    std::vector<int64_t>   w_numel_;
+    std::vector<int32_t>   buf_live0_, buf_live1_;   /* BufferInfo::first_def / last_use */
+    void refresh_buf_numel();
     /* Every level's templates; `buf_tmpl_` is a copy of the active one. */
     std::vector<std::vector<RadTensor>> level_tmpl_;
     int                    level_ = 0;
@@ -788,6 +817,8 @@ private:
      * route_report. */
     int32_t*               route_pool_     = nullptr;   /* host */
     int32_t*               route_dev_      = nullptr;   /* card */
+    /* The card rows are the plugin's buffer (rad_route_table), which the arena owns. */
+    bool                   route_dev_arena_ = false;
     RadEvent               route_done_[kRouteBanks] = {};
     /* The layers this pass reported into `route_bank_`, as [lo, hi]; lo > hi when none. */
     int                    route_bank_ = -1, route_lo_ = 1, route_hi_ = 0;

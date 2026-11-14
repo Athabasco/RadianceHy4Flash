@@ -1163,6 +1163,30 @@ TEST(the_lanczos_resize_is_pillows_bit_for_bit) {
     }
 }
 
+TEST(the_threaded_lanczos_resize_is_the_serial_one) {
+    /* imaging.cpp splits a tall resize's rows across threads (its goldens above are 23 rows
+     * tall and take the serial path, bar the 50-row upscale's vertical pass). At an unchanged
+     * height each output row depends only on its own input row, so resizing row bands small
+     * enough to stay serial and stacking them is an oracle for the threaded whole. */
+    const FrameRGBA src = rgba_frame(3, 100, 61);
+    FrameRGBA whole;
+    resize_lanczos_rgba(src, 23, 100, &whole);
+    REQUIRE_EQ(whole.rgba.size(), (size_t)23 * 100 * 4);
+    std::vector<uint8_t> stacked;
+    for (int y0 = 0; y0 < 100; y0 += 25) {
+        FrameRGBA band;
+        band.w = 61;
+        band.h = 25;
+        band.rgba.assign(src.rgba.begin() + (size_t)y0 * 61 * 4,
+                         src.rgba.begin() + (size_t)(y0 + 25) * 61 * 4);
+        FrameRGBA out;
+        resize_lanczos_rgba(band, 23, 25, &out);
+        REQUIRE_EQ(out.rgba.size(), (size_t)23 * 25 * 4);
+        stacked.insert(stacked.end(), out.rgba.begin(), out.rgba.end());
+    }
+    CHECK(stacked == whole.rgba);
+}
+
 TEST(the_white_composite_is_pillows_paste) {
     const FrameRGBA src = rgba_frame(0, kGoldLanczosSrcH, kGoldLanczosSrcW);
     Frame out;
@@ -1292,6 +1316,15 @@ TEST(a_picture_over_the_pixel_limit_is_refused_from_its_header) {
     why.clear();
     CHECK_EQ(decode_image_rgba(png.data(), png.size(), 64 * 48 - 1, &fa, &why), RAD_E_INVAL);
     CHECK(has(why, "3071-pixel limit"));
+    /* A JPEG's size is read from its start of frame the same way. */
+    std::vector<uint8_t> jpg;
+    REQUIRE_EQ(encode_image(px.data(), 64, 48, 3, "jpeg", 90, &jpg, &why), RAD_OK);
+    CHECK_EQ(decode_image(jpg.data(), jpg.size(), 64 * 48, &f, &why), RAD_OK);
+    CHECK_EQ(f.w, 64);
+    CHECK_EQ(f.h, 48);
+    why.clear();
+    CHECK_EQ(decode_image(jpg.data(), jpg.size(), 64 * 48 - 1, &f, &why), RAD_E_INVAL);
+    CHECK(has(why, "64x48, over the server's 3071-pixel limit"));
 
     /* 81 million pixels claimed in 66 bytes: refused on the header, so nothing is allocated for
      * them. A side past what FFmpeg can hold (60000) is refused by its own size check. */

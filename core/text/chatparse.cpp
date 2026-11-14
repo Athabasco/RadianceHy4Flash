@@ -6,7 +6,7 @@
  * vendor/ runs while a reply is read. */
 #include "llama/common/json-schema-to-grammar.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <cctype>
@@ -17,7 +17,7 @@
 
 namespace rad {
 
-using ojson = nlohmann::ordered_json;
+using ojson = Json;
 
 namespace {
 
@@ -303,7 +303,7 @@ private:
 
 /* ================================================================== JSON text helpers */
 
-/* A string's JSON encoding without its quotes, byte for byte what nlohmann::json::dump writes:
+/* A string's JSON encoding without its quotes, byte for byte what Json::dump writes:
  * two-character escapes where JSON has one, \u00XX in lower-case hex for other control
  * characters, and everything else (DEL and UTF-8 included) verbatim. */
 void json_escape_into(std::string& out, const char* p, size_t n) {
@@ -581,7 +581,7 @@ private:
         while (!v.empty() && is_ws((unsigned char)v.front())) v.remove_prefix(1);
         if (v.empty()) out += "null";
         else if (const char* lit = json_literal(v)) out += lit;
-        else if (nlohmann::json::accept(v)) out.append(v.data(), v.size());
+        else if (Json::accept(v)) out.append(v.data(), v.size());
         else out += json_quote(scalar_);
         scalar_.clear();
     }
@@ -592,7 +592,7 @@ private:
         std::string j;
         j.reserve(cont_.size() + 8);
         normalise(cont_, j);
-        if (partial || nlohmann::json::accept(j)) out += j;
+        if (partial || Json::accept(j)) out += j;
         else out += json_quote(cont_);
         cont_.clear();
     }
@@ -1667,7 +1667,7 @@ struct ReplyStream::Impl {
         const bool json = bare_txt.size() < kBareKeep && !v.empty() &&
                           (v == "true" || v == "false" || v == "null" ||
                            ((v[0] == '-' || (v[0] >= '0' && v[0] <= '9')) &&
-                            nlohmann::json::accept(v)));
+                            Json::accept(v)));
         if (!json) lenient();
     }
 
@@ -2026,7 +2026,7 @@ struct ReplyStream::Impl {
      * surrogate escape, a vertical tab or form feed after the value). Such a value is read by the
      * grammar's other arm, as text, so the arguments stay JSON. */
     void json_value_done(std::string_view text) {
-        begin_value_out(ValueOut::Raw, /*json=*/nlohmann::json::accept(text));
+        begin_value_out(ValueOut::Raw, /*json=*/Json::accept(text));
         val.add(text.data(), text.size(), scratch);
         val.finish(false, scratch);
         flush_scratch();

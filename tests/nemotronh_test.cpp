@@ -185,6 +185,7 @@ TEST(drafter_geom_replicates_kv_heads_only_when_the_block_asks) {
  * query heads over that head (gqa 8, a libr4d row of its own) where two ranks run 16 (gqa 16). At
  * two ranks nothing is spanned: the even shard is the head. */
 TEST(lilicorr_replicates_its_two_kv_heads_at_four_ranks) {
+    SKIP("Nemotron-H's trunk is block fp8, which this build does not serve; the case returns with an int8 container");
     Nemo f;
     const RadModelMeta meta = f.meta();
     for (int world : { 2, 4 })
@@ -244,6 +245,7 @@ TEST(lilicorr_replicates_its_two_kv_heads_at_four_ranks) {
 /* A speculative step at four ranks: the trunk's verify of two sequences, the drafter's context pass
  * over its rows and its query pass, each without a step failure and lint-clean. */
 TEST(nemotronh_tp4_steps_lint_clean_with_the_lilicorr_drafter) {
+    SKIP("Nemotron-H's trunk is block fp8, which this build does not serve; the case returns with an int8 container");
     Nemo f;
     const RadModelMeta meta = f.meta();
     for (int rank : { 0, 3 }) {
@@ -271,6 +273,7 @@ TEST(nemotronh_tp4_steps_lint_clean_with_the_lilicorr_drafter) {
  * counts and buffer rows smaller. The drafter's split fc gathers its message as a range; a fixed
  * numel there left every level unplanned, and sixteen sequences short of the lent arena. */
 TEST(nemotronh_sizing_declares_match_the_real_graph_at_every_arena_level) {
+    SKIP("Nemotron-H's trunk is block fp8, which this build does not serve; the case returns with an int8 container");
     Nemo f;
     const RadModelMeta meta = f.meta();
     for (int world : { 2, 4 })

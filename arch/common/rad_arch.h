@@ -37,9 +37,12 @@ namespace rad {
 namespace arch {
 
 /* One thread per tensor-parallel rank in one process (spec §1), and declare runs once per rank,
- * so declared handles are per-rank state; a single global would let rank 1 overwrite rank 0.
- * libr4d all-reduces over 2/4/8 ranks, hence eight. */
-enum { MAX_RANKS = 8 };
+ * so declared handles are per-instance state; a single global would let rank 1 overwrite rank 0.
+ * libr4d all-reduces over 2/4/8 ranks, hence eight ranks. Several engines may run in the process
+ * (docs/MULTIMODEL.md), each with its own ranks, so state is indexed by the instance's slot
+ * (rad_build_slot at declare, rad_slot in step), unique across all of them, never by the rank two
+ * engines share. */
+enum { MAX_RANKS = 8, MAX_SLOTS = RAD_MAX_SLOTS };
 
 /* ================================================================== a debug residual probe
  *
@@ -220,13 +223,14 @@ inline bool calib_write(RadCtx* c, rad_buf b, int64_t k, long long rows, const c
     return calib_write_host(h.data(), k, rows, what, domain, rad_rank(c));
 }
 
-/* A pinned host buffer of at least `bytes`, one per rank, held for the process lifetime, so a tap
- * that copies a scratch back every pass runs at link speed. Null (and logged) on failure. */
+/* A pinned host buffer of at least `bytes`, one per instance (slot), held for the process
+ * lifetime, so a tap that copies a scratch back every pass runs at link speed. Null (and logged)
+ * on failure. */
 inline float* calib_staging(RadCtx* c, int64_t bytes) {
     static std::mutex mu;
-    static std::map<int, std::pair<void*, int64_t>> per_rank;
+    static std::map<int, std::pair<void*, int64_t>> per_slot;
     std::lock_guard<std::mutex> lk(mu);
-    std::pair<void*, int64_t>& s = per_rank[rad_rank(c)];
+    std::pair<void*, int64_t>& s = per_slot[rad_slot(c)];
     if (s.second >= bytes) return (float*)s.first;
     if (s.first) rad_dev_free(s.first, RAD_MEM_HOST_PINNED);
     s.first = rad_dev_alloc(bytes, RAD_MEM_HOST_PINNED);
@@ -733,9 +737,6 @@ struct Geom {
     /* Messages below this many bytes use the exact all-reduce even with a lossy wire. Passed as
      * `all_reduce`'s `min_bytes`; 0 leaves the default to the kernel plugin. */
     int64_t wire_min_bytes = 0;
-    /* RAD_ATTN_FP8_* bits: the attention products accepted in e4m3 (RadBuildCtx describes it).
-     * decl_attn passes it on as `attn_paged`'s `prefill_fp8`. */
-    int     attn_prefill_fp8 = 0;
     float   eps        = 1e-6f;
     /* GemmaRMSNorm's `1 +`. Qwen3.5, Qwen3-Next and Gemma normalise with `x_hat * (1 + w)` and
      * store `w` near 0.1, so reading it as a plain gain shrinks every normed activation 5-10x. An
@@ -771,6 +772,12 @@ struct Geom {
      * setting because producers and consumers must agree; the plugin reads it off a trunk weight's
      * encoding and every linear checks its own against it. */
     bool    w_bf16 = false;
+    /* The linears are rotated int8 (rad_fp8.h's linear_is_w8h: IQ8R, or the 128-group form) with
+     * one activation scale per `w_i8_group` columns, for a plugin whose producers are declared away
+     * from its probe: each then declares an int8 code pair (ActFP8::declare_pair). Model-wide as
+     * w_bf16 is. */
+    bool    w_i8h = false;
+    int64_t w_i8_group = 128;
 
     int64_t q_dim()   const { return n_head * head_dim; }
     int64_t kv_dim()  const { return n_head_kv * head_dim; }
@@ -1007,7 +1014,6 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
     g.world     = c->world_size ? c->world_size : 1;
     g.wire_exact= c->tp_wire_lossy ? 0 : 1;
     g.wire_min_bytes = c->tp_wire_min_bytes;
-    g.attn_prefill_fp8 = c->attn_prefill_fp8;
     g.eps       = m->rms_eps;
     g.theta     = m->rope_theta;
     g.rope_scale= 1.0f;   /* yarn_from reads the model's rotary scaling */
@@ -1324,16 +1330,6 @@ inline rad_op decl_rotary(RadBuilder* b, const Geom& g, const char* name,
     return rad_decl_op(b, name, p.data(), (int)p.size(), weights, nw);
 }
 
-/* An `attn_paged` op with the deployment's `prefill_fp8` appended (docs/OPS.md). At 0 the
- * parameters are passed unchanged, so op identities and tune keys do not change. */
-inline rad_op decl_attn(RadBuilder* b, const Geom& g, const char* name,
-                        const RadParam* params, int n, const rad_weight* weights, int nw) {
-    if (g.attn_prefill_fp8 == 0) return rad_decl_op(b, name, params, n, weights, nw);
-    std::vector<RadParam> p(params, params + n);
-    p.push_back(RAD_INT("prefill_fp8", g.attn_prefill_fp8));
-    return rad_decl_op(b, name, p.data(), (int)p.size(), weights, nw);
-}
-
 /* Reads a model's rotary scaling into `g.rope_scale` and `g.yarn`. Every architecture calls it
  * after geom_from, for the target ("") and for a drafter with its own config ("draft."). Only the
  * free-form keys are read; RadModelMeta::rope_scale is not, since a factor without its type would
@@ -1637,6 +1633,11 @@ inline int drafter_kv_group(RadBuilder* b, Names& nm, const RadBuildCtx* ctx, Ge
  * an imported checkpoint (rad_builder.h, rad_arch_serves_imports). */
 #define RAD_ARCH_SERVES_IMPORTS(V)                                                             \
     extern "C" int rad_arch_serves_imports(void) { return V; }
+
+/* RAD_ARCH_MULTI_INSTANCE() states that the plugin keeps all per-instance state by slot, so several
+ * engines in one process may run it at once (rad_builder.h, rad_arch_multi_instance). */
+#define RAD_ARCH_MULTI_INSTANCE()                                                              \
+    extern "C" int rad_arch_multi_instance(void) { return 1; }
 
 }  /* namespace arch */
 }  /* namespace rad */

@@ -55,12 +55,6 @@ using std::max;
 #ifndef R4D_ATTN_H256
 #define R4D_ATTN_H256 1
 #endif
-/* The fp8_v4 and k6_v4 caches at head_dim 256 (RadBuildCtx::kv_quant), off unless the including
- * unit serves a model whose plugin offers them: Qwen3.8-Flash-Next's QSA layers (gqa12, and gqa6
- * at four ranks). The kernels are the h256/gqa6 templates' O_V4 / O_K6 forms. */
-#ifndef R4D_ATTN_V4
-#define R4D_ATTN_V4 0
-#endif
 #define GQ_JOIN_(a, b, c) a##b##c
 #define GQ_JOIN(a, b, c)  GQ_JOIN_(a, b, c)
 #define GQ_SYM(pre, suf)  GQ_JOIN(pre, R4D_ATTN_GQA, suf)
@@ -138,7 +132,7 @@ template <int HEAD_DIM, int KVP, int XOPT = 0>
 /* Two dispatches: the attention kernel and the split-KV combine. R4DArgs is passed by value (184
  * bytes) like any other kernel argument. Non-null `gq` adds the output gate and quantiser to the
  * combine (attn_paged_gate_quant; R4DGateQuant in r4d_attn_decode_h256_gqa6.hip). `XOPT` adds
- * option bits to the attention kernel's (O_V4, O_K6: the cache layout). */
+ * option bits to the attention kernel's (O_KVI8: the int8 cache). */
 static int g8_decode_launch(const R4DArgs* a, RadStream stream,
                             const R4DGateQuant* gq = nullptr) {
     int emit_rc = RAD_OK;
@@ -149,26 +143,28 @@ static int g8_decode_launch(const R4DArgs* a, RadStream stream,
     const int nw = (rows + 15) / 16;
     const int splits = r4d_decode_splits(a, G8_D_TILE);
 
-#define G8_LAUNCH(NW)                                                                          \
-    emit_rc = R4D_EMIT(stream, (r4d_attn_decode_kernel<NW, G8_D_TILE, HEAD_DIM, G8_GQA,        \
-                                                   G8_BLOCK_SIZE, KVP, G8_D_OPT | XOPT>),      \
+    /* `a->chain`: the chained forms (r4d_chain.h) of the attention kernel and of the merge
+     * without a gate; the merge with a gate and quantiser has none. */
+#define G8_LAUNCH_K(K_, NW, OPT_)                                                              \
+    emit_rc = R4D_EMIT(stream, (K_<NW, G8_D_TILE, HEAD_DIM, G8_GQA, G8_BLOCK_SIZE, KVP,        \
+                                   G8_D_OPT | OPT_ | XOPT>),                                   \
                        dim3(splits, a->kv_heads, a->num_seqs), dim3(NW * 32), 0, *a, splits)
-    /* One-wave workgroups stage V as codes (O_V8): same conversion count, half the LDS. A v4
-     * cache stages V widened (the kernel drops O_V8 under O_V4). */
-    if      (nw == 1)
-        emit_rc = R4D_EMIT(stream, (r4d_attn_decode_kernel<1, G8_D_TILE, HEAD_DIM, G8_GQA,
-                                                       G8_BLOCK_SIZE, KVP,
-                                                       G8_D_OPT | O_V8 | XOPT>),
-                           dim3(splits, a->kv_heads, a->num_seqs), dim3(32), 0, *a, splits);
-    else if (nw == 2) G8_LAUNCH(2);
-    else if (nw == 3) G8_LAUNCH(3);
+#define G8_LAUNCH(NW, OPT_)                                                                    \
+    do { if (a->chain) G8_LAUNCH_K(r4dchain_attn_decode, NW, OPT_);                            \
+         else          G8_LAUNCH_K(r4d_attn_decode_kernel, NW, OPT_); } while (0)
+    /* One-wave workgroups stage V as codes (O_V8): same conversion count, half the LDS. The int8
+     * cache stages V widened (the kernel drops O_V8 under it). */
+    if      (nw == 1) G8_LAUNCH(1, O_V8);
+    else if (nw == 2) G8_LAUNCH(2, 0);
+    else if (nw == 3) G8_LAUNCH(3, 0);
 #if G8_MAX_DECODE_ROWS > 64
     /* Five to eight waves take eight; a wave past the last query row computes a copy of it and
      * stores nothing. */
-    else if (nw > 4)  G8_LAUNCH(8);
+    else if (nw > 4)  G8_LAUNCH(8, 0);
 #endif
-    else              G8_LAUNCH(4);
+    else              G8_LAUNCH(4, 0);
 #undef G8_LAUNCH
+#undef G8_LAUNCH_K
     if (emit_rc != RAD_OK) return -5;
     CHK8();
 
@@ -176,7 +172,7 @@ static int g8_decode_launch(const R4DArgs* a, RadStream stream,
     // segment count fits a wave, else the general LDS-tree form. Both give identical bytes.
     const int jobs3 = r4d_q_total(*a) * a->q_heads;
     if (gq) {
-        /* GQ 2: int8 codes, GQ 1: E4M3; see R4DGateQuant. */
+        /* GQ 3: rotated int8 codes, GQ 2: int8 codes, GQ 1: E4M3; see R4DGateQuant. */
 #define G8_GQ_VEC(PF, GQV)                                                                     \
         R4D_EMIT(stream,                                                                       \
                  (r4d_attn_splitkv_combine_vec_gq_kernel<HEAD_DIM, 4, PF, G8_D_JPB, 0, GQV>),   \
@@ -186,35 +182,47 @@ static int g8_decode_launch(const R4DArgs* a, RadStream stream,
         R4D_EMIT(stream, (r4d_attn_splitkv_combine_gq_kernel<HEAD_DIM, 4, PF, 0, GQV>),         \
                  dim3(jobs3), dim3(HEAD_DIM), splits * sizeof(float), *a, splits, G8_D_TILE,   \
                  *gq)
-        const bool i8 = gq->i8 != 0;
+        const bool i8 = gq->i8 != 0, rot = gq->rot != 0;
         if (splits <= 64 && jobs3 >= G8_D_VECMIN) {
-            if (G8_D_OPT & 32) emit_rc = i8 ? G8_GQ_VEC(1, 2) : G8_GQ_VEC(1, 1);
-            else               emit_rc = i8 ? G8_GQ_VEC(0, 2) : G8_GQ_VEC(0, 1);
+            if (G8_D_OPT & 32)
+                emit_rc = rot ? G8_GQ_VEC(1, 3) : i8 ? G8_GQ_VEC(1, 2) : G8_GQ_VEC(1, 1);
+            else
+                emit_rc = rot ? G8_GQ_VEC(0, 3) : i8 ? G8_GQ_VEC(0, 2) : G8_GQ_VEC(0, 1);
         } else if (G8_D_OPT & 32) {
-            emit_rc = i8 ? G8_GQ_GEN(1, 2) : G8_GQ_GEN(1, 1);
+            emit_rc = rot ? G8_GQ_GEN(1, 3) : i8 ? G8_GQ_GEN(1, 2) : G8_GQ_GEN(1, 1);
         } else {
-            emit_rc = i8 ? G8_GQ_GEN(0, 2) : G8_GQ_GEN(0, 1);
+            emit_rc = rot ? G8_GQ_GEN(0, 3) : i8 ? G8_GQ_GEN(0, 2) : G8_GQ_GEN(0, 1);
         }
 #undef G8_GQ_VEC
 #undef G8_GQ_GEN
     } else if (splits <= 64 && jobs3 >= G8_D_VECMIN) {
         const int blocks = (jobs3 + G8_D_JPB - 1) / G8_D_JPB;
-        if (G8_D_OPT & 32)
-            emit_rc = R4D_EMIT(stream,
-                               (r4d_attn_splitkv_combine_vec_kernel<HEAD_DIM, 4, 1, G8_D_JPB>),
-                               dim3(blocks), dim3(32 * G8_D_JPB), 0, *a, splits, G8_D_TILE);
-        else
-            emit_rc = R4D_EMIT(stream,
-                               (r4d_attn_splitkv_combine_vec_kernel<HEAD_DIM, 4, 0, G8_D_JPB>),
-                               dim3(blocks), dim3(32 * G8_D_JPB), 0, *a, splits, G8_D_TILE);
-    } else if (G8_D_OPT & 32)
+#define G8_VEC(K_, PF)                                                                         \
+        emit_rc = R4D_EMIT(stream, (K_<HEAD_DIM, 4, PF, G8_D_JPB>), dim3(blocks),              \
+                           dim3(32 * G8_D_JPB), 0, *a, splits, G8_D_TILE)
+        if (G8_D_OPT & 32) {
+            if (a->chain) G8_VEC(r4dchain_attn_splitkv_combine_vec, 1);
+            else          G8_VEC(r4d_attn_splitkv_combine_vec_kernel, 1);
+        } else {
+            if (a->chain) G8_VEC(r4dchain_attn_splitkv_combine_vec, 0);
+            else          G8_VEC(r4d_attn_splitkv_combine_vec_kernel, 0);
+        }
+#undef G8_VEC
+    } else {
         /* Block of HEAD_DIM threads, not 256: the general combine is __launch_bounds__(HEAD_DIM),
          * one thread per channel, and the runtime refuses a larger block. */
-        emit_rc = R4D_EMIT(stream, (r4d_attn_splitkv_combine_kernel<HEAD_DIM, 4, 1>), dim3(jobs3),
-                           dim3(HEAD_DIM), splits * sizeof(float), *a, splits, G8_D_TILE);
-    else
-        emit_rc = R4D_EMIT(stream, (r4d_attn_splitkv_combine_kernel<HEAD_DIM, 4, 0>), dim3(jobs3),
-                           dim3(HEAD_DIM), splits * sizeof(float), *a, splits, G8_D_TILE);
+#define G8_GEN(K_, PF)                                                                         \
+        emit_rc = R4D_EMIT(stream, (K_<HEAD_DIM, 4, PF>), dim3(jobs3), dim3(HEAD_DIM),         \
+                           splits * sizeof(float), *a, splits, G8_D_TILE)
+        if (G8_D_OPT & 32) {
+            if (a->chain) G8_GEN(r4dchain_attn_splitkv_combine, 1);
+            else          G8_GEN(r4d_attn_splitkv_combine_kernel, 1);
+        } else {
+            if (a->chain) G8_GEN(r4dchain_attn_splitkv_combine, 0);
+            else          G8_GEN(r4d_attn_splitkv_combine_kernel, 0);
+        }
+#undef G8_GEN
+    }
     if (emit_rc != RAD_OK) return -5;
     CHK8();
     return 0;
@@ -248,14 +256,6 @@ extern "C" int64_t GQ_SYM(r4d_rad_attn_prefill_h256_gqa, _scratch)(const RadArgs
     return g8_prefill_scratch(a, 512);
 }
 
-extern "C" int GQ_SYM(r4d_rad_attn_prefill_h256_gqa, _fp8)(const RadArgs* a, RadStream s) {
-    R4DArgs r;
-    const int rc = fill_paged(a, &r, 256);
-    if (rc != RAD_OK) return rc;
-    r.splits = r4d_prefill_splits(a, &r, G8_P_BQ, G8_P_TILE);
-    /* Absent descales mean 1.0, as on the gqa6 leg. */
-    return g8_prefill_launch<256, G8_P_OPT_256, 0>(&r, (hipStream_t)s);
-}
 extern "C" int GQ_SYM(r4d_rad_attn_prefill_h256_gqa, _bf16)(const RadArgs* a, RadStream s) {
     R4DArgs r;
     const int rc = fill_paged(a, &r, 256);
@@ -265,12 +265,6 @@ extern "C" int GQ_SYM(r4d_rad_attn_prefill_h256_gqa, _bf16)(const RadArgs* a, Ra
 }
 #endif
 #if R4D_ATTN_H128
-extern "C" int GQ_SYM(r4d_rad_attn_prefill_h128_gqa, _fp8)(const RadArgs* a, RadStream s) {
-    R4DArgs r;
-    const int rc = fill_paged(a, &r, 128);
-    if (rc != RAD_OK) return rc;
-    return g8_prefill_launch<128, G8_P_OPT_128, 0>(&r, (hipStream_t)s);
-}
 extern "C" int GQ_SYM(r4d_rad_attn_prefill_h128_gqa, _bf16)(const RadArgs* a, RadStream s) {
     R4DArgs r;
     const int rc = fill_paged(a, &r, 128);
@@ -279,11 +273,12 @@ extern "C" int GQ_SYM(r4d_rad_attn_prefill_h128_gqa, _bf16)(const RadArgs* a, Ra
 }
 #endif
 #if R4D_ATTN_H64
-extern "C" int GQ_SYM(r4d_rad_attn_prefill_h64_gqa, _fp8)(const RadArgs* a, RadStream s) {
+/* The int8 cache at this width: a token's row is 2 * 64 + 4 = 132 bytes. */
+extern "C" int GQ_SYM(r4d_rad_attn_prefill_h64_gqa, _i8)(const RadArgs* a, RadStream s) {
     R4DArgs r;
-    const int rc = fill_paged(a, &r, 64);
+    const int rc = fill_paged_row(a, &r, 64, 2 * 64 + 4);
     if (rc != RAD_OK) return rc;
-    return g8_prefill_launch<64, G8_P_OPT_64, 0>(&r, (hipStream_t)s);
+    return g8_prefill_launch<64, G8_P_OPT_64 | O_KVI8, 0>(&r, (hipStream_t)s);
 }
 extern "C" int GQ_SYM(r4d_rad_attn_prefill_h64_gqa, _bf16)(const RadArgs* a, RadStream s) {
     R4DArgs r;
@@ -300,7 +295,7 @@ extern "C" int GQ_SYM(r4d_rad_attn_prefill_h64_gqa, _bf16)(const RadArgs* a, Rad
  * split law's targets (r4d_decode_splits: 256 workgroups at q_len * gqa <= 32; above, 128 to 16384
  * tokens deep and more past it) can give a shorter query more splits: at gqa 8 a 4-row step needs
  * 1.6x the partials of the band bound 5. */
-/* `row` is a token's bytes in a (block, head) page, 0 for the 16-bit and E4M3 caches' 2 * head_dim
+/* `row` is a token's bytes in a (block, head) page, 0 for the bf16 cache's 2 * head_dim elements
  * (fill_paged_row). */
 static int64_t g8_decode_scratch(const RadArgs* a, int head_dim, long long row = 0) {
     const int sp = split_of(a);
@@ -360,16 +355,9 @@ static int g8_decode_common(const RadArgs* a, R4DArgs* r, int head_dim, long lon
 }
 
 #if R4D_ATTN_H256
-extern "C" int GQ_SYM(r4d_rad_attn_decode_h256_gqa, _fp8)(const RadArgs* a, RadStream stream) {
-    R4DArgs r;
-    const int rc = g8_decode_common(a, &r, 256);
-    if (rc != RAD_OK) return rc;
-    return g8_decode_launch<256, 0>(&r, stream);
-}
 /* ---- attn_paged_gate_quant: attn_paged's eight operands, then the gate, codes and scales.
  * The gate is a [T, n_head, head_dim] column view of the [q|gate] projection; its (token, head)
- * rows are one pitch apart only if the view narrowed the last axis alone. gq_row_pitch repeats
- * gate_quant_fp8's tq_pitch test, which this unit cannot link. */
+ * rows are one pitch apart only if the view narrowed the last axis alone. */
 enum { AP_GQ_G = AP_OUT + 1, AP_GQ_Q, AP_GQ_S };
 
 static long long gq_row_pitch(const RadTensor* t, long long width) {
@@ -382,7 +370,9 @@ static long long gq_row_pitch(const RadTensor* t, long long width) {
     return t->stride[t->rank - 2];
 }
 
-static int g8_gate_quant_args(const RadArgs* a, const R4DArgs& r, R4DGateQuant* gq) {
+/* `rot`: attn_paged_gate_had_quant, whose codes are in the rotated domain. */
+static int g8_gate_quant_args(const RadArgs* a, const R4DArgs& r, R4DGateQuant* gq,
+                              bool rot = false) {
     const RadTensor* g = r4d_opt(a, AP_GQ_G);
     const RadTensor* q = r4d_opt(a, AP_GQ_Q);
     const RadTensor* s = r4d_opt(a, AP_GQ_S);
@@ -391,6 +381,7 @@ static int g8_gate_quant_args(const RadArgs* a, const R4DArgs& r, R4DGateQuant* 
     if (g->dtype != RAD_BF16 || (q->dtype != RAD_F8E4M3 && q->dtype != RAD_I8) ||
         s->dtype != RAD_F32)
         return R4D_NO(RAD_E_DTYPE);
+    if (rot && q->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
     const char* act = r4d_gets(a, "act");
     if (!act || std::strcmp(act, "sigmoid")) return R4D_NO(RAD_E_UNSUPPORTED);
     if (r4d_geti_or(a, "group", kGqGroup) != kGqGroup) return R4D_NO(RAD_E_SHAPE);
@@ -413,20 +404,12 @@ static int g8_gate_quant_args(const RadArgs* a, const R4DArgs& r, R4DGateQuant* 
     gq->q_ld = (unsigned)qp;
     gq->s_ld = (unsigned)sp;
     gq->i8   = q->dtype == RAD_I8 ? 1 : 0;
+    gq->rot  = rot ? 1 : 0;
     return RAD_OK;
 }
 
-extern "C" int GQ_SYM(r4d_rad_attn_decode_gq_h256_gqa, _fp8)(const RadArgs* a, RadStream stream) {
-    R4DArgs r;
-    const int rc = g8_decode_common(a, &r, 256);
-    if (rc != RAD_OK) return rc;
-    R4DGateQuant gq{};
-    const int gc = g8_gate_quant_args(a, r, &gq);
-    if (gc != RAD_OK) return gc;
-    return g8_decode_launch<256, 0>(&r, stream, &gq);
-}
-
-/* bf16-cache decode, plain and gated: the fp8 pair at KVP 1. */
+/* bf16-cache decode, plain and with the gate and quantiser in the merge (`_gq` E4M3 or int8 codes,
+ * `_ghq` rotated int8 codes for an out projection stored rotated). */
 extern "C" int GQ_SYM(r4d_rad_attn_decode_h256_gqa, _bf16)(const RadArgs* a, RadStream stream) {
     R4DArgs r;
     const int rc = g8_decode_common(a, &r, 256);
@@ -442,14 +425,17 @@ extern "C" int GQ_SYM(r4d_rad_attn_decode_gq_h256_gqa, _bf16)(const RadArgs* a, 
     if (gc != RAD_OK) return gc;
     return g8_decode_launch<256, 1>(&r, stream, &gq);
 }
+extern "C" int GQ_SYM(r4d_rad_attn_decode_ghq_h256_gqa, _bf16)(const RadArgs* a, RadStream stream) {
+    R4DArgs r;
+    const int rc = g8_decode_common(a, &r, 256);
+    if (rc != RAD_OK) return rc;
+    R4DGateQuant gq{};
+    const int gc = g8_gate_quant_args(a, r, &gq, true);
+    if (gc != RAD_OK) return gc;
+    return g8_decode_launch<256, 1>(&r, stream, &gq);
+}
 #endif
 #if R4D_ATTN_H128
-extern "C" int GQ_SYM(r4d_rad_attn_decode_h128_gqa, _fp8)(const RadArgs* a, RadStream s) {
-    R4DArgs r;
-    const int rc = g8_decode_common(a, &r, 128);
-    if (rc != RAD_OK) return rc;
-    return g8_decode_launch<128, 0>(&r, s);
-}
 extern "C" int GQ_SYM(r4d_rad_attn_decode_h128_gqa, _bf16)(const RadArgs* a, RadStream s) {
     R4DArgs r;
     const int rc = g8_decode_common(a, &r, 128);
@@ -458,11 +444,32 @@ extern "C" int GQ_SYM(r4d_rad_attn_decode_h128_gqa, _bf16)(const RadArgs* a, Rad
 }
 #endif
 
-#if R4D_ATTN_H256 && R4D_ATTN_V4
-/* ---- the fp8_v4 cache (a token's row 25 * 256 / 16 = 400 bytes: E4M3 K, int4 V, f16 scales) and
- * the k6_v4 cache (352 bytes: int6 K, int4 V), prefill, decode and decode with the gate and
- * quantiser in the merge. */
-#define G8_V4_ENTRIES(TAG, ROWB, XOPT)                                                        \
+#if R4D_ATTN_H128
+/* ---- the int8 cache at head_dim 128: a token's row is 2 * 128 + 4 = 260 bytes. Prefill (K staged
+ * eight dims a thread, having no wide fetch at this width), and the decode that also serves a
+ * drafter's non-causal block. */
+extern "C" int GQ_SYM(r4d_rad_attn_prefill_h128_gqa, _i8)(const RadArgs* a, RadStream s) {
+    R4DArgs r;
+    const int rc = fill_paged_row(a, &r, 128, 2 * 128 + 4);
+    if (rc != RAD_OK) return rc;
+    return g8_prefill_launch<128, G8_P_OPT_128 | O_KVI8, 0>(&r, (hipStream_t)s);
+}
+extern "C" int64_t GQ_SYM(r4d_rad_attn_decode_h128_gqa, _i8_scratch)(const RadArgs* a) {
+    return g8_decode_scratch(a, 128, 2 * 128 + 4);
+}
+extern "C" int GQ_SYM(r4d_rad_attn_decode_h128_gqa, _i8)(const RadArgs* a, RadStream stream) {
+    R4DArgs r;
+    const int rc = g8_decode_common(a, &r, 128, 2 * 128 + 4);
+    if (rc != RAD_OK) return rc;
+    return g8_decode_launch<128, 0, O_KVI8>(&r, stream);
+}
+#endif
+
+#if R4D_ATTN_H256
+/* ---- the int8 cache at head_dim 256 (a token's row 2 * 256 + 4 = 516 bytes): prefill, decode
+ * and decode with the gate and quantiser in the merge. `_ghq` is `_gq` with the rotated
+ * quantiser. */
+#define G8_I8_ENTRIES(TAG, ROWB, XOPT)                                                        \
 extern "C" int64_t GQ_SYM(r4d_rad_attn_prefill_h256_gqa, _##TAG##_scratch)(const RadArgs* a) { \
     return g8_prefill_scratch(a, ROWB);                                                        \
 }                                                                                              \
@@ -492,8 +499,17 @@ extern "C" int GQ_SYM(r4d_rad_attn_decode_gq_h256_gqa, _##TAG)(const RadArgs* a,
     const int gc = g8_gate_quant_args(a, r, &gq);                                              \
     if (gc != RAD_OK) return gc;                                                               \
     return g8_decode_launch<256, 0, (XOPT)>(&r, stream, &gq);                                  \
+}                                                                                              \
+extern "C" int GQ_SYM(r4d_rad_attn_decode_ghq_h256_gqa, _##TAG)(const RadArgs* a,              \
+                                                                RadStream stream) {            \
+    R4DArgs r;                                                                                 \
+    const int rc = g8_decode_common(a, &r, 256, ROWB);                                         \
+    if (rc != RAD_OK) return rc;                                                               \
+    R4DGateQuant gq{};                                                                         \
+    const int gc = g8_gate_quant_args(a, r, &gq, true);                                        \
+    if (gc != RAD_OK) return gc;                                                               \
+    return g8_decode_launch<256, 0, (XOPT)>(&r, stream, &gq);                                  \
 }
-G8_V4_ENTRIES(fp8v4, 400, O_V4)
-G8_V4_ENTRIES(k6v4, 352, O_V4 | O_K6)
-#undef G8_V4_ENTRIES
+G8_I8_ENTRIES(i8, 516, O_KVI8)
+#undef G8_I8_ENTRIES
 #endif

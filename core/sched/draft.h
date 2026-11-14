@@ -17,9 +17,10 @@
  *   chance of being emitted still pays for its verify row (kDraftMinChance).
  *
  *   Per step (plan_step): the head depth D. A serial head runs as many rounds as the deepest
- *   window in the step, so D maximises sum_i E_i(min(D, stop_i)) / T(D, n), with
- *   E(d) = 1 + sum_k prod_{j<=k} a_j and T measured online (step_time). Each sequence then
- *   drafts min(D, stop_i).
+ *   window in the step, so D maximises sum_i E_i(min(D, stop_i)) / T(R(D)), with
+ *   E(d) = 1 + sum_k prod_{j<=k} a_j, R(D) the query rows the step would then carry (a row a
+ *   sequence plus sum_i min(D, stop_i)) and T measured online by row count (step_time,
+ *   step_cost.h). Each sequence then drafts min(D, stop_i).
  *
  * Both move only past a hold, and D also past a hysteresis, because a new window is a new pass
  * shape that must be recorded before it plays (runtime/ctx.h). `max_depth` stays the ceiling and
@@ -35,6 +36,7 @@
  */
 #pragma once
 #include "rad_core.h"
+#include "step_cost.h"
 
 namespace rad {
 
@@ -96,15 +98,16 @@ public:
     static constexpr int kMinDepth = 1;
     /* A sequence stops at the first draft whose chance of being emitted, prod_{j<=d} a_j, is
      * under 1 in 10. Once the head runs D rounds for the deepest neighbour, a sequence's only
-     * added cost is its verify row. At one sequence the step-cost prior (1 + 0.06 d) breaks even
-     * near this chance (a draft pays while p_d / E exceeds the ~6% it adds, with E around 2), and
-     * a row alone costs less than a round plus a row, so this is never stricter than D's own
-     * trade. A constant because a row's share cannot be separated from the head's rounds in step
-     * times keyed by depth. */
+     * added cost is its verify row, and a draft pays while p_d / E exceeds the share of the step
+     * that row adds. That share is a few percent at any load and E is two to three tokens a
+     * sequence, so this is never stricter than D's own trade; it only keeps a sequence that
+     * accepts little from riding its neighbours' rounds with rows that are almost never emitted. */
     static constexpr double kDraftMinChance = 0.1;
-    /* Step times are kept per running-row class: 1, 2-3, 4-7, 8-15, 16+. Cost moves with how many
-     * rows share the weight reads; power-of-two classes keep every key fed. */
-    static constexpr int kCostClasses = 5;
+    /* The shape an untimed row count is priced on (StepCost): each query row adds 12% of a
+     * one-row step, a verify row of streamed experts and its share of a head round. Qwen3.8
+     * Flash-Next on two R9700s, ms a step at 3 / 4 / 5 rows of one sequence: 11.2 / 12.3 / 13.6.
+     * Only ratios are used, and a timed row count replaces it. */
+    static constexpr double kRowCost = 0.12;
 
     int  configure(const Params& p);
     const Params& params() const { return p_; }
@@ -145,15 +148,15 @@ public:
      * the head (prompt lookup) are held to it, so they add no deeper pass shape. */
     int  step_window() const { return adapt_ && step_w_ > 0 ? step_w_ : p_.max_depth; }
 
-    /* T(depth, n): a decode step with deepest window `depth` and `n_rows` decode rows took `ms`
-     * since the end of the previous step. Fed by Scheduler::step_finished; adaptive policy only. */
-    void step_time(int depth, int n_rows, double ms);
-    /* Expected cost of a step at `depth` with `n_rows` rows: the key's mean (ms) if it has
-     * samples; else the nearest measured key scaled by the prior's ratio (1 + 0.06 d); else the
-     * unitless prior itself. */
-    double step_cost(int depth, int n_rows) const;
-    /* Samples behind a key: for tests and logs. */
-    int64_t cost_samples(int depth, int n_rows) const;
+    /* T(R): a drafting decode step of `q_rows` query rows (every sequence's verified token and
+     * its drafts) took `ms` since the end of the previous step, the head's rounds included. Fed
+     * by Scheduler::step_finished; adaptive policy only. */
+    void step_time(int q_rows, double ms);
+    /* Expected cost of a step of `q_rows` query rows (StepCost::cost): ms once anything is timed,
+     * else the unitless prior. */
+    double step_cost(int q_rows) const;
+    /* Samples behind a row count: for tests and logs. */
+    int64_t cost_samples(int q_rows) const;
 
     /* E(d) for `s`'s current estimate: expected tokens emitted by a verify of d drafts, the
      * verified token included. For tests and logs. */
@@ -205,15 +208,13 @@ private:
     /* The prior from finished sequences (adapt_retire), and how many are behind it. */
     float   prior_[RAD_SCHED_MAX_SPEC] = {};
     int64_t prior_n_ = 0;
-    /* T(d, class): the mean step time of each key, and the steps behind it. */
-    double  cost_ms_[RAD_SCHED_MAX_SPEC + 1][kCostClasses] = {};
-    int64_t cost_n_ [RAD_SCHED_MAX_SPEC + 1][kCostClasses] = {};
+    /* T(R): drafting steps' times by query rows. */
+    StepCost cost_{kRowCost};
 
     /* Fill a sequence's estimate from the prior and set its first stop. */
     void    start(DraftAdapt& s) const;
     /* The deepest draft whose chance of being emitted is at least kDraftMinChance. */
     int     stop_of(const float* a) const;
-    static int cost_class(int n_rows);
 };
 
 }  /* namespace rad */

@@ -3,7 +3,7 @@
 
 #include "rad_internal.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -93,8 +93,8 @@ std::vector<GenFieldSource> gen_sampling_sources(const GenSampling& stated, cons
 }
 
 bool gen_sampling_parse(const std::string& json_text, const char* src, GenSampling* out) {
-    nlohmann::json j;
-    try { j = nlohmann::json::parse(json_text); }
+    Json j;
+    try { j = Json::parse(json_text); }
     catch (const std::exception& e) { RAD_WARN("%s: %s; ignoring it", src, e.what()); return false; }
     if (!j.is_object()) { RAD_WARN("%s: not a JSON object; ignoring it", src); return false; }
 
@@ -190,7 +190,7 @@ bool gen_sampling_from_file(const std::string& path, bool required, GenSampling*
 bool gen_sampling_from_kv(const std::function<const char*(const char*)>& get, GenSampling* out) {
     /* Rebuilt as JSON and passed to gen_sampling_parse, so container metadata and the original
      * file share one set of range checks and one reading of `do_sample`. */
-    nlohmann::json j = nlohmann::json::object();
+    Json j = Json::object();
     static const char* const kFields[] = { "do_sample", "temperature", "top_p", "min_p", "top_k",
                                            "no_repeat_ngram_size", "no_repeat_ngram_window_size",
                                            "no_repeat_ngram_whitelist", "suppress_tokens" };
@@ -206,7 +206,7 @@ bool gen_sampling_from_kv(const std::function<const char*(const char*)>& get, Ge
             /* Not a number: the container's metadata is string-valued, and the whitelist is a
              * JSON array spelled as JSON text. */
             try {
-                j[k] = nlohmann::json::parse(v);
+                j[k] = Json::parse(v);
             } catch (const std::exception& e) {
                 RAD_WARN("the container states generation.%s as \"%s\", which is not a JSON "
                          "array of ids (%s); ignoring it", k, v, e.what());
@@ -215,7 +215,7 @@ bool gen_sampling_from_kv(const std::function<const char*(const char*)>& get, Ge
         }
         if (std::strcmp(k, "suppress_tokens") == 0) {
             /* An array of scalars is flattened to a space-separated string (flatten_json). */
-            nlohmann::json ids = nlohmann::json::array();
+            Json ids = Json::array();
             char* p = const_cast<char*>(v);
             for (char* e = nullptr;; p = e) {
                 const long long id = std::strtoll(p, &e, 10);

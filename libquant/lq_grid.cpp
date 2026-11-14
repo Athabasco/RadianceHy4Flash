@@ -1387,6 +1387,11 @@ Scales grid_scales(const Grid& g, const float* w, int64_t rows, int64_t cols, co
         } else {
             s2r[k] = round_nz(g.scale2_dt, v);
             s.s2[k] = round_nz(g.scale2_dt, s2r[k] * resid);
+            /* An integer first level cannot pass its top, so a second level that rounded down
+             * takes the next value up: the largest scale under it then still fits. */
+            if (g.l1_int)
+                for (float up = 0x1p-12f; up < 0.5f && s.s2[k] / resid * g.l1max < peak[k]; up *= 2.0f)
+                    s.s2[k] = round_nz(g.scale2_dt, s2r[k] * resid * (1.0f + up));
         }
         /* As for a first level alone (store_first_level): the first level is taken relative to
          * what the reader multiplies by, which is N times the stored second level. */

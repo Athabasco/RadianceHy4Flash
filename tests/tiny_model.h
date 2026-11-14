@@ -24,7 +24,9 @@
 #include "rad_plugin.h"
 #include "rad_test.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
+
+using Json = rad::Json;
 
 #include <algorithm>
 #include <cerrno>
@@ -136,7 +138,7 @@ inline Tensor linear(const std::string& name, int64_t n_out, int64_t n_in, Rng& 
 
 /* One safetensors file holding `ts` in order, with the header padded to 8 bytes. */
 inline bool write_safetensors(const std::string& path, const std::vector<Tensor>& ts) {
-    nlohmann::ordered_json h = nlohmann::ordered_json::object();
+    Json h = Json::object();
     uint64_t off = 0;
     for (const Tensor& t : ts) {
         h[t.name] = { { "dtype", t.dtype }, { "shape", t.shape },
@@ -163,7 +165,7 @@ inline std::vector<Tensor> read_safetensors(const std::string& path) {
     uint64_t n = 0;
     std::memcpy(&n, raw.data(), 8);
     if (8 + n > raw.size()) return ts;
-    const auto h = nlohmann::ordered_json::parse(raw.substr(8, n), nullptr, false);
+    const auto h = Json::parse(raw.substr(8, n), nullptr, false);
     if (!h.is_object()) return ts;
     for (auto it = h.begin(); it != h.end(); ++it) {
         if (it.key() == "__metadata__") continue;
@@ -205,18 +207,18 @@ enum : int32_t { kEndOfText = 256, kImStart = 257, kImEnd = 258, kTokenizerSize 
 /* tokenizer.json: byte-level BPE, ids 0..255 the bytes, no merges, then the specials, then
  * `extra` special tokens from kTokenizerSize on. */
 inline std::string tokenizer_json(const std::vector<std::string>& extra = {}) {
-    nlohmann::ordered_json vocab = nlohmann::ordered_json::object();
+    Json vocab = Json::object();
     for (int b = 0; b < 256; ++b) vocab[byte_symbol(b)] = b;
     std::vector<std::string> specials = { "<|endoftext|>", "<|im_start|>", "<|im_end|>" };
     specials.insert(specials.end(), extra.begin(), extra.end());
-    nlohmann::ordered_json added = nlohmann::ordered_json::array();
+    Json added = Json::array();
     for (int i = 0; i < (int)specials.size(); ++i) {
         vocab[specials[(size_t)i]] = 256 + i;
         added.push_back({ { "id", 256 + i }, { "content", specials[(size_t)i] },
                           { "single_word", false }, { "lstrip", false }, { "rstrip", false },
                           { "normalized", false }, { "special", true } });
     }
-    nlohmann::ordered_json j;
+    Json j;
     j["version"] = "1.0";
     j["added_tokens"] = added;
     j["normalizer"] = nullptr;
@@ -227,7 +229,7 @@ inline std::string tokenizer_json(const std::vector<std::string>& extra = {}) {
                      { "trim_offsets", false }, { "use_regex", true } };
     j["model"] = { { "type", "BPE" }, { "dropout", nullptr }, { "unk_token", nullptr },
                    { "byte_fallback", false }, { "vocab", vocab },
-                   { "merges", nlohmann::ordered_json::array() } };
+                   { "merges", Json::array() } };
     return j.dump();
 }
 
@@ -239,7 +241,7 @@ inline std::vector<int32_t> byte_ids(const std::string& text) {
 }
 
 /* config.json, model.safetensors and tokenizer.json in `dir`. */
-inline bool write_checkpoint(const std::string& dir, const nlohmann::ordered_json& config,
+inline bool write_checkpoint(const std::string& dir, const Json& config,
                              const std::vector<Tensor>& ts,
                              const std::vector<std::string>& extra_specials = {}) {
     return write_text(dir + "/config.json", config.dump(2)) &&
@@ -262,10 +264,10 @@ struct Qwen35 {
 
 inline bool write_qwen35(const std::string& dir, const Qwen35& s) {
     Rng r(s.seed);
-    nlohmann::ordered_json types = nlohmann::ordered_json::array();
+    Json types = Json::array();
     for (int64_t l = 0; l < s.layers; ++l)
         types.push_back((l + 1) % s.interval == 0 ? "full_attention" : "linear_attention");
-    nlohmann::ordered_json c;
+    Json c;
     c["architectures"] = { "Qwen3_5ForConditionalGeneration" };
     c["model_type"] = "qwen3_5";
     c["vocab_size"] = s.vocab;
@@ -344,9 +346,9 @@ struct Lfm2 {
 inline bool write_lfm2(const std::string& dir, const Lfm2& s) {
     Rng r(s.seed);
     const int64_t H = s.hidden, hd = s.hidden / s.heads, kv = s.kv_heads * hd;
-    nlohmann::ordered_json types = nlohmann::ordered_json::array();
+    Json types = Json::array();
     for (int64_t l = 0; l < s.layers; ++l) types.push_back(l % 2 ? "full_attention" : "conv");
-    nlohmann::ordered_json c;
+    Json c;
     c["architectures"] = { "Lfm2ForCausalLM" };
     c["model_type"] = "lfm2";
     c["vocab_size"] = s.vocab;
@@ -414,10 +416,10 @@ struct Gemma4 {
 inline bool write_gemma4(const std::string& dir, const Gemma4& s) {
     Rng r(s.seed);
     const int64_t H = s.hidden;
-    nlohmann::ordered_json types = nlohmann::ordered_json::array();
+    Json types = Json::array();
     for (int64_t l = 0; l < s.layers; ++l)
         types.push_back((l + 1) % s.interval == 0 ? "full_attention" : "sliding_attention");
-    nlohmann::ordered_json t;
+    Json t;
     t["model_type"] = "gemma4_text";
     t["vocab_size"] = s.vocab;
     t["hidden_size"] = H;
@@ -442,7 +444,7 @@ inline bool write_gemma4(const std::string& dir, const Gemma4& s) {
         { "sliding_attention", { { "rope_type", "default" }, { "rope_theta", 10000.0 } } },
         { "full_attention", { { "rope_type", "proportional" }, { "rope_theta", 1000000.0 },
                               { "partial_rotary_factor", 0.25 } } } };
-    nlohmann::ordered_json c;
+    Json c;
     c["architectures"] = { "Gemma4ForConditionalGeneration" };
     c["model_type"] = "gemma4";
     c["text_config"] = t;
@@ -505,9 +507,9 @@ struct DFlash2 {
 inline bool write_dflash2(const std::string& dir, const DFlash2& s) {
     Rng r(s.seed);
     const int64_t H = s.hidden, q = s.heads * s.head_dim, kv = s.kv_heads * s.head_dim;
-    nlohmann::ordered_json types = nlohmann::ordered_json::array();
+    Json types = Json::array();
     for (int64_t l = 0; l < s.layers; ++l) types.push_back("sliding_attention");
-    nlohmann::ordered_json t;
+    Json t;
     t["attention_bias"] = false;
     t["head_dim"] = s.head_dim;
     t["hidden_act"] = "silu";
@@ -524,18 +526,18 @@ inline bool write_dflash2(const std::string& dir, const DFlash2& s) {
     t["sliding_window"] = s.window;
     t["use_sliding_window"] = true;
     t["vocab_size"] = s.vocab;
-    nlohmann::ordered_json greedy;
+    Json greedy;
     greedy["proposal_type"] = "greedy";
     greedy["speculative_tokens"] = s.block - 1;
-    nlohmann::ordered_json verifier;
+    Json verifier;
     verifier["architectures"] = { "Gemma4ForConditionalGeneration" };
     verifier["name_or_path"] = "tiny";
-    nlohmann::ordered_json spec;
+    Json spec;
     spec["algorithm"] = "dflash2";
     spec["default_proposal_method"] = "greedy";
-    spec["proposal_methods"] = nlohmann::ordered_json::array({ greedy });
+    spec["proposal_methods"] = Json::array({ greedy });
     spec["verifier"] = verifier;
-    nlohmann::ordered_json c;
+    Json c;
     c["architectures"] = { "DFlash2DraftModel" };
     c["aux_hidden_state_layer_ids"] = s.taps;
     c["block_size"] = s.block;
@@ -599,7 +601,7 @@ struct Llama {
 inline bool write_llama(const std::string& dir, const Llama& s) {
     Rng r(s.seed);
     const int64_t H = s.hidden, q = s.heads * s.head_dim, kv = s.kv_heads * s.head_dim;
-    nlohmann::ordered_json c;
+    Json c;
     c["architectures"] = { "LlamaForCausalLM" };
     c["model_type"] = "llama";
     c["vocab_size"] = s.vocab;
@@ -692,7 +694,7 @@ inline bool write_llama_ct_int4(const std::string& dir, const Llama& s, bool asy
         out.push_back(std::move(sc));
         if (asym) out.push_back(std::move(zp));
     }
-    nlohmann::ordered_json c = nlohmann::ordered_json::parse(read_text(dir + "/config.json"));
+    Json c = Json::parse(read_text(dir + "/config.json"));
     c["quantization_config"] = {
         { "quant_method", "compressed-tensors" }, { "format", "pack-quantized" },
         { "config_groups",
@@ -702,7 +704,7 @@ inline bool write_llama_ct_int4(const std::string& dir, const Llama& s, bool asy
                 { "weights",
                   { { "num_bits", 4 }, { "type", "int" }, { "symmetric", !asym },
                     { "strategy", "group" }, { "group_size", G }, { "dynamic", false },
-                    { "actorder", asym ? nullptr : nlohmann::ordered_json("static") } } } } } } },
+                    { "actorder", asym ? nullptr : Json("static") } } } } } } },
         { "ignore", { "lm_head" } } };
     return write_text(dir + "/config.json", c.dump(2)) &&
            write_safetensors(dir + "/model.safetensors", out);
@@ -734,7 +736,7 @@ inline bool write_qwen3asr(const std::string& dir, const Qwen3Asr& s) {
     const int64_t H = s.hidden, q = s.heads * s.head_dim, kv = s.kv_heads * s.head_dim;
     const int64_t A = s.a_dim, C = s.a_channels;
     const int64_t f3 = ((((s.mels + 1) / 2) + 1) / 2 + 1) / 2;
-    nlohmann::ordered_json c;
+    Json c;
     c["architectures"] = { "Qwen3ASRForConditionalGeneration" };
     c["model_type"] = "qwen3_asr";
     c["audio_token_id"] = (int)kAsrAudioPad;
@@ -806,7 +808,7 @@ inline bool write_qwen3asr(const std::string& dir, const Qwen3Asr& s) {
     }
     ts.push_back(noise(m + "norm.weight", { H }, r, 0.1f, 1.0f));
 
-    nlohmann::ordered_json fe;
+    Json fe;
     fe["feature_extractor"] = { { "feature_extractor_type", "Qwen3ASRFeatureExtractor" },
                                 { "feature_size", s.mels }, { "hop_length", 160 },
                                 { "n_fft", 400 }, { "sampling_rate", 16000 }, { "dither", 0.0 },
@@ -832,7 +834,7 @@ inline bool write_lora(const std::string& dir, const std::string& base,
     if (ws.empty()) return false;
     const float scale = (float)(alpha / (double)r);
     std::vector<Tensor> ad;
-    nlohmann::ordered_json leaves = nlohmann::ordered_json::array();
+    Json leaves = Json::array();
     for (Tensor& w : ws) {
         const std::string sfx = ".weight";
         if (w.shape.size() != 2 || w.dtype != "BF16" || w.name.size() <= sfx.size() ||
@@ -863,7 +865,7 @@ inline bool write_lora(const std::string& dir, const std::string& base,
         ad.push_back(std::move(B));
     }
     for (const std::string& t : targets) leaves.push_back(t);
-    nlohmann::ordered_json c;
+    Json c;
     c["peft_type"] = "LORA";
     c["base_model_name_or_path"] = base;
     c["r"] = r;
@@ -884,21 +886,14 @@ inline bool write_lora(const std::string& dir, const std::string& base,
            write_safetensors(merged + "/model.safetensors", ws);
 }
 
-/* The rad-convert recipe that makes llama_dense_fp8's linears block fp8, as
- * data/recipes/minicpm5-2b-dspark.recipe does for the trunk. */
-inline const char* kLlamaFp8Recipe =
-    "blk.*.attn_qkv.weight     rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
-    "blk.*.attn_output.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
-    "blk.*.ffn_gate_up.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
-    "blk.*.ffn_down.weight     rtn codes=fp8_e4m3 block=128x128 scale=bf16\n";
-
-/* The same trunk as OCP-MXFP4: e2m1 codes with an E8M0 exponent per 32 of K, read by gemm_nt_q at
- * mxfp4a8 against the E4M3 activation pair scaled per 128. */
-inline const char* kLlamaMxfp4Recipe =
-    "blk.*.attn_qkv.weight     rtn codes=fp4_e2m1 group=32 scale=e8m0\n"
-    "blk.*.attn_output.weight  rtn codes=fp4_e2m1 group=32 scale=e8m0\n"
-    "blk.*.ffn_gate_up.weight  rtn codes=fp4_e2m1 group=32 scale=e8m0\n"
-    "blk.*.ffn_down.weight     rtn codes=fp4_e2m1 group=32 scale=e8m0\n";
+/* The rad-convert recipe that makes llama_dense_fp8's linears rotated int8 with a bf16 scale per
+ * row and 128 of K (the 128-wide Hadamard domain), read by gemm_nt_q at i8a8h against int8
+ * activations rotated the same way. */
+inline const char* kLlamaI8Recipe =
+    "blk.*.attn_qkv.weight     rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym\n"
+    "blk.*.attn_output.weight  rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym\n"
+    "blk.*.ffn_gate_up.weight  rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym\n"
+    "blk.*.ffn_down.weight     rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym\n";
 
 /* ------------------------------------------------------------------ Qwen-Image 2.1 */
 
@@ -918,7 +913,7 @@ struct QwenImage {
 
 inline bool write_qwen_image(const std::string& dir, const QwenImage& s) {
     Rng r(s.seed);
-    using oj = nlohmann::ordered_json;
+    using oj = Json;
     for (const char* sub : { "text_encoder", "transformer", "vae", "scheduler", "tokenizer" })
         if (mkdir((dir + "/" + sub).c_str(), 0755) != 0 && errno != EEXIST) return false;
     oj index;
@@ -1091,21 +1086,19 @@ inline bool write_qwen_image(const std::string& dir, const QwenImage& s) {
            write_text(dir + "/tokenizer/tokenizer.json", tokenizer_json());
 }
 
-/* The rad-convert recipe that makes the DiT's linears block fp8, as a shipped fp8 container holds
- * them; the plugin then takes the fp8 forms of its norms and attention scores. The text encoder's
- * 64-wide linears are no whole 128 x 128 block and stay bf16. */
-inline const char* kQwenImageFp8Recipe =
-    "dit.blk.*.attn_qkv.weight     rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
-    "dit.blk.*.attn_output.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
-    "dit.blk.*.ffn_gate_up.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
-    "dit.blk.*.ffn_down.weight     rtn codes=fp8_e4m3 block=128x128 scale=bf16\n";
+/* The rad-convert recipe that makes the DiT's linears rotated int8 with a bf16 scale per row and
+ * 128 of K, as a shipped int8 container holds them; the plugin then takes the int8 forms of its
+ * norms and attention scores. The text encoder's 64-wide linears are no whole 128 of K and stay
+ * bf16. */
+inline const char* kQwenImageI8Recipe =
+    "dit.blk.*.attn_qkv.weight     rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym\n"
+    "dit.blk.*.attn_output.weight  rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym\n"
+    "dit.blk.*.ffn_gate_up.weight  rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym\n"
+    "dit.blk.*.ffn_down.weight     rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym\n";
 
-/* The lm head quantised as the shipped containers hold it, one rule each, after the trunk's:
- * block fp8 (the 27B family, data/recipes/q38-27b-fp8-df2.recipe) and int8 with a bf16 scale per
- * row and 128 of K (Flash-Next's, Gemma 4 31B's). Declared over all its planes, the head is joined
- * on the host (abi/rad_planes.h). */
-inline const char* kLlamaFp8HeadRule =
-    "output.weight             rtn codes=fp8_e4m3 block=128x128 scale=bf16\n";
+/* The lm head quantised as the shipped containers hold it, after the trunk's rules: int8 with a
+ * bf16 scale per row and 128 of K (Flash-Next's, Gemma 4 31B's). Declared over all its planes, the
+ * head is joined on the host (abi/rad_planes.h). */
 inline const char* kLlamaI8HeadRule =
     "output.weight             rtn codes=i8 group=128 scale=bf16 clamp=sym\n";
 

@@ -152,7 +152,7 @@ static Program stream_program(const KVGroupInfo& g, int64_t sel_pitch, bool with
         oi.op = "kv_store_streamed";
         oi.bands.resize(1);
         if (store_resolved) oi.bands[0].dom[RAD_DOMAIN_DEVICE].row = &a_resolved_row();
-        else oi.bands[0].miss[RAD_DOMAIN_DEVICE] = "kv_dtype in {fp8_e4m3}, have fp8_v4";
+        else oi.bands[0].miss[RAD_DOMAIN_DEVICE] = "kv_dtype in {bf16}, have i8";
         oi.base.set_i("block_size", g.block_size);
         p.ops.push_back(std::move(oi));
     }
@@ -1425,7 +1425,7 @@ TEST(a_ring_below_one_decode_step_s_selection_is_raised_to_the_ceiling) {
     f.cfg.n_spec = 0;
     f.cfg.vram_kv_mib = 64;
     std::vector<KVGroupInfo> groups = hybrid_groups();
-    groups[G_FULL].decl.dtype = RAD_F8E4M3;               /* the streamed store's one row */
+    groups[G_FULL].decl.dtype = RAD_I8;                   /* a streamed store's row */
     groups[G_FULL].bytes_per_block = 2048;                 /* as declare sets it */
     const int64_t sel_pitch = 2048;                        /* a synthetic indexer's topk + 1 */
     const int64_t ctx_blocks = 2 * (65536 / 16);           /* 8192 blocks of 16 tokens */
@@ -1569,7 +1569,7 @@ TEST(a_declared_streamed_store_with_no_kernel_is_not_a_streamed_path) {
     f.cfg.max_seqs = 2;
     f.cfg.kv_resident = 256;                             /* under the ring floor, so it is raised */
     std::vector<KVGroupInfo> groups = hybrid_groups();
-    groups[G_FULL].decl.dtype = RAD_F8E4M3;
+    groups[G_FULL].decl.dtype = RAD_I8;
     groups[G_FULL].bytes_per_block = 2048;
     /* The resolve resolves; the store is declared with no row (both domains null). */
     const Program unresolved = stream_program(groups[G_FULL], 8, true, true, /*store_resolved=*/false);
@@ -1595,45 +1595,6 @@ TEST(a_declared_streamed_store_with_no_kernel_is_not_a_streamed_path) {
     CHECK(has(log, "ignored"));
     CHECK(has(log, "kv_store_streamed"));                /* the op that is missing, by name */
 
-}
-
-TEST(a_packed_cache_warns_that_the_layout_has_no_writer_and_serves_non_streamed) {
-    /* --kv-cache-dtype fp8_v4 / k6_v4: the architecture declares the resolve and no streamed store,
-     * because libr4d's streamed rows are E4M3 and bf16 and a packed cache has base-store rows only
-     * (arch/common/rad_block_attn_gated_fp8.h). The group is declared to the core as plain E4M3, so
-     * no dtype gate downstream can see the layout: the operator has to be told the *layout* has no
-     * writer, not that the architecture cannot stream -- and the group must run the base path.
-     * Before this the op was declared against a table with no row for it, which is a weightless
-     * device hole: startup refused with or without --kv-resident, naming a kernel band and never the
-     * flag. */
-    for (const char* dtype : { "fp8_v4", "k6_v4" }) {
-        Fixture f;
-        f.cfg.checkpoint_slots = 0;
-        f.cfg.max_ctx = 65536;   /* above the 32 768-token ring floor */
-        f.cfg.max_seqs = 2;
-        f.cfg.kv_resident = 256;                         /* under the ring floor, so it is raised */
-        f.cfg.kv_cache_dtype = dtype;
-        std::vector<KVGroupInfo> groups = hybrid_groups();
-        groups[G_FULL].decl.dtype = RAD_F8E4M3;          /* what declare gives the core, packed or not */
-        groups[G_FULL].bytes_per_block = 2048;
-        /* What the gated plugin emits for a packed cache: the layout-blind resolve, no store. */
-        const Program packed = stream_program(groups[G_FULL], 8, true, /*with_store=*/false);
-        KVStreamSetup s;
-        int st = RAD_OK;
-        const std::string log = stderr_of([&] {
-            st = kvstream_configure(f.cfg, 65536, groups, packed, &s);
-        });
-        CHECK_OK(st);                                    /* started, not refused */
-        CHECK_EQ(s.group, -1);
-        CHECK_EQ(s.asked_tokens, (int64_t)0);
-        CHECK_EQ(s.stage_blocks, (int64_t)0);
-        CHECK(has(log, "ignored"));
-        CHECK(has(log, std::string("group 'full' has a ") + dtype + " cache"));
-        CHECK(has(log, "has no writer for that layout (E4M3 and bf16 only)"));
-        CHECK(!has(log, "declares no"));                 /* not that sentence: the arch declared it */
-        CHECK(!has(log, "raised to"));                   /* and not the ring's */
-
-    }
 }
 
 TEST(a_resolve_declared_for_another_group_does_not_enable_streaming) {
@@ -2176,6 +2137,17 @@ TEST(chained_hash_identity) {
 
     /* The same span, same parent, different position is also a different block. */
     CHECK(chain_block_hash(a0, shared.data(), 16, nullptr, 0, 32) != a1);
+
+    /* Token order matters both inside a packed pair and across the hash's four lanes, and the
+     * length is part of the identity even where one span is the other's prefix. */
+    auto swapped = a;
+    std::swap(swapped[0], swapped[1]);
+    CHECK(chain_block_hash(root, swapped.data(), 16, nullptr, 0, 0) != a0);
+    swapped = a;
+    std::swap(swapped[0], swapped[8]);
+    std::swap(swapped[1], swapped[9]);
+    CHECK(chain_block_hash(root, swapped.data(), 16, nullptr, 0, 0) != a0);
+    CHECK(chain_block_hash(root, a.data(), 15, nullptr, 0, 0) != a0);
 
     /* Multimodal blocks hash by content: identical placeholder ids, different content keys. */
     MMContentKey m1{ 0, 16, 0x1111 };
@@ -6123,6 +6095,30 @@ TEST(a_window_shift_and_a_seeded_window_mark_the_whole_row) {
  * speculation a linear group's sequence owns two physical slots (copy k of s at s + k *
  * n_seq_states) and both are named; a conv group keeps one copy. The index row the kernels read
  * names copy 0 three times, then copy 1. */
+/* Giving idle slots back leaves a sequence that holds tokens its slot: ensure() grabs one only as
+ * the sequence grows, so its next step would have no recurrent state. */
+TEST(giving_idle_state_slots_back_leaves_a_sequence_holding_tokens_its_slot) {
+    Fixture f;
+    REQUIRE_EQ(f.build_groups(hybrid_conv_groups()), RAD_OK);
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16));
+    CHECK_OK(f.kv.add_sequence(2));
+    CHECK_OK(f.kv.ensure(2, 16));
+    const int32_t s1 = f.kv.state_slot(1, G_GDN);
+    REQUIRE(s1 >= 0);
+    /* Preempted, then handed a slot it holds at zero tokens: that one goes back. */
+    CHECK_OK(f.kv.preempt(2));
+    CHECK_EQ(f.kv.state_slot(2, G_GDN), -1);
+    const int64_t free_before = f.kv.free_states(G_GDN);
+    CHECK_EQ(f.kv.release_idle_states(), 0);
+    CHECK_EQ(f.kv.state_slot(1, G_GDN), s1);
+    CHECK_EQ(f.kv.free_states(G_GDN), free_before);
+    /* A slot held is not free, however many times the slots are counted. */
+    for (int i = 0; i < 3; ++i) (void)f.kv.release_idle_states();
+    CHECK_OK(f.kv.ensure(2, 16));
+    CHECK(f.kv.state_slot(2, G_GDN) != s1);
+}
+
 TEST(a_handed_out_state_slot_is_named_for_clearing_once_per_copy) {
     Fixture f;
     f.cfg.n_spec = 2;

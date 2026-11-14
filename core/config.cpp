@@ -13,7 +13,7 @@
 #include "util/kernel_list.h"
 #include "place/planner.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <cctype>
@@ -30,11 +30,7 @@
 
 namespace rad {
 
-struct Flag {
-    const char* name;
-    const char* arg;     /* null for a boolean */
-    const char* help;
-};
+using Flag = ConfigFlag;
 
 /* Built from kDraftWindowDefault so the default is stated once. Defined before the table that
  * points at it, which fixes their initialisation order. */
@@ -93,21 +89,19 @@ static const Flag g_flags[] = {
                                         "Not with --gpu-headroom-mib" },
     { "--gpu-headroom-mib",   "N",      "VRAM left unclaimed on every card (default 96).\n"
                                         "Not with --gpu-memory-mib" },
-    { "--kv-cache-dtype",     "T",      "bf16 | fp8 | fp8_v4 | k6_v4 -- fp8 halves what a token of\n"
-                                        "context costs; fp8_v4 keeps V in 4 bits (0.78 of fp8), k6_v4\n"
-                                        "also K in 6 (0.69); both Qwen3.8-27B and -Flash-Next" },
+    { "--kv-cache-dtype",     "T",      "bf16 (default) | i8 | fp8 -- i8 halves what a token of\n"
+                                        "context costs: K and V as int8 with one scale each per token\n"
+                                        "and head. fp8 (E4M3) is GLM-5.3's latent cache only" },
     { "--state-cache-dtype",  "T",      "f32 (default) | f16 -- the recurrent state cache (delta net):\n"
                                         "f16 halves the state pool, its checkpoints and its traffic,\n"
                                         "and is lossy; the qwen35 plugins serve it" },
-    { "--attn-prefill-fp8",   "MODE",   "off (default) | qk | pv | both -- the prefill attention's\n"
-                                        "Q.K^T, P.V or both as e4m3 WMMA over an fp8, fp8_v4 or\n"
-                                        "k6_v4 cache: faster at long context, and lossy" },
     { "--kv-resident",        "N",      "stream the sparse attention group's KV from host memory,\n"
     "                                    keeping N tokens of it in a VRAM ring (0, the default, is\n"
     "                                    off). Raised to 32768 and to what one decode step selects;\n"
     "                                    a ring that covers the context (sequences x\n"
     "                                    --max-model-len) streams nothing" },
-    { "--host-pool-mib",      "N",      "pinned host tier" },
+    { "--host-pool-mib",      "N",      "pinned host tier for weights, in all: the ranks of a model\n"
+    "                                    pin equal shares of it (N / --tp each)" },
     { "--host-headroom-mib",  "N",      "host RAM to leave free for the system when radiance\n"
     "                                    pins its host memory at startup (default 4096)" },
     { "--embedding-placement", "WHERE", "ram (default) | vram: where the token embedding lives. ram\n"
@@ -381,6 +375,11 @@ static const Flag g_flags[] = {
     { "--help",               nullptr,  "this" },
 };
 
+const ConfigFlag* config_flags(size_t* n) {
+    *n = sizeof g_flags / sizeof g_flags[0];
+    return g_flags;
+}
+
 void config_usage(const char* argv0) {
     fprintf(stderr, "usage: %s --model FILE [options]\n\n", argv0);
     /* Align help continuation lines under the first, whatever indentation the string carries. */
@@ -486,7 +485,7 @@ static bool parse_template_kwargs(const char* v, std::map<std::string, std::stri
         src += " " + text.substr(1);
         text = ss.str();
     }
-    const nlohmann::json j = nlohmann::json::parse(text, nullptr, false);
+    const Json j = Json::parse(text, nullptr, false);
     if (j.is_discarded() || !j.is_object()) {
         RAD_ERR("%s takes a JSON object, such as '{\"enable_thinking\": false}'", src.c_str());
         return false;
@@ -511,6 +510,7 @@ static bool parse_template_kwargs(const char* v, std::map<std::string, std::stri
 /* Returns 0 on success, 1 for --help (caller exits 0), negative on a bad argument. An unknown flag
  * is an error, not a warning, since a mistyped budget flag changes the plan. */
 int config_parse(int argc, char** argv, Config* c) {
+    bool pool_all = false;   /* --host-pool-mib was given: a total, split among the ranks at the end */
     /* --help wins from anywhere on the line, even after an otherwise fatal argument. */
     for (int i = 1; i < argc; ++i)
         if (!std::strcmp(argv[i], "--help") || !std::strcmp(argv[i], "-h")) return 1;
@@ -619,9 +619,13 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--host-headroom-mib"))      { if (!num(0, INT64_MAX, &c->host_headroom_mib)) return RAD_E_INVAL; }
         else if (S("--kv-cache-dtype")) {
             if (!(v = need(i))) return RAD_E_INVAL;
-            if (std::strcmp(v, "bf16") && std::strcmp(v, "fp8") && std::strcmp(v, "fp8_v4") &&
-                std::strcmp(v, "k6_v4")) {
-                RAD_ERR("--kv-cache-dtype takes bf16, fp8, fp8_v4 or k6_v4, not '%s'", v);
+            if (!std::strcmp(v, "fp8_v4") || !std::strcmp(v, "k6_v4")) {
+                RAD_ERR("--kv-cache-dtype %s: the packed caches are no longer served; i8 is the "
+                        "8-bit cache (int8 K and V, a scale each per token and head)", v);
+                return RAD_E_INVAL;
+            }
+            if (std::strcmp(v, "bf16") && std::strcmp(v, "i8") && std::strcmp(v, "fp8")) {
+                RAD_ERR("--kv-cache-dtype takes bf16, i8 or fp8, not '%s'", v);
                 return RAD_E_INVAL;
             }
             c->kv_cache_dtype = v;
@@ -634,19 +638,8 @@ int config_parse(int argc, char** argv, Config* c) {
             }
             c->state_cache_dtype = v;
         }
-        else if (S("--attn-prefill-fp8")) {
-            if (!(v = need(i))) return RAD_E_INVAL;
-            if      (!std::strcmp(v, "off"))  c->attn_prefill_fp8 = 0;
-            else if (!std::strcmp(v, "qk"))   c->attn_prefill_fp8 = RAD_ATTN_FP8_QK;
-            else if (!std::strcmp(v, "pv"))   c->attn_prefill_fp8 = RAD_ATTN_FP8_PV;
-            else if (!std::strcmp(v, "both")) c->attn_prefill_fp8 = RAD_ATTN_FP8_QK | RAD_ATTN_FP8_PV;
-            else {
-                RAD_ERR("--attn-prefill-fp8 takes off, qk, pv or both, not '%s'", v);
-                return RAD_E_INVAL;
-            }
-        }
         else if (S("--kv-resident"))           { if (!num(0, INT64_MAX, &c->kv_resident)) return RAD_E_INVAL; }
-        else if (S("--host-pool-mib"))         { if (!num(0, INT64_MAX, &c->host_pool_mib)) return RAD_E_INVAL; }
+        else if (S("--host-pool-mib"))         { if (!num(0, INT64_MAX, &c->host_pool_mib)) return RAD_E_INVAL; pool_all = true; }
         else if (S("--embedding-placement") || S("--ngram-placement")) {
             const bool emb = S("--embedding-placement");
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -991,7 +984,7 @@ int config_parse(int argc, char** argv, Config* c) {
         }
         else if (S("--dry-sequence-breakers")) {
             if (!(v = need(i))) return RAD_E_INVAL;
-            const nlohmann::json j = nlohmann::json::parse(v, nullptr, false);
+            const Json j = Json::parse(v, nullptr, false);
             bool strings = j.is_array();
             if (strings) for (const auto& e : j) strings = strings && e.is_string();
             if (!strings) {
@@ -1299,18 +1292,11 @@ int config_parse(int argc, char** argv, Config* c) {
         RAD_ERR("--video-min-pixels is above --video-max-pixels"); return RAD_E_INVAL; }
     if (c->video_min_frames && c->video_max_frames && *c->video_min_frames > *c->video_max_frames) {
         RAD_ERR("--video-min-frames is above --video-max-frames"); return RAD_E_INVAL; }
+    /* --host-pool-mib is what the model pins for its weights in all; Config::host_pool_mib is a
+     * rank's share of it, whichever of the two options came first. */
+    if (pool_all) c->host_pool_mib /= std::max(c->tp, 1);
 
     return RAD_OK;
-}
-
-const char* attn_prefill_fp8_name(int bits) {
-    switch (bits) {
-        case 0:                                   return "off";
-        case RAD_ATTN_FP8_QK:                     return "qk";
-        case RAD_ATTN_FP8_PV:                     return "pv";
-        case RAD_ATTN_FP8_QK | RAD_ATTN_FP8_PV:  return "both";
-    }
-    return "?";
 }
 
 /* ------------------------------------------------------------------ the startup report's rows */
@@ -1376,11 +1362,9 @@ const ShowRow kShow[] = {
     { "--gpu-headroom-mib",   [](const Config& c) { return num(c.gpu_headroom_mib); } },
     { "--kv-cache-dtype",     [](const Config& c) { return c.kv_cache_dtype; } },
     { "--state-cache-dtype",  [](const Config& c) { return c.state_cache_dtype; } },
-    { "--attn-prefill-fp8",   [](const Config& c) {
-          return std::string(attn_prefill_fp8_name(c.attn_prefill_fp8)); } },
     { "--kv-resident",        [](const Config& c) {
           return c.kv_resident > 0 ? num(c.kv_resident) : std::string("0 (off)"); } },
-    { "--host-pool-mib",      [](const Config& c) { return num(c.host_pool_mib); } },
+    { "--host-pool-mib",      [](const Config& c) { return num(c.host_pool_mib * std::max(c.tp, 1)); } },
     { "--host-headroom-mib",  [](const Config& c) { return num(c.host_headroom_mib); } },
     { "--embedding-placement", [](const Config& c) { return std::string(table_placement_name(c.embedding_placement)); } },
     { "--ngram-placement",    [](const Config& c) {
@@ -1469,8 +1453,8 @@ const ShowRow kShow[] = {
     { "--dry-sequence-breakers", [](const Config& c) {
           /* Invalid UTF-8 is replaced, not thrown on: these strings come from outside. */
           return c.sample_dry_seq_breakers
-                     ? nlohmann::json(*c.sample_dry_seq_breakers)
-                           .dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)
+                     ? Json(*c.sample_dry_seq_breakers)
+                           .dump(-1, ' ', false, Json::error_handler_t::replace)
                      : std::string("the request default"); } },
     { "--xtc-probability",    [](const Config& c) { return opt(c.sample_xtc_probability, "the request default"); } },
     { "--xtc-threshold",      [](const Config& c) { return opt(c.sample_xtc_threshold, "the request default"); } },

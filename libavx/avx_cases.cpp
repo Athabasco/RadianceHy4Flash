@@ -219,6 +219,15 @@ std::vector<Case> build_cases() {
     add("quant_cols_fp8", { HI("M", 5), HI("n", 256), HS("dtype", "bf16") }, EB(5, 256, 2, 1.5));
     add("quant_cols_fp8", { HI("M", 7), HI("n", 96), HS("dtype", "f32") }, EB(7, 96, 4, 1.25));
 
+    /* IQ8R's activation: one scale per 256 columns, each 128-wide half rotated on its own. */
+    add("had_quant_act_i8g", { HI("M", 5), HI("n", 512), HI("group", 256), HS("dtype", "bf16") });
+
+    /* The packed four-bit weight read back: two's complement at a group of 64, a zero point at
+     * 128, one fragment tile of rows each. */
+    add("dequant_w4", { HI("N", 16), HI("K", 64), HI("group", 64), HI("twos", 1),
+                        HS("dtype", "w4a8") });
+    add("dequant_w4", { HI("N", 16), HI("K", 128), HI("group", 128), HI("twos", 0),
+                        HS("dtype", "w4a8") });
     /* Quantisation. 128 is the real grid; 64 tests a second block edge. n = 256 is divisible by
      * both, which the had_* forms require (a rotation block may not straddle the row end). */
     for (int group : { 64, 128 }) {
@@ -232,8 +241,6 @@ std::vector<Case> build_cases() {
                                     HS("dtype", "f32") }, EB(5, 256, 4, 1.25));
         add("quant_act_fp8",      { HI("M", 5), HI("n", 256), HI("group", group),
                                     HS("dtype", "bf16") }, EB(5, 256, 2, 1.5));
-        add("had_quant_act_fp8",  { HI("M", 5), HI("n", 256), HI("group", group),
-                                    HS("dtype", "bf16") });
         add("had_quant_act_i8g",  { HI("M", 5), HI("n", 256), HI("group", group),
                                     HS("dtype", "bf16") });
         add("had_quant_act_i8",   { HI("M", 5), HI("n", 256), HI("group", group),
@@ -312,6 +319,9 @@ std::vector<Case> build_cases() {
                            HS("dtype", "i8a8") }, 0, 2.0 * M * 96 * 256);
         add("gemm_nt_q", { HI("M", M), HI("N", 96), HI("K", 256), HI("group", 128),
                            HS("dtype", "i8a8h") }, 0, 2.0 * M * 96 * 256);
+        /* IQ8R's grid: one scale per 256 of K on both sides. */
+        add("gemm_nt_q", { HI("M", M), HI("N", 96), HI("K", 512), HI("group", 256),
+                           HS("dtype", "i8a8h") }, 0, 2.0 * M * 96 * 512);
         add("gemm_nt_q", { HI("M", M), HI("N", 96), HI("K", 256), HI("group", 32),
                            HS("dtype", "mxfp4a8") }, 0, 2.0 * M * 96 * 256);
     }
@@ -477,39 +487,19 @@ std::vector<Case> build_cases() {
             add("attn_local_rel", { HI("M", 40), HI("head_dim", 32), HI("n_head", 3),
                                     HI("left", 12), HI("right", 0), HF("softcap", 50.0),
                                     HI("cu_div", cd), HS("dtype", dt) });
-    /* An fp8 cache under bf16 queries, as --kv-cache-dtype fp8 serves: decode and a ragged verify
-     * window, unbounded and sliding. */
-    for (int qlen : { 1, 17 })
-        for (int window : { 0, 8 })
-            add("attn_paged", { HI("q_len", qlen), HI("head_dim", 64), HI("gqa", 4),
-                                HI("block_size", 16), HI("causal", 1), HI("window", window),
-                                HS("q_dtype", "bf16"), HS("kv_dtype", "fp8_e4m3"),
-                                HF("scale", 0.125), HI("max_ctx", 128), HI("n_head", 8),
-                                HI("max_seqs", 2) });
-    for (const char* dt : { "f32", "bf16" })
+    /* The store into each cache: the values themselves, the int8 cache's codes and scales, or
+     * E4M3 (GLM-5.3's latent attention). */
+    for (const char* dt : { "f32", "bf16", "i8", "fp8_e4m3" })
         add("kv_store", { HI("M", 12), HI("head_dim", 64), HI("n_head_kv", 2),
-                          HI("block_size", 16), HS("kv_dtype", dt), HF("k_scale", 1.0),
-                          HF("v_scale", 1.0) });
-    /* The fp8 store divides by the reader's descales; one below 1 and one above. */
-    for (double ks : { 0.5, 2.0 })
-        add("kv_store", { HI("M", 12), HI("head_dim", 64), HI("n_head_kv", 2),
-                          HI("block_size", 16), HS("kv_dtype", "fp8_e4m3"), HF("k_scale", ks),
-                          HF("v_scale", 1.0 / ks) });
+                          HI("block_size", 16), HS("kv_dtype", dt) });
     /* The streamed store, on one block and one ring slot (ref_shapes.cpp says why); the resident and
      * mirror-only split is built by hand in avx_check_hand.cpp. */
-    for (double ks : { 1.0, 0.5 })
+    for (const char* dt : { "i8", "bf16", "fp8_e4m3" }) {
         add("kv_store_streamed", { HI("M", 12), HI("head_dim", 64), HI("n_head_kv", 2),
-                                   HI("block_size", 32), HS("kv_dtype", "fp8_e4m3"),
-                                   HF("k_scale", ks), HF("v_scale", 1.0 / ks) });
-    add("kv_store_streamed", { HI("M", 3), HI("head_dim", 32), HI("n_head_kv", 1),
-                               HI("block_size", 4), HS("kv_dtype", "fp8_e4m3") });
-    /* The same store into a bf16 cache: both planes are the values themselves, two bytes wide. */
-    for (double ks : { 1.0, 0.5 })
-        add("kv_store_streamed", { HI("M", 12), HI("head_dim", 64), HI("n_head_kv", 2),
-                                   HI("block_size", 32), HS("kv_dtype", "bf16"),
-                                   HF("k_scale", ks), HF("v_scale", 1.0 / ks) });
-    add("kv_store_streamed", { HI("M", 3), HI("head_dim", 32), HI("n_head_kv", 1),
-                               HI("block_size", 4), HS("kv_dtype", "bf16") });
+                                   HI("block_size", 32), HS("kv_dtype", dt) });
+        add("kv_store_streamed", { HI("M", 3), HI("head_dim", 32), HI("n_head_kv", 1),
+                                   HI("block_size", 4), HS("kv_dtype", dt) });
+    }
     for (const char* mode : { "neox", "gptj" }) {
         add("rope", { HI("M", 12), HI("head_dim", 64), HI("n_head", 4), HI("n_head_kv", 2),
                       HF("theta", 10000.0), HF("scale", 1.0), HS("mode", mode),
@@ -881,9 +871,6 @@ std::vector<Case> build_cases() {
             for (int var : { 0, 1 })
                 add("chan_stats", { HI("M", 7), HI("n", 645), HS("mode", mode), HI("var", var),
                                     HF("eps", 1e-4), HS("dtype", dt) });
-        for (int gated : { 1, 0 })
-            add("ln_mod_quant_fp8", { HI("M", 5), HI("n", 256), HF("eps", 1e-6), HI("group", 128),
-                                      HI("gated", gated), HS("dtype", dt) });
         for (int round : { 3, 2, 1, 0 })
             add("timestep_embed", { HI("M", 3), HI("n", 256), HF("scale", 1000.0),
                                     HF("max_period", 10000.0), HI("round", round),
@@ -975,19 +962,12 @@ std::vector<Case> build_cases() {
         for (int gated : { 1, 0 }) {
             add("rms_mod", { HI("M", 7), HI("n", 645), HF("eps", 1e-5), HI("gated", gated),
                              HS("dtype", dt) });
-            add("rms_mod_quant_fp8", { HI("M", 5), HI("n", 256), HF("eps", 1e-5), HI("group", 128),
-                                       HI("gated", gated), HS("dtype", dt) });
             /* A zero-centred gain (1 + w), the norm and gain rounded once (Krea 2's). */
             add("rms_mod", { HI("M", 7), HI("n", 645), HF("eps", 1e-5), HI("gated", gated),
                              HS("dtype", dt), HF("wadd", 1.0), HI("norm_once", 1) });
-            add("rms_mod_quant_fp8", { HI("M", 5), HI("n", 256), HF("eps", 1e-5), HI("group", 128),
-                                       HI("gated", gated), HS("dtype", dt), HF("wadd", 1.0),
-                                       HI("norm_once", 1) });
             /* A LayerNorm without a gain (FLUX's). */
             add("rms_mod", { HI("M", 7), HI("n", 645), HF("eps", 1e-6), HI("gated", gated),
                              HS("dtype", dt), HS("norm", "layer") });
-            add("rms_mod_quant_fp8", { HI("M", 5), HI("n", 256), HF("eps", 1e-6), HI("group", 128),
-                                       HI("gated", gated), HS("dtype", dt), HS("norm", "layer") });
         }
         add("flow_x0_step", { HI("M", 9), HI("n", 645), HS("dtype", dt) });
         for (int pt : { 1, 4 })
@@ -1280,9 +1260,7 @@ std::vector<Case> build_cases() {
 
     /* The row-form names: every case of the base op again under the name. */
     {
-        const char* const forms[][2] = { { "rmsnorm", "rmsnorm_rows" }, { "rope", "rope_rows" },
-                                         { "gemm_nt_q", "gemm_nt_q_short" },
-                                         { "gemm_nt_q_gated", "gemm_nt_q_gated_wide" } };
+        const char* const forms[][2] = { { "rmsnorm", "rmsnorm_rows" }, { "rope", "rope_rows" } };
         const size_t n = c.size();
         for (size_t i = 0; i < n; ++i)
             for (const auto& f : forms)
@@ -1326,8 +1304,6 @@ std::vector<Case> build_cases() {
               (double)M * 2048 * 4 * 2, 0);
         speed("quant_act_fp8", { HI("M", M), HI("n", 2048), HI("group", 128),
                                  HS("dtype", "bf16") }, (double)M * 2048 * 3, 0);
-        speed("had_quant_act_fp8", { HI("M", M), HI("n", 2048), HI("group", 128),
-                                     HS("dtype", "bf16") }, (double)M * 2048 * 3, 0);
         speed("quant_act_i8", { HI("M", M), HI("n", 2048), HI("group", 128),
                                 HS("dtype", "bf16") }, (double)M * 2048 * 3, 0);
         speed("quant_act_i8g", { HI("M", M), HI("n", 2048), HI("group", 128),
@@ -1473,9 +1449,6 @@ std::vector<Case> build_cases() {
           1024.0 * 4096 * 2 * 2, 0);
     speed("gate_add", { HI("M", 1024), HI("n", 4096), HS("dtype", "bf16") },
           1024.0 * 4096 * 2 * 3, 0);
-    speed("ln_mod_quant_fp8", { HI("M", 1024), HI("n", 4096), HF("eps", 1e-6), HI("group", 128),
-                                HI("gated", 1), HS("dtype", "bf16") },
-          1024.0 * 4096 * (2 * 3 + 1), 0);
     speed("qk_norm_rope", { HI("M", 1024), HI("head_dim", 128), HI("n_head", 32),
                             HI("n_head_kv", 32), HF("theta", 10000.0), HF("eps", 1e-6),
                             HS("mode", "gptj_blocks"), HS("sections", "64"),

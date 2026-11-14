@@ -1,7 +1,7 @@
 /* xstats.cpp -- the --expert-stats tally, its merge across ranks and its file. See xstats.h. */
 #include "xstats.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -259,7 +259,7 @@ void put_i32s(std::string& o, const std::vector<int32_t>& v) {
     o += ']';
 }
 
-std::string jstr(const std::string& s) { return nlohmann::json(s).dump(); }
+std::string jstr(const std::string& s) { return Json(s).dump(); }
 
 /* {"prefill": f(0), "decode": f(1), ...} on one line. */
 template <typename F>
@@ -499,9 +499,9 @@ int xs_profile_load(const std::string& path, std::vector<RadFileProfile>* out, i
         RAD_ERR("--expert-profile: reading %s failed", path.c_str());
         return RAD_E_IO;
     }
-    nlohmann::json j;
-    try { j = nlohmann::json::parse(text); }
-    catch (const nlohmann::json::exception& e) {
+    Json j;
+    try { j = Json::parse(text); }
+    catch (const Json::exception& e) {
         RAD_ERR("--expert-profile: %s is not JSON: %s", path.c_str(), e.what());
         return RAD_E_INVAL;
     }

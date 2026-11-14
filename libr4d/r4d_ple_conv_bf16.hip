@@ -29,6 +29,7 @@
 // on `hist < kPcBT`, asserted below.
 #include "r4d.h"
 #include "r4d_args.h"
+#include "r4d_chain.h"
 #include "r4d_common.h"
 
 #include <cstdint>
@@ -54,16 +55,16 @@ __device__ __forceinline__ float pc_silu(float z) { return z / (1.0f + expf(-z))
 
 /* SILU is ple_conv's activation; causal_conv1d (LFM2's short convolution) is the same window with
  * no activation, no residual and dilation one. */
+#define PLE_CONV_PARAMS                                                                         \
+    const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,                             \
+    uint16_t* __restrict__ cs, const int32_t* __restrict__ cu,                                  \
+    const uint16_t* __restrict__ resid, const int32_t* __restrict__ sidx,                       \
+    const int32_t* __restrict__ hini, const int32_t* __restrict__ nacc,                         \
+    uint16_t* __restrict__ y, const uint16_t* __restrict__ bias, uint32_t n, uint32_t wid,      \
+    uint32_t dil, uint32_t hist, uint32_t xld, uint32_t rld, uint32_t yld, uint32_t wld,        \
+    long long cs_slot, long long cs_ch, long long cs_tok, long long state_len
 template <bool SILU>
-__global__ __launch_bounds__(kPcThreads) void ple_conv_kernel(
-    const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
-    uint16_t* __restrict__ cs, const int32_t* __restrict__ cu,
-    const uint16_t* __restrict__ resid, const int32_t* __restrict__ sidx,
-    const int32_t* __restrict__ hini, const int32_t* __restrict__ nacc,
-    uint16_t* __restrict__ y, const uint16_t* __restrict__ bias,
-    uint32_t n, uint32_t wid, uint32_t dil, uint32_t hist,
-    uint32_t xld, uint32_t rld, uint32_t yld, uint32_t wld,
-    long long cs_slot, long long cs_ch, long long cs_tok, long long state_len) {
+__device__ __forceinline__ void ple_conv_body(PLE_CONV_PARAMS) {
 
     const uint32_t c = blockIdx.x * kPcThreads + threadIdx.x;
     if (c >= n) return;
@@ -151,6 +152,18 @@ __global__ __launch_bounds__(kPcThreads) void ple_conv_kernel(
         if (i < hist) dst[(size_t)i * cs_tok] = keep[i];
 }
 
+/* The kernel around the body, whose blocks return where their work ends: CH `r4dchain` is the
+ * chained form (r4d_chain.h), taken at decode heights. */
+template <bool SILU, class CH>
+__global__ __launch_bounds__(kPcThreads)
+void ple_conv_kernel(PLE_CONV_PARAMS) {
+    if (CH::on) r4d_chain_wait();
+    ple_conv_body<SILU>(x, w, cs, cu, resid, sidx, hini, nacc, y, bias, n, wid, dil, hist, xld, rld,
+                        yld, wld, cs_slot, cs_ch, cs_tok, state_len);
+    if (CH::on) r4d_chain_done();
+}
+#undef PLE_CONV_PARAMS
+
 enum { PC_X = 0, PC_W, PC_CS, PC_CU, PC_RESID, PC_CIDX, PC_HINIT, PC_NACC, PC_Y };
 /* ple_conv_bias: ple_conv's operands with `b`, the per-channel bias inside the silu (Mamba-2's
  * conv1d), before `y`. */
@@ -216,19 +229,24 @@ int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, co
 
     const uint32_t cb = (uint32_t)((n + kPcThreads - 1) / kPcThreads);
     const uint32_t tb = (uint32_t)((T + kPcBT - 1) / kPcBT);
-    const auto kernel = silu ? ple_conv_kernel<true> : ple_conv_kernel<false>;
-    hipLaunchKernelGGL(kernel, dim3(cb, tb, (uint32_t)N), dim3(kPcThreads), 0, (hipStream_t)s,
-                       (const uint16_t*)r4d_addr(x), (const uint16_t*)r4d_addr(w),
-                       have_cs ? (uint16_t*)r4d_addr(cs) : nullptr,
-                       (const int32_t*)r4d_addr(cu),
-                       resid ? (const uint16_t*)r4d_addr(resid) : nullptr,
-                       cidx ? (const int32_t*)r4d_addr(cidx) : nullptr,
-                       hini ? (const int32_t*)r4d_addr(hini) : nullptr,
-                       nacc ? (const int32_t*)r4d_addr(nacc) : nullptr,
-                       (uint16_t*)r4d_addr(y), b ? (const uint16_t*)r4d_addr(b) : nullptr,
-                       (uint32_t)n, (uint32_t)wid, (uint32_t)dil,
-                       (uint32_t)hist, (uint32_t)xld, (uint32_t)rld, (uint32_t)yld, (uint32_t)wld,
-                       cs_slot, cs_ch, cs_tok, state_len);
+    const bool chain = r4d_geti_or(a, "chain", 0) != 0 && T <= 64;
+#define R4D_PC(S_, CH_)                                                                         \
+    hipLaunchKernelGGL((ple_conv_kernel<S_, CH_>), dim3(cb, tb, (uint32_t)N),                   \
+                       dim3(kPcThreads), 0, (hipStream_t)s,                                      \
+                       (const uint16_t*)r4d_addr(x), (const uint16_t*)r4d_addr(w),               \
+                       have_cs ? (uint16_t*)r4d_addr(cs) : nullptr,                              \
+                       (const int32_t*)r4d_addr(cu),                                             \
+                       resid ? (const uint16_t*)r4d_addr(resid) : nullptr,                       \
+                       cidx ? (const int32_t*)r4d_addr(cidx) : nullptr,                          \
+                       hini ? (const int32_t*)r4d_addr(hini) : nullptr,                          \
+                       nacc ? (const int32_t*)r4d_addr(nacc) : nullptr,                          \
+                       (uint16_t*)r4d_addr(y), b ? (const uint16_t*)r4d_addr(b) : nullptr,       \
+                       (uint32_t)n, (uint32_t)wid, (uint32_t)dil,                                \
+                       (uint32_t)hist, (uint32_t)xld, (uint32_t)rld, (uint32_t)yld, (uint32_t)wld, \
+                       cs_slot, cs_ch, cs_tok, state_len)
+    if (silu) { if (chain) R4D_PC(true, r4dchain);  else R4D_PC(true, R4dUnchained); }
+    else      { if (chain) R4D_PC(false, r4dchain); else R4D_PC(false, R4dUnchained); }
+#undef R4D_PC
     return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
 }
 

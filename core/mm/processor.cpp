@@ -1,5 +1,7 @@
 /* processor.cpp -- see processor.h. */
 #include "mm/processor.h"
+#include "util/rowpool.h"
+#include "util/simd.h"
 #include "mm/imaging.h"
 
 #include "rad_internal.h"
@@ -13,7 +15,6 @@
 #include <cstring>
 #include <functional>
 #include <sstream>
-#include <thread>
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
 #include <immintrin.h>
@@ -895,17 +896,7 @@ RAD_MM_AVX2 void patch_row(const uint8_t* row, uint16_t* dst, int32_t P, size_t 
  * its own output row, in the same per-tap order, so splitting the rows across threads is bit-exact
  * (the goldens pin it). */
 static void run_rows(int32_t rows, const std::function<void(int32_t)>& row) {
-    unsigned hw = std::thread::hardware_concurrency();
-    const int32_t nt = (int32_t)std::min<int32_t>(rows, (int32_t)std::min<unsigned>(hw ? hw : 1, 8));
-    if (nt <= 1) {
-        for (int32_t y = 0; y < rows; ++y) row(y);
-        return;
-    }
-    std::vector<std::thread> ts;
-    ts.reserve((size_t)nt);
-    for (int32_t t = 0; t < nt; ++t)
-        ts.emplace_back([&row, t, nt, rows] { for (int32_t y = t; y < rows; y += nt) row(y); });
-    for (std::thread& th : ts) th.join();
+    row_pool_run(rows, 8, [&row](int64_t y) { row((int32_t)y); });
 }
 
 static void pass_horizontal(const Frame& src, int32_t y0, int32_t rows, int32_t w,
@@ -1193,7 +1184,19 @@ void content_key(const Item& it, uint64_t* hi, uint64_t* lo) {
         a = mix64(a ^ ((uint64_t)(uint32_t)sg.h << 32 | (uint32_t)sg.w)) + (uint64_t)sg.patch0;
     const uint8_t* p = reinterpret_cast<const uint8_t*>(it.pixels.data());
     const size_t n = it.pixels.size() * sizeof(uint16_t);
-    size_t i = 0;
+    /* The pixels' whole 64-byte stripes through eight independent lanes (util/simd.h, XXH3's
+     * accumulation), which run in vector registers; a chain of mixes a word would hash at about
+     * a byte a cycle. The lanes fold into both halves; the tail mixes as below. */
+    uint64_t lane[8] = { 0xc2b2ae3d27d4eb4full, 0x9e3779b185ebca87ull, 0xc2b2ae3d27d4eb4full ^ n,
+                         0x165667b19e3779f9ull, 0x85ebca77c2b2ae63ull, 0x27d4eb2f165667c5ull,
+                         0x9e3779b97f4a7c15ull ^ n, 0x94d049bb133111ebull };
+    const size_t stripes = n / 64;
+    simd::stripe_acc_u64x8(lane, p, stripes);
+    for (int j = 0; j < 8; ++j) {
+        a = mix64(a ^ lane[j]) + (uint64_t)j;
+        b = mix64(b + lane[j]) ^ (uint64_t)(j + 8);
+    }
+    size_t i = stripes * 64;
     for (; i + 16 <= n; i += 16) {
         uint64_t w0, w1;
         std::memcpy(&w0, p + i, 8);

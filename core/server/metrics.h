@@ -89,15 +89,19 @@ public:
     Metrics(std::string model_name, int64_t max_model_len);
 
     /* --- observed at the HTTP boundary, per finished request --- */
+    /* A time below zero was not observed (`queue_s`: the request was never admitted). */
     void observe_request(int64_t n_prompt, int64_t n_generated,
                          double ttft_s, double tpot_s, double e2e_s, double decode_s,
-                         int n_choices, int64_t max_tokens, SuccessReason r);
+                         double queue_s, int n_choices, int64_t max_tokens, SuccessReason r);
     void observe_rejected();        /* 429: the admission queue was full */
     void observe_disconnect();      /* the client went away mid-stream */
     void observe_overflow();        /* the sink ring filled: the HTTP side could not keep up */
     void observe_http(int status);
 
     void set_queue_depth(int64_t d) { queue_depth_.set((double)d); }
+    /* The cache settings vllm:cache_config_info carries as labels; set once, before serving. */
+    void set_cache_config(const std::string& dtype, int64_t block_size, bool prefix_caching,
+                          int64_t prefix_cache_mib);
 
     /* --- pulled from the scheduler at scrape time --- */
     void sample(const SchedMetrics& m);
@@ -109,6 +113,7 @@ public:
 private:
     std::string model_;
     std::string labels_;        /* {model_name="...",engine="0"} */
+    std::string cache_labels_;  /* vllm:cache_config_info's; empty until set_cache_config */
 
     Gauge   g_running_, g_waiting_, g_kv_util_, g_prefix_hit_;
     Gauge   g_kv_max_tokens_, g_kv_max_bytes_, g_kv_resident_blocks_;
@@ -152,6 +157,7 @@ private:
     Counter c_draft_refills_, c_draft_refill_tokens_;
     Counter c_lookup_proposals_, c_lookup_held_, c_lookup_held_drafts_, c_lookup_held_hits_;
     Counter c_attn_cached_, c_linear_cached_, c_checkpoints_;
+    Counter c_prefix_queries_;
     Counter c_prefix_evict_, c_prefix_ckpt_evict_;
     Counter c_prefix_expired_, c_prefix_ckpt_expired_;
     Counter c_prefix_released_, c_prefix_ckpt_released_;
@@ -163,7 +169,7 @@ private:
     Counter c_rejected_, c_disconnect_, c_overflow_;
     Counter c_http_2xx_, c_http_4xx_, c_http_5xx_;
 
-    Histogram h_ttft_, h_tpot_, h_e2e_, h_decode_;
+    Histogram h_ttft_, h_tpot_, h_e2e_, h_decode_, h_queue_;
     Histogram h_prompt_tokens_, h_generation_tokens_, h_params_n_, h_params_max_tokens_;
 };
 

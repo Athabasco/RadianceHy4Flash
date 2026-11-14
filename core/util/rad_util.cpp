@@ -65,6 +65,21 @@ void log_rank_tags(bool on) { g_rank_tags = on; }
 LogRank::LogRank(int rank) : prev_(g_log_rank) { g_log_rank = rank; }
 LogRank::~LogRank() { g_log_rank = prev_; }
 
+static thread_local int         g_owner = 0;
+static thread_local const char* g_model = nullptr;
+static bool                     g_model_tags = false;
+
+void log_model_tags(bool on) { g_model_tags = on; }
+int  engine_owner() { return g_owner; }
+EngineScope::EngineScope(int owner, const char* model) : prev_owner_(g_owner), prev_model_(g_model) {
+    g_owner = owner;
+    g_model = model;
+}
+EngineScope::~EngineScope() {
+    g_owner = prev_owner_;
+    g_model = prev_model_;
+}
+
 static std::atomic<uint64_t> g_last_line_ns{0};
 uint64_t log_last_line_ns() { return g_last_line_ns.load(std::memory_order_relaxed); }
 
@@ -101,8 +116,14 @@ void log_emit(Log l, const char* file, int line, const char* fmt, ...) {
     const char* col = level_colour(l);
     const char* rst = col[0] ? "\033[0m" : "";
 
-    char rank[16] = "";
-    if (g_rank_tags && g_log_rank >= 0) snprintf(rank, sizeof rank, "[%d]", g_log_rank);
+    char rank[80] = "";
+    const bool tag_rank = g_rank_tags && g_log_rank >= 0;
+    if (g_model_tags && g_model) {
+        if (tag_rank) snprintf(rank, sizeof rank, "[%.60s/r%d]", g_model, g_log_rank);
+        else          snprintf(rank, sizeof rank, "[%.60s]", g_model);
+    } else if (tag_rank) {
+        snprintf(rank, sizeof rank, "[%d]", g_log_rank);
+    }
 
     /* Debug and Trace carry the source site; Info and above do not. */
     if ((int)l >= (int)Log::Debug)

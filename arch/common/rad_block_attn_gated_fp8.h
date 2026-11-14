@@ -9,7 +9,7 @@
  *     state); the gate pass quantises the out-projection's input.
  *   - Per-head norms, rope, kv_store and attn_paged stay bf16.
  *   - The KV cache dtype is `g.kv_dtype`, not `g.dtype`: it is a deployment choice that selects
- *     libr4d's fp8kv attention family. The attention op and kv_store both take it, so they agree.
+ *     the attention family's cache rows. The attention op and kv_store both take it, so they agree.
  *   - Optional fused prologue, QSA sparse attention and an attention-zero mode (see declare).
  *
  * The q|gate projection is [2*n_head*head_dim, n_embd] = [12288, 5120] at 27B, scale plane
@@ -25,14 +25,6 @@
 
 namespace rad {
 namespace arch {
-
-/* Whether the streamed store has a row for this cache layout: libr4d's are E4M3 and bf16 only. A
- * packed cache (fp8_v4, k6_v4) must not declare it, since a weightless op with no row is a hole
- * that refuses startup even with --kv-resident off; kvstream_configure then names the layout. */
-inline bool kv_store_streamed_dtype(const char* kv_dtype) {
-    return kv_dtype && (std::strcmp(kv_dtype, "fp8_e4m3") == 0 ||
-                        std::strcmp(kv_dtype, "bf16") == 0);
-}
 
 struct AttnGatedFP8 {
     struct Wire {
@@ -115,6 +107,10 @@ struct AttnGatedFP8 {
     /* The input was normed and quantised by the caller; this block declares no norm. */
     bool       ext_in = false;
     LinearFP8  qg{}, kp{}, vp{}, o{};
+    /* Set by the architecture after declare: a `prefetch` of the out projection's leading bytes
+     * (decl_prefetch, rad_arch.h), issued behind the q, k and v projections on decode steps
+     * (prefetch_beside). 0 where none is declared. */
+    rad_op     op_pf_o = 0;
     NormQuantFP8 nq_h{};
 
     rad_op     op_fused = 0;                                 /* qk_norm_rope_gate, if it resolves */
@@ -125,7 +121,7 @@ struct AttnGatedFP8 {
     int64_t    fused_rows = 0;                               /* widest T the fused ops take */
     rad_op     op_q_norm = 0, op_k_norm = 0, op_rope_q = 0, op_rope_k = 0;
     rad_op     op_attn = 0, op_kv_store = 0, op_gq = 0;
-    rad_op     op_attn_gq = 0;                               /* attn_paged + gate_quant_fp8 */
+    rad_op     op_attn_gq = 0;          /* attn_paged + gate_quant_fp8 or gate_had_quant_i8g */
     /* kv_store_streamed: the host mirror always, the ring slot when `res` says the block is resident
      * (docs/OPS.md). Zero when no row serves it; a streamed group then fails the step. */
     rad_op     op_kv_stream = 0;
@@ -334,7 +330,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
 
     /* Declared before kv_store, which reads back the resolved `block_size`
      * (rad_block_attn_gated.h). */
-    op_attn = decl_attn(b, g, "attn_paged",
+    op_attn = rad_decl_op(b, "attn_paged",
                      RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
                                 RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
                                 RAD_INT("window", 0),
@@ -374,8 +370,8 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
 
     /* The streamed store: kv_store's operands and parameters plus the residency map and the layer's
      * mirror row, which the batch carries (store_cache). `block_size` does not bind the group;
-     * `attn_paged` already has. Only for a layout with a row (kv_store_streamed_dtype). */
-    if (kv_store_streamed_dtype(g.kv_dtype) && rad_op_declared(b, "kv_store_streamed"))
+     * `attn_paged` already has. */
+    if (rad_op_declared(b, "kv_store_streamed"))
         op_kv_stream = rw(b, RAD_OP(b, "kv_store_streamed",
                              RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
                                         RAD_INT("head_dim", g.head_dim),
@@ -388,7 +384,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
     /* The fused prologue with the cache store folded in: a k head's block already holds its
      * token's rotated k, so it also writes k and v into the cache, byte-identical to kv_store.
      * Declared here because the cache block size is read back from the attention op above.
-     * Resolves for E4M3 and bf16 caches. */
+     * Resolves for either cache. */
     if (op_fused && rad_op_declared(b, "qk_norm_rope_gate_kv_store"))
         op_fused_kv = rw(b, RAD_OP(b, "qk_norm_rope_gate_kv_store",
                             RAD_PARAMS(RAD_RANGE("M", 1, fused_rows),
@@ -402,9 +398,8 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
                          {w.qg, w.k, w.cos_sin, w.v}, {w.q, w.k});
 
     /* The fold for a streamed group: also writes the mirror and consults the residency map, whose
-     * operands are added at issue. Gated on the same layouts. */
-    if (op_fused && kv_store_streamed_dtype(g.kv_dtype) &&
-        rad_op_declared(b, "qk_norm_rope_gate_kv_store_streamed"))
+     * operands are added at issue. */
+    if (op_fused && rad_op_declared(b, "qk_norm_rope_gate_kv_store_streamed"))
         op_fused_stream = rw(b, RAD_OP(b, "qk_norm_rope_gate_kv_store_streamed",
                             RAD_PARAMS(RAD_RANGE("M", 1, fused_rows),
                                        RAD_INT("head_dim", g.head_dim), RAD_INT("n_head", g.n_head),
@@ -455,7 +450,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
         if (rad_op_declared(b, gq))
             op_gq = rw(b, RAD_OP(b, gq,
                            RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok * g.n_head),
-                                      RAD_INT("n", g.head_dim), RAD_INT("group", RAD_FP8_BLOCK),
+                                      RAD_INT("n", g.head_dim), RAD_INT("group", w.attn.cg()),
                                       RAD_STR("dtype", g.dtype), RAD_STR("act", "sigmoid")),
                            RAD_NOWEIGHTS),
                        {w.qg, w.attn.x}, {w.attn.cq(), w.attn.cs(), w.attn.x});
@@ -471,10 +466,12 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
      * row is one (token, head) at q_len 1, and the merge already holds the head_dim values the gate
      * and quantiser read, so one op merges, gates, rounds and quantises (byte-identical to the
      * pair). Declared only with a selection: the dense path also uses the prefill kernel, which
-     * has no merge. */
-    if (op_attn && qsa_sel && qsa_sequ && !g.w_bf16 && !w.attn.q8_rot &&
-        rad_op_declared(b, "attn_paged_gate_quant")) {
-        op_attn_gq = RAD_OP(b, "attn_paged_gate_quant",
+     * has no merge. Rotated int8 codes (ActFP8::q8_rot) take attn_paged_gate_had_quant, the merge
+     * with gate_had_quant_i8g's quantiser. */
+    const char* attn_gq = w.attn.q8_rot ? "attn_paged_gate_had_quant" : "attn_paged_gate_quant";
+    if (op_attn && qsa_sel && qsa_sequ && !g.w_bf16 && w.attn.cg() == RAD_FP8_BLOCK &&
+        rad_op_declared(b, attn_gq)) {
+        op_attn_gq = RAD_OP(b, attn_gq,
                             RAD_PARAMS(RAD_INT("q_len", 1), RAD_INT("head_dim", g.head_dim),
                                        RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
                                        RAD_INT("window", 0), RAD_INT("n_head", g.n_head),
@@ -619,7 +616,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
             RAD_ISSUE_N(c, op_gq, n * g.n_head,
                         bcol_at(w.qg, r0, qgw, hd, hd, n), brow_slice(w.attn.x, r0, n, qw),
                         brow_slice(w.attn.cq(), r0, n, qw),
-                        brow_slice(w.attn.cs(), r0, n, fp8_blocks(qw)),
+                        brow_slice(w.attn.cs(), r0, n, qw / w.attn.cg()),
                         brow_slice(w.attn.x, r0, n, qw));
             o.step(c, w.attn, w.h.x, T, r0, n);
             if (p == 0) pieces->hand(r0, n);
@@ -639,6 +636,8 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     qg.step(c, w.h, w.qg, T);
     kp.step(c, w.h, w.k,  T);
     vp.step(c, w.h, w.v,  T);
+    /* The out projection's weight, read beside the prologue and the attention (op_pf_o). */
+    prefetch_beside(c, op_pf_o, o.w, T);
 
     /* Fused or unfused prologue. The fused kernel takes the whole [q|gate] projection and splits it
      * itself, and rotates k in place like the unfused ops. It reads one rotary component per
@@ -743,7 +742,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                             brow_slice(w.attn.x, off, rows, qw),
                             bcol_at(w.qg, off, g.n_head * 2 * hd, hd, hd, rows),
                             brow_slice(w.attn.cq(), off, rows, qw),
-                            brow_slice(w.attn.cs(), off, rows, fp8_blocks(qw)));
+                            brow_slice(w.attn.cs(), off, rows, qw / w.attn.cg()));
             }
             o.step(c, w.attn, w.h.x, T, p0, pn);
             if (p0 + pn < T) pieces->hand(p0, pn);
@@ -767,7 +766,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                         brow_slice(w.attn.x, off, rows, qw),
                         bcol_at(w.qg, off, g.n_head * 2 * hd, hd, hd, rows),
                         brow_slice(w.attn.cq(), off, rows, qw),
-                        brow_slice(w.attn.cs(), off, rows, fp8_blocks(qw)));
+                        brow_slice(w.attn.cs(), off, rows, qw / w.attn.cg()));
         }
     } else if (sparse) {
         const int64_t chunk = qsa_rows();

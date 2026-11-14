@@ -5,6 +5,7 @@
 #include "derive.h"
 #include "device/device.h"
 #include "kvstream/bind.h"
+#include "util/simd.h"
 
 #include <algorithm>
 #include <cassert>
@@ -691,9 +692,9 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
     };
 
     /* Reset every group's row: a sequence with no state in a group must read -1, not a stale slot
-     * from the previous step. */
+     * from the previous step. -1 is all-ones, so the reset is a memset. */
     for (int64_t gi = 0; gi < (int64_t)kvgeom_.g.size(); ++gi)
-        for (int64_t i = 0; i < n_seq; ++i) s.h_convslot[gi * max_seqs_ + i] = -1;
+        std::memset(s.h_convslot + gi * max_seqs_, 0xff, (size_t)n_seq * sizeof(int32_t));
 
     for (size_t gi = 0; gi < s.groups.size(); ++gi) {
         Group& g = s.groups[gi];
@@ -717,17 +718,20 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
         for (int64_t i = 0; i < n_seq; ++i) {
             const StepEntry& e = plan.e[(size_t)i];
 
-            int64_t first = 0;
-            SeqWindow win;
-            bool has_win = false;
+            /* One lookup of the sequence for everything below (IKVManager::seq_group); the
+             * change mark is taken with it, for a paged group only, as take_table_changes was. */
+            SeqGroupView gv;
+            kv.seq_group(e.seq, (int32_t)gi, L.paged, &gv);
+            /* A state group's row starts at 0 and carries no window, as before the view: only a
+             * paged group was ever asked. */
+            int64_t first = L.paged ? gv.first : 0;
+            const SeqWindow& win = gv.win;
+            const bool has_win = L.paged && gv.has_win;
             int64_t bt_len = 0;       /* the sequence's block table, in blocks */
             int64_t table_end = 0;    /* the table's last position, for a runtime window's used */
             if (L.paged) {
                 /* The manager's block table, by sequence id; Request::blocks is not the source
                  * of truth (see IKVManager). */
-                const std::vector<int32_t>& bt = kv.block_table(e.seq, (int32_t)gi);
-                first = kv.first_block_pos(e.seq, (int32_t)gi);
-                has_win = kv.runtime_window(e.seq, (int32_t)gi, &win);
                 if (has_win) {
                     /* The ring size sets the group header's geometry, so every sequence in the
                      * group must report the same one. */
@@ -738,36 +742,47 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                     }
                     ring_blocks = (int32_t)win.ring_blocks;
                 }
-                bt_len = (int64_t)bt.size();
+                bt_len = (int64_t)gv.bt_n;
                 table_end = bt_len * L.block_size;
-                for (int32_t j = 0; j < e.n_tokens; ++j) {
-                    const int64_t pos = (int64_t)e.ctx_len + j;
-                    g.h_slot[t + j] = has_win
-                        ? kvgeom_.slot_ring((int)gi, bt, first, pos, win)
-                        : kvgeom_.slot((int)gi, bt, first, pos);
-                }
+                /* Consecutive positions: the segment walk (KVGeom::slots) stages the same
+                 * slots slot()/slot_ring() would, one division a block instead of two a token. */
+                if (has_win)
+                    kvgeom_.slots_ring((int)gi, gv.bt, gv.bt_n, first, (int64_t)e.ctx_len,
+                                       e.n_tokens, win, g.h_slot + t);
+                else
+                    kvgeom_.slots((int)gi, gv.bt, gv.bt_n, first, (int64_t)e.ctx_len,
+                                  e.n_tokens, g.h_slot + t);
                 /* Restage relative to what the card holds (BtMirror). The same sequence in the
                  * same row keeps entries below the first changed one and below the end of both
                  * old and new tables, so a decode step stages nothing or one appended block. A
                  * new or moved sequence restages the whole row, and its copies in other rows go
                  * unknown. Change marks are taken for every row. */
-                const int64_t nb = std::min<int64_t>((int64_t)bt.size(), pitch);
-                const int64_t chg = kv.take_table_changes(e.seq, (int32_t)gi);
+                const int64_t nb = std::min<int64_t>((int64_t)gv.bt_n, pitch);
+                const int64_t chg = gv.changed_from;
                 int64_t lo = 0, hi = pitch;
                 if (m.len[(size_t)i] >= 0 && m.seq[(size_t)i] == e.seq) {
                     lo = std::min(std::min(chg, m.len[(size_t)i]), nb);
                     hi = std::max(nb, m.len[(size_t)i]);
                 } else {
-                    for (int64_t k = 0; k < max_seqs_; ++k)
-                        if (m.seq[(size_t)k] == e.seq) m.len[(size_t)k] = -1;
+                    /* Invalidate this sequence's copies in other rows. Ids compare bitwise, so
+                     * the uint64 row array is searched as int64 (simd::find_eq_i64). */
+                    const int64_t* rows = (const int64_t*)m.seq.data();
+                    int64_t k = simd::find_eq_i64(rows, (size_t)max_seqs_, (int64_t)e.seq);
+                    while (k >= 0) {
+                        m.len[(size_t)k] = -1;
+                        if (k + 1 >= max_seqs_) break;
+                        const int64_t nx = simd::find_eq_i64(
+                            rows + k + 1, (size_t)(max_seqs_ - k - 1), (int64_t)e.seq);
+                        k = nx < 0 ? -1 : k + 1 + nx;
+                    }
                 }
                 if (lo < hi) {
                     int32_t* w = pay + np;
                     const int64_t nc = nb > lo ? nb - lo : 0;
                     /* Guarded: an empty table's data() may be null, and memcpy's source must
                      * not be, even for zero bytes. */
-                    if (nc > 0) std::memcpy(w, bt.data() + lo, (size_t)nc * sizeof(int32_t));
-                    std::fill(w + nc, w + (hi - lo), -1);
+                    if (nc > 0) std::memcpy(w, gv.bt + lo, (size_t)nc * sizeof(int32_t));
+                    std::memset(w + nc, 0xff, (size_t)(hi - lo - nc) * sizeof(int32_t));
                     stage(g.bt_fix + i * pitch + lo, np, hi - lo);
                     np += hi - lo;
                 }
@@ -777,8 +792,17 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                 /* A linear or conv group has one state slot per sequence; every token maps to it
                  * and the block-table row is that slot, so table-reading kernels need no second
                  * path. */
-                int32_t st = kv.state_slot(e.seq, (int32_t)gi);
-                for (int32_t j = 0; j < e.n_tokens; ++j) g.h_slot[t + j] = st;
+                const int32_t st = gv.state;
+                /* A kernel reads -1 as "no state" and carries on, so a sequence without its slot
+                 * would compute fluent, wrong text. A drafter's pass may still name a finished
+                 * sequence's rows; the trunk's may not. */
+                if (st < 0 && plan.draft_pass == 0 && e.n_tokens > 0 &&
+                    (L.kind == RAD_KV_CONV || L.kind == RAD_KV_LINEAR)) {
+                    RAD_ERR("step plan row %lld: sequence %llu holds no state slot in KV group %d",
+                            (long long)i, (unsigned long long)e.seq, (int)gi);
+                    return RAD_E_STATE;
+                }
+                std::fill(g.h_slot + t, g.h_slot + t + e.n_tokens, st);
                 pay[np + i] = st;
                 /* Every conv group, at its own row. Feeds only DeriveInput::conv_slot; conv
                  * kernels read RadKVGroupBatch::state_index (see conv_window_ in batch.h). */
@@ -812,16 +836,16 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
             if (used < 0) used = 0;
             g.h_used[i] = (int32_t)used;
             if (L.paged) {
-                for (int64_t j = 0; j < g.sidx_pitch; ++j) g.h_sidx[i * g.sidx_pitch + j] = -1;
+                std::memset(g.h_sidx + i * g.sidx_pitch, 0xff,
+                            (size_t)g.sidx_pitch * sizeof(int32_t));
             } else {
                 kv.state_index_row(e.seq, (int32_t)gi, g.h_sidx + i * g.sidx_pitch,
                                    (int)g.sidx_pitch);
             }
         }
-        int32_t group_used = 0;
-        for (int64_t i = 0; i < n_seq; ++i)
-            group_used = std::max(group_used, g.h_used[i]);
-        o.kv_used_max_h[gi] = group_used;
+        /* As the loop it replaces: the rows' maximum, floored at 0 (n_seq may be 0 and a row's
+         * used is clamped non-negative above, so the floor only binds then). */
+        o.kv_used_max_h[gi] = std::max<int32_t>(0, simd::max_i32(g.h_used, (size_t)n_seq));
         /* A state group's rows are one slot per sequence: n_seq words, restaged whole. */
         if (!L.paged) {
             stage(g.bt_fix, np, n_seq);

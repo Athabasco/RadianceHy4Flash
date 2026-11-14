@@ -79,7 +79,7 @@ struct Model {
     GlmVision vit{};
     MediaRows mrows{};
 };
-static std::unique_ptr<Model> models[MAX_RANKS];
+static std::unique_ptr<Model> models[MAX_SLOTS];
 static thread_local std::unique_ptr<Model> probe_model;
 
 /* Whether every routed expert is MXFP4, asked before any buffer is sized and of the same experts on
@@ -473,7 +473,8 @@ static int geometry(Geom& g, const RadModelMeta* meta, const RadBuildCtx* ctx, i
     return g.max_tok < 1 || g.max_ctx < 1 || g.max_seqs < 1 || g.eps <= 0 ? RAD_E_INVAL : RAD_OK;
 }
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
-    if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
+    if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS ||
+        rad_build_slot(ctx) >= MAX_SLOTS)
         return RAD_E_INVAL;
     const int world = ctx->world_size ? ctx->world_size : 1;
     if (!GlmTp::world_ok(world)) {
@@ -514,7 +515,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 rad_dtype_name(ctx->kv_dtype));
         return RAD_E_UNSUPPORTED;
     }
-    auto& slot = ctx->shape_probe ? probe_model : models[ctx->rank];
+    auto& slot = ctx->shape_probe ? probe_model : models[rad_build_slot(ctx)];
     slot = std::make_unique<Model>();
     auto& m = *slot;
     auto& g = m.g;
@@ -625,7 +626,7 @@ static void draft_pass(RadCtx* c, Model& m, const RadBatch* batch) {
     m.mtp.step_head(c, batch);
 }
 static void step(RadCtx* c, const RadBatch* batch) {
-    auto& m = *models[rad_rank(c)];
+    auto& m = *models[rad_slot(c)];
     const int64_t T = batch->n_tok;
     // An encoder pass runs only the vision tower (RadBatch::enc).
     if (batch->enc) {
@@ -675,11 +676,15 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     }
     out->shape_probe_ok = 1;
     out->tp_attn_rows_ok = 1;
+    /* --kv-cache-dtype fp8: the latent attention cache as E4M3 (declare, kv_groups). */
+    out->kv_fp8_ok = 1;
     return RAD_OK;
 }
 } // namespace glm5next
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PROBE(glm5next)
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(glm5next, "glm5next", "", "0.1.0",
                 "GLM-5.3-Flash mixed MXFP4/FP8, mHC/KDA/MLA and native serial MTP")
 #endif

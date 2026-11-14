@@ -7,7 +7,7 @@
 #include "llama/common/jinja/runtime.h"
 #include "shim/log.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <atomic>
@@ -15,7 +15,7 @@
 
 namespace rad {
 
-using ojson = nlohmann::ordered_json;
+using ojson = Json;
 
 struct ChatTemplate::Impl {
     common_chat_templates_ptr tmpls;
@@ -99,6 +99,11 @@ int ChatTemplate::load(const std::string& jinja_source, const std::string& bos,
     impl_->caps.string_content      = get("supports_string_content", true);
     impl_->caps.typed_content       = get("supports_typed_content", false);
     impl_->caps.object_arguments    = get("supports_object_arguments", false);
+    impl_->caps.probe_error         = common_chat_templates_get_probe_error(impl_->tmpls.get());
+    if (!impl_->caps.tools && !impl_->caps.probe_error.empty())
+        RAD_WARN("chat: the template's tool capability probe failed (%s), so tools are off. A "
+                 "template that declares tools and fails here calls something this engine lacks",
+                 impl_->caps.probe_error.c_str());
 
     /* The thinking probe is the first full render, through the reply-format analysis every render
      * runs. A template that compiles but cannot render a one-message conversation there (it calls
@@ -192,6 +197,153 @@ static bool lead_system(const ojson& messages, ojson* out) {
     return true;
 }
 
+/* One thing, several names: an assistant turn's reasoning, replayed with the history.
+ * The templates (and the lifted parser) read `reasoning_content`; vLLM and its router
+ * canonicalise it to `reasoning`, OpenRouter may carry it only in `reasoning_details`,
+ * and Anthropic-shaped histories use a `thinking` field or content part. Fill the
+ * canonical field from whichever spelling a message carries -- with the details' text
+ * preferred over their summary, never both, and encrypted details unrecoverable -- so
+ * the reasoning is rendered (and tokenised) exactly as the turn was generated. Dropped,
+ * the history would differ from the cached prefix at every reasoning turn and the model
+ * would not see its own earlier reasoning. A null `reasoning_content` is absent (the
+ * serializers beside a router emit one routinely), and a non-string alias is not
+ * reasoning text (other APIs use the names for a flag or an effort object) and is left
+ * alone. The same pass rewrites the other spellings the lifted parser refuses: text
+ * parts named for the Responses API, and replayed tool calls left flat or without their
+ * defaults. Returns false when nothing needed changing. */
+static bool alias_reasoning(const ojson& messages, ojson* out) {
+    if (!messages.is_array()) return false;
+    auto str_of = [](const ojson& o, const char* k) -> std::string {
+        if (!o.is_object()) return "";
+        const auto it = o.find(k);
+        return it != o.end() && it->is_string() ? it->get<std::string>() : "";
+    };
+    auto details_text = [&](const ojson& m) -> std::string {
+        const auto it = m.find("reasoning_details");
+        if (it == m.end()) return "";
+        std::string text, summary;
+        auto take = [&](const ojson& d) {
+            if (!d.is_object()) return;
+            const std::string type = str_of(d, "type");
+            if (type.find("summary") != std::string::npos) summary += str_of(d, "summary");
+            else if (type.find("encrypted") == std::string::npos) text += str_of(d, "text");
+        };
+        if (it->is_array()) for (const ojson& d : *it) take(d);
+        else take(*it);
+        return !text.empty() ? text : summary;
+    };
+    auto is_reasoning_part = [](const std::string& type) {
+        return type == "thinking" || type == "reasoning" || type == "reasoning_text" ||
+               type == "redacted_thinking";
+    };
+    auto part_text = [&](const ojson& p) -> std::string {
+        for (const char* k : { "thinking", "text", "reasoning", "reasoning_content", "summary" }) {
+            const std::string v = str_of(p, k);
+            if (!v.empty()) return v;
+        }
+        const auto c = p.find("content");
+        if (c != p.end() && c->is_string()) return c->get<std::string>();
+        if (c != p.end() && c->is_array()) {
+            std::string t;
+            for (const ojson& q : *c) t += str_of(q, "text");
+            return t;
+        }
+        return "";
+    };
+    auto alias_of = [&](const ojson& m) -> std::string {
+        if (!m.is_object()) return "";
+        std::string v = str_of(m, "reasoning");
+        if (v.empty()) v = str_of(m, "thinking");
+        if (v.empty()) v = details_text(m);
+        if (v.empty()) {
+            const auto c = m.find("content");
+            if (c != m.end() && c->is_array())
+                for (const ojson& p : *c)
+                    if (is_reasoning_part(str_of(p, "type"))) v += part_text(p);
+        }
+        return v;
+    };
+    auto needs = [&](const ojson& m) {
+        if (!m.is_object()) return false;
+        const auto rc = m.find("reasoning_content");
+        const bool canonical = rc != m.end() && rc->is_string() &&
+                               !rc->get_ref<const std::string&>().empty();
+        if (rc != m.end() && rc->is_null()) return true;
+        if (!canonical && !alias_of(m).empty()) return true;
+        const auto c = m.find("content");
+        if (c != m.end() && c->is_array())
+            for (const ojson& p : *c) {
+                const std::string type = str_of(p, "type");
+                if (type == "input_text" || type == "output_text" || is_reasoning_part(type))
+                    return true;
+            }
+        const auto tc = m.find("tool_calls");
+        if (tc != m.end() && tc->is_array())
+            for (const ojson& call : *tc) {
+                if (!call.is_object()) continue;
+                const auto fn = call.find("function");
+                if (!call.contains("type") || fn == call.end() || !fn->is_object() ||
+                    !fn->contains("arguments") || fn->at("arguments").is_null())
+                    return true;
+            }
+        return false;
+    };
+    bool any = false;
+    for (const ojson& m : messages) any = any || needs(m);
+    if (!any) return false;
+    *out = messages;
+    for (ojson& m : *out) {
+        if (!m.is_object() || !needs(m)) continue;
+        std::string extracted;
+        if (auto c = m.find("content"); c != m.end() && c->is_array()) {
+            ojson parts = ojson::array();
+            for (const ojson& p : *c) {
+                const std::string type = str_of(p, "type");
+                if (is_reasoning_part(type)) {
+                    extracted += part_text(p);
+                    continue;
+                }
+                ojson part = p;
+                if (type == "input_text" || type == "output_text") part["type"] = "text";
+                parts.push_back(std::move(part));
+            }
+            m["content"] = parts.empty() ? ojson("") : std::move(parts);
+        }
+        const auto rc = m.find("reasoning_content");
+        const bool canonical = rc != m.end() && rc->is_string() &&
+                               !rc->get_ref<const std::string&>().empty();
+        if (rc != m.end() && rc->is_null()) m.erase("reasoning_content");
+        if (!canonical) {
+            std::string v = alias_of(m);
+            if (v.empty()) v = extracted;
+            if (!v.empty()) m["reasoning_content"] = v;
+        }
+        if (auto tc = m.find("tool_calls"); tc != m.end() && tc->is_array())
+            for (ojson& call : *tc) {
+                if (!call.is_object()) continue;
+                if (!call.contains("type") || call.at("type").is_null())
+                    call["type"] = "function";
+                auto fn = call.find("function");
+                if (fn == call.end() || !fn->is_object()) {
+                    if (call.contains("name") && call.at("name").is_string()) {
+                        ojson f = ojson::object();
+                        f["name"] = call.at("name");
+                        f["arguments"] = call.contains("arguments") &&
+                                                !call.at("arguments").is_null()
+                                            ? call.at("arguments")
+                                            : ojson("{}");
+                        call["function"] = std::move(f);
+                        call.erase("name");
+                        call.erase("arguments");
+                    }
+                } else if (!fn->contains("arguments") || fn->at("arguments").is_null()) {
+                    (*fn)["arguments"] = "{}";
+                }
+            }
+    }
+    return true;
+}
+
 int ChatTemplate::apply(const ojson& messages, const ojson& tools, const ChatOptions& opt,
                         ChatPrompt* out) const {
     if (!ready()) {
@@ -214,9 +366,12 @@ int ChatTemplate::apply(const ojson& messages, const ojson& tools, const ChatOpt
         }
     }
 
+    ojson aliased;
+    const ojson& msgs = alias_reasoning(messages, &aliased) ? aliased : messages;
+
     common_chat_templates_inputs in;
     try {
-        in.messages = common_chat_msgs_parse_oaicompat(messages);
+        in.messages = common_chat_msgs_parse_oaicompat(msgs);
         if (tools.is_array() && !tools.empty())
             in.tools = common_chat_tools_parse_oaicompat(tools);
         in.tool_choice = common_chat_tool_choice_parse_oaicompat(opt.tool_choice);
@@ -228,7 +383,10 @@ int ChatTemplate::apply(const ojson& messages, const ojson& tools, const ChatOpt
     }
     if (!in.tools.empty() && !impl_->caps.tools) {
         RAD_WARN("chat: the model's template declares no tool support; request refused");
-        out->error = "this model's chat template declares no tool support";
+        out->error = impl_->caps.probe_error.empty()
+                         ? "this model's chat template declares no tool support"
+                         : "this model's chat template failed the tool capability probe: " +
+                               impl_->caps.probe_error;
         return RAD_E_UNSUPPORTED;
     }
 
@@ -257,7 +415,7 @@ int ChatTemplate::apply(const ojson& messages, const ojson& tools, const ChatOpt
          * merged into one at the head. Anything else the template refuses is the request's. */
         ojson merged;
         bool served = false;
-        if (lead_system(messages, &merged)) {
+        if (lead_system(msgs, &merged)) {
             try {
                 in.messages = common_chat_msgs_parse_oaicompat(merged);
                 p = common_chat_templates_apply(impl_->tmpls.get(), in);

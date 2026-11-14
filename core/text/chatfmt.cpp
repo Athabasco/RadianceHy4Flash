@@ -11,7 +11,7 @@
 #include "llama/common/json-schema-to-grammar.h"
 #include "shim/log.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <cctype>
@@ -23,7 +23,7 @@
 
 namespace rad {
 
-using ojson = nlohmann::ordered_json;
+using ojson = Json;
 
 namespace {
 
@@ -47,7 +47,7 @@ bool confusable(const std::string& a, const std::string& b) {
     return a.starts_with(b) || b.starts_with(a) || occurs_inside(a, b) || occurs_inside(b, a);
 }
 
-std::string show(const std::string& s) { return nlohmann::json(s).dump(); }
+std::string show(const std::string& s) { return Json(s).dump(); }
 
 int refuse(std::string* why, const std::string& s) {
     if (why) *why = s;

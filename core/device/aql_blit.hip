@@ -14,6 +14,7 @@
 #include <cstdint>
 
 #include "aql.h"
+#include "chain_kernel.h"
 #include "device.h"
 
 namespace {
@@ -34,6 +35,22 @@ __global__ __launch_bounds__(kThreads) void aql_copy16(const u32x4* __restrict__
         dst[i] = a; dst[i + stride] = b; dst[i + 2 * stride] = c; dst[i + 3 * stride] = d;
     }
     for (; i < n; i += stride) dst[i] = src[i];
+}
+
+/* aql_copy16 as a chained form (chain_kernel.h), launched where launches chain: a card-side copy
+ * between two kernels of a pass (a routed layer's counts into the core's row) then costs no
+ * barrier on either side. */
+__global__ __launch_bounds__(kThreads) void r4dchain_copy16(const u32x4* __restrict__ src,
+                                                            u32x4* __restrict__ dst, uint64_t n) {
+    rad_chain_wait();
+    const uint64_t stride = (uint64_t)gridDim.x * kThreads;
+    uint64_t i = (uint64_t)blockIdx.x * kThreads + threadIdx.x;
+    for (; i + 3 * stride < n; i += 4 * stride) {
+        const u32x4 a = src[i], b = src[i + stride], c = src[i + 2 * stride], d = src[i + 3 * stride];
+        dst[i] = a; dst[i + stride] = b; dst[i + 2 * stride] = c; dst[i + 3 * stride] = d;
+    }
+    for (; i < n; i += stride) dst[i] = src[i];
+    rad_chain_done();
 }
 
 /* A copy across the link (pinned host memory) is one workgroup of four waves.
@@ -190,6 +207,9 @@ extern "C" int rad_aql_blit_copy(void* dst, const void* src, uint64_t bytes, voi
         if (link)
             hipLaunchKernelGGL(aql_copy_link, dim3(1), dim3(kLinkThreads), 0, s,
                                (const u32x4*)src, (u32x4*)dst, n);
+        else if (rad_dev_chain_enabled())
+            hipLaunchKernelGGL(r4dchain_copy16, dim3(blocks_for(n, 4 * kThreads)), dim3(kThreads),
+                               0, s, (const u32x4*)src, (u32x4*)dst, n);
         else
             hipLaunchKernelGGL(aql_copy16, dim3(blocks_for(n, 4 * kThreads)), dim3(kThreads), 0,
                                s, (const u32x4*)src, (u32x4*)dst, n);

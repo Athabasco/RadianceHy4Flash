@@ -72,6 +72,9 @@ struct Engine::Rank {
     /* Where the prefill stager's ring is at the span's shared level, from the arena's base; -1
      * without that level. */
     int64_t                 arena_low_off = -1;
+    /* Expert flex (docs/MULTIMODEL.md §6.7): address space for the slab slots the fleet may lend,
+     * one slot for every expert in the pinned pool, backed from the top as the loan grows. */
+    VMem                    xflex;
     /* Prefill stager (core/place/stager.h): copies the next routed layer's pooled experts into the
      * top of this rank's arena while a full-plan step runs the layer before. */
     PrefillStager stager;

@@ -5,7 +5,7 @@
 
 #include "place/xstats.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <dirent.h>
 #include <unistd.h>
@@ -230,7 +230,7 @@ TEST(the_file_is_json_written_at_boot_and_replaced_through_a_rename) {
     ExpertStats xs;
     CHECK_OK(xs.init(path, m, info, 0.05));
 
-    nlohmann::json j = nlohmann::json::parse(slurp(path), nullptr, false);
+    Json j = Json::parse(slurp(path), nullptr, false);
     REQUIRE(!j.is_discarded());
     CHECK_EQ(j["format"].get<std::string>(), std::string("radiance-expert-stats/1"));
     CHECK_EQ(j["model"].get<std::string>(), info.model);
@@ -246,16 +246,16 @@ TEST(the_file_is_json_written_at_boot_and_replaced_through_a_rename) {
     xs.start();
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     xs.stop();
-    j = nlohmann::json::parse(slurp(path), nullptr, false);
+    j = Json::parse(slurp(path), nullptr, false);
     REQUIRE(!j.is_discarded());
-    CHECK(j["counts"]["decode"][0] == nlohmann::json({ 0, 1, 1, 0 }));
+    CHECK(j["counts"]["decode"][0] == Json({ 0, 1, 1, 0 }));
     CHECK_EQ(j["selections"]["decode"][0].get<uint64_t>(), (uint64_t)2);
     CHECK_EQ(j["observed_tokens"]["decode"][0].get<uint64_t>(), (uint64_t)1);
     CHECK_EQ(j["tokens"]["decode"].get<uint64_t>(), (uint64_t)1);
     CHECK(j["uptime_s"].get<double>() > 0.0);
 
     CHECK_OK(xs.write(true));
-    j = nlohmann::json::parse(slurp(path), nullptr, false);
+    j = Json::parse(slurp(path), nullptr, false);
     REQUIRE(!j.is_discarded());
     CHECK_EQ(j["final"].get<bool>(), true);
 

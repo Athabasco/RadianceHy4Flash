@@ -245,6 +245,7 @@ int rad_operand_shapes(const std::string& op, const Geometry& g, int n_opd, int6
     /* ---- the paged pair, sharing the layout stated in libref/ref_ops.h:
      *
      *     kv_cache[num_blocks, kv_heads, block_size, 2 * head_dim]   K first, V second in a slot
+     *     (2 * head_dim + 4 at the int8 cache: rad_kv_row_elems)
      *
      * The block count and context length are this tool's choice; any cache large enough for the
      * case works as long as the indices land inside it. */
@@ -262,7 +263,8 @@ int rad_operand_shapes(const std::string& op, const Geometry& g, int n_opd, int6
         add((uint32_t)RAD_BF16, {M, kvh, head_dim});
         add((uint32_t)RAD_BF16, {M, kvh, head_dim});
         add_idx({M}, nb * bs, -1, /*uniq*/ true);
-        add(kvd == (uint32_t)RAD_DT_INVALID ? (uint32_t)RAD_BF16 : kvd, {nb, kvh, bs, 2 * head_dim});
+        const uint32_t cd = kvd == (uint32_t)RAD_DT_INVALID ? (uint32_t)RAD_BF16 : kvd;
+        add(cd, {nb, kvh, bs, rad_kv_row_elems(cd, head_dim)});
     }
     else if (op == "attn_paged") {
         /* `M` is q_len (decode and prefill are different kernels, docs/OPS.md). One sequence whose

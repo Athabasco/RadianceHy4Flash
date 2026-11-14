@@ -312,7 +312,7 @@ TEST(the_sizes_and_counts_reach_the_fields_they_name) {
     CHECK_EQ(c.max_tok, 512ll);
     CHECK_EQ(c.max_seqs, 8ll);
     CHECK_EQ(c.max_ctx, 200000ll);
-    CHECK_EQ(c.host_pool_mib, 12288ll);
+    CHECK_EQ(c.host_pool_mib, 6144ll);   /* a rank's share of the 12288 at --tp 2 */
     CHECK_EQ(c.prefix_cache_mib, 4096ll);
     CHECK_EQ(c.prefix_cache_ttl, 600ll);
     CHECK_EQ(c.checkpoint_interval, 2048ll);
@@ -524,8 +524,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
         { "--gpu-memory-mib", { "16384" } }, { "--gpu-headroom-mib", { "128" } },
-        { "--kv-cache-dtype", { "fp8" } },
-        { "--state-cache-dtype", { "f16" } }, { "--attn-prefill-fp8", { "both" } },
+        { "--kv-cache-dtype", { "i8" } },
+        { "--state-cache-dtype", { "f16" } },
         { "--kv-resident", { "65536" } },
         { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
         { "--embedding-placement", { "vram" } },
@@ -786,25 +786,6 @@ TEST(weight_prefetch_is_on_or_off) {
     CHECK_EQ(parse({ "--weight-prefetch", "" }, &c), RAD_E_INVAL);
 }
 
-/* The prefill attention's e4m3 legs are lossy, so the default is off and anything but the four
- * names stops the server. */
-TEST(the_attention_fp8_mode_is_one_of_four_names) {
-    Config c;
-    CHECK_EQ(c.attn_prefill_fp8, 0);
-    CHECK_EQ(parse({ "--attn-prefill-fp8", "qk" }, &c), RAD_OK);
-    CHECK_EQ(c.attn_prefill_fp8, (int)RAD_ATTN_FP8_QK);
-    CHECK_EQ(parse({ "--attn-prefill-fp8", "pv" }, &c), RAD_OK);
-    CHECK_EQ(c.attn_prefill_fp8, (int)RAD_ATTN_FP8_PV);
-    CHECK_EQ(parse({ "--attn-prefill-fp8", "both" }, &c), RAD_OK);
-    CHECK_EQ(c.attn_prefill_fp8, (int)(RAD_ATTN_FP8_QK | RAD_ATTN_FP8_PV));
-    CHECK_EQ(std::string(attn_prefill_fp8_name(c.attn_prefill_fp8)), std::string("both"));
-    CHECK_EQ(parse({ "--attn-prefill-fp8", "off" }, &c), RAD_OK);
-    CHECK_EQ(c.attn_prefill_fp8, 0);
-    CHECK_EQ(parse({ "--attn-prefill-fp8", "3" }, &c), RAD_E_INVAL);
-    CHECK_EQ(parse({ "--attn-prefill-fp8", "" }, &c), RAD_E_INVAL);
-    CHECK_EQ(parse({ "--attn-prefill-fp8", "QK" }, &c), RAD_E_INVAL);
-}
-
 TEST(the_p2p_mode_is_one_of_three_names) {
     Config c;
     CHECK_EQ(c.p2p, RAD_P2P_AUTO);
@@ -835,21 +816,26 @@ TEST(the_state_cache_dtype_is_f32_or_f16) {
     CHECK_EQ(parse({ "--state-cache-dtype" }, &c), RAD_E_INVAL);
 }
 
-TEST(the_kv_cache_dtype_is_one_of_four_names) {
+TEST(the_kv_cache_dtype_is_one_of_three_names) {
     Config c;
     CHECK_EQ(parse({ "--kv-cache-dtype", "bf16" }, &c), RAD_OK);
     CHECK_EQ(c.kv_cache_dtype, std::string("bf16"));
     CHECK_EQ(parse({ "--kv-cache-dtype", "fp8" }, &c), RAD_OK);
     CHECK_EQ(c.kv_cache_dtype, std::string("fp8"));
-    CHECK_EQ(parse({ "--kv-cache-dtype", "fp8_v4" }, &c), RAD_OK);
-    CHECK_EQ(c.kv_cache_dtype, std::string("fp8_v4"));
-    CHECK_EQ(parse({ "--kv-cache-dtype", "k6_v4" }, &c), RAD_OK);
-    CHECK_EQ(c.kv_cache_dtype, std::string("k6_v4"));
-    /* Four values only: an "auto" resolving to bf16 would be a second name for the default, and
-     * each value should be unambiguous in a log. */
+    CHECK_EQ(parse({ "--kv-cache-dtype", "i8" }, &c), RAD_OK);
+    CHECK_EQ(c.kv_cache_dtype, std::string("i8"));
+    /* Three values only: an "auto" resolving to bf16 would be a second name for the default, and
+     * each value should be unambiguous in a log. The packed caches are refused by name, with the
+     * cache that serves in their place. */
     CHECK_EQ(parse({ "--kv-cache-dtype", "auto" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--kv-cache-dtype", "fp16" }, &c), RAD_E_INVAL);
-    CHECK_EQ(parse({ "--kv-cache-dtype", "v4" }, &c), RAD_E_INVAL);
+    for (const char* gone : { "fp8_v4", "k6_v4" }) {
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = parse({ "--kv-cache-dtype", gone }, &c); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(err.find("i8 is the 8-bit cache") != std::string::npos);
+    }
+    CHECK_EQ(c.kv_cache_dtype, std::string("i8"));
 
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
@@ -1550,8 +1536,8 @@ TEST(a_repeated_flag_takes_the_last_one) {
     Config c;
     CHECK_EQ(parse({ "--port", "1", "--port", "8100" }, &c), RAD_OK);
     CHECK_EQ(c.port, 8100);
-    CHECK_EQ(parse({ "--kv-cache-dtype", "bf16", "--kv-cache-dtype", "fp8" }, &c), RAD_OK);
-    CHECK_EQ(c.kv_cache_dtype, std::string("fp8"));
+    CHECK_EQ(parse({ "--kv-cache-dtype", "bf16", "--kv-cache-dtype", "i8" }, &c), RAD_OK);
+    CHECK_EQ(c.kv_cache_dtype, std::string("i8"));
     /* A bad value is refused even after a good one. */
     CHECK_EQ(parse({ "--tp-wire", "exact", "--tp-wire", "nope" }, &c), RAD_E_INVAL);
 }
@@ -1564,7 +1550,7 @@ TEST(usage_names_every_flag_it_documents) {
                            "--num-speculative-tokens", "--draft-window", "--draft-coupling",
                            "--checkpoint-policy",
                            "--prefix-cache-mib", "--prefix-cache-ttl", "--tp-wire",
-                           "--attn-prefill-fp8", "--embedding-placement", "--ngram-placement",
+                           "--embedding-placement", "--ngram-placement",
                            "--kld-record", "--kld-ref", "--default-max-tokens", "--max-tokens-cap",
                            "--presence-penalty", "--dry-sequence-breakers",
                            "--chat-template-kwargs", "--reasoning-format", "--max-n",

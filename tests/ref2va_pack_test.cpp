@@ -12,24 +12,25 @@
 #include "rad_test.h"
 #include "rad_ref2va_pack.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <fstream>
 #include <string>
 
+using Json = rad::Json;
 using namespace minimaxh3;
 
 namespace {
 
-nlohmann::json& golden() {
-    static nlohmann::json g = [] {
+Json& golden() {
+    static Json g = [] {
         std::ifstream f(std::string(RAD_REF2VA_GOLDEN) + "/golden.json");
         if (!f.is_open()) {
             fprintf(stderr, "  FAIL golden.json missing -- regenerate with "
                             "tests/data/ref2va/gen_golden.py\n");
             std::exit(1);
         }
-        return nlohmann::json::parse(f);
+        return Json::parse(f);
     }();
     return g;
 }
@@ -50,7 +51,7 @@ int ref_kind(const std::string& s) {
 }
 
 /* The pack `name`'s case asks for, built. */
-Ref2VAPack build_case(const nlohmann::json& c) {
+Ref2VAPack build_case(const Json& c) {
     Ref2VAGeom g{ c["latent_t"], c["latent_h"], c["latent_w"], c["audio_t"] };
     std::vector<Ref2VAKeyframe> kfs;
     for (const auto& k : c["keyframes"])
@@ -65,7 +66,7 @@ Ref2VAPack build_case(const nlohmann::json& c) {
 }
 
 void check_case(const std::string& name) {
-    const nlohmann::json& c = golden()[name];
+    const Json& c = golden()[name];
     const Ref2VAPack p = build_case(c);
 
     CHECK_EQ(p.rows, c["seq_len"].get<int64_t>());

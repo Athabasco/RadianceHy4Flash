@@ -225,7 +225,7 @@ private:
 
 /* Replace every byte that is not part of a well-formed UTF-8 sequence with U+FFFD; well-formed
  * input is returned unchanged. A byte-fallback vocab can emit a byte no continuation completes
- * (`<0xC1>` only starts overlong, never-legal encodings), and nlohmann::json::dump throws
+ * (`<0xC1>` only starts overlong, never-legal encodings), and Json::dump throws
  * type_error.316 on it, failing the whole response. Such bytes cannot be held back, and dropping
  * them would hide that the model produced something undecodable. */
 std::string utf8_sanitize(std::string_view s);

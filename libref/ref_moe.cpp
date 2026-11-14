@@ -295,6 +295,9 @@ static CbForm cb_form(const RadParam* p, int n_p) {
     if (s && !std::strcmp(s, "w4nl64a8h")) return CbForm{ 4, 64, RAD_F8E4M3, true };
     if (s && !std::strcmp(s, "w4nl32a8h")) return CbForm{ 4, 32, RAD_F8E4M3, true };
     if (s && !std::strcmp(s, "w5nl64a8h")) return CbForm{ 5, 64, RAD_F8E4M3, true };
+    /* The same stored experts under their names against an int8 activation. */
+    if (s && !std::strcmp(s, "w4nl64a8i8h")) return CbForm{ 4, 64, RAD_F8E4M3, true };
+    if (s && !std::strcmp(s, "w4nl32a8i8h")) return CbForm{ 4, 32, RAD_F8E4M3, true };
     return CbForm{ 0, 0, 0, false };
 }
 
@@ -519,7 +522,9 @@ static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
 
     const Mat ma = as_mat(A, K);
     const Scales SA = make_scales(as_, AR, K, false);
-    const int64_t gp = p_int(a, "group", 0);
+    /* The activation's scales are per `a_group` of K where the caller states one (an int8
+     * activation at one scale per 256 against experts scaled per 128), else per `group`. */
+    const int64_t gp = p_int(a, "a_group", p_int(a, "group", 0));
     if (quant && gp > 0 && SA.p && SA.group != gp) return RAD_E_SHAPE;
 
     const int64_t y_rs = row_stride(Y, N);
@@ -711,8 +716,14 @@ static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
 int ref_moe_gemm(const RadArgs* a, RadStream)   { return moe_gemm_impl(a, false); }
 int ref_moe_gemm_q(const RadArgs* a, RadStream s) {
     const char* dt = p_str(a, "dtype", "");
-    if (dt && std::strcmp(dt, "w4a8") == 0) return ref_moe_gemm_w4a8(a, s);
     if (dt && std::strcmp(dt, "w4a4") == 0) return ref_moe_gemm_w4a4(a, s);
+    /* w4a8 over bf16 scales has its own body, summed in the order libr3d's kernel sums. Any other
+     * four-bit expert (f16 scales, a code plane with a zero point) is a form that body does not
+     * read, and the general one does. */
+    if (dt && std::strcmp(dt, "w4a8") == 0) {
+        const int rc = ref_moe_gemm_w4a8(a, s);
+        if (rc != RAD_E_DTYPE) return rc;
+    }
     return moe_gemm_impl(a, true);
 }
 int ref_moe_gemm_q_mod4(const RadArgs* a, RadStream) { return moe_gemm_impl(a, true, 4); }

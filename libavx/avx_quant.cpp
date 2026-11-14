@@ -313,6 +313,43 @@ AVX_KERNEL(gated_had_quant_i8) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ dequant_w4 */
+/* The packed 4-bit weight back to row-major bf16 [N, K], as libref reads it (ref_quant.cpp): eight
+ * nibbles a dword in fragment order [t][kb][lh][r][s], t = n / 16, r = n % 16, kb = k / 64,
+ * s = (k % 64) / 16, the k inside a step 4 * lh + {0, 8, 1, 9, 2, 10, 3, 11}[i]; the scale dword at
+ * [t][g][r] holds the f16 scale low and -(1024 + zero) high. `twos` reads the nibble as two's
+ * complement with no zero point. A table's inverse, run where weights are checked, so scalar. */
+AVX_KERNEL(dequant_w4) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *wq = &a->t[0], *ws = &a->t[1], *y = &a->t[2];
+    if (y->rank < 2) return RAD_E_SHAPE;
+    const int64_t N = y->shape[0], K = y->shape[1];
+    const int64_t group = p_int(a, "group", 128);
+    const int64_t twos  = p_int(a, "twos", 1);
+    if (N <= 0 || K <= 0 || N % 16 || K % 64 || group < 1 || K % group) return RAD_E_SHAPE;
+    static const int kOff[8] = { 0, 8, 1, 9, 2, 10, 3, 11 };
+    const uint32_t* Wq = (const uint32_t*)wq->data;
+    const uint32_t* Ws = (const uint32_t*)ws->data;
+    const int64_t nkb = K / 64, ng = K / group;
+
+    AVX_PARALLEL_FOR_IF(N * K >= AVX_PAR_MIN)
+    for (int64_t idx = 0; idx < N * K / 8; ++idx) {
+        const int64_t s  = idx & 3, r = (idx >> 2) & 15, lh = (idx >> 6) & 1;
+        const int64_t kb = (idx >> 7) % nkb, t = (idx >> 7) / nkb;
+        const int64_t row = t * 16 + r, kbase = kb * 64 + s * 16 + 4 * lh;
+        const uint32_t w  = Wq[idx];
+        const uint32_t sz = Ws[(size_t)(t * ng + kbase / group) * 16 + (size_t)r];
+        const float sc   = rad_f16_to_f32((uint16_t)(sz & 0xFFFFu));
+        const float zero = -rad_f16_to_f32((uint16_t)(sz >> 16)) - 1024.f;
+        for (int i = 0; i < 8; ++i) {
+            const int n = (int)((w >> (4 * i)) & 0xF);
+            const float q = twos ? (float)((n ^ 8) - 8) : (float)n;
+            stt(y, row * K + kbase + kOff[i], (q - (twos ? 0.f : zero)) * sc);
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ dequant */
 /* q * scale, with the scale tensor's extent giving the group count. The inverse of quant_act_i8
  * only; it does not undo a rotation. */
@@ -539,8 +576,10 @@ AVX_KERNEL(gated_quant_fp8) {
  * Unlike had_quant_act_i8, 1/sqrt(g) is not applied here. <Hw, Ha> = g <w, a>, and the whole g is
  * divided out of the weight scale instead, where dividing a bf16 by a power of two is exact.
  *
- * had_quant_act_i8g is the same at int8 codes (`top` 127), for the i8a8h weight. */
-static int had_quant_q8(const RadArgs* a, float top) {
+ * had_quant_act_i8g is the same at int8 codes (`top` 127), for the i8a8h weight. Its rotation is
+ * at most `rot_cap` (128) wide: a wider group (IQ8R's 256) is whole 128-wide rotations under one
+ * scale, as libref's. */
+static int had_quant_q8(const RadArgs* a, float top, int64_t rot_cap = 0) {
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *q = &a->t[1], *s = &a->t[2];
     const int64_t n = p_int(a, "n", 0);
@@ -560,7 +599,7 @@ static int had_quant_q8(const RadArgs* a, float top) {
         float* out = scratch_f32_b((size_t)n);
         const float* v = in_row(x, rowoff(x, r, n), n, buf);
         if (v != buf) std::memcpy(buf, v, (size_t)n * sizeof(float));
-        fwht_row(buf, n, g);
+        fwht_row(buf, n, rot_cap > 0 && g > rot_cap ? rot_cap : g);
         for (int64_t gi = 0; gi < ngrp; ++gi) {
             float sc;
             fp8_group(buf, out, gi * g, gi * g + g, &sc, top);
@@ -571,12 +610,8 @@ static int had_quant_q8(const RadArgs* a, float top) {
     return RAD_OK;
 }
 
-AVX_KERNEL(had_quant_act_fp8) {
-    return had_quant_q8(a, 448.0f);
-}
-
 AVX_KERNEL(had_quant_act_i8g) {
-    return had_quant_q8(a, 127.0f);
+    return had_quant_q8(a, 127.0f, 128);
 }
 
 /* ------------------------------------------------------------- givens_rotate */
@@ -585,59 +620,6 @@ AVX_KERNEL(had_quant_act_i8g) {
  * libref's arithmetic and order (ref_quant.cpp): the divide, then a' = a cos t + b sin t,
  * b' = b cos t - a sin t in f32, stage by stage. The pair walk is a gather/scatter and stays
  * scalar; the cos and sin of each angle are computed once per call. */
-AVX_KERNEL(givens_rotate) {
-    if (!rad_args_have(a, 5)) return RAD_E_INVAL;
-    const RadTensor *x = &a->t[0], *pr = &a->t[1], *an = &a->t[2], *sc = &a->t[3], *y = &a->t[4];
-    const int64_t n = p_int(a, "n", 0), S = p_int(a, "stages", 0), P = p_int(a, "parts", 1);
-    const int64_t g = p_int(a, "group", 0);
-    if (n <= 0 || S <= 0 || P <= 0 || (n & 1)) return RAD_E_SHAPE;
-    if (g <= 0 || g > n || n % g != 0) return RAD_E_SHAPE;
-    const int64_t NP = P * S * (n / 2);
-    if (numel(pr) < P * S * n || numel(an) < NP || numel(sc) < P * n) return RAD_E_SHAPE;
-    const int64_t rows = numel(x) / n;
-    if (rows <= 0 || numel(y) < rows * P * n) return RAD_E_SHAPE;
-
-    int32_t* idx = (int32_t*)scratch_raw((size_t)(P * S * n) * sizeof(int32_t) +
-                                         (size_t)(2 * NP + P * n) * sizeof(float) + 64);
-    float* cs = (float*)(idx + P * S * n);
-    float* sn = cs + NP;
-    float* rs = sn + NP;
-    for (int64_t i = 0; i < P * S * n; ++i) {
-        const int64_t c = ldi(pr, i);
-        if (c < 0 || c >= n) return RAD_E_INVAL;
-        idx[i] = (int32_t)c;
-    }
-    for (int64_t j = 0; j < NP; ++j) {
-        const float th = ldt(an, j);
-        cs[j] = sc_cos(th);
-        sn[j] = sc_sin(th);
-    }
-    for (int64_t k = 0; k < P * n; ++k) rs[k] = ldt(sc, k);
-
-    AVX_PARALLEL_FOR_IF(rows * P * n * S >= AVX_PAR_MIN)
-    for (int64_t r = 0; r < rows; ++r) {
-        float* buf = scratch_f32((size_t)n);
-        float* out = scratch_f32_b((size_t)(P * n));
-        const float* v = in_row(x, rowoff(x, r, n), n, buf);
-        for (int64_t p = 0; p < P; ++p) {
-            float* w = out + p * n;
-            for (int64_t k = 0; k < n; ++k) w[k] = v[k] / rs[p * n + k];
-            for (int64_t st = 0; st < S; ++st) {
-                const int32_t* ip = idx + (p * S + st) * n;
-                const int64_t a0 = (p * S + st) * (n / 2);
-                for (int64_t j = 0; j < n / 2; ++j) {
-                    const float c = cs[a0 + j], s1 = sn[a0 + j];
-                    const float va = w[ip[2 * j]], vb = w[ip[2 * j + 1]];
-                    w[ip[2 * j]] = va * c + vb * s1;
-                    w[ip[2 * j + 1]] = vb * c - va * s1;
-                }
-            }
-        }
-        out_row(y, rowoff(y, r, P * n), P * n, out);
-    }
-    return RAD_OK;
-}
-
 /* --------------------------------------------------------- givens_dense_quant */
 /* Quantising form: the rotation as one dense 128 x 128 f16 matrix per (part, group) (`tdense`,
  * which rad-convert composes from the pairs and angles as the weight's "t.dense" table), then the
@@ -645,59 +627,6 @@ AVX_KERNEL(givens_rotate) {
  * amax / 127, rounded to nearest; scale 1 for an all-zero group, as libref. The matrices are widened
  * to f32 once per call. Each group is a matrix-vector product summed in f32 (libref uses f64), so a
  * code on a rounding edge can differ from libref's. */
-AVX_KERNEL(givens_dense_quant) {
-    if (!rad_args_have(a, 5)) return RAD_E_INVAL;
-    const RadTensor *x = &a->t[0], *tm = &a->t[1], *sc = &a->t[2], *q = &a->t[3], *s = &a->t[4];
-    const int64_t n = p_int(a, "n", 0), P = p_int(a, "parts", 1), g = p_int(a, "group", 0);
-    if (n <= 0 || P <= 0 || g != 128 || n % g != 0) return RAD_E_SHAPE;
-    const bool i8 = q->dtype == RAD_I8;
-    if (!i8 && q->dtype != RAD_F8E4M3) return RAD_E_DTYPE;
-    const char* outs = p_str(a, "out", "");
-    if (std::strcmp(outs, i8 ? "i8" : "fp8") != 0) return RAD_E_DTYPE;   // `out` names q's dtype
-    const int64_t rows = numel(x) / n, ngrp = n / g;
-    if (rows <= 0 || numel(tm) < P * n * g || numel(sc) < P * n || numel(q) < rows * P * n ||
-        numel(s) < rows * P * ngrp) return RAD_E_SHAPE;
-    const float qmax = i8 ? 127.0f : 448.0f;
-
-    float* T = (float*)scratch_raw((size_t)(P * n * g + P * n) * sizeof(float) + 64);
-    float* rs = T + P * n * g;
-    for (int64_t i = 0; i < P * n; ++i) {
-        row_to_f32(tm->dtype, byte_at(tm->data, tm->dtype, rowoff(tm, i, g)), T + i * g, g);
-        rs[i] = ldt(sc, i);
-    }
-
-    AVX_PARALLEL_FOR_IF(rows * P * n * g >= AVX_PAR_MIN)
-    for (int64_t r = 0; r < rows; ++r) {
-        float* buf = scratch_f32((size_t)n);
-        float* out = scratch_f32_b((size_t)(P * n));
-        float* in = scratch_f32_c((size_t)g);
-        const float* v = in_row(x, rowoff(x, r, n), n, buf);
-        for (int64_t p = 0; p < P; ++p)
-            for (int64_t gi = 0; gi < ngrp; ++gi) {
-                for (int64_t i = 0; i < g; ++i) in[i] = v[gi * g + i] / rs[p * n + gi * g + i];
-                float* yv = out + p * n + gi * g;
-                const float* Tg = T + (p * n + gi * g) * g;
-                for (int64_t j = 0; j < g; ++j) {
-                    vf acc = vf_zero();
-                    for (int64_t i = 0; i < g; i += VF_N)
-                        acc = vf_fma(vf_loadu(Tg + j * g + i), vf_loadu(in + i), acc);
-                    yv[j] = vf_hsum(acc);
-                }
-                const float amax = row_amax(yv, g);
-                const float scl = amax > 0.0f ? amax * (1.0f / qmax) : 1.0f;
-                const float inv = 1.0f / scl;
-                for (int64_t j = 0; j < g; ++j) {
-                    float t = yv[j] * inv;
-                    t = t > qmax ? qmax : (t < -qmax ? -qmax : t);
-                    yv[j] = i8 ? std::nearbyint(t) : t;
-                }
-                stt(s, rowoff(s, r, P * ngrp) + (p * ngrp + gi) * laststride(s), scl);
-            }
-        out_row(q, rowoff(q, r, P * n), P * n, out);
-    }
-    return RAD_OK;
-}
-
 /* ---------------------------------------------------------------- the Gram accumulator
  *
  * h[k1][k2] += sum over rows of x[m][k1] * x[m][k2], where x is the dequantised E4M3 input, or a

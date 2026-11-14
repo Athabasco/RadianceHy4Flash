@@ -23,6 +23,7 @@
 #include "kvstream/mirror.h"
 #include "mem/hostarena.h"
 #include "mem/pools.h"
+#include "mem/seqwindow.h"
 #include "rad_core.h"
 
 #include <functional>
@@ -88,14 +89,8 @@ const char* kv_kind_name(int kind);
  * A sequence with a runtime window is excluded from prefix-cache reuse, window snapshots, forking
  * and speculative rollback: all three assume the declare-time window, and the runtime length is
  * not in any cache key (see KVManager::set_window). */
-struct SeqWindow {
-    bool    set = false;
-    int64_t window = 0;       /* W as set */
-    int64_t visible_lo = 0;   /* the retained reference ends here */
-    int64_t ring_pos = 0;     /* block-aligned first ring token position */
-    int64_t ring_blocks = 0;  /* whole blocks the ring holds */
-    int64_t ring_span(int64_t block) const { return ring_blocks * block; }
-};
+/* SeqWindow itself is mem/seqwindow.h, so the scheduler's interface (sched/mem_iface.h) can
+ * name it without this header. */
 
 /* ------------------------------------------------------------------ per-group plan */
 struct KVGroupPlan {
@@ -408,6 +403,9 @@ public:
 
     const std::vector<int32_t>& block_table(uint64_t seq, int32_t group) const;
     int32_t state_slot(uint64_t seq, int32_t group) const;
+    /* The batch builder's reads about (seq, group) with one find() of the sequence
+     * (SeqGroupView, mem/seqwindow.h); each field answers as the like-named accessor does. */
+    void seq_group(uint64_t seq, int32_t group, bool take_changes, SeqGroupView* out) const;
     int     state_index_row(uint64_t seq, int32_t group, int32_t* out, int max) const;
     int64_t state_index_width(int32_t group) const;
 
@@ -454,8 +452,9 @@ public:
 
     /* Whether `seq` can grow to `n_tokens` without taking blocks from another sequence. */
     bool can_grow(uint64_t seq, int64_t n_tokens) const;
-    /* Drop every sequence's state slot and put back any slot neither free nor held. The
-     * scheduler calls this only when nothing is running (IKVManager::release_idle_states). */
+    /* Drop the state slot of every sequence holding no tokens and put back any slot neither free
+     * nor held. The scheduler calls this only when nothing is running or just admitted
+     * (IKVManager::release_idle_states). */
     int release_idle_states();
 
     /* Blocks a paged group can still hand out, including the lendable part. */
@@ -509,6 +508,30 @@ public:
 
     /* Blocks of a group the cache may hand out: the carve less the loan. */
     int64_t live_blocks(int32_t group) const;
+
+    /* ---------------- flex (docs/MULTIMODEL.md §6) ----------------
+     *
+     * In a fleet the KV pool is reserved for the most the model may hold and backed only for what
+     * it holds now: set_flex(backed) before the carve makes the carve size its blocks for the
+     * whole reservation, lend the top of every FULL group to nobody, and back each layer's stripe
+     * only below the live mark (plus everything that is not a FULL group). Growing is the loan
+     * shrinking with the stripes between the two marks backed first (flex_back); giving back is
+     * the loan growing with those stripes unbacked after (flex_unback_above). Both take loans in
+     * tokens, as set_loan does, and work on any rank's manager, since every rank carves the same
+     * layout. Not with the expert loan: a cache that lends to a slab never runs as flex. */
+    void    set_flex(int64_t backed_bytes) { flex_backed_ = backed_bytes; }
+    bool    flex() const { return flex_backed_ > 0; }
+    int     flex_back(int64_t from_loan, int64_t to_loan);
+    /* Unbacks every FULL stripe above the live mark of `loan`, including any backed ahead. */
+    int     flex_unback_above(int64_t loan);
+    /* How many lent tokens admission may count on: what the fleet could still grow the cache by
+     * now. A request admitted against blocks the fleet then refuses would only be preempted. */
+    void    set_flex_room(int64_t tokens) { flex_room_ = tokens < 0 ? 0 : tokens; }
+    /* Bytes a token costs across the FULL groups, the unit flex is priced in. */
+    int64_t flex_token_bytes() const;
+    /* The loan the carve started at: every token past the backed floor is lent to nobody. Giving
+     * back never raises the loan above it (a loan of zero leaves the cache every carved token). */
+    int64_t flex_floor_loan() const { return flex_floor_loan_; }
 
     /* ---------------- preemption by recompute (spec §7.1, §17) ---------------- */
     /* Frees the sequence's blocks and state slots and resets it to zero tokens. A recurrent
@@ -725,6 +748,11 @@ private:
     std::vector<int64_t>  short_peak_;
     Pool*    pool_ = nullptr;
     int64_t  loan_ = 0;                     /* tokens lent from the top of every lendable group */
+    int64_t  flex_backed_ = 0;              /* set_flex: the bytes the carve backs at start */
+    int64_t  flex_floor_loan_ = 0;          /* the loan the carve started at */
+    int64_t  flex_room_ = 0;                /* set_flex_room */
+    /* Backs (or unbacks) every lendable group's stripes between the live marks of two loans. */
+    int      flex_span(int64_t lo_loan, int64_t hi_loan, bool back);
     uint64_t seq_frees_ = 0;
     std::function<int(int64_t)> reclaim_;
     std::vector<int64_t>  live_;            /* per group: blocks the cache may hand out */

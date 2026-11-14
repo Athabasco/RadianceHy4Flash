@@ -824,6 +824,47 @@ TEST(a_bank_is_credited_once_for_every_pass_of_its_step) {
     CHECK_EQ(f.ctx.route_dropped(), (uint64_t)1);
 }
 
+/* A plugin's routing table (rad_route_table) is the card-side rows: a layer's row is the table's,
+ * a report naming it is read from there at the end of the pass, and a report naming another
+ * buffer is copied into it. A table short of a row per reporting layer is refused at bind. */
+TEST(a_routing_table_holds_the_card_side_rows) {
+    Fixture f;
+    f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    const rad_buf tab = f.add_buffer("ecnt", RAD_I32, 2, 4, 1024);
+    f.P.route_table = tab;
+    CHECK_OK(f.start());
+    int32_t* const rows = (int32_t*)f.ctx.buf_ptr(tab);
+    REQUIRE(rows != nullptr);
+    CHECK(f.ctx.route_counts(0, 4) == rows);
+    CHECK(f.ctx.route_counts(1, 4) == rows + 4);
+
+    const int32_t in_place[4] = { 5, 0, 2, 1 };
+    std::memcpy(rows + 4, in_place, sizeof in_place);
+    RadRouting r{};
+    r.n_expert = 4;
+    r.top_k = 2;
+    r.expert_count = rows + 4;
+    CHECK_OK(f.step(1, 0, [&](Ctx& c) { CHECK_OK(c.route_report(1, &r)); }));
+    int b = -1;
+    while ((b = f.ctx.next_histogram(1, -1, 1)) < 0) std::this_thread::yield();
+    const int32_t* h = f.ctx.last_histogram(1, b);
+    CHECK(h != nullptr);
+    if (h) { CHECK_EQ(h[0], 5); CHECK_EQ(h[2], 2); CHECK_EQ(h[3], 1); }
+
+    static const int32_t elsewhere[4] = { 9, 8, 7, 6 };
+    r.expert_count = elsewhere;
+    CHECK_OK(f.step(1, 1, [&](Ctx& c) { CHECK_OK(c.route_report(0, &r)); }));
+    CHECK_OK(rad_stream_sync(f.ctx.stream()));
+    CHECK_EQ(rows[0], 9);
+    CHECK_EQ(rows[3], 6);
+    CHECK_EQ(rows[4], 5);                    /* the other layer's row is untouched */
+
+    Fixture g;
+    g.add_buffer("x", RAD_BF16, 64, 4, 0);
+    g.P.route_table = g.add_buffer("ecnt", RAD_I32, 1, 4, 1024);
+    CHECK_EQ(g.start(), RAD_E_SHAPE);
+}
+
 /* Every event the context creates at bind is one Ctx::shutdown destroys: the routing ring holds
  * one per bank, not two. */
 TEST(shutdown_destroys_every_event_the_context_created) {
@@ -2296,6 +2337,36 @@ TEST(a_host_op_reads_what_an_earlier_device_op_wrote_to_the_host_arena) {
     CHECK_EQ(f.ctx.host_syncs(), (int64_t)3);
 }
 
+/* The same in a recorded pass, at every play: the host op waits for the device op the play just
+ * submitted, whatever the pass was entered with. This pass leaves no host-arena touch pending
+ * (its host op joined the only one), so every pass after the first is entered with none; a play
+ * that went by the mark at entry ran the host op at once, on the poison. The host backend records
+ * no tape and runs every round live. */
+TEST(a_played_pass_joins_its_host_op_to_the_device_op_it_replays) {
+    ord_setup();
+    Fixture f;
+    rad_buf hb = f.add_buffer("ids", RAD_I32, 4, 1, 0);
+    f.P.buffers[hb].decl.domain = RAD_DOMAIN_HOST;
+    rad_op dev = f.add_op("rope", "M", { 8192 }, { k_late_write }, { "late_write" }, nullptr, {});
+    rad_op hst = host_op(f, k_host_read, "host_read");
+    CHECK_OK(f.start(nullptr, false, /*record=*/true));
+    REQUIRE(f.ctx.set_op_domain(hst, RAD_DOMAIN_HOST) == RAD_OK);
+    f.batch.phase = RAD_PHASE_DECODE;
+    for (int round = 0; round < 8; ++round) {
+        *g_ord_value = 2000 + round;
+        *(int32_t*)f.ctx.buf_ptr(hb) = -7;            /* the poison */
+        g_ord_seen = -1;
+        CHECK_OK(f.step(1, round, [&](Ctx& c) {
+            const RadOperand o[1] = { RAD_B(hb) };
+            CHECK_OK(c.issue(dev, o, 1, RAD_N_BATCH));
+            CHECK_OK(c.issue(hst, o, 1, RAD_N_BATCH));
+        }));
+        CHECK_EQ(g_ord_seen, 2000 + round);
+        CHECK_OK(rad_stream_sync(f.ctx.stream()));
+    }
+    if (f.ctx.records_passes()) CHECK(f.ctx.pass_counts().played > 0);
+}
+
 /* A host op naming memory the arena does not track (a raw pointer) cannot know which device op
  * wrote it, so it drains the stream first and still reads the written value. */
 TEST(a_host_op_on_untracked_memory_drains_the_stream_first) {
@@ -2473,6 +2544,49 @@ TEST(issue_passes_only_proven_kv_host_summaries) {
     CHECK_EQ(issue(used_device + 1, 1, 2, RAD_PHASE_DECODE, 0), 2050);
     CHECK_EQ(issue(used_device, 3, 2, RAD_PHASE_DECODE, 1), -1);   // still nothing to bound
     CHECK_EQ(issue(used_device, 2, 2, RAD_PHASE_PREFILL, 0), 1152); // prefill keeps the exact one
+}
+
+/* Under an architecture's pass-key callback as without one, a decode, verify or draft launch reads
+ * the step's keyed context bound, so those passes record; a prefill launch keeps the exact
+ * maximum that the callback keys. */
+TEST(an_arch_keyed_program_issues_decode_passes_at_the_keyed_bound) {
+    Fixture f;
+    rad_op op = f.add_op("rope", "M", { 8192 }, { k_pre }, { "prefill" }, nullptr, {});
+    CHECK_OK(f.start(nullptr, false, false, test_prefill_geometry_key));
+
+    int32_t used_device[2] = { 896, 1152 }, used_host[2] = { 896, 1152 };
+    RadKVGroupBatch kv{};
+    kv.group = 1;
+    kv.seqused = used_device;
+    kv.seqused_h = used_host;
+    int32_t used_max[1] = { 1152 };
+    f.batch.n_kv_groups = 1;
+    f.batch.kv = &kv;
+    f.batch.kv_used_max_h = used_max;
+    f.batch.max_ctx_len = 2048;
+    f.batch.max_q_len = 2;
+
+    auto issue = [&](int phase, int n_spec, int draft_pass) -> int32_t {
+        f.batch.phase = phase;
+        f.batch.n_tok = 4;
+        f.batch.n_seq = 2;
+        f.batch.n_spec = n_spec;
+        f.batch.draft_pass = draft_pass;
+        g_rec.clear();
+        g_body = [&](Ctx& c) {
+            const RadOperand arg[1] = { RAD_P_T2(used_device, RAD_I32, 2, 1) };
+            (void)c.issue(op, arg, 1, RAD_N_BATCH);
+        };
+        const int status = f.ctx.run_step(&f.batch);
+        g_body = nullptr;
+        if (status < 0 || g_rec.size() != 1) return -999;
+        return g_rec[0].kv_used_max_h;
+    };
+    CHECK_EQ(issue(RAD_PHASE_DECODE, 0, 0), 2050);
+    CHECK_EQ(issue(RAD_PHASE_DECODE, 1, 0), 2050);
+    CHECK_EQ(issue(RAD_PHASE_DECODE, 0, 1), 2050);
+    CHECK_EQ(issue(RAD_PHASE_PREFILL, 0, 0), 1152);
+    CHECK_EQ(issue(RAD_PHASE_MIXED, 0, 0), 1152);
 }
 
 TEST(the_prefill_geometry_key_reuses_equal_grids_and_separates_changed_grids) {

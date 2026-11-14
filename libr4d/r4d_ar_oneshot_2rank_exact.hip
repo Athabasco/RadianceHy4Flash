@@ -18,8 +18,8 @@
 //  * Fine-grained memory (hipDeviceMallocFinegrained) is uncached and posted straight to the
 //    fabric, so system-scope release/acquire skip the L2 writeback. The drain/acq fences are
 //    selectable (default drain=1/acq=0 on fine-grained).
-#include "r4d_chain.h"
 #include "r4d.h"
+#include "r4d_chain.h"
 #include "r4d_ar_seq.h"
 #include "r4d_ar_hc.h"      // the gather word and the hc write word, shared with the rotated wire
 #include <hip/hip_fp16.h>
@@ -61,11 +61,13 @@ __device__ __forceinline__ int4 vadd(const int4& a, const int4& b) {
 
 // Multi-block one-shot all-reduce. Each block owns words [start,end) of the 16B-word space and
 // drives its own flag handshake; no cross-block sync.
-template <typename T, int LANES>
+// CH `r4dchain`: the chained form (r4d_chain.h); no block returns early.
+template <typename T, int LANES, class CH>
 __global__ void r4d_ar_oneshot_2rank_exact_kernel(
     const int4* __restrict__ in4, int4* peer_base, const int4* my_base, int4* __restrict__ out4,
     unsigned int* peer_flags, unsigned int* my_flags, unsigned int* seq_ctrs,
     int n16, int slot_stride16, int drain, int acq, unsigned int nbw, long stage) {
+  if (CH::on) r4d_chain_wait();
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;
   r4d_ar_seq_take(seq_ctrs, nbw, s_seq, s_slot);   // device-resident, replay-safe
@@ -138,6 +140,7 @@ __global__ void r4d_ar_oneshot_2rank_exact_kernel(
     }
     for (; k < end; k += nt) out4[k] = vadd<T, LANES>(in4[k], ms[k]);
   }
+  if (CH::on) r4d_chain_done();
 }
 
 // The same all-reduce with the gated residual write as its epilogue. `y` is the message: each word
@@ -148,12 +151,15 @@ __global__ void r4d_ar_oneshot_2rank_exact_kernel(
 //
 // n is a multiple of eight, so a word never straddles a row and the block that reduces it owns
 // every stream element behind it.
-__device__ __forceinline__ void r4d_ar_hc_write_kernel_body(
+// CH `r4dchain`: the chained form (r4d_chain.h); no block returns early.
+template <class CH>
+__global__ void r4d_ar_hc_write_kernel(
     int4* __restrict__ y4, int4* peer_base, const int4* my_base, unsigned int* peer_flags,
     unsigned int* my_flags, unsigned int* seq_ctrs, const unsigned short* __restrict__ inj,
     unsigned short* __restrict__ h, int n16, int n, int hc, long irow, long hrow,
     int slot_stride16, int drain, int acq, unsigned int nbw, long long* gate,
     unsigned int* gate_ctr, long stage) {
+  if (CH::on) r4d_chain_wait();
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;
   const long long gate_word = r4d_ar_link_word(gate, (unsigned int)tid);
@@ -208,26 +214,7 @@ __device__ __forceinline__ void r4d_ar_hc_write_kernel_body(
     r4d_ar_hc_write_word(inj, h, row, i0, n, hc, irow, hrow,
                          reinterpret_cast<const unsigned short*>(&r));
   }
-}
-
-/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
-__global__ void r4d_ar_hc_write_kernel(
-    int4* __restrict__ y4, int4* peer_base, const int4* my_base, unsigned int* peer_flags,
-    unsigned int* my_flags, unsigned int* seq_ctrs, const unsigned short* __restrict__ inj,
-    unsigned short* __restrict__ h, int n16, int n, int hc, long irow, long hrow,
-    int slot_stride16, int drain, int acq, unsigned int nbw, long long* gate,
-    unsigned int* gate_ctr, long stage) {
-    r4d_ar_hc_write_kernel_body(y4, peer_base, my_base, peer_flags, my_flags, seq_ctrs, inj, h, n16, n, hc, irow, hrow, slot_stride16, drain, acq, nbw, gate, gate_ctr, stage);
-}
-__global__ void r4dchain_ar_hc_write(
-    int4* __restrict__ y4, int4* peer_base, const int4* my_base, unsigned int* peer_flags,
-    unsigned int* my_flags, unsigned int* seq_ctrs, const unsigned short* __restrict__ inj,
-    unsigned short* __restrict__ h, int n16, int n, int hc, long irow, long hrow,
-    int slot_stride16, int drain, int acq, unsigned int nbw, long long* gate,
-    unsigned int* gate_ctr, long stage) {
-    r4d_chain_wait();
-    r4d_ar_hc_write_kernel_body(y4, peer_base, my_base, peer_flags, my_flags, seq_ctrs, inj, h, n16, n, hc, irow, hrow, slot_stride16, drain, acq, nbw, gate, gate_ctr, stage);
-    r4d_chain_done();
+  if (CH::on) r4d_chain_done();
 }
 
 // The same write with the MoE gather as its prologue. The routed experts' rows go back to token
@@ -258,13 +245,15 @@ __global__ void r4d_ar_gather_inv_kernel(int* __restrict__ inv, const int* __res
   }
 }
 
-template <bool INV>
-__device__ __forceinline__ void r4d_ar_gather_hc_write_kernel_body(
+// CH `r4dchain`: the chained form (r4d_chain.h); no block returns early.
+template <bool INV, class CH>
+__global__ void r4d_ar_gather_hc_write_kernel(
     int4* __restrict__ y4, int4* peer_base, const int4* my_base, unsigned int* peer_flags,
     unsigned int* my_flags, unsigned int* seq_ctrs, const unsigned short* __restrict__ inj,
     unsigned short* __restrict__ h, int n16, int n, int hc, long irow, long hrow,
     int slot_stride16, int drain, int acq, unsigned int nbw, R4dArGather G,
     const int* __restrict__ inv, long long* gate, unsigned int* gate_ctr, long stage) {
+  if (CH::on) r4d_chain_wait();
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;
   __shared__ int   s_i[R4D_ARG_ROWS * R4D_ARG_SLOTS];
@@ -345,28 +334,7 @@ __device__ __forceinline__ void r4d_ar_gather_hc_write_kernel_body(
     r4d_ar_hc_write_word(inj, h, row, i0, n, hc, irow, hrow,
                          reinterpret_cast<const unsigned short*>(&r));
   }
-}
-
-/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
-template <bool INV>
-__global__ void r4d_ar_gather_hc_write_kernel(
-    int4* __restrict__ y4, int4* peer_base, const int4* my_base, unsigned int* peer_flags,
-    unsigned int* my_flags, unsigned int* seq_ctrs, const unsigned short* __restrict__ inj,
-    unsigned short* __restrict__ h, int n16, int n, int hc, long irow, long hrow,
-    int slot_stride16, int drain, int acq, unsigned int nbw, R4dArGather G,
-    const int* __restrict__ inv, long long* gate, unsigned int* gate_ctr, long stage) {
-    r4d_ar_gather_hc_write_kernel_body<INV>(y4, peer_base, my_base, peer_flags, my_flags, seq_ctrs, inj, h, n16, n, hc, irow, hrow, slot_stride16, drain, acq, nbw, G, inv, gate, gate_ctr, stage);
-}
-template <bool INV>
-__global__ void r4dchain_ar_gather_hc_write(
-    int4* __restrict__ y4, int4* peer_base, const int4* my_base, unsigned int* peer_flags,
-    unsigned int* my_flags, unsigned int* seq_ctrs, const unsigned short* __restrict__ inj,
-    unsigned short* __restrict__ h, int n16, int n, int hc, long irow, long hrow,
-    int slot_stride16, int drain, int acq, unsigned int nbw, R4dArGather G,
-    const int* __restrict__ inv, long long* gate, unsigned int* gate_ctr, long stage) {
-    r4d_chain_wait();
-    r4d_ar_gather_hc_write_kernel_body<INV>(y4, peer_base, my_base, peer_flags, my_flags, seq_ctrs, inj, h, n16, n, hc, irow, hrow, slot_stride16, drain, acq, nbw, G, inv, gate, gate_ctr, stage);
-    r4d_chain_done();
+  if (CH::on) r4d_chain_done();
 }
 
 // The IPC handle goes into a caller-owned buffer of R4D_AR_HANDLE_BYTES so this stays a C ABI.
@@ -479,11 +447,14 @@ void r4d_ar_hc_write(long peer_scratch, long my_scratch, long peer_flags, long m
   if (nt < 64) nt = 64;
   if (nt > 1024) nt = 1024;
   nt &= ~31;   // whole waves: the push check's wave sum reads all 32 lanes
-  (chain ? r4dchain_ar_hc_write : r4d_ar_hc_write_kernel)<<<nb, nt, 0, st>>>(
-      (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,
-      (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h,
-      n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw,
-      (long long*)gate, (unsigned int*)gate_ctr, stage);
+#define R4D_ARHW(CH_)                                                                           \
+  r4d_ar_hc_write_kernel<CH_><<<nb, nt, 0, st>>>(                                               \
+      (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,           \
+      (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h, \
+      n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw,         \
+      (long long*)gate, (unsigned int*)gate_ctr, stage)
+  if (chain) R4D_ARHW(r4dchain); else R4D_ARHW(R4dUnchained);
+#undef R4D_ARHW
 }
 
 int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
@@ -530,20 +501,22 @@ int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, 
   G.sg = (const unsigned short*)sg;
   G.ye_ld = ye_ld; G.ew_ld = ew_ld; G.sh_ld = sh_ld; G.sg_ld = sg_ld;
   G.top_k = (int)top_k; G.T = (int)(M * top_k); G.sig = (int)sig;
+  /* The inverse table's two launches stay plain; the decode form's one has a chained form. */
+#define R4D_ARGHW(INV_, CH_, inv_)                                                              \
+    r4d_ar_gather_hc_write_kernel<INV_, CH_><<<nb, nt, 0, st>>>(                                \
+        (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,         \
+        (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h, \
+        n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw, G,    \
+        inv_, (long long*)gate, (unsigned int*)gate_ctr, stage)
   if (by_inv) {
     r4d_ar_gather_inv_kernel<<<1, 1024, 0, st>>>((int*)inv, (const int*)sorted, G.T);
-    (chain ? r4dchain_ar_gather_hc_write<true> : r4d_ar_gather_hc_write_kernel<true>)<<<nb, nt, 0, st>>>(
-        (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,
-        (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h,
-        n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw, G,
-        (const int*)inv, (long long*)gate, (unsigned int*)gate_ctr, stage);
+    R4D_ARGHW(true, R4dUnchained, (const int*)inv);
+  } else if (chain) {
+    R4D_ARGHW(false, r4dchain, nullptr);
   } else {
-    (chain ? r4dchain_ar_gather_hc_write<false> : r4d_ar_gather_hc_write_kernel<false>)<<<nb, nt, 0, st>>>(
-        (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,
-        (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h,
-        n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw, G,
-        nullptr, (long long*)gate, (unsigned int*)gate_ctr, stage);
+    R4D_ARGHW(false, R4dUnchained, nullptr);
   }
+#undef R4D_ARGHW
   return (int)hipGetLastError();
 }
 
@@ -597,7 +570,7 @@ void r4d_ar_oneshot_2rank_exact(long peer_scratch, long my_scratch, long peer_fl
                             long my_flags, long seq_ctrs, long slot_stride16,
                             long inp, long out, long n_elem, long dtype,
                             long stream_i, long nblocks, long nthreads,
-                            long drain, long acq, long stage) {
+                            long drain, long acq, long stage, long chain) {
   hipStream_t st = (hipStream_t)stream_i;
   const int esize = (dtype == 2) ? 4 : 2;
   const long nbytes = (long)n_elem * esize;
@@ -619,14 +592,16 @@ void r4d_ar_oneshot_2rank_exact(long peer_scratch, long my_scratch, long peer_fl
   // Tests only: every push lands after its flag (drain 4 above). Not in the tuning table, so no
   // tuner can pick it.
   if (g_ar_late_push) drain = 4;
-#define L(T, LN) r4d_ar_oneshot_2rank_exact_kernel<T, LN><<<nb, nt, 0, st>>>(              \
+#define LK(T, LN, CH_) r4d_ar_oneshot_2rank_exact_kernel<T, LN, CH_><<<nb, nt, 0, st>>>(   \
     (const int4*)inp, (int4*)peer_scratch, (const int4*)my_scratch, (int4*)out,        \
     (unsigned*)peer_flags, (unsigned*)my_flags, (unsigned*)seq_ctrs, n16,              \
     (int)slot_stride16, (int)drain, (int)acq, nbw, stage)
+#define L(T, LN) do { if (chain) LK(T, LN, r4dchain); else LK(T, LN, R4dUnchained); } while (0)
   if (dtype == 0) L(__hip_bfloat16, 8);
   else if (dtype == 1) L(__half, 8);
   else if (dtype == 2) L(float, 4);
   else throw std::runtime_error("all_reduce: bad dtype");
 #undef L
+#undef LK
 }
 

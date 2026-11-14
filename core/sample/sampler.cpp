@@ -4,6 +4,7 @@
 #include "sampler.h"
 #include "gbnf.h"
 #include "../sched/draft.h"   /* RAD_SCHED_MAX_SPEC */
+#include "../util/simd.h"
 
 #include <algorithm>
 #include <chrono>
@@ -85,11 +86,34 @@ void Sampler::shard_mask(uint32_t* dst) const {
         if (n > 0) std::memcpy(dst, mask_full_.data() + w0, (size_t)n * 4);
         return;
     }
-    for (int64_t i = 0; i < cfg_.n_vocab_local; ++i) {
-        const int64_t g = cfg_.vocab_off + i;
-        if (g >= cfg_.n_vocab) break;
-        if (mask_full_[(size_t)(g >> 5)] & (1u << (uint32_t)(g & 31)))
-            dst[i >> 5] |= 1u << (uint32_t)(i & 31);
+    /* The window is the full mask's bitstream shifted right by vocab_off: word i of the shard is
+     * (full[w0+i] >> sh) | (full[w0+i+1] << (32-sh)), which simd::bitstream_shr does a vector at
+     * a time where the per-bit loop did one bit (and one dependent read-modify-write) at a time.
+     * Bits at or past the last global token this shard may name are cleared after, as the loop's
+     * `g >= n_vocab` break cleared them: the shift can pull in bits past n_vocab that
+     * mask_full_'s tail word happens to hold. */
+    const int64_t w0 = cfg_.vocab_off >> 5;
+    const unsigned sh = (unsigned)(cfg_.vocab_off & 31);
+    const int64_t have = full - w0;   /* source words at and after w0 */
+    const int64_t local = std::min<int64_t>(cfg_.n_vocab_local, cfg_.n_vocab - cfg_.vocab_off);
+    if (have <= 0 || local <= 0) return;
+    /* bitstream_shr pairs word i with i+1 and reads one past its count as zero. Given words-1, it
+     * reads source word words-1 as zero for dst[words-2], so that word's high bits are added
+     * after; the last word -- whose high half is a real source word when the shard is narrower
+     * than the source -- is finished by hand. */
+    const int64_t words = std::min<int64_t>(mask_words_, have);
+    if (words > 1) {
+        simd::bitstream_shr(dst, mask_full_.data() + w0, (size_t)(words - 1), sh);
+        dst[words - 2] |= mask_full_[(size_t)(w0 + words - 1)] << (32 - sh);
+    }
+    if (words >= 1) {
+        const int64_t i = words - 1;
+        const uint32_t hi = w0 + i + 1 < full ? mask_full_[(size_t)(w0 + i + 1)] : 0u;
+        dst[i] = (mask_full_[(size_t)(w0 + i)] >> sh) | (hi << (32 - sh));
+    }
+    if (local < words * 32) {
+        if (local & 31) dst[local >> 5] &= (1u << (uint32_t)(local & 31)) - 1u;
+        for (int64_t i = (local + 31) >> 5; i < words; ++i) dst[i] = 0;
     }
 }
 
@@ -695,7 +719,13 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
         const int rep = dry_rep_limit(*brk, h + w0, (int)win);
         if (rep < allowed) return false;
         p.dry_rep_limit = rep < win ? rep : 0;
-        for (int64_t i = 0; i < win; ++i) f[i] = brk->is_single(h[w0 + i]) ? 1 : 0;
+        /* Marked from the indexed bitset when there is one (dry_prepare_breakers built it);
+         * is_single answers the same from the map for a set filled by hand. */
+        if (!brk->singles.empty())
+            simd::bitmap_marks(f, h + w0, (size_t)win, brk->singles.data(),
+                               brk->singles.size());
+        else
+            for (int64_t i = 0; i < win; ++i) f[i] = brk->is_single(h[w0 + i]) ? 1 : 0;
         any_brk_ = true;
         return true;
     };
@@ -902,11 +932,24 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
                 const int64_t len  = n_total + dk;
                 const int64_t take = std::min<int64_t>(len, cfg_.max_hist);
                 int32_t* h = hist_stage_ + row * cfg_.max_hist;
-                for (int64_t i = 0; i < take; ++i) {
-                    const int64_t src = len - take + i;
-                    h[i] = src < n_prompt ? r->prompt[(size_t)src]
-                         : src < n_total  ? r->output[(size_t)(src - n_prompt)]
-                                          : anc[src - n_total];
+                /* The three sources are contiguous runs of one logical sequence, so the tail
+                 * `take` long is at most three memcpys where the element loop branched per token
+                 * (per row per step: at 8k of history the copies are the difference between a
+                 * few microseconds of memcpy and tens of the branchy loop). */
+                {
+                    int64_t i = 0, src = len - take;
+                    auto seg = [&](const int32_t* p, int64_t base, int64_t end) {
+                        if (src >= end || i >= take) return;
+                        const int64_t n = std::min(end - src, take - i);
+                        if (n > 0) {
+                            std::memcpy(h + i, p + (src - base), (size_t)n * sizeof(int32_t));
+                            i += n;
+                            src += n;
+                        }
+                    };
+                    seg(r->prompt.data(), 0, n_prompt);
+                    seg(r->output.data(), n_prompt, n_total);
+                    seg(anc, n_total, len);
                 }
                 p.hist_len = (int32_t)take;
                 if (pen) p.flags |= RAD_SP_PENALTY;
@@ -1189,8 +1232,14 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     const RadOperand o_tok = opd_rows(out_tokens, n_seq_);
 
     auto issue = [&](rad_op op, std::initializer_list<RadOperand> ops) -> int {
-        std::vector<RadOperand> v(ops);
-        return rad_issue(c, op, v.data(), (int)v.size(), n_seq_);
+        /* On the stack, not in a vector: this runs for every sampler stage of every step and a
+         * heap allocation each was pure overhead beside the launch. Sixteen covers every call
+         * below (the widest is five operands); a wider one is refused, never truncated --
+         * operands are positional, so dropping one would be silent numerical garbage. */
+        if (ops.size() > 16) return RAD_E_INVAL;
+        RadOperand v[16];
+        std::memcpy(v, ops.begin(), ops.size() * sizeof(RadOperand));
+        return rad_issue(c, op, v, (int)ops.size(), n_seq_);
     };
 
     /* The logprobs summary reads the raw logits, before any stage writes them in place. Only for
@@ -1317,8 +1366,8 @@ float Sampler::raw_logit(const LpRow& L, int32_t token, float v) const {
     if (p.flags & RAD_SP_PENALTY) {
         int64_t n = (int64_t)L.hist.size(), o = 0;
         if (p.penalty_last_n > 0 && n > p.penalty_last_n) { o = n - p.penalty_last_n; n = p.penalty_last_n; }
-        int64_t count = 0;
-        for (int64_t i = 0; i < n; ++i) count += L.hist[(size_t)(o + i)] == token;
+        const int64_t count = (int64_t)simd::count_eq_i32(
+            n > 0 ? L.hist.data() + o : L.hist.data(), (size_t)std::max<int64_t>(n, 0), token);
         if (count > 0) {
             y += (double)count * p.freq_penalty + p.pres_penalty;
             y = y > 0.0 ? y * p.rep_penalty : y / p.rep_penalty;

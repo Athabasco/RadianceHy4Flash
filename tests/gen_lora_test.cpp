@@ -20,7 +20,7 @@
 #include <arch/rad_arch.h>
 #include <arch/rad_fp8.h>
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <cmath>
 #include <cstdio>
@@ -33,7 +33,7 @@
 
 using namespace rad;
 namespace AR = rad::arch;
-using ojson = nlohmann::ordered_json;
+using ojson = Json;
 
 namespace {
 
@@ -560,7 +560,7 @@ TEST(requests_name_adapters_in_a_field_or_in_prompt_tags) {
     std::vector<std::pair<std::string, double>> out;
     std::string field, why;
     std::string prompt = "a cat, <lora:pixel art:0.7>, sitting <lora:detail>";
-    nlohmann::json body = { { "loras", { "style", "ink:0.5", { { "name", "x:y" }, { "weight", 2 } } } } };
+    Json body = { { "loras", { "style", "ink:0.5", { { "name", "x:y" }, { "weight", 2 } } } } };
     REQUIRE_EQ(server::parse_loras(body, &prompt, &out, &field, &why), RAD_OK);
     REQUIRE_EQ(out.size(), (size_t)5);
     CHECK_EQ(out[0].first, std::string("style"));

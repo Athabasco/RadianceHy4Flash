@@ -293,6 +293,9 @@ static const RadOperandSpec oGram[] = { OPD("a"), OPD_O("a_scale"), INOUT("h") }
 static const RadParamSpec pDequant[]   = { P_INT("M"), P_INT("n"), P_INT("group"),
                                            P_STR("dtype") };
 static const RadOperandSpec oDequant[] = { OPD("q"), OPD("scale"), OUT("y") };
+static const RadParamSpec pDequantW4[] = { P_INT("N"), P_INT("K"), P_INT("group"), P_STR("dtype"),
+                                           P_INT("twos") };
+static const RadOperandSpec oDequantW4[] = { WGT("wq"), WGT("ws"), OUT("y") };
 
 /* ---- gemm --------------------------------------------------------------------------------- */
 static const RadParamSpec pGemm[]       = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype") };
@@ -522,7 +525,7 @@ static const RadOperandSpec oMoeGemm[] = { OPD("a"), WTAB("w"), OPD("sorted_tok"
 static const RadParamSpec pMoeGemmQ[]   = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"),
                                             P_INT("top_k"), P_INT("group"), P_STR("a_order"),
                                             P_STR("dtype"), P_INTO("N_odd"), P_INTO("K_odd"),
-                                            P_INTO("parts") };
+                                            P_INTO("parts"), P_INTO("a_group") };
 static const RadOperandSpec oMoeGemmQ[] = { OPD("a"), OPD_O("a_scale"), WTAB("w"), WTAB("w_scale"),
                                             OPD("sorted_tok"), OPD("expert_offset"),
                                             WTAB("w_odd"), WTAB("w_odd_scale"), OUT("y") };
@@ -532,7 +535,8 @@ static const RadParamSpec pMoeGemmQMod4[]   = { P_INT("M"), P_INT("N"), P_INT("K
                                                 P_INT("n_expert"), P_INT("top_k"), P_INT("group"),
                                                 P_STR("a_order"), P_STR("dtype"), P_INTO("N_1"),
                                                 P_INTO("K_1"), P_INTO("N_2"), P_INTO("K_2"),
-                                                P_INTO("N_3"), P_INTO("K_3"), P_INTO("parts") };
+                                                P_INTO("N_3"), P_INTO("K_3"), P_INTO("parts"),
+                                                P_INTO("a_group") };
 static const RadOperandSpec oMoeGemmQMod4[] = { OPD("a"), OPD_O("a_scale"), WTAB("w"),
                                                 WTAB("w_scale"), OPD("sorted_tok"),
                                                 OPD("expert_offset"), WTAB("w_1"),
@@ -994,7 +998,8 @@ static const RadOpSchema kSchemas[] = {
 { "ssd_update", ARR(pSsdUpdate), ARR(oSsdUpdate), "Mamba-2 scalar-decay state update with candidate-state rollback, per_candidate or anchor." },
 { "hc_read", ARR(pHcRead), ARR(oHcRead),
   "The read half of a gated residual: grouped norm, low-rank gate, stream mix, and optionally the "
-  "block-scaled fp8 form of x and its Hadamard-rotated twin. See docs/OPS.md for the three facts "
+  "block-scaled fp8 form of x and its Hadamard-rotated twin, each int8 into an int8 buffer. See "
+  "docs/OPS.md for the three facts "
   "a second implementation has to match (the mix is a MEAN, there is a separate / hc inside each "
   "gate argument, and hc_write adds into the UNNORMED h). `mix` names the matrices' stored "
   "format; a host kernel reads them as the dense tensors it is handed." },
@@ -1116,21 +1121,11 @@ static const RadOpSchema kSchemas[] = {
   "symmetric int8, one f32 scale per `group` contiguous elements, row-major." },
 { "quant_act_fp8", ARR(pQuant), ARR(oQuantFp8), "symmetric block-scaled E4M3 quantiser." },
 { "quant_cols_fp8", ARR(pQuantCols), ARR(oQuantCols), "E4M3 with one scale per column." },
-{ "had_quant_act_fp8", ARR(pQuant), ARR(oQuantFp8),
-  "width-`group` Hadamard, then the same symmetric block-scaled E4M3 quantiser. No normalisation: "
-  "the 1/group is folded into the stored weight scale at convert (docs/OPS.md)." },
 { "had_quant_act_i8g", ARR(pQuant), ARR(oQuantFp8),
   "width-`group` Hadamard, then quant_act_i8g's symmetric int8 per group. No normalisation: the "
   "1/group is the i8a8h weight's stored scale (docs/OPS.md)." },
 { "gram_accum", ARR(pGram), ARR(oGram),
   "h += x^T x over a dequantised E4M3 activation. `h` is [n, n] and INOUT." },
-{ "givens_dense_quant", ARR(pGivensDense), ARR(oGivensDense),
-  "ParoQuant's activation quantiser with the rotation as a dense per-group matrix: y = T (x / "
-  "rscale) for each of `parts` rotated copies, then the block-scaled quantiser `out` names "
-  "(\"i8\": amax / 127, round to nearest; \"fp8\": E4M3, amax / 448)." },
-{ "givens_rotate", ARR(pGivensRotate), ARR(oGivensRotate),
-  "ParoQuant's rotation without a quantiser: x / rscale rotated by `stages` rounds of Givens "
-  "pairs, `parts` copies side by side, in y's own dtype." },
 { "had_quant_act_i8", ARR(pQuant), ARR(oHadQuant),
   "Walsh-Hadamard rotation at width `group`, then symmetric int8 with ONE scale per row carrying "
   "the 1/sqrt(group)." },
@@ -1139,6 +1134,9 @@ static const RadOpSchema kSchemas[] = {
 { "gated_had_quant_i8", ARR(pGatedQuant), ARR(oGatedQuant),
   "gated product, rotation and int8 in one pass." },
 { "dequant", ARR(pDequant), ARR(oDequant), "group-scaled dequantisation." },
+{ "dequant_w4", ARR(pDequantW4), ARR(oDequantW4),
+  "Packed int4 weight to row-major bf16. Each 32-bit word holds 8 codes; the scale is "
+  "f16 in the low 16 bits, the zero point -(1024+zero) as f16 in the high 16 bits." },
 { "rmsnorm_quant_fp8", ARR(pRmsQuantFp8), ARR(oRmsQuantFp8),
   "RMS norm with an optional residual add, then the E4M3 quantiser, in one pass. The add is "
   "stored before the variance reads it, and the codes are taken over the bf16-narrowed row that "
@@ -1287,9 +1285,6 @@ static const RadOpSchema kSchemas[] = {
 { "all_reduce", ARR(pAllReduce), ARR(oAllReduce),
   "sum across ranks, f32, ascending rank order." },
 { "all_gather", ARR(pAllGather), ARR(oAllGather), "gather every rank's shard." },
-{ "ln_mod_quant_fp8", ARR(pLnModQ), ARR(oLnModQ),
-  "gate_add (with `gated` 1), ln_mod and quant_act_fp8 in one pass, each value rounded as its own "
-  "store would round it; z written when bound." },
 { "ln_mod", ARR(pLnMod), ARR(oLnMod),
   "y = bf16(bf16(LN(x)) * bf16(1 + s[seq])): a gainless layer norm and the row's entry's "
   "modulation row of `s` ([n_seq, >= n] at its own pitch)." },
@@ -1354,8 +1349,6 @@ static const RadOpSchema kSchemas[] = {
 { "rms_mod", ARR(pRmsMod), ARR(oRmsMod),
   "the gated residual (no tanh), then an RMS norm with a gain times bf16(1 + scale row) plus the "
   "shift row, `s` holding [shift | scale]; libref's roundings." },
-{ "rms_mod_quant_fp8", ARR(pRmsModQ), ARR(oRmsModQ),
-  "rms_mod with its norm chain in bf16, then the E4M3 codes and scales of that row." },
 { "flow_x0_step", ARR(pMnD), ARR(oFlowX0),
   "x = r x + (1 - r)(x + (1 - t) v), r = sigma_next / sigma, each step one f32 rounding, bit for "
   "bit libref's." },
@@ -1543,10 +1536,6 @@ static const RadOpSchema kSchemas[] = {
   "rmsnorm, for rows a model declares in thousands (the head norms over head_dim)." },
 { "rope_rows", ARR(pRope), ARR(oRope),
   "rope, for a model that wants the per-(token, pair) angles form at prefill row counts." },
-{ "gemm_nt_q_short", ARR(pGemmQ), ARR(oGemmQ),
-  "gemm_nt_q, for the short-prompt split rule's rows." },
-{ "gemm_nt_q_gated_wide", ARR(pGemmQGated), ARR(oGemmQGated),
-  "gemm_nt_q_gated at any M." },
 };
 
 /* ================================================================== the kernel table
@@ -1581,6 +1570,9 @@ static CbForm cb_form(const RadParam* p, int n_p) {
     if (s && !std::strcmp(s, "w4nl64a8h")) return CbForm{ 4, 64, RAD_F8E4M3, true };
     if (s && !std::strcmp(s, "w4nl32a8h")) return CbForm{ 4, 32, RAD_F8E4M3, true };
     if (s && !std::strcmp(s, "w5nl64a8h")) return CbForm{ 5, 64, RAD_F8E4M3, true };
+    /* The same stored experts under their names against an int8 activation. */
+    if (s && !std::strcmp(s, "w4nl64a8i8h")) return CbForm{ 4, 64, RAD_F8E4M3, true };
+    if (s && !std::strcmp(s, "w4nl32a8i8h")) return CbForm{ 4, 32, RAD_F8E4M3, true };
     return CbForm{ 0, 0, 0, false };
 }
 static int cb_check(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
@@ -1796,21 +1788,10 @@ SIMPLE("avx_quant_act_fp8", "quant_act_fp8", "quant", "symmetric block-scaled E4
        "float in, fp8_e4m3 out, f32 scale", L(quant_act_fp8)),
 SIMPLE("avx_quant_cols_fp8", "quant_cols_fp8", "quant", "E4M3 with one scale per column",
        "float in, fp8_e4m3 out, f32 scale", L(quant_cols_fp8)),
-SIMPLE("avx_had_quant_act_fp8", "had_quant_act_fp8", "quant",
-       "width-`group` Hadamard, then the same symmetric block-scaled E4M3 quantiser",
-       "float in, fp8_e4m3 out, f32 scale per group; n a multiple of group",
-       L(had_quant_act_fp8)),
 SIMPLE("avx_had_quant_act_i8g", "had_quant_act_i8g", "quant",
        "width-`group` Hadamard, then the symmetric int8 quantiser, one scale per group",
        "float in, i8 out, f32 scale per group; n a multiple of group",
        L(had_quant_act_i8g)),
-SIMPLE("avx_givens_rotate", "givens_rotate", "quant",
-       "channel scale and Givens rotations per part, in the output's dtype",
-       "float in, float out; int32 pairs, f32 angles and channel scales", L(givens_rotate)),
-SIMPLE("avx_givens_dense_quant", "givens_dense_quant", "quant",
-       "the rotation as a dense per-group matrix, then the block-scaled int8 or E4M3 quantiser",
-       "float in, int8 or fp8_e4m3 out, f32 scale per group; f16 matrices and f32 channel scales",
-       L(givens_dense_quant)),
 SIMPLE("avx_gram_accum", "gram_accum", "quant",
        "h += x^T x over a dequantised E4M3 activation, or a plain bf16 one",
        "fp8_e4m3 plus an f32 scale per group, or bf16 with no scale, in; an f32 [n][n] "
@@ -1823,6 +1804,8 @@ SIMPLE("avx_gated_had_quant_i8", "gated_had_quant_i8", "quant",
        "gated product, rotation and int8 in one pass", "float in, i8 out, f32 scale",
        L(gated_had_quant_i8)),
 SIMPLE("avx_dequant", "dequant", "quant", "group-scaled dequantisation", DT_ANY, L(dequant)),
+SIMPLE("avx_dequant_w4", "dequant_w4", "quant", "packed int4 weight to row-major bf16", DT_ANY,
+       L(dequant_w4)),
 SIMPLE("avx_rmsnorm_quant_fp8", "rmsnorm_quant_fp8", "quant",
        "RMS norm, optional residual add, and the E4M3 quantiser in one pass",
        "float in, fp8_e4m3 out, f32 scale, bf16 out_bf16", L(rmsnorm_quant_fp8)),
@@ -1980,9 +1963,6 @@ SIMPLE("avx_mix_rows", "mix_rows", "elem", "a weighted sum of k consecutive rows
        L(mix_rows)),
 SIMPLE("avx_chan_stats", "chan_stats", "elem", "per-channel statistics held as weights",
        DT_FLOAT, L(chan_stats)),
-SIMPLE("avx_ln_mod_quant_fp8", "ln_mod_quant_fp8", "norm",
-       "gated residual, adaptive norm and the E4M3 quantiser in one pass",
-       "float in, fp8_e4m3 out, f32 scale, bf16 z", L(ln_mod_quant_fp8)),
 SIMPLE("avx_timestep_embed", "timestep_embed", "elem", "sinusoidal timestep embedding", DT_FLOAT,
        L(timestep_embed)),
 SIMPLE("avx_gather_rows2", "gather_rows2", "elem", "rows from two sources by a signed index",
@@ -2022,9 +2002,6 @@ SIMPLE("avx_attn_prefix_self", "attn_prefix_self", "attn",
 SIMPLE("avx_rms_mod", "rms_mod", "norm",
        "gated residual, RMS norm with a gain times (1 + scale row) plus a shift row", DT_FLOAT,
        L(rms_mod)),
-SIMPLE("avx_rms_mod_quant_fp8", "rms_mod_quant_fp8", "norm",
-       "gated residual, modulated RMS norm and the E4M3 quantiser in one pass", DT_FLOAT,
-       L(rms_mod_quant_fp8)),
 SIMPLE("avx_flow_x0_step", "flow_x0_step", "elem", "a sampler step toward the clean estimate",
        DT_FLOAT, L(flow_x0_step)),
 SIMPLE("avx_flow_res_multistep", "flow_res_multistep", "elem",
@@ -2191,12 +2168,6 @@ SIMPLE("avx_dflash_tree", "dflash_tree", "draft",
 SIMPLE("avx_rmsnorm_rows", "rmsnorm_rows", "norm", "rmsnorm under its row-form name", DT_FLOAT,
        L(rmsnorm)),
 SIMPLE("avx_rope_rows", "rope_rows", "attn", "rope under its row-form name", DT_FLOAT, L(rope)),
-ROWL("avx_gemm_nt_q_short", "gemm_nt_q_short", "gemm", "gemm_nt_q under its row-form name",
-     "as avx_gemm_nt_q", L(gemm_nt_q), avx_layout_gemm_q),
-SIMPLE("avx_gemm_nt_q_gated_wide", "gemm_nt_q_gated_wide", "gemm",
-       "gemm_nt_q_gated under its row-form name",
-       "i8 / fp8 / float A; w4, w2, mxfp4, i8 or float B; fp8_e4m3 out, f32 scale",
-       L(gemm_nt_q_gated)),
 };
 
 /* ================================================================== plugin exports */

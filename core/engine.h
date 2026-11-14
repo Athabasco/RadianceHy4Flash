@@ -37,6 +37,7 @@
 #include "format/table_share.h"
 #include "lora/adapter.h"
 #include "lora/slots.h"
+#include "fleet/broker.h"
 
 #include <atomic>
 #include <chrono>
@@ -48,10 +49,14 @@
 
 namespace rad {
 
+/* While on, the sweeps' pinned staging is kept for the next sweep, for a process that restores
+ * models again and again; off frees what is kept. */
+void sweep_buffers_keep(bool on);
+
 class Kld;
 class StallWatch;
 namespace gen { class Driver; class AudioDriver; class VideoDriver; class ShapeDriver; struct IPassDriver; }
-namespace server { class Sink; }
+namespace server { class Sink; class Front; class Server; }
 struct TierPump;
 struct TierJob;
 struct StepSlot;
@@ -77,6 +82,101 @@ public:
      * reports where it waits like start() itself. */
     int serve(std::unique_ptr<StallWatch> watch);
 
+    /* Serve behind `front` (server/front.h) instead of listening: serve() attaches this model's
+     * server under its name and `aliases` once it is ready, and returns after the front stops or
+     * request_stop() is called, detaching first so no response outlives the server. Set before
+     * serve(). */
+    void set_front(server::Front* front, std::vector<std::string> aliases) {
+        front_ = front;
+        front_aliases_ = std::move(aliases);
+    }
+    /* Ends serve() behind a front: the model stops taking requests, its in-flight responses are
+     * waited for, and serve() returns. Safe from any thread. */
+    void request_stop(int64_t drain_ms = 600000) {
+        stop_drain_ms_.store(drain_ms, std::memory_order_relaxed);
+        stop_requested_.store(true, std::memory_order_release);
+    }
+    /* The fleet that grants this engine its part of the cards (fleet/broker.h); null splits the
+     * cards as a process of one model does. Set before start(). */
+    void set_broker(VramBroker* b) { broker_ = b; }
+    /* For the broker while its grant waits for room: other engines' bring-ups go on meanwhile,
+     * since only this engine's own steps need the bring-up lock (engine_bringup.cpp). Called on
+     * the starting thread, inside the grant. */
+    /* What this engine keeps pinned in host memory: its pools, its tables and its prefix cache's
+     * host tier, as configured. */
+    int64_t host_pinned_bytes() const {
+        return ((int64_t)cfg_.tp * (cfg_.host_pool_mib + cfg_.embedding_host_mib + cfg_.tower_host_mib) +
+                cfg_.prefix_cache_mib) << 20;
+    }
+    void bringup_pause()  { if (bringup_lk_ && bringup_lk_->owns_lock()) bringup_lk_->unlock(); }
+    void bringup_resume() { if (bringup_lk_ && !bringup_lk_->owns_lock()) bringup_lk_->lock(); }
+
+    /* ---- parking (docs/MULTIMODEL.md §7). park() stops taking requests (the ones handed out
+     * finish within `drain_ms`, then are ended), brings the step loop to rest, and pages the
+     * engine's memory out to pinned host memory at the same addresses (dev_page_out): the engine
+     * keeps its threads, queues, server, kernels and recorded passes, and holds only its small
+     * allocations on the card. unpark() pages it back in and takes requests again. From the
+     * fleet's thread, while serve() runs behind a front. RAD_E_UNSUPPORTED when the card has no
+     * virtual memory manager, since nothing could leave at the same address.
+     *
+     * `req` says how much to take off each card (empty: everything), the host memory the copies
+     * may take and the disk tier for the rest (device.h, PageOut); `got` what left. A parked
+     * engine may be asked again for more. */
+    int  park(int64_t drain_ms, const PageOut& req, PageResult* got, std::string* why);
+    int  unpark(std::string* why);
+    /* unpark() that takes requests at once: the weights parked in host memory stay there, read in
+     * place over the link, and dev_page_promote moves them onto the card while the engine serves
+     * (`left` is how much stays for now). */
+    int  unpark_live(std::string* why, int64_t* left);
+    /* Every request is one step: an embedding program's pass over the prompt, nothing generated.
+     * Set at bring-up. */
+    bool one_step() const { return embedding_; }
+    bool parked() const { return parked_.load(std::memory_order_acquire); }
+    /* While parked, the linear-state snapshot store's pinned host memory goes back to the host:
+     * the park emptied the prefix cache, so the store holds no snapshot, and the next unpark pins
+     * it again before paging in (4 GiB pins in about 0.3 s, far less than the host copies of
+     * weights it makes room for would cost to read back from the drive). The bytes released; 0
+     * when not parked, already released, or a snapshot is still held. From the fleet's thread. */
+    int64_t release_host_spare();
+    /* While parked: up to about `max_bytes` of the parked memory with no host copy comes into
+     * host memory at its own addresses, so the next restore copies it over the link: chunks
+     * whose copy is on the drive are read back, and the weights pool's chunks are filled from the
+     * container, whole weights at a time. The bytes filled, or a negative status. From the fleet's
+     * thread, with the model idle. */
+    int64_t fill_host(int64_t max_bytes);
+    /* Host memory a refill (a restore's or a host fill's) holds while it runs, at most: the
+     * relayout pool's staged inputs (kRefillStaging), its workers' output buffers and the sweep's
+     * pinned windows. The fleet keeps this much room for it. */
+    static constexpr int64_t kRefillStaging = (int64_t)2 << 30;
+    static constexpr int64_t kRefillHost = (int64_t)4 << 30;
+    /* What release_host_spare gave back and unpark will pin again. */
+    int64_t host_spare_released() const { return ck_released_.load(std::memory_order_acquire) ? ck_cap_ : 0; }
+    /* Runs `fn` on the step loop between steps, with nothing of the engine's in flight on any rank
+     * (every stream drained), and returns its result; for mapping changes under a serving engine.
+     * RAD_E_STATE when the engine stops first. From any thread but the step loop's. */
+    int  run_quiet(const std::function<int()>& fn);
+    /* The engine's owner id for the device layer (engine_owner): every thread it starts files its
+     * allocations under it. */
+    int  owner() const { return owner_; }
+
+    /* ---- flex (docs/MULTIMODEL.md §6). What the cache and the expert slab hold on each card
+     * beyond the claim, and giving it back: the step loop recalls the slab's loan first, then
+     * takes the free top of the cache, the prefix cache's entries and (with `preempt`) the running
+     * requests, which go back to the queue by recompute, and unbacks it. Blocks the calling thread
+     * until the step loop has done it, at most `wait_ms`. The bytes given back on each card. */
+    int64_t flex_bytes() const;
+    /* Jobs running with no open request (a video, an async shape): the model is at work. */
+    int64_t background_jobs() const { return background_jobs_.load(std::memory_order_acquire); }
+    int64_t flex_release(int64_t bytes, bool preempt, int64_t wait_ms, bool kv = true);
+    /* Expert flex (§6.7): the bytes on each card the expert slab holds past the claim, lent by the
+     * fleet; they go first in flex_release, and with `kv` false they are all that goes. */
+    int64_t expert_flex_bytes() const { return xflex_bytes_.load(std::memory_order_acquire); }
+    /* What the slab could still grow by on each card while the engine is busy and the fleet had
+     * no free memory for it; 0 when it is idle, at its ceiling or still filling what it has. */
+    int64_t expert_flex_wanted() const { return xflex_want_.load(std::memory_order_acquire); }
+    /* True once serve() has attached to its front (or listens): the model takes requests. */
+    bool serving() const { return serving_.load(std::memory_order_acquire); }
+
     /* --debug-graph and friends: print everything declare and plan learned, without serving. A
      * first-class mode rather than a verbose-flag side effect, so what runs is always visible. */
     int dump();
@@ -95,6 +195,10 @@ public:
      * serving cards' power-management files (hardware_facts). */
     std::string diagnostics_json() const;
     bool startup_report_printed() const { return report_printed_; }
+    /* The cards an engine may run on, as start() filters them (one architecture, discrete before
+     * integrated); the fleet places models on them. */
+    static int usable_cards(std::vector<int>* out);
+
     /* --proceed-with-incompatible-configuration's banner (diag::unsupported_banner) on W lines;
      * main prints it before anything else, so it heads the log. */
     static void print_unsupported_banner();
@@ -162,6 +266,13 @@ private:
 
     RadModelMeta   meta_{};
     LoadedPlugins  plugins_;
+    /* This engine's share of the process plugin set (plugin/registry.h, Sharing): its device facts,
+     * selection table and kernel instances. Made by load_plugins; plugins_.registry points at it. */
+    std::unique_ptr<Registry> reg_;
+    /* The first of this engine's instance slots (RadBuildCtx::slot_base), held from load_plugins
+     * to the destructor (rad_engine_claim); -1 while none is held. */
+    int slot_base_ = -1;
+    bool cards_claimed_ = false;    /* rad_dev_cards_claim, for an engine of more than one rank */
 
     /* RadModelMeta holds bare char*, so the strings behind its key/value table must outlive
      * every declare. */
@@ -229,6 +340,11 @@ private:
      * pins host memory (engine_bringup.cpp). 4 GiB suits a busy server; a small host wants to
      * leave less to make room for its tiers, which is why it is a flag and not a constant. */
     int64_t host_headroom_bytes() const { return cfg_.host_headroom_mib * ((int64_t)1 << 20); }
+    /* What a table's or a stream's pin leaves free: the headroom, and in a fleet what the fleet
+     * keeps (VramBroker::host_margin). */
+    int64_t host_margin_bytes() const;
+    /* Why a fleet's load put an embedding left to its default on the card; empty if it did not. */
+    std::string emb_on_card_why_;
     /* Resolves --embedding-placement, --vision-tower-placement and --ngram-placement into Config
      * before the card is split (engine_bringup.cpp describes how auto chooses). `wfs` is every
      * rank's footprint, read for its towers. `host_late` is the pinned host memory startup
@@ -264,6 +380,14 @@ private:
      * rank's planner in place of the container's activation profile. */
     std::vector<RadFileProfile> expert_profile_;
     int load_weights();
+    /* After a page-in: every weight with a byte in `spans` (memory the page-in mapped back empty,
+     * dev_page_refilled) is read from the container and laid out again at its current address,
+     * through the load's sweep and relayout pool. */
+    /* `before_writes`, when set, runs once before the refill's first write into the spans. */
+    int refill_weights(const std::vector<PageSpan>& spans, const char* what = "restore",
+                       const std::function<int()>& before_writes = {});
+    /* dev_page_in (or the live form with `left`) and the refill of what it mapped back empty. */
+    int page_back_in(int64_t* left);
     int configure_kv();
     /* Resolves --checkpoint-slots auto for snapshots of `slot` bytes (`what` names their kind). */
     int size_checkpoint_store(int64_t slot, const char* what);
@@ -324,6 +448,64 @@ private:
     /* The error the step loop ended on; RAD_OK while running or after a clean stop. Written once
      * by fail_loop(); read by the server watcher to stop HTTP and by serve() to return it. */
     std::atomic<int>              loop_status_{RAD_OK};
+    server::Front*                front_ = nullptr;
+    std::vector<std::string>      front_aliases_;
+    std::atomic<bool>             stop_requested_{false};
+    /* How long a stop lets responses already handed out finish before the server ends them. */
+    std::atomic<int64_t>          stop_drain_ms_{600000};
+    VramBroker*                   broker_ = nullptr;
+    std::unique_lock<std::mutex>* bringup_lk_ = nullptr;   /* start()'s, while it runs */
+    const int                     owner_;
+    std::atomic<bool>             parked_{false};
+    /* The step loop's rest for a park: the fleet sets hold_req_, the loop answers with hold_ack_
+     * once it is idle with nothing in flight and waits there until hold_req_ clears. */
+    std::atomic<bool>             hold_req_{false};
+    std::atomic<bool>             hold_ack_{false};
+    /* hold_point's wait: woken when the hold clears (hold_release) or the engine stops
+     * (wake_hold). */
+    std::mutex                    hold_mu_;
+    std::condition_variable       hold_cv_;
+    void                          hold_point(StallWatch* watch = nullptr);
+    void                          hold_release();
+    void                          wake_hold();
+    int                           unpark_with(std::string* why, int64_t* left);
+    void                          drain_streams();
+    std::vector<int>              rank_devices() const;   /* each rank's card, in rank order */
+    server::Server*               srv_ = nullptr;   /* run_server's, while it runs */
+    std::atomic<int64_t>          background_jobs_{0};  /* server::Deps::background */
+    /* flex_release's handoff to the step loop (flex_service). */
+    int64_t                       flex_floor_bytes_ = 0;   /* rank 0's KV backing after the carve */
+    std::mutex                    flex_mu_;
+    std::condition_variable       flex_cv_;
+    std::atomic<bool>             flex_pending_{false};
+    int64_t                       flex_want_ = 0;
+    bool                          flex_preempt_ = false;
+    bool                          flex_kv_ = true;          /* the cache's flex may go too */
+    int64_t                       flex_got_ = -1;
+    uint64_t                      flex_room_ns_ = 0;
+    void                          flex_service();
+    void                          flex_room_tick(uint64_t now_ns);
+    /* Expert flex (§6.7). Each rank's slab borrows from its own reserved range (Rank::xflex), the
+     * top `xflex_bytes_` of it backed; the ceiling is the loan that covers every slot carved there.
+     * xflex_tick grows it on the step loop while the engine is busy, a GiB at a time once the
+     * slab has filled what it holds; xflex_give recalls and unbacks it, between steps. */
+    std::atomic<int64_t>          xflex_bytes_{0};
+    std::atomic<int64_t>          xflex_want_{0};
+    int64_t                       xflex_cap_ = 0;
+    int64_t                       xflex_claimed_ = 0;       /* the claim's expert bytes a card */
+    uint64_t                      xflex_ns_ = 0, xflex_busy_ns_ = 0, xflex_retry_ns_ = 0;
+    void                          xflex_tick(bool busy);
+    int64_t                       xflex_give(int64_t bytes);
+    int64_t                       xflex_settle();
+    /* run_quiet's handoff to the step loop (quiet_service). */
+    std::mutex                    quiet_mu_;
+    std::condition_variable       quiet_cv_;
+    std::atomic<bool>             quiet_pending_{false};
+    const std::function<int()>*   quiet_fn_ = nullptr;
+    int                           quiet_rc_ = 0;
+    bool                          quiet_done_ = false;
+    void                          quiet_service();
+    std::atomic<bool>             serving_{false};
     int  fail_loop(int st);
 
     /* This step's scored rows (Request::token_scores): a logits row and the result it fills.
@@ -594,6 +776,9 @@ private:
      * rank's shard of one snapshot (KVManager::set_checkpoint_store). Off the card because no
      * kernel reads a snapshot; it is only copied back into a sequence's state. */
     HostArena ck_store_;
+    std::atomic<bool> ck_released_{ false };   /* release_host_spare closed it; unpark opens it */
+    int64_t           ck_slot_ = 0, ck_cap_ = 0;
+    int  repin_host_spare(std::string* why);
     int  run_server();
     /* KL mode (core/kld.h), replacing run_server: submits the corpus documents as scoring
      * requests and hands every step's scored rows, copied to the host, to `kld_`. One pinned

@@ -30,6 +30,7 @@
 #include "ref_ops.h"
 
 #include <algorithm>
+#include <cstring>
 
 using namespace ref;
 
@@ -71,6 +72,32 @@ struct KvDyn  {
     uint32_t dt;
     float operator()(const void* p, int64_t i) const { return ld_dt(dt, p, i); }
 };
+
+/* The int8 cache (abi/rad_builder.h): a token's row in a head is head_dim K codes, head_dim V
+ * codes and the two f16 scales, K's then V's. `row` is the row's byte offset in the cache; `half`
+ * 0 reads K's scale, 1 V's. A value is its code times its scale. */
+static inline float kv_i8_scale(const void* cache, int64_t row, int64_t head_dim, int half) {
+    uint16_t h;
+    std::memcpy(&h, (const uint8_t*)cache + row + 2 * head_dim + 2 * half, sizeof h);
+    return f16_to_f32(h);
+}
+
+/* One head's K or V into its row of the int8 cache: the scale is the head's absmax / 127 rounded
+ * to f16 (clamped at 515 so 127 times it stays an f16), the codes round(x / scale) against the
+ * rounded scale, clamped to +-127. An all-zero head stores scale 0 and codes 0. */
+static inline void kv_i8_put(void* cache, int64_t row, int64_t head_dim, int half,
+                             const RadTensor* x, int64_t xb, int64_t x_ds) {
+    float am = 0.0f;
+    for (int64_t d = 0; d < head_dim; ++d) am = std::fmax(am, std::fabs(ldt(x, xb + d * x_ds)));
+    const uint16_t h = f32_to_f16(std::fmin(am / 127.0f, 515.0f));
+    const float sc = f16_to_f32(h);
+    int8_t* const c = (int8_t*)cache + row + half * head_dim;
+    for (int64_t d = 0; d < head_dim; ++d) {
+        const float r = sc > 0.0f ? std::nearbyint(ldt(x, xb + d * x_ds) / sc) : 0.0f;
+        c[d] = (int8_t)std::fmin(std::fmax(r, -127.0f), 127.0f);
+    }
+    std::memcpy((uint8_t*)cache + row + 2 * head_dim + 2 * half, &h, sizeof h);
+}
 
 }  /* namespace */
 
@@ -125,6 +152,11 @@ static int attn_paged_impl(const RadArgs* a, const RadTensor* sinks, int oi, boo
     if (numel(o) < rows * q_heads * head_dim) return RAD_E_SHAPE;
     if (kv->rank == 4 && kv->shape[2] != block_size) return RAD_E_SHAPE;
     if (kv->rank == 4 && kv->shape[3] < 2 * head_dim) return RAD_E_SHAPE;
+    /* The int8 cache: dense rows of 2 * head_dim + 4 bytes, each key's scales in its own row, and
+     * no descales. */
+    const bool i8 = kv->dtype == RAD_I8;
+    if (i8 && (kv->rank != 4 || kv->shape[3] != 2 * head_dim + 4 || kv->stride[3] != 1))
+        return RAD_E_SHAPE;
 
     const int64_t max_blocks = bt->rank >= 2 ? bt->shape[bt->rank - 1] : numel(bt) / n_seq;
     const int64_t bt_rs = bt->rank >= 2 ? bt->stride[bt->rank - 2] : max_blocks;
@@ -146,7 +178,8 @@ static int attn_paged_impl(const RadArgs* a, const RadTensor* sinks, int oi, boo
     /* Every (query row, head) is one output row, computed as below in a fixed order: per visible
      * key, dot = sum over d of q[d] * (k[d] * k_descale), score = dot * scale; then the max over the
      * scores in key order; then sum and acc[d] accumulate exp(score - max) and
-     * exp(...) * (v[d] * v_descale) in key order. The query row is widened once, each score is kept
+     * exp(...) * (v[d] * v_descale) in key order. At the int8 cache k[d] and v[d] are codes and
+     * the key's own K and V scales stand where the descales do. The query row is widened once, each score is kept
      * for the second pass instead of recomputed, and four keys' dot chains run side by side; none
      * of that changes a value. */
     REF_PAR_REGION(total * head_dim * 64)
@@ -196,8 +229,12 @@ static int attn_paged_impl(const RadArgs* a, const RadTensor* sinks, int oi, boo
                 }
                 const int64_t wpos = tree ? base + tdep : pos;
 
-                const float kds = kdes ? ldt(kdes, s * kv_heads + kh) : 1.0f;
-                const float vds = vdes ? ldt(vdes, s * kv_heads + kh) : 1.0f;
+                const float kds = i8 ? 1.0f : kdes ? ldt(kdes, s * kv_heads + kh) : 1.0f;
+                const float vds = i8 ? 1.0f : vdes ? ldt(vdes, s * kv_heads + kh) : 1.0f;
+                /* A key's K (half 0) or V (half 1) multiplier. */
+                auto mul_of = [&](int64_t kb, int half) -> float {
+                    return i8 ? kv_i8_scale(kv->data, kb, head_dim, half) : half ? vds : kds;
+                };
 
                 /* Keys past the block table's width are never read. */
                 const int64_t jend = std::min(ctx, jcap);
@@ -228,21 +265,24 @@ static int attn_paged_impl(const RadArgs* a, const RadTensor* sinks, int oi, boo
                 for (int64_t j0 = 0; j0 < jend; j0 += 4) {
                     int64_t kb[4];
                     float dot[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                    float km[4]  = { kds, kds, kds, kds };
                     const int nk = (int)std::min<int64_t>(4, jend - j0);
                     for (int u = 0; u < 4; ++u) kb[u] = u < nk ? key_at(j0 + u) : -1;
+                    if (i8)
+                        for (int u = 0; u < nk; ++u) if (kb[u] >= 0) km[u] = mul_of(kb[u], 0);
                     if (kb[0] >= 0 && kb[1] >= 0 && kb[2] >= 0 && kb[3] >= 0) {
                         for (int64_t d = 0; d < head_dim; ++d) {
                             const float qd = qf[d];
-                            dot[0] += qd * (kl(kv->data, kb[0] + d * kvv.sd) * kds);
-                            dot[1] += qd * (kl(kv->data, kb[1] + d * kvv.sd) * kds);
-                            dot[2] += qd * (kl(kv->data, kb[2] + d * kvv.sd) * kds);
-                            dot[3] += qd * (kl(kv->data, kb[3] + d * kvv.sd) * kds);
+                            dot[0] += qd * (kl(kv->data, kb[0] + d * kvv.sd) * km[0]);
+                            dot[1] += qd * (kl(kv->data, kb[1] + d * kvv.sd) * km[1]);
+                            dot[2] += qd * (kl(kv->data, kb[2] + d * kvv.sd) * km[2]);
+                            dot[3] += qd * (kl(kv->data, kb[3] + d * kvv.sd) * km[3]);
                         }
                     } else {
                         for (int u = 0; u < nk; ++u) {
                             if (kb[u] < 0) continue;
                             for (int64_t d = 0; d < head_dim; ++d)
-                                dot[u] += qf[d] * (kl(kv->data, kb[u] + d * kvv.sd) * kds);
+                                dot[u] += qf[d] * (kl(kv->data, kb[u] + d * kvv.sd) * km[u]);
                         }
                     }
                     for (int u = 0; u < nk; ++u) {
@@ -275,8 +315,9 @@ static int attn_paged_impl(const RadArgs* a, const RadTensor* sinks, int oi, boo
                     const float w = ref_exp(sc[j] - mx);
                     sum += w;
                     const int64_t vb = kb + head_dim * kvv.sd;
+                    const float vm = mul_of(kb, 1);
                     for (int64_t d = 0; d < head_dim; ++d)
-                        acc[d] += w * (kl(kv->data, vb + d * kvv.sd) * vds);
+                        acc[d] += w * (kl(kv->data, vb + d * kvv.sd) * vm);
                 }
                 if (sinks) sum += ref_exp(sk - mx);
                 const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
@@ -285,7 +326,7 @@ static int attn_paged_impl(const RadArgs* a, const RadTensor* sinks, int oi, boo
             switch (kv->dtype) {
                 case RAD_F32:    unit(KvFix<RAD_F32>{}); break;
                 case RAD_BF16:   unit(KvFix<RAD_BF16>{}); break;
-                case RAD_F8E4M3: unit(KvFix<RAD_F8E4M3>{}); break;
+                case RAD_I8:     unit(KvFix<RAD_I8>{}); break;
                 default:         unit(KvDyn{ kv->dtype }); break;
             }
         }
@@ -605,8 +646,12 @@ int ref_kv_store(const RadArgs* a, RadStream) {
     const int64_t v_hs = v->rank >= 3 ? v->stride[v->rank - 2] : head_dim * v_ds;
     const int64_t v_rs = row_stride(v, kv_heads * head_dim);
     const KVView kvv = kv_view(kv, head_dim, block_size, kv_heads);
-    /* An fp8 cache stores k / k_scale, where the scales are the reader's descales (default 1.0).
-     * A wider cache stores the value itself. */
+    /* The int8 cache stores each head's codes and scale (kv_i8_put). An fp8 cache (GLM-5.3's
+     * latent attention) stores k / k_scale, where the scales are the reader's descales (default
+     * 1.0). A wider cache stores the value itself. */
+    const bool i8 = kv->dtype == RAD_I8;
+    if (i8 && (kv->rank != 4 || kv->shape[3] != 2 * head_dim + 4 || kv->stride[3] != 1))
+        return RAD_E_SHAPE;
     const bool  fp8 = kv->dtype == RAD_F8E4M3 || kv->dtype == RAD_F8E5M2;
     const float ks = fp8 ? 1.0f / p_f32(a, "k_scale", 1.0f) : 1.0f;
     const float vs = fp8 ? 1.0f / p_f32(a, "v_scale", 1.0f) : 1.0f;
@@ -623,6 +668,11 @@ int ref_kv_store(const RadArgs* a, RadStream) {
         const int64_t blk = slot / block_size, off = slot % block_size;
         for (int64_t h = 0; h < kv_heads; ++h) {
             const int64_t cb = blk * kvv.sb + h * kvv.sh + off * kvv.so;
+            if (i8) {
+                kv_i8_put(kv->data, cb, head_dim, 0, k, t * k_rs + h * k_hs, k_ds);
+                kv_i8_put(kv->data, cb, head_dim, 1, v, t * v_rs + h * v_hs, v_ds);
+                continue;
+            }
             for (int64_t d = 0; d < head_dim; ++d) {
                 stt(kv, cb + d * kvv.sd, ldt(k, t * k_rs + h * k_hs + d * k_ds) * ks);
                 stt(kv, cb + (head_dim + d) * kvv.sd, ldt(v, t * v_rs + h * v_hs + d * v_ds) * vs);
@@ -653,19 +703,22 @@ int ref_kv_store_streamed(const RadArgs* a, RadStream) {
     if (k->dtype != RAD_BF16 || v->dtype != RAD_BF16) return RAD_E_DTYPE;
     if (sm->dtype != RAD_I32 || res->dtype != RAD_I32) return RAD_E_DTYPE;
     if (host->dtype != RAD_U8) return RAD_E_DTYPE;
-    /* E4M3 or bf16: a bf16 group doubles every offset and stores the value itself, as
-     * kv_store_bf16 does. A packed fp8_v4/k6_v4 group has no streamed row. */
-    const bool fp8 = kv->dtype == RAD_F8E4M3;
-    if (!fp8 && kv->dtype != RAD_BF16) return RAD_E_UNSUPPORTED;
+    /* The int8 cache, bf16 or E4M3: a bf16 group stores the value itself, as kv_store_bf16 does,
+     * the int8 one each head's codes and scale, an E4M3 one (GLM-5.3's latent attention) the
+     * value over the reader's descale. */
+    const bool i8 = kv->dtype == RAD_I8, fp8 = kv->dtype == RAD_F8E4M3;
+    if (!i8 && !fp8 && kv->dtype != RAD_BF16) return RAD_E_UNSUPPORTED;
+    const float ks = fp8 ? 1.0f / p_f32(a, "k_scale", 1.0f) : 1.0f;
+    const float vs = fp8 ? 1.0f / p_f32(a, "v_scale", 1.0f) : 1.0f;
     if (kv->rank != 4) return RAD_E_SHAPE;
-    if (kv->shape[1] != kv_heads || kv->shape[2] != block_size ||
-        kv->shape[3] != 2 * head_dim) return RAD_E_SHAPE;
+    const int64_t rowe = i8 ? 2 * head_dim + 4 : 2 * head_dim;   /* a token's row in a head */
+    if (kv->shape[1] != kv_heads || kv->shape[2] != block_size || kv->shape[3] != rowe ||
+        kv->stride[3] != 1) return RAD_E_SHAPE;
     if (host->rank != 2) return RAD_E_SHAPE;
 
     /* Both planes are dense rows of one block of one layer: a padded mirror row would copy over its
      * neighbour, and the two copies must share offsets. */
-    const int64_t EB = fp8 ? 1 : 2;
-    const int64_t row = kv_heads * block_size * 2 * head_dim * EB;
+    const int64_t row = kv_heads * block_size * rowe * (kv->dtype == RAD_BF16 ? 2 : 1);
     const int64_t slots = kv->shape[0], blocks = host->shape[0];
     if (host->shape[1] != row || host->stride[0] * rad_dtype_bytes(host->dtype, 1) != row)
         return RAD_E_STRIDE;
@@ -683,10 +736,6 @@ int ref_kv_store_streamed(const RadArgs* a, RadStream) {
     const int64_t v_ds = v->rank >= 2 ? v->stride[v->rank - 1] : 1;
     const int64_t v_hs = v->rank >= 3 ? v->stride[v->rank - 2] : head_dim * v_ds;
     const int64_t v_rs = row_stride(v, kv_heads * head_dim);
-    /* kv_store_bf16 stores the value itself; only the E4M3 row divides by the reader's descales. */
-    const float ks = fp8 ? 1.0f / p_f32(a, "k_scale", 1.0f) : 1.0f;
-    const float vs = fp8 ? 1.0f / p_f32(a, "v_scale", 1.0f) : 1.0f;
-
     /* Everything that can refuse is checked before the first write: a half-written mirror would
      * make later copies plausible and wrong. */
     const int32_t* const R = (int32_t*)res->data;
@@ -698,9 +747,11 @@ int ref_kv_store_streamed(const RadArgs* a, RadStream) {
         if (R[blk] < -1 || R[blk] >= slots) return RAD_E_INVAL;
     }
 
-    /* The mirror seen as the plane it holds, so both copies round the same. */
-    RadTensor hkv = *host;
-    hkv.dtype = kv->dtype;
+    /* The mirror seen as the plane it holds, so both copies round the same. A view's strides are
+     * in the plane's elements: the mirror's row pitch is `row` bytes. */
+    RadTensor hkv = *kv;
+    hkv.data = host->data;
+    hkv.shape[0] = blocks;
     const KVView kvv = kv_view(kv, head_dim, block_size, kv_heads);
     const KVView hv  = kv_view(&hkv, head_dim, block_size, kv_heads);
 
@@ -713,9 +764,19 @@ int ref_kv_store_streamed(const RadArgs* a, RadStream) {
         /* A non-resident block is written to the mirror alone; the resolve copies it in whole. */
         const int64_t cb = R[blk] >= 0 ? R[blk] * kvv.sb + off * kvv.so : -1;
         for (int64_t h = 0; h < kv_heads; ++h) {
+            const int64_t kx = t * k_rs + h * k_hs, vx = t * v_rs + h * v_hs;
+            if (i8) {
+                kv_i8_put(hkv.data, hb + h * hv.sh, head_dim, 0, k, kx, k_ds);
+                kv_i8_put(hkv.data, hb + h * hv.sh, head_dim, 1, v, vx, v_ds);
+                if (cb >= 0) {
+                    kv_i8_put(kv->data, cb + h * kvv.sh, head_dim, 0, k, kx, k_ds);
+                    kv_i8_put(kv->data, cb + h * kvv.sh, head_dim, 1, v, vx, v_ds);
+                }
+                continue;
+            }
             for (int64_t d = 0; d < head_dim; ++d) {
-                const float xk = ldt(k, t * k_rs + h * k_hs + d * k_ds) * ks;
-                const float xv = ldt(v, t * v_rs + h * v_hs + d * v_ds) * vs;
+                const float xk = ldt(k, kx + d * k_ds) * ks;
+                const float xv = ldt(v, vx + d * v_ds) * vs;
                 stt(&hkv, hb + h * hv.sh + d * hv.sd, xk);
                 stt(&hkv, hb + h * hv.sh + (head_dim + d) * hv.sd, xv);
                 if (cb >= 0) {

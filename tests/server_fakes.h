@@ -27,7 +27,7 @@
 #include "text/chatfmt.h"
 #include "text/chatparse.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <atomic>
@@ -44,7 +44,6 @@
 
 using namespace rad;
 using namespace rad::server;
-using json = nlohmann::ordered_json;
 
 /* ================================================================== text */
 

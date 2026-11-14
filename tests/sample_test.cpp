@@ -995,6 +995,28 @@ TEST(json_schema_refuses_a_schema_nested_past_its_limit) {
     CHECK_OK(grammar_from_json_schema(nested(100), "root", &gbnf, &err));
 }
 
+TEST(json_schema_conversion_is_cached_by_schema_text) {
+    /* The same schema text converts to the same grammar every time, and a schema that
+     * differs anywhere converts to its own; admission on /v1/completions sees the same
+     * schema resent per request and must not re-derive it (nor confuse two schemas). */
+    const char* schema =
+        R"({"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}},"required":["city"]})";
+    std::string a, b, c, err;
+    CHECK_OK(grammar_from_json_schema(schema, "root", &a, &err));
+    CHECK_OK(grammar_from_json_schema(schema, "root", &b, &err));
+    CHECK_EQ(a, b);
+    CHECK(!a.empty());
+    CHECK_OK(grammar_from_json_schema(
+        R"({"type":"object","properties":{"city":{"type":"string"},"days":{"type":"string"}},"required":["city"]})",
+        "root", &c, &err));
+    CHECK(c != a);
+    /* A refusal is not cached as a grammar, and does not poison the cached one. */
+    CHECK(grammar_from_json_schema("{\"not\":{\"type\":\"string\"}}", "root", &c, &err) < 0);
+    std::string d;
+    CHECK_OK(grammar_from_json_schema(schema, "root", &d, &err));
+    CHECK_EQ(d, a);
+}
+
 /* The bounded machinery against upstream's walk, over the shapes the bounds were built for: a star
  * over something nullable, a wide converging rule (past the 64 stacks a firing pattern is
  * memoised for and the 16 past which a set is indexed), an ambiguous rule whose stack set grows,
@@ -3197,6 +3219,21 @@ TEST(each_rank_stages_its_window_of_the_grammar_mask) {
         }
         CHECK(r0.staged(0, off) == want0);
         CHECK(r1.staged(off, sp2[1]) == want1);
+
+        /* t60..t69 lie on rank 1 across its first word's top bits (from the source word after
+         * the one the window starts in) and its second word. */
+        SamplingParams hi = greedy_params();
+        hi.grammar = "root ::= \"t6\" [0-9]";
+        Request h = make_req(9, { 70 }, hi);
+        for (SplitRank* r : { &r0, &r1 }) {
+            std::string err;
+            REQUIRE(r->s.begin_request(9, hi, &err) >= 0);
+            REQUIRE(r->s.build_step({ &h }) >= 0);
+        }
+        std::vector<int32_t> want_hi;
+        for (int32_t id = 60; id <= 69; ++id) want_hi.push_back(id);
+        CHECK(r0.staged(0, off).empty());
+        CHECK(r1.staged(off, sp2[1]) == want_hi);
 
         /* A spent thinking budget, the close on rank 1 and admitted by the grammar: only its
          * bit, on rank 1. */

@@ -24,6 +24,37 @@ rotated int8 activations on the `i8a8h` trunk:
 The embedding and the head decode the same forms, unrotated. The arithmetic is the int8 grid's
 for every form: a narrower code changes the bytes read, not the values multiplied.
 
+## IQ8R at one scale a 256 of K
+
+`data/recipes/q38-27b-iq8r.recipe` is the int8 trunk, at block fp8's size. It keeps IQ8R's
+codes and rotation and widens the scale group: a u8 scale per (row, 256 of K) under one bf16 scale
+a row (`codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128`), eight bits and
+1/256 of a byte a weight plus two bytes a row. The rotation stays 128 wide, and the activations
+carry one scale per (token, 256). libr4d reads it with `gemm_iq8r_nt_m16` and `gemm_iq8r_tiled`
+behind the 256-group quantisers, whose decode rows have chained forms; `kv-cache-dtype: i8`
+([GUIDE §4.4](GUIDE.md)) is the cache that goes with it.
+
+The group is 256 for the prefill: at one scale a 128 the tiled GEMM folds a scale twice as often and
+an 8192-token prefill of Qwen3.8-27B runs 11.6% under block fp8's (2407 tok/s against 2724); at 256
+it runs 2.4% under (2649 against 2715). The cost is 0.00004 KL (round to nearest: 0.00045 at 128,
+0.00049 at 256).
+
+Qwen3.8-27B on two R9700s, KL against bf16 over the 464 091 positions the model writes itself:
+
+| container | KL | top-1 |
+|---|---|---|
+| block fp8, the published checkpoint | 0.00363 | 97.38% |
+| the same on the int8 KV cache | 0.00365 | 97.38% |
+| IQ8R by round to nearest from that fp8 checkpoint | 0.00217 | 98.17% |
+| IQ8R by round to nearest from bf16 | 0.00049 | |
+| IQ8R by GPTQ from bf16 (the recipe) | 0.00039 | 99.19% |
+| the same on the int8 KV cache | 0.00043 | 99.18% |
+
+One R9700, ms a decode step: 47.9 at one sequence and 53.6 at eight against block fp8's 48.7 and
+53.9, and with the DFlash2 drafter (the recipe's, on the 16-level codebook) 55.0 / 59.9 / 70.4 at 1
+/ 4 / 8 sequences against 54.6 / 60.8 / 72.3. Over 24 prompts, four at a time, the drafter lands
+12.5 tokens a step against 12.6.
+
 ## The quantiser
 
 `gptq` (libquant) over the rotated weight against the calibration Hessians:

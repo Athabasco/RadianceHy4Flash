@@ -47,6 +47,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <list>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -488,6 +489,7 @@ private:
     std::vector<BlockHash> chain_all(const std::vector<int32_t>& tokens,
                                      const std::vector<MMContentKey>& mm,
                                      int64_t n_blocks) const;
+    void touch(Entry& e, uint64_t now_ns) const;
     void touch(const BlockHash& h, uint64_t now_ns) const;
     /* trim(), leaving the entries in `spare` (when given) where they are. */
     int64_t trim_sparing(int64_t n_entries,
@@ -518,8 +520,9 @@ private:
      * monotonic stamp. */
     bool is_tip(const Ckpt& c) const;
     /* The deepest valid snapshot on the chain `hs` at or below `limit` tokens; end() if none.
-     * Checkpoints sit on any block boundary (the interval or a prompt's tail), so this walks the
-     * snapshots, a few hundred, rather than the chain's blocks. */
+     * Checkpoints sit on any block boundary (the interval or a prompt's tail), so this probes the
+     * distinct snapshot positions deepest-first (ck_positions_) rather than either every snapshot
+     * or every block of the chain. */
     std::unordered_map<BlockHash, Ckpt, BlockHashHash>::iterator
     deepest_ckpt(const std::vector<BlockHash>& hs, int64_t limit) const;
     static double idle_s(uint64_t used_ns);
@@ -549,6 +552,9 @@ private:
     bool        released_ = false;
     mutable std::unordered_map<BlockHash, Ckpt, BlockHashHash> ck_by_prefix_;
     mutable std::unordered_map<uint64_t, std::vector<BlockHash>> ck_by_session_;
+    /* Snapshots per token position, for deepest_ckpt's deepest-first probe. Maintained where
+     * ck_by_prefix_ gains (reserve_checkpoint) and loses (retire_ckpt) an entry. */
+    std::map<int64_t, int64_t> ck_positions_;
     /* Snapshots lookup handed out since begin_step; kept in their slots until the next one. */
     mutable std::vector<BlockHash> handed_;
     bool handed(const BlockHash& h) const {

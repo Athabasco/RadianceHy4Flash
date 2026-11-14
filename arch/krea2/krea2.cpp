@@ -33,10 +33,15 @@
  *
  * ============================== WHAT IS QUANTISED ==============================
  *
- * One plugin serves bf16 and block-fp8 containers: every linear of the language model, of the
- * text fusion and of the DiT's blocks is a LinearFP8 (rad_fp8.h), bf16 throughout when the first
- * DiT projection is plain. txt_in, img_in, the timestep MLP and modulation, the final layer and
- * the VAE stay bf16.
+ * One plugin serves bf16, block-fp8 and rotated int8 (IQ8R) containers: every linear of the
+ * language model, of the text fusion and of the DiT's blocks is a LinearFP8 (rad_fp8.h), bf16
+ * throughout when the first DiT projection is plain. That projection also says whether the
+ * linears are rotated int8: the activations they read then carry int8 codes in place of the E4M3
+ * pair, written by the rotating twins of the fused ops where a library serves them
+ * (rms_mod_had_quant_i8g for a modulated norm, gate_had_quant_i8g for an attention's output
+ * gate); elsewhere the norm, or the sigmoid and multiply pair, is followed by the rotating
+ * quantiser. txt_in, img_in, the timestep MLP and modulation, the final layer and the VAE stay
+ * bf16.
  *
  * ============================== TENSOR PARALLEL ==============================
  *
@@ -132,6 +137,9 @@ struct DitLayer {
     rad_op     op_tab = 0;    /* the shared modulation plus this block's table, into its columns */
     LinearFP8  qkv{}, gate{}, o{}, gate_up{}, down{};
     QuantFP8   q_attn{};
+    /* The two modulated norms' quantisers for a rotated int8 model whose norms are the
+     * unquantised form (Model::norm_i8 false). */
+    QuantFP8   q_n1{}, q_n2{};
     GateQuantFP8 gq{};
     rad_op     op_n1 = 0, op_n2 = 0, op_qkr = 0, op_attn = 0, op_gq = 0, op_sig = 0;
     rad_op     op_ar1 = 0, op_ar2 = 0;
@@ -189,6 +197,15 @@ struct Model {
     ActFP8  a_hm{}, a_attn{}, a_ffn{};
     std::vector<DitLayer> dit;
     LinearFP8 qkv0{};
+    /* The linears of every network are rotated int8 (IQ8R, or the 128-group int8 before it), read
+     * off qkv0's probe: the activations then carry int8 code pairs with one scale per (token, `g8`
+     * columns) in place of the E4M3 pair. */
+    bool      i8 = false;
+    int64_t   g8 = RAD_FP8_BLOCK;
+    /* Where a library serves the rotating twins, a DiT block's modulated norms write those int8
+     * codes in their own pass (rms_mod_had_quant_i8g: norm_i8) and an attention's output gate
+     * writes the out projection's (gate_had_quant_i8g: gate_i8, and fgate_i8 for the fusion blocks'). */
+    bool      norm_i8 = false, gate_i8 = false, fgate_i8 = false;
     rad_weight w_fn = 0, w_pout = 0, b_pout = 0;
     rad_op  op_fn = 0, op_pout = 0, op_euler = 0;
     rad_buf b_fz = 0, b_v = 0;
@@ -205,7 +222,7 @@ struct Model {
     std::string inv_std, mean, ones, zeros;
 };
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 /* A space-separated list off the container (rad-convert flattens arrays that way). */
 static std::vector<double> meta_list(const RadModelMeta* m, const char* key) {
@@ -281,14 +298,27 @@ static rad_op zc_norm(RadBuilder* b, int64_t rows, int64_t n, double eps, rad_we
 }
 
 /* The attention's sigmoid output gate: `gate_quant_fp8` (gate, multiply and the out projection's
- * quantiser in one pass) over fp8 linears, or `sigmoid` then `mul` over bf16 ones and wherever no
- * loaded library declares the fused op (the out projection's quantiser then runs on its own).
- * Rows are (token, head) pairs of `head_dim` columns. Returns the gate op; `sig` is the pair's
- * sigmoid, written into `g` itself. */
+ * quantiser in one pass) over fp8 linears, rows (token, head) pairs of `head_dim` columns; over
+ * rotated int8 ones (`pair`) its rotating twin `gate_had_quant_i8g`, a token a row, since one
+ * scale covers the codes' group across heads (`fused_i8` says so); or `sigmoid` then `mul` over
+ * bf16 ones and wherever no loaded library declares the fused op (the out projection's quantiser
+ * then runs on its own). Returns the gate op; `sig` is the pair's sigmoid, written into `g`
+ * itself. */
 static rad_op out_gate(RadBuilder* b, const Geom& g, int64_t rows, int64_t width, rad_buf gate,
-                       const ActFP8& attn, rad_op* sig) {
+                       const ActFP8& attn, rad_op* sig, bool pair, bool* fused_i8) {
     const int64_t hd = g.head_dim;
-    if (g.w_bf16 || !rad_op_declared(b, "gate_quant_fp8")) {
+    *fused_i8 = false;
+    if (pair && !g.w_bf16 && attn.q8_fed && attn.q8_rot && rad_op_declared(b, "gate_had_quant_i8g")) {
+        *sig = 0;
+        *fused_i8 = true;
+        return rw(b, RAD_OP(b, "gate_had_quant_i8g",
+                            RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", width),
+                                       RAD_INT("group", attn.cg()), RAD_STR("dtype", "bf16"),
+                                       RAD_STR("act", "sigmoid")),
+                            RAD_NOWEIGHTS),
+                  { gate, attn.x }, { attn.cq(), attn.cs(), attn.x });
+    }
+    if (g.w_bf16 || pair || !rad_op_declared(b, "gate_quant_fp8")) {
         *sig = rw(b, RAD_OP(b, "sigmoid",
                             RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", width),
                                        RAD_STR("dtype", "bf16")),
@@ -369,14 +399,17 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                      RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
     m.b_tx   = decl_b(b, nm.f("te.x"), RAD_BF16, { T, g.n_embd });
     m.a_th.x = decl_b(b, nm.f("te.h"), RAD_BF16, { T, g.n_embd });
-    RAD_ARCH_TRY(m.a_th.declare_qs(b, nm, g, "te.h", g.n_embd, T));
+    RAD_ARCH_TRY(m.a_th.declare_pair(b, nm, g, "te.h", g.n_embd, T, m.i8, m.g8,
+                                 "had_quant_act_i8g"));
     m.b_tkv  = decl_b(b, nm.f("te.qkv"), RAD_BF16, { T, q_dim + 2 * kv_dim });
     m.a_tattn.x = decl_b(b, nm.f("te.attn"), RAD_BF16, { T, q_dim });
-    RAD_ARCH_TRY(m.a_tattn.declare_qs(b, nm, g, "te.attn", q_dim, T));
+    RAD_ARCH_TRY(m.a_tattn.declare_pair(b, nm, g, "te.attn", q_dim, T, m.i8, m.g8,
+                                 "had_quant_act_i8g"));
     m.b_th2  = decl_b(b, nm.f("te.h2"), RAD_BF16, { T, g.n_embd });
     m.b_tgu  = decl_b(b, nm.f("te.gate_up"), RAD_BF16, { T, 2 * g.n_ff });
     m.a_tffn.x = decl_b(b, nm.f("te.ffn"), RAD_BF16, { T, g.n_ff });
-    RAD_ARCH_TRY(m.a_tffn.declare_qs(b, nm, g, "te.ffn", g.n_ff, T));
+    RAD_ARCH_TRY(m.a_tffn.declare_pair(b, nm, g, "te.ffn", g.n_ff, T, m.i8, m.g8,
+                                 "gated_had_quant_i8g"));
     m.b_taps = decl_b(b, nm.f("te.taps"), RAD_BF16, { (int64_t)kTeRows * kNTaps, g.n_embd });
     m.b_tidx = decl_b(b, nm.f("te.tap_idx"), RAD_I32, { T });
 
@@ -579,7 +612,7 @@ static int declare_fuse_block(RadBuilder* b, Model& m, FuseBlock& F, const char*
                                         RAD_F64("scale", 1.0 / std::sqrt((double)hd))),
                              RAD_NOWEIGHTS),
                    { m.b_fqkv }, { m.a_fattn.x });
-    F.op_gq = out_gate(b, g, rows, qd, m.b_fg, m.a_fattn, &F.op_sig);
+    F.op_gq = out_gate(b, g, rows, qd, m.b_fg, m.a_fattn, &F.op_sig, m.i8, &m.fgate_i8);
     if (F.op_sig) RAD_ARCH_TRY(F.q_attn.declare(b, g, m.a_fattn, qd));
     RAD_ARCH_TRY(F.o.declare(b, nm, g, nm.f("%s.attn_output", dn), D, qd, RAD_SHARD_COL,
                              grp_layer(grp), { nm.ckpt("%s.attn.to_out.0.weight", pre) },
@@ -610,15 +643,35 @@ static int declare_fusion(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     const int64_t D = g.n_embd, qd = g.q_dim();
     const int64_t RL = (int64_t)kCondRows * kNTaps;   /* the layer-wise blocks' rows */
     m.a_fh.x = decl_b(b, nm.f("fuse.h"), RAD_BF16, { RL, D });
-    RAD_ARCH_TRY(m.a_fh.declare_qs(b, nm, g, "fuse.h", D, RL));
+    RAD_ARCH_TRY(m.a_fh.declare_pair(b, nm, g, "fuse.h", D, RL, m.i8, m.g8,
+                                 "had_quant_act_i8g"));
     m.b_fqkv = decl_b(b, nm.f("fuse.qkv"), RAD_BF16, { RL, 3 * qd });
     m.b_fg   = decl_b(b, nm.f("fuse.gate"), RAD_BF16, { RL, qd });
     m.a_fattn.x = decl_b(b, nm.f("fuse.attn"), RAD_BF16, { RL, qd });
-    RAD_ARCH_TRY(m.a_fattn.declare_qs(b, nm, g, "fuse.attn", qd, RL));
+    RAD_ARCH_TRY(m.a_fattn.declare_pair(b, nm, g, "fuse.attn", qd, RL, m.i8, m.g8,
+                                 "had_quant_act_i8g"));
     m.b_fo   = decl_b(b, nm.f("fuse.o"), RAD_BF16, { RL, D });
     m.b_fgu  = decl_b(b, nm.f("fuse.gate_up"), RAD_BF16, { RL, 2 * g.n_ff });
     m.a_fffn.x = decl_b(b, nm.f("fuse.ffn"), RAD_BF16, { RL, g.n_ff });
-    RAD_ARCH_TRY(m.a_fffn.declare_qs(b, nm, g, "fuse.ffn", g.n_ff, RL));
+    /* The feed-forward product's scale group is its reader's, the first block's down projection,
+     * which a recipe may keep narrower than the other linears: the fusion's 6912-wide product is
+     * 3456 a rank at two, which whole 128s tile and whole 256s do not (krea-2-iq8r.recipe). The
+     * probe maps the weight through the block's own LinearFP8, which then does not map it again;
+     * the resizes here keep the blocks the loops below declare. */
+    const int nlw = (int)rad_meta_geti(meta, "transformer.num_layerwise_text_blocks", 2);
+    const int nrf = (int)rad_meta_geti(meta, "transformer.num_refiner_text_blocks", 2);
+    m.lw.resize((size_t)nlw);
+    m.rf.resize((size_t)nrf);
+    int64_t ffn_g8 = m.g8;
+    if (m.i8 && nlw + nrf > 0) {
+        LinearFP8& d0 = nlw > 0 ? m.lw[0].down : m.rf[0].down;
+        RAD_ARCH_TRY(d0.probe(b, nm, g, nm.f("fuse.0.ffn_down"),
+                              { nm.ckpt("transformer.text_fusion.%s.0.ff.down.weight",
+                                        nlw > 0 ? "layerwise_blocks" : "refiner_blocks") }));
+        ffn_g8 = d0.probed_g8;
+    }
+    RAD_ARCH_TRY(m.a_fffn.declare_pair(b, nm, g, "fuse.ffn", g.n_ff, RL, m.i8, ffn_g8,
+                                 "gated_had_quant_i8g"));
     m.b_fcu  = decl_b(b, nm.f("fuse.cu"), RAD_I32, { kCondRows + 1 });
     m.b_ft   = decl_b(b, nm.f("fuse.out"), RAD_BF16, { kCondRows, D });
 
@@ -628,10 +681,6 @@ static int declare_fusion(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                        RAD_INT("step", kNTaps)),
                             RAD_NOWEIGHTS),
                   {}, { m.b_fcu });
-    const int nlw = (int)rad_meta_geti(meta, "transformer.num_layerwise_text_blocks", 2);
-    const int nrf = (int)rad_meta_geti(meta, "transformer.num_refiner_text_blocks", 2);
-    m.lw.resize((size_t)nlw);
-    m.rf.resize((size_t)nrf);
     for (int i = 0; i < nlw; ++i) {
         RAD_ARCH_TRY(declare_fuse_block(b, m, m.lw[(size_t)i],
                                         nm.f("transformer.text_fusion.layerwise_blocks.%d", i),
@@ -645,7 +694,7 @@ static int declare_fusion(RadBuilder* b, const RadModelMeta* meta, Model& m) {
      * served bf16 as diffusers runs them: a recipe casts them. */
     if (weight_codes_dtype(b, "fuse.mix.weight", RAD_BF16) != RAD_BF16) {
         fprintf(stderr, "radiance: krea2: 'fuse.mix.weight' is stored %s; convert with "
-                        "data/recipes/krea-2-bf16.recipe or krea-2-fp8.recipe, which cast the "
+                        "data/recipes/krea-2-bf16.recipe or krea-2-iq8r.recipe, which cast the "
                         "release's f32 tensors\n",
                 rad_dtype_name(weight_codes_dtype(b, "fuse.mix.weight", RAD_BF16)));
         return RAD_E_UNSUPPORTED;
@@ -789,15 +838,18 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
 
     /* ---- the blocks */
     m.a_hm.x = decl_b(b, nm.f("dit.hm"), RAD_BF16, { T, D });
-    RAD_ARCH_TRY(m.a_hm.declare_qs(b, nm, g, "dit.hm", D));
+    RAD_ARCH_TRY(m.a_hm.declare_pair(b, nm, g, "dit.hm", D, 0, m.i8, m.g8,
+                                 "had_quant_act_i8g"));
     m.b_qkv = decl_b(b, nm.f("dit.qkv"), RAD_BF16, { T, qd + 2 * kvd });
     m.b_g   = decl_b(b, nm.f("dit.gate"), RAD_BF16, { T, qd });
     m.a_attn.x = decl_b(b, nm.f("dit.attn"), RAD_BF16, { T, qd });
-    RAD_ARCH_TRY(m.a_attn.declare_qs(b, nm, g, "dit.attn", qd));
+    RAD_ARCH_TRY(m.a_attn.declare_pair(b, nm, g, "dit.attn", qd, 0, m.i8, m.g8,
+                                 "had_quant_act_i8g"));
     m.b_ao = decl_b(b, nm.f("dit.ao"), RAD_BF16, { T, D });
     m.b_gu = decl_b(b, nm.f("dit.gate_up"), RAD_BF16, { T, 2 * g.n_ff });
     m.a_ffn.x = decl_b(b, nm.f("dit.ffn"), RAD_BF16, { T, g.n_ff });
-    RAD_ARCH_TRY(m.a_ffn.declare_qs(b, nm, g, "dit.ffn", g.n_ff));
+    RAD_ARCH_TRY(m.a_ffn.declare_pair(b, nm, g, "dit.ffn", g.n_ff, 0, m.i8, m.g8,
+                                 "gated_had_quant_i8g"));
 
     const std::vector<double> ax = meta_list(meta, "transformer.axes_dims_rope");
     const int64_t a0 = ax.size() == 3 ? (int64_t)ax[0] : 32, a1 = ax.size() == 3 ? (int64_t)ax[1] : 48,
@@ -811,12 +863,15 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     const double theta = rad_meta_getf(meta, "transformer.rope_theta", 1000.0);
 
     /* The modulated norm, gated by the branch before it when `gated`, into the next linear's
-     * input (codes for fp8, the bf16 plane for bf16). */
+     * input: codes for fp8 and, where the rotating twin is served, for rotated int8; the bf16
+     * plane for bf16 and for rotated int8 without the twin, whose codes the rotating quantiser
+     * then takes from it (DitLayer::q_n1 / q_n2). */
+    m.norm_i8 = m.i8 && m.a_hm.q8_fed && rad_op_declared(b, "rms_mod_had_quant_i8g") != 0;
     auto mod_norm = [&](rad_weight w, bool gated) {
-        const bool q = !g.w_bf16;
-        rad_op op = q ? RAD_OP(b, "rms_mod_quant_fp8",
+        const bool q = (!g.w_bf16 && !m.i8) || m.norm_i8;
+        rad_op op = q ? RAD_OP(b, m.norm_i8 ? "rms_mod_had_quant_i8g" : "rms_mod_quant_fp8",
                                RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_F64("eps", eps),
-                                          RAD_INT("group", RAD_FP8_BLOCK),
+                                          RAD_INT("group", m.norm_i8 ? m.g8 : RAD_FP8_BLOCK),
                                           RAD_INT("gated", gated ? 1 : 0), RAD_STR("dtype", "bf16"),
                                           RAD_F64("wadd", 1.0), RAD_INT("norm_once", 1)),
                                RAD_WEIGHTS(w))
@@ -827,7 +882,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                RAD_WEIGHTS(w));
         if (!op) return op;
         rad_buf rd[3] = { m.b_mods, m.b_h, m.b_ao };
-        rad_buf wq[3] = { m.a_hm.q, m.a_hm.s, m.b_h };
+        rad_buf wq[3] = { m.a_hm.cq(), m.a_hm.cs(), m.b_h };
         rad_buf wb[2] = { m.a_hm.x, m.b_h };
         rad_op_reads(b, op, rd, gated ? 3 : 2);
         if (q) rad_op_writes(b, op, wq, 3);
@@ -866,6 +921,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
             if (!B.w_tab || !B.op_tab) return RAD_E_INVAL;
         }
         B.op_n1 = mod_norm(B.w_n1, l > 0);
+        if (m.i8 && m.a_hm.q8_fed && !m.norm_i8) RAD_ARCH_TRY(B.q_n1.declare(b, g, m.a_hm, D));
         if (l == 0) B.qkv = m.qkv0;
         RAD_ARCH_TRY(B.qkv.declare(b, nm, g, nm.f("%s.attn_qkv", dn), qd + 2 * kvd, D,
                                    RAD_SHARD_ROW, grp_layer(grp),
@@ -893,13 +949,14 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                             RAD_F64("scale", 1.0 / std::sqrt((double)hd))),
                                  RAD_NOWEIGHTS),
                        { m.b_qkv }, { m.a_attn.x });
-        B.op_gq = out_gate(b, g, T, qd, m.b_g, m.a_attn, &B.op_sig);
+        B.op_gq = out_gate(b, g, T, qd, m.b_g, m.a_attn, &B.op_sig, m.i8, &m.gate_i8);
         if (B.op_sig) RAD_ARCH_TRY(B.q_attn.declare(b, g, m.a_attn, qd));
         RAD_ARCH_TRY(B.o.declare(b, nm, g, nm.f("%s.attn_output", dn), D, qd, RAD_SHARD_COL,
                                  grp_layer(grp), { nm.ckpt("%s.attn.to_out.0.weight", pre) },
                                  m.a_attn, m.b_ao));
         B.op_ar1 = all_reduce(b, g, m.b_ao, T);
         B.op_n2 = mod_norm(B.w_n2, true);
+        if (m.i8 && m.a_hm.q8_fed && !m.norm_i8) RAD_ARCH_TRY(B.q_n2.declare(b, g, m.a_hm, D));
         RAD_ARCH_TRY(B.gate_up.declare(b, nm, g, nm.f("%s.ffn_gate_up", dn), 2 * g.n_ff, D,
                                        RAD_SHARD_ROW, grp_layer(grp),
                                        { nm.ckpt("%s.ff.gate.weight", pre),
@@ -1090,8 +1147,9 @@ static int declare_decoder(RadBuilder* b, const RadModelMeta* meta, Model& m) {
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
-    Model& m = g_model[ctx->rank];
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
+    Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     RAD_ARCH_TRY(check_format(meta));
@@ -1150,9 +1208,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                    "transformer.transformer_blocks.0.attn.to_k.weight",
                                    "transformer.transformer_blocks.0.attn.to_v.weight" }));
         RadEncoding e{};
-        const bool plain = weight_enc(b, nm.f("dit.blk.0.attn_qkv.weight"), &e) &&
-                           rad_enc_is(&e, "plain");
+        const bool known = weight_enc(b, nm.f("dit.blk.0.attn_qkv.weight"), &e);
+        const bool plain = known && rad_enc_is(&e, "plain");
         gd.w_bf16 = gf.w_bf16 = m.gt.w_bf16 = plain;
+        /* Or rotated int8 (IQ8R): the activations then carry int8 codes at the weights' scale
+         * group in place of the E4M3 pair (ActFP8::declare_pair). */
+        m.i8 = known && (linear_is_w8h(e) || linear_is_wnh(e));
+        if (m.i8) m.g8 = linear_w8h_group(e);
     }
 
     /* ---- the per-image state, the conditioning store, and in issue order the language model,
@@ -1220,7 +1282,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              m.gt.rank, m.gt.world, m.turbo ? " Turbo" : "", kTaps[kNTaps - 1],
              (long long)m.gt.n_layer, m.lw.size(), m.rf.size(), (long long)gd.n_layer,
              (long long)gd.n_head, (long long)gd.n_head_kv, (long long)gd.n_ff,
-             gd.w_bf16 ? "bf16" : "block-fp8");
+             gd.w_bf16 ? "bf16" : m.i8 ? "rotated int8" : "block-fp8");
     return RAD_OK;
 }
 
@@ -1284,6 +1346,9 @@ static void step_fuse(RadCtx* c, const Model& m, const FuseBlock& F, int64_t r0,
         RAD_ISSUE_N(c, F.op_sig, R, brows(m.b_fg, R), brows(m.b_fg, R));
         RAD_ISSUE_N(c, F.op_gq, R, brows(m.a_fattn.x, R), brows(m.b_fg, R), brows(m.a_fattn.x, R));
         F.q_attn.step(c, R);
+    } else if (m.fgate_i8) {
+        RAD_ISSUE_N(c, F.op_gq, R, brows(m.b_fg, R), brows(m.a_fattn.x, R),
+                    brows(m.a_fattn.cq(), R), brows(m.a_fattn.cs(), R), brows(m.a_fattn.x, R));
     } else {
         const int64_t rh = R * (qd / hd), nb = hd / RAD_FP8_BLOCK;
         RAD_ISSUE_N(c, F.op_gq, rh, RAD_P_T2(rad_buf_ptr(c, m.b_fg), RAD_BF16, rh, hd),
@@ -1368,7 +1433,7 @@ static void step_denoise(RadCtx* c, const RadBatch* batch, const Model& m) {
     const RadOperand pos = praw2(G->rope_f, RAD_F32, 4, N);
     auto mod = [&](int64_t l, int k, int width) { return bcol_at(m.b_mods, 0, W, (6 * l + k) * D,
                                                                  width * D, S); };
-    const bool q8 = !g.w_bf16;
+    const bool q8 = (!g.w_bf16 && !m.i8) || m.norm_i8;
     for (int64_t l = 0; l < L; ++l) {
         const DitLayer& B = m.dit[(size_t)l];
         /* The block's modulation: the shared projection plus its own table, into its columns. */
@@ -1377,11 +1442,13 @@ static void step_denoise(RadCtx* c, const RadBatch* batch, const Model& m) {
         if (q8)
             RAD_ISSUE_N(c, B.op_n1, N, l > 0 ? brows(m.b_ao, N) : RAD_NONE,
                         l > 0 ? mod(l - 1, 5, 1) : RAD_NONE, mod(l, 0, 2), RAD_W(B.w_n1), cu,
-                        brows(m.b_h, N), brows(m.a_hm.q, N), brows(m.a_hm.s, N), RAD_NONE);
+                        brows(m.b_h, N), brows(m.a_hm.cq(), N), brows(m.a_hm.cs(), N),
+                        RAD_NONE);
         else
             RAD_ISSUE_N(c, B.op_n1, N, l > 0 ? brows(m.b_ao, N) : RAD_NONE,
                         l > 0 ? mod(l - 1, 5, 1) : RAD_NONE, mod(l, 0, 2), RAD_W(B.w_n1), cu,
                         brows(m.b_h, N), brows(m.a_hm.x, N));
+        B.q_n1.step(c, N);
         B.qkv.step(c, m.a_hm, m.b_qkv, N);
         B.gate.step(c, m.a_hm, m.b_g, N);
         RAD_ISSUE_N(c, B.op_qkr, N, brows(m.b_qkv, N), pos, RAD_W(B.w_qn), RAD_W(B.w_kn));
@@ -1391,6 +1458,9 @@ static void step_denoise(RadCtx* c, const RadBatch* batch, const Model& m) {
             RAD_ISSUE_N(c, B.op_sig, N, brows(m.b_g, N), brows(m.b_g, N));
             RAD_ISSUE_N(c, B.op_gq, N, brows(m.a_attn.x, N), brows(m.b_g, N), brows(m.a_attn.x, N));
             B.q_attn.step(c, N);
+        } else if (m.gate_i8) {
+            RAD_ISSUE_N(c, B.op_gq, N, brows(m.b_g, N), brows(m.a_attn.x, N),
+                        brows(m.a_attn.cq(), N), brows(m.a_attn.cs(), N), brows(m.a_attn.x, N));
         } else {
             const int64_t rh = N * (qd / hd), nb = hd / RAD_FP8_BLOCK;
             RAD_ISSUE_N(c, B.op_gq, rh, RAD_P_T2(rad_buf_ptr(c, m.b_g), RAD_BF16, rh, hd),
@@ -1403,10 +1473,12 @@ static void step_denoise(RadCtx* c, const RadBatch* batch, const Model& m) {
         if (B.op_ar1) RAD_ISSUE_N(c, B.op_ar1, N * D, brows(m.b_ao, N), RAD_NONE);
         if (q8)
             RAD_ISSUE_N(c, B.op_n2, N, brows(m.b_ao, N), mod(l, 2, 1), mod(l, 3, 2), RAD_W(B.w_n2),
-                        cu, brows(m.b_h, N), brows(m.a_hm.q, N), brows(m.a_hm.s, N), RAD_NONE);
+                        cu, brows(m.b_h, N), brows(m.a_hm.cq(), N), brows(m.a_hm.cs(), N),
+                        RAD_NONE);
         else
             RAD_ISSUE_N(c, B.op_n2, N, brows(m.b_ao, N), mod(l, 2, 1), mod(l, 3, 2), RAD_W(B.w_n2),
                         cu, brows(m.b_h, N), brows(m.a_hm.x, N));
+        B.q_n2.step(c, N);
         B.gate_up.step(c, m.a_hm, m.b_gu, N);
         B.gq.step(c, m.b_gu, N);
         B.down.step(c, m.a_ffn, m.b_ao, N);
@@ -1467,7 +1539,7 @@ static void step_decode(RadCtx* c, const RadBatch* batch, const Model& m) {
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    const Model& m = g_model[rad_rank(c)];
+    const Model& m = g_model[rad_slot(c)];
     if (!batch->gen || !batch->gen_b) {
         rad_step_fail(c, "krea2 is an image generator and runs generator passes only");
         return;
@@ -1493,6 +1565,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
 
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PROBE(krea2)
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(krea2, "krea2", "", "0.1.0",
                 "Krea 2 / Krea 2 Turbo: Qwen3-VL-4B taps through a text-fusion transformer, a 12.9B "
                 "single-stream diffusion transformer over the joint text and image, and Wan 2.1's "

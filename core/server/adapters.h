@@ -31,13 +31,15 @@
 #include "text/tokenizer.h"
 #include "mm/processor.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <iterator>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 
 namespace rad {
 namespace server {
@@ -96,6 +98,7 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
      * rate has a different granularity (spec §7.3) and is reported separately, not averaged
      * in. */
     o.prefix_hit_rate = m.attn_hit_rate;
+    o.prefix_queries = m.prompt_tokens;
     o.prefix_evictions = m.prefix_evictions;
     /* What only the cache holds (SchedMetrics::prefix_held_tokens), clamped to the pool's
      * used figure: the two are counted at different moments in a step, and cached > used
@@ -568,6 +571,7 @@ public:
 
     bool ready() const { return t_.ready() && fmt_ != nullptr; }
     bool supports_tools() const override { return t_.caps().tools; }
+    std::string tools_probe_error() const override { return t_.caps().probe_error; }
     bool supports_reasoning() const override { return t_.caps().preserve_reasoning; }
     std::string tool_refusal() const override { return tool_refusal_; }
     std::string source() const override { return t_.source(); }
@@ -628,12 +632,46 @@ public:
         out->preserved_tokens  = declared_ ? chat_format_markers(f) : p.preserved_tokens;
         out->grammar_triggers.clear();
 
+        /* The grammar and the parser below are pure functions of the tools, the schema, the
+         * generation prompt and the call options -- all fixed for this deployment's format --
+         * and building them walks every tool schema (measured ~0.4 ms for a dozen agent tools).
+         * An agent resends the same tools every turn, so a repeated build is a cache hit. The
+         * key is the tools' own dump plus length-prefixed fields; the dump is an order of
+         * magnitude cheaper than the build it gates. */
+        std::string built_key;
+        if (calls || doc) {
+            built_key = tools.dump();
+            auto field = [&built_key](const std::string& s) {
+                built_key += '\x1f';
+                built_key += std::to_string(s.size());
+                built_key += ':';
+                built_key += s;
+            };
+            field(opt.json_schema);
+            field(p.generation_prompt);
+            field(opt.tool_choice);
+            field(opt.tool_name);
+            field(opt.reasoning_format);
+            built_key += opt.parallel_tool_calls ? '\x01' : '\x00';
+            std::lock_guard<std::mutex> lk(built_mu_);
+            const auto it = built_.find(built_key);
+            if (it != built_.end()) {
+                const BuiltCall& b = it->second;
+                out->grammar           = b.grammar;
+                out->grammar_lazy      = b.grammar_lazy;
+                out->grammar_triggers  = b.triggers;
+                out->parser            = b.parser;
+                out->think_open        = b.think_open;
+                out->think_close       = b.think_close;
+                out->think_starts_open = b.think_starts_open;
+                return RAD_OK;
+            }
+        }
+
         if (calls || doc) {
             /* The grammar, and the words that trigger it, come from the reply format: the same
              * description the parser reads the reply back with. */
-            const nlohmann::ordered_json schema =
-                doc ? nlohmann::ordered_json::parse(opt.json_schema, nullptr, false)
-                    : nlohmann::ordered_json();
+            const Json schema = doc ? Json::parse(opt.json_schema, nullptr, false) : Json();
             ChatGrammarRequest gq;
             gq.tools               = calls ? &tools : nullptr;
             gq.json_schema         = doc && schema.is_object() ? &schema : nullptr;
@@ -678,6 +716,19 @@ public:
         out->think_close       = rm.close;
         out->think_starts_open = rm.starts_open;
         out->parser = std::make_shared<ReplyParserBridge>(std::move(rp));
+        if (!built_key.empty()) {
+            BuiltCall b;
+            b.grammar           = out->grammar;
+            b.grammar_lazy      = out->grammar_lazy;
+            b.triggers          = out->grammar_triggers;
+            b.parser            = out->parser;
+            b.think_open        = out->think_open;
+            b.think_close       = out->think_close;
+            b.think_starts_open = out->think_starts_open;
+            std::lock_guard<std::mutex> lk(built_mu_);
+            if (built_.size() >= 32) built_.clear();
+            built_.emplace(std::move(built_key), std::move(b));
+        }
         return RAD_OK;
     }
 
@@ -686,11 +737,23 @@ private:
      * kinds the way llama.cpp's common_grammar_trigger_type does. */
     static constexpr int kTriggerWord = 1;
 
+    /* What one (tools, schema, options) build produced; see apply(). */
+    struct BuiltCall {
+        std::string grammar;
+        bool grammar_lazy = false;
+        std::vector<SamplingParams::GrammarTrigger> triggers;
+        std::shared_ptr<IReplyParser> parser;
+        std::string think_open, think_close;
+        bool think_starts_open = false;
+    };
+
     ChatTemplate t_;
     std::vector<std::string> terminators_;
     std::shared_ptr<const ReplyFormat> fmt_;
     bool declared_ = false;
     std::string tool_refusal_;
+    mutable std::mutex built_mu_;
+    mutable std::unordered_map<std::string, BuiltCall> built_;
 };
 
 /* ================================================================== grammar

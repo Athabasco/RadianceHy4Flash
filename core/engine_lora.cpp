@@ -13,7 +13,7 @@
 #include "engine_priv.h"
 #include "lora/lora.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <chrono>
@@ -36,7 +36,7 @@ int read_targets(const std::string& dir, std::set<std::string>* out, std::string
     const std::string path = dir + "/adapter_config.json";
     std::ifstream f(path);
     if (!f) { *err = "cannot read " + path; return RAD_E_NOTFOUND; }
-    nlohmann::json j;
+    Json j;
     try { f >> j; } catch (const std::exception& e) {
         *err = path + ": " + e.what();
         return RAD_E_INVAL;

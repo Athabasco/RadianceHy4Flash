@@ -17,7 +17,7 @@
 #include "diag/diag.h"
 #include "gen_config.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <cstdlib>
 #include <filesystem>
@@ -500,8 +500,8 @@ TEST(a_run_started_anyway_says_so_at_the_top) {
     CHECK(text.find("--proceed-with-incompatible-configuration") != std::string::npos);
     CHECK(text.find("1 incompatible (started anyway)") != std::string::npos);
     CHECK(text.find("INCOMPATIBLE cwsr-off") != std::string::npos);
-    const nlohmann::json j =
-        nlohmann::json::parse(diag::to_json({}, {}, f, run, found), nullptr, false);
+    const Json j =
+        Json::parse(diag::to_json({}, {}, f, run, found), nullptr, false);
     CHECK(!j.is_discarded());
     if (j.is_discarded()) return;
     CHECK(j["unsupported_configuration"] == true);
@@ -679,7 +679,7 @@ TEST(a_value_that_is_not_utf8_does_not_break_the_json) {
     std::string out;
     try { out = diag::to_json(rows, {}, f, diag::RunFacts{}, {}); } catch (...) { threw = true; }
     CHECK(!threw);
-    const nlohmann::json j = nlohmann::json::parse(out, nullptr, false);
+    const Json j = Json::parse(out, nullptr, false);
     CHECK(!j.is_discarded());
     if (j.is_discarded()) return;
     CHECK(j["configuration"][0]["value"].get<std::string>() == "/m/caf\xef\xbf\xbd.rad");
@@ -736,7 +736,7 @@ TEST(the_json_carries_every_section) {
     Config c;
     Argv a({ "--model", "/m/x.rad" });
     CHECK_EQ(config_parse(a.argc(), a.argv.data(), &c), 0);
-    const nlohmann::json j = nlohmann::json::parse(
+    const Json j = Json::parse(
         diag::to_json(diag::config_rows(c), {}, f, diag::RunFacts{}, found), nullptr, false);
     CHECK(!j.is_discarded());
     if (j.is_discarded()) return;

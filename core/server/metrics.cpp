@@ -80,6 +80,7 @@ Metrics::Metrics(std::string model_name, int64_t max_model_len)
       h_tpot_(buckets_tpot()),
       h_e2e_(buckets_latency()),
       h_decode_(buckets_latency()),
+      h_queue_(buckets_latency()),
       h_prompt_tokens_(buckets_1_2_5(max_model_len > 0 ? max_model_len : 32768)),
       h_generation_tokens_(buckets_1_2_5(max_model_len > 0 ? max_model_len : 32768)),
       h_params_n_({1, 2, 5, 10, 20}),
@@ -98,9 +99,17 @@ static const char* reason_str(SuccessReason r) {
     }
 }
 
+void Metrics::set_cache_config(const std::string& dtype, int64_t block_size, bool prefix_caching,
+                               int64_t prefix_cache_mib) {
+    cache_labels_ = labels_.substr(0, labels_.size() - 1) + ",cache_dtype=\"" + esc_label(dtype) +
+                    "\",block_size=\"" + std::to_string(block_size) +
+                    "\",enable_prefix_caching=\"" + (prefix_caching ? "True" : "False") +
+                    "\",prefix_cache_mib=\"" + std::to_string(prefix_cache_mib) + "\"}";
+}
+
 void Metrics::observe_request(int64_t n_prompt, int64_t n_generated,
                               double ttft_s, double tpot_s, double e2e_s, double decode_s,
-                              int n_choices, int64_t max_tokens, SuccessReason r) {
+                              double queue_s, int n_choices, int64_t max_tokens, SuccessReason r) {
     c_prompt_tokens_.inc((double)n_prompt);
     c_generation_tokens_.inc((double)n_generated);
     c_success_[(size_t)r].inc();
@@ -116,6 +125,7 @@ void Metrics::observe_request(int64_t n_prompt, int64_t n_generated,
     if (tpot_s >= 0.0 && n_generated > 1) h_tpot_.observe(tpot_s);
     if (e2e_s >= 0.0) h_e2e_.observe(e2e_s);
     if (decode_s >= 0.0 && n_generated > 1) h_decode_.observe(decode_s);
+    if (queue_s >= 0.0) h_queue_.observe(queue_s);
 }
 
 void Metrics::observe_rejected()   { c_rejected_.inc(); }
@@ -189,6 +199,7 @@ void Metrics::sample(const SchedMetrics& m) {
     c_lookup_held_hits_.advance_to(m.lookup_held_hits);
     c_attn_cached_.advance_to(m.attn_cached_tokens);
     c_linear_cached_.advance_to(m.linear_cached_tokens);
+    c_prefix_queries_.advance_to(m.prefix_queries);
     c_checkpoints_.advance_to(m.checkpoints_written);
     /* The cache's own cumulative counts, turned into deltas like the others. */
     c_prefix_evict_.advance_to(m.prefix_evictions);
@@ -305,6 +316,17 @@ std::string Metrics::render() const {
     w.out += '\n';
     w.gauge("vllm:gpu_prefix_cache_hit_rate",
             "GPU prefix cache block hit rate.", L, g_prefix_hit_.get());
+    /* The same as counters, which sum over time and across instances where the gauge cannot.
+     * Hits are the tokens a request did not compute again: on a hybrid model the checkpoint it
+     * resumed from bounds them, not the attention blocks found. */
+    w.counter("vllm:prefix_cache_queries_total",
+              "Prompt tokens of admitted requests, each looked up in the prefix cache.",
+              L, c_prefix_queries_.get());
+    w.counter("vllm:prefix_cache_hits_total",
+              "Prompt tokens served from the prefix cache instead of computed.",
+              L, c_linear_cached_.get());
+    if (!cache_labels_.empty())
+        w.gauge("vllm:cache_config_info", "The KV cache's settings, as labels.", cache_labels_, 1.0);
 
     /* ---------------- vLLM-compatible: counters ---------------- */
     w.counter("vllm:prompt_tokens_total",
@@ -341,6 +363,9 @@ std::string Metrics::render() const {
            "Histogram of end to end request latency in seconds.", L, h_e2e_);
     w.hist("vllm:request_decode_time_seconds",
            "Histogram of time spent in the decode phase, in seconds.", L, h_decode_);
+    w.hist("vllm:request_queue_time_seconds",
+           "Histogram of time a request waited before the scheduler admitted it, in seconds.",
+           L, h_queue_);
     w.hist("vllm:request_prompt_tokens",
            "Number of prefill tokens processed.", L, h_prompt_tokens_);
     w.hist("vllm:request_generation_tokens",

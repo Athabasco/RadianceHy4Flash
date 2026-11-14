@@ -3,7 +3,7 @@
 #include "ggml_planes.h"
 #include "rad_plugin.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -63,7 +63,7 @@ void MetaOwn::finish() {
 /* An array's scalars appended to `s` space-separated, nested arrays flattened row-major (a
  * vocoder's per-resnet dilations, [[1, 3, 5], [1, 3, 5]], read as "1 3 5 1 3 5"); false for an
  * array holding an object or a null. */
-static bool join_scalars(const nlohmann::json& v, std::string* s) {
+static bool join_scalars(const Json& v, std::string* s) {
     for (const auto& e : v) {
         if (e.is_array()) {
             if (!join_scalars(e, s)) return false;
@@ -79,10 +79,10 @@ static bool join_scalars(const nlohmann::json& v, std::string* s) {
     return true;
 }
 
-static void flatten_json(const nlohmann::json& j, const std::string& prefix, MetaOwn* out) {
+static void flatten_json(const Json& j, const std::string& prefix, MetaOwn* out) {
     for (auto it = j.begin(); it != j.end(); ++it) {
         const std::string key = prefix.empty() ? it.key() : prefix + "." + it.key();
-        const nlohmann::json& v = it.value();
+        const Json& v = it.value();
         /* Retain otherwise invisible Quark weight overrides so import validation can reject
          * null/empty schemes instead of accidentally inheriting global MXFP4 packing. */
         if (key.rfind("quantization_config.layer_quant_config.", 0) == 0 &&
@@ -128,7 +128,7 @@ int meta_merge_config_json(const std::string& dir, const std::string& prefix, Me
                 "-- and none of it is derivable from the target.", dir.c_str());
         return RAD_E_NOTFOUND;
     }
-    nlohmann::json j;
+    Json j;
     try { f >> j; }
     catch (const std::exception& e) { RAD_ERR("%s: %s", path.c_str(), e.what()); return RAD_E_FORMAT; }
     flatten_json(j, prefix, out);
@@ -145,7 +145,7 @@ int meta_merge_generation_config(const std::string& dir, MetaOwn* out) {
     const std::string path = dir + "/generation_config.json";
     std::ifstream f(path);
     if (!f) return RAD_OK;               /* optional */
-    nlohmann::json j;
+    Json j;
     try { f >> j; }
     catch (const std::exception& e) {
         RAD_WARN("%s: %s; no sampling defaults are carried", path.c_str(), e.what());
@@ -180,7 +180,7 @@ int meta_merge_preprocessor_configs(const std::string& dir, MetaOwn* out) {
         const std::string path = dir + "/" + f.file;
         std::ifstream in(path);
         if (!in) continue;
-        nlohmann::json j;
+        Json j;
         try { in >> j; }
         catch (const std::exception& e) {
             RAD_WARN("%s: %s; it is not carried", path.c_str(), e.what());
@@ -199,7 +199,7 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
                 "dimensions there; without it nothing can be sized.", dir.c_str());
         return RAD_E_NOTFOUND;
     }
-    nlohmann::json j;
+    Json j;
     try { f >> j; }
     catch (const std::exception& e) {
         RAD_ERR("%s: %s", path.c_str(), e.what());
@@ -566,7 +566,7 @@ static int meta_merge_json_file(const std::string& path, const std::string& pref
         RAD_ERR("%s: cannot read it", path.c_str());
         return RAD_E_NOTFOUND;
     }
-    nlohmann::json j;
+    Json j;
     try { f >> j; }
     catch (const std::exception& e) { RAD_ERR("%s: %s", path.c_str(), e.what()); return RAD_E_FORMAT; }
     if (!j.is_object()) {
@@ -1881,15 +1881,15 @@ struct LoraRule {
 };
 
 /* Read the map file: {"strip": [...], "modules": {"<pat>": ["<t>", ...], ...}}. The module
- * order is preserved (an nlohmann object keeps insertion order), so the first rule whose
+ * order is preserved (the DOM keeps insertion order), so the first rule whose
  * pattern matches a module wins. */
 static int lora_map_read(const std::string& file, std::vector<std::string>* strip,
                          std::vector<LoraRule>* rules) {
     std::ifstream f(file);
     if (!f) { RAD_ERR("lora: --lora-map %s cannot be read", file.c_str()); return RAD_E_NOTFOUND; }
-    nlohmann::ordered_json j;
+    Json j;
     try {
-        j = nlohmann::ordered_json::parse(f);
+        j = Json::parse(f);
     } catch (const std::exception& e) {
         RAD_ERR("lora: --lora-map %s: %s", file.c_str(), e.what());
         return RAD_E_FORMAT;

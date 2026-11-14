@@ -235,6 +235,10 @@ enum {
      * cannot be static_asserted against `r4d_gemm_fp8a8_block()` (a function, not a macro), so
      * r4d_gemm_fp8a8.hip checks it at launch. */
     R4D_FP8_BLOCK = 128,
+    /* IQR's 8-bit format (IQ8R): int8 codes rotated 128 wide, one bf16 scale per row per 256 of K
+     * against an int8 activation with one f32 scale per (token, 256). Twice the int8 block, so a
+     * fold covers two 128-wide rotation blocks. */
+    R4D_I8_GROUP_WIDE = 256,
     R4D_WAVE     = 32,
     R4D_NTILE    = 16     /* output rows per WMMA n-tile                          */
 };
@@ -274,6 +278,23 @@ static constexpr uint32_t kW4nlPerm[4]  = { 0x504B4539u, 0x5B595653u, 0xD0CBC5B9
 static constexpr float kW4nlTable[16] = { 1.125f, 3.25f, 5.5f, 8.0f, 11.0f, 14.0f, 18.0f, 22.0f,
                                           -1.125f, -3.25f, -5.5f, -8.0f, -11.0f, -14.0f, -18.0f,
                                           -22.0f };
+/* w4nl's magnitudes as the int8 levels an int8 activation's WMMA multiplies, in units of
+ * kW4nlI8Unit: the integer set under 128 with the least squared distance from the table at one
+ * unit, and that unit, both over the code histogram of Qwen3.8-Flash-Next's GPTQ experts (19, 18,
+ * 17, 16, 12, 9, 5 and 4 percent by ascending magnitude), where the weight read this way is 2.4e-3
+ * of the stored one away in relative L2. w4nl_i8_dword packs entries 4d..4d+3 of the sixteen (the
+ * magnitudes, then their negatives) as kW4nlPerm packs its E4M3 bytes. */
+static constexpr int8_t kW4nlI8[8] = { 6, 17, 29, 42, 58, 74, 95, 116 };
+static constexpr float kW4nlI8Unit = 0.18965f;
+static constexpr uint32_t w4nl_i8_dword(int d) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; ++i) {
+        const int e = 4 * d + i;
+        const int8_t l = (int8_t)(e < 8 ? kW4nlI8[e] : -kW4nlI8[e - 8]);
+        v |= (uint32_t)(uint8_t)l << (8 * i);
+    }
+    return v;
+}
 
 /* `w5nl64a8h` decodes libquant's `table=w5nl`: thirty-two levels, sixteen magnitudes ascending
  * then their negatives, so a code's high bit is its sign and its low four bits index the

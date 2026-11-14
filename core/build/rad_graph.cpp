@@ -16,7 +16,7 @@
 
 #include "startup.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <atomic>
@@ -27,7 +27,7 @@
 namespace rad {
 
 /* ordered_json keeps keys in insertion order rather than alphabetical. */
-using json = nlohmann::ordered_json;
+using json = Json;
 
 namespace {
 
@@ -564,8 +564,8 @@ static json weight_json(const WeightInfo& w) {
     return j;
 }
 
-std::string dump_graph_json(const Program& p) {
-    Registry& reg = rad_tools_registry();
+std::string dump_graph_json(const Program& p, Registry* r) {
+    Registry& reg = r ? *r : rad_tools_registry();
     json root;
     json meta;
     meta["arch"]     = p.meta.arch_id ? p.meta.arch_id : "";

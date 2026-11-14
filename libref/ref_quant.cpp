@@ -279,22 +279,6 @@ int ref_dequant(const RadArgs* a, RadStream) {
  * s = (k%64)/16, and the k inside the step is 4*lh + _KOFF[i] with _KOFF = {0,8,1,9,2,10,3,11}.
  * The scale dword at [t][g][r] holds the f16 scale low and -(1024+zero) high. */
 static const int kKOFF[8] = {0, 8, 1, 9, 2, 10, 3, 11};
-static float f16_bits_to_f32(uint16_t h) {
-    uint32_t sign = (uint32_t)(h >> 15) << 31;
-    uint32_t exp  = (uint32_t)(h >> 10) & 0x1fu;
-    uint32_t mant = (uint32_t)(h & 0x3ffu);
-    uint32_t f32;
-    if (exp == 0) {
-        if (mant == 0) f32 = sign;
-        else { while (!(mant & 0x400u)) { mant <<= 1; --exp; } f32 = sign | ((exp + 126u) << 23) | ((mant & 0x3ffu) << 13); }
-    } else if (exp == 31) {
-        f32 = sign | 0x7f800000u | (mant << 13);
-    } else {
-        f32 = sign | ((exp + 112u) << 23) | (mant << 13);
-    }
-    float f; std::memcpy(&f, &f32, 4); return f;
-}
-
 int ref_dequant_w4(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor *wq = &a->t[0], *ws = &a->t[1], *y = &a->t[2];
@@ -319,8 +303,8 @@ int ref_dequant_w4(const RadArgs* a, RadStream) {
 
         const int kbase = kb * 64 + s * 16 + 4 * lh;
         const uint32_t sz = Ws[(size_t)(t * ng + kbase / group) * 16 + r];
-        const float sc   = f16_bits_to_f32((uint16_t)(sz & 0xFFFFu));
-        const float nz   = f16_bits_to_f32((uint16_t)(sz >> 16));
+        const float sc   = rad_f16_to_f32((uint16_t)(sz & 0xFFFFu));
+        const float nz   = rad_f16_to_f32((uint16_t)(sz >> 16));
         const float zero = -nz - 1024.f;
 
         for (int i = 0; i < 8; i++) {
@@ -423,8 +407,9 @@ int ref_quant_cols_fp8(const RadArgs* a, RadStream) {
  * carries the matching rotation and /g.
  *
  * had_quant_act_i8g is the same at int8 codes (`top` 127), for the i8a8h weight, whose scale
- * carries the /g the same way. */
-static int had_quant_act_q8(const RadArgs* a, float top) {
+ * carries the /g the same way. Its rotation is at most `rot_cap` (128) wide: a wider group (IQ8R's
+ * 256) is whole 128-wide rotations under one scale, the weight's scale carrying /128. */
+static int had_quant_act_q8(const RadArgs* a, float top, int64_t rot_cap = 0) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *q = &a->t[1], *s = &a->t[2];
     const int64_t n = p_int(a, "n", 0);
@@ -432,6 +417,7 @@ static int had_quant_act_q8(const RadArgs* a, float top) {
     /* n % g != 0 is refused: no weight block was rotated across the row's end. */
     if (n <= 0 || !pow2(g) || n % g != 0) return RAD_E_SHAPE;
     if (g > REF_HAD_MAX) return RAD_E_UNSUPPORTED;
+    const int64_t rw = rot_cap > 0 && g > rot_cap ? rot_cap : g;
     const int64_t rows = numel(x) / n;
     const int64_t ngrp = n / g;
     if (rows <= 0 || numel(q) < rows * n) return RAD_E_SHAPE;
@@ -445,7 +431,7 @@ static int had_quant_act_q8(const RadArgs* a, float top) {
         for (int64_t gi = 0; gi < ngrp; ++gi) {
             const int64_t k0 = gi * g;
             for (int64_t i = 0; i < g; ++i) buf[i] = ldt(x, xb + (k0 + i) * xs);
-            fwht(buf, g);
+            for (int64_t b = 0; b < g; b += rw) fwht(buf + b, rw);
             const float sc = q8_group([&](int64_t i) { return buf[i]; }, g, top, q,
                                       qb + k0 * qs, qs);
             stt(s, rowoff(s, r, ngrp) + gi * laststride(s), sc);
@@ -454,114 +440,8 @@ static int had_quant_act_q8(const RadArgs* a, float top) {
     return RAD_OK;
 }
 
-int ref_had_quant_act_fp8(const RadArgs* a, RadStream) {
-    return had_quant_act_q8(a, 448.0f);
-}
-
 int ref_had_quant_act_i8g(const RadArgs* a, RadStream) {
-    return had_quant_act_q8(a, 127.0f);
-}
-
-/* ------------------------------------------------------------- givens_rotate */
-/* ParoQuant's activation side: each row divided by its channel factors and rotated by `stages`
- * rounds of disjoint Givens pairs, written in y's dtype. A weight stored as v = w . D . G_1 ... G_S
- * (abi/rad_encoding.h, "givens") meets x . D^-1 . G_1 ... G_S, since each G is orthogonal and so
- * <v, x D^-1 G_1..G_S> = <w, x>. For GEMMs reading a 16-bit activation (w5a16); the quantising
- * form is givens_dense_quant.
- *
- * Parts: a fused projection (gate|up, q|k|v) was rotated per piece, so y is [rows, parts * n] with
- * part p at columns [p*n, (p+1)*n). The tables stack per part: `stages` rows of pairs and angles,
- * one row of scales. A part's pairs stay within one `group` (128 in the checkpoints).
- *
- * The device kernel's arithmetic: divide by the channel scale, then per stage
- * a' = a cos t + b sin t, b' = b cos t - a sin t in f32. Not bit-identical: libm's and the GPU's
- * cos and sin differ by an ulp. */
-int ref_givens_rotate(const RadArgs* a, RadStream) {
-    if (!have(a, 5)) return RAD_E_INVAL;
-    const RadTensor *x = &a->t[0], *pr = &a->t[1], *an = &a->t[2], *sc = &a->t[3], *q = &a->t[4];
-    const int64_t n = p_int(a, "n", 0), S = p_int(a, "stages", 0), P = p_int(a, "parts", 1);
-    const int64_t g = p_int(a, "group", 0);
-    if (n <= 0 || S <= 0 || P <= 0 || (n & 1)) return RAD_E_SHAPE;
-    if (g <= 0 || g > n || n % g != 0) return RAD_E_SHAPE;
-    if (numel(pr) < P * S * n || numel(an) < P * S * (n / 2) || numel(sc) < P * n) return RAD_E_SHAPE;
-    const int64_t rows = numel(x) / n;
-    if (rows <= 0 || numel(q) < rows * P * n) return RAD_E_SHAPE;
-
-    // validated before the loop, because an OpenMP body cannot return
-    for (int64_t i = 0; i < P * S * n; ++i) {
-        const int64_t c = ld_int(pr->dtype, pr->data, i);
-        if (c < 0 || c >= n) return RAD_E_INVAL;
-    }
-
-    REF_PAR_FOR(rows * P * n * S)
-    for (int64_t r = 0; r < rows; ++r) {
-        std::vector<float> buf((size_t)n);
-        const int64_t xb = rowoff(x, r, n), qb = rowoff(q, r, P * n);
-        const int64_t xs = laststride(x), qs = laststride(q);
-        for (int64_t p = 0; p < P; ++p) {
-            for (int64_t k = 0; k < n; ++k) buf[(size_t)k] = ldt(x, xb + k * xs) / ldt(sc, p * n + k);
-            for (int64_t st = 0; st < S; ++st) {
-                const int64_t t0 = (p * S + st) * n, a0 = (p * S + st) * (n / 2);
-                for (int64_t j = 0; j < n / 2; ++j) {
-                    const int64_t ia = ld_int(pr->dtype, pr->data, t0 + 2 * j);
-                    const int64_t ib = ld_int(pr->dtype, pr->data, t0 + 2 * j + 1);
-                    const float th = ldt(an, a0 + j), c = ref_cos(th), sn = ref_sin(th);
-                    const float va = buf[(size_t)ia], vb = buf[(size_t)ib];
-                    buf[(size_t)ia] = va * c + vb * sn;
-                    buf[(size_t)ib] = vb * c - va * sn;
-                }
-            }
-            for (int64_t k = 0; k < n; ++k) st_dt(q->dtype, q->data, qb + (p * n + k) * qs, buf[(size_t)k]);
-        }
-    }
-    return RAD_OK;
-}
-
-/* ParoQuant's activation quantiser: the rotation as a dense matrix, y[j] = sum_i T[j][i] * x[i] / D[i]
- * per (part, 128-column group), then the quantiser named by `q`'s dtype. T is an f16 weight, one
- * [128, 128] matrix per (part, group), composed by rad-convert from the givens tables ("t.dense"). */
-int ref_givens_dense_quant(const RadArgs* a, RadStream) {
-    if (!have(a, 5)) return RAD_E_INVAL;
-    const RadTensor *x = &a->t[0], *tm = &a->t[1], *sc = &a->t[2], *q = &a->t[3], *s = &a->t[4];
-    const int64_t n = p_int(a, "n", 0), P = p_int(a, "parts", 1), g = p_int(a, "group", 0);
-    if (n <= 0 || P <= 0 || g != 128 || n % g != 0) return RAD_E_SHAPE;
-    const bool i8 = q->dtype == RAD_I8;
-    if (!i8 && q->dtype != RAD_F8E4M3) return RAD_E_DTYPE;
-    if (std::strcmp(p_str(a, "out", ""), i8 ? "i8" : "fp8") != 0) return RAD_E_DTYPE;   // `out` names q's dtype
-    const int64_t rows = numel(x) / n, ngrp = n / g;
-    if (rows <= 0 || numel(tm) < P * n * g || numel(sc) < P * n || numel(q) < rows * P * n ||
-        numel(s) < rows * P * ngrp) return RAD_E_SHAPE;
-    const float qmax = i8 ? 127.0f : 448.0f;
-    REF_PAR_FOR(rows * P * n * g)
-    for (int64_t r = 0; r < rows; ++r) {
-        const int64_t xb = rowoff(x, r, n), qb = rowoff(q, r, P * n);
-        const int64_t xs = laststride(x), qs = laststride(q);
-        std::vector<float> in((size_t)g), y((size_t)g);
-        for (int64_t p = 0; p < P; ++p)
-            for (int64_t gi = 0; gi < ngrp; ++gi) {
-                for (int64_t i = 0; i < g; ++i)
-                    in[(size_t)i] = ldt(x, xb + (gi * g + i) * xs) / ldt(sc, p * n + gi * g + i);
-                float amax = 0.0f;
-                for (int64_t j = 0; j < g; ++j) {
-                    double acc = 0.0;
-                    for (int64_t i = 0; i < g; ++i)
-                        acc += (double)ldt(tm, ((p * ngrp + gi) * g + j) * g + i) * (double)in[(size_t)i];
-                    y[(size_t)j] = (float)acc;
-                    amax = std::max(amax, std::fabs(y[(size_t)j]));
-                }
-                const float scl = amax > 0.0f ? amax * (1.0f / qmax) : 1.0f;
-                const float inv = 1.0f / scl;
-                for (int64_t j = 0; j < g; ++j) {
-                    float v = y[(size_t)j] * inv;
-                    if (v > qmax) v = qmax;
-                    if (v < -qmax) v = -qmax;
-                    if (i8) v = std::nearbyint(v);
-                    st_dt(q->dtype, q->data, qb + (p * n + gi * g + j) * qs, v);
-                }
-                stt(s, rowoff(s, r, P * ngrp) + (p * ngrp + gi) * laststride(s), scl);
-            }
-    }
-    return RAD_OK;
+    return had_quant_act_q8(a, 127.0f, 128);
 }
 
 

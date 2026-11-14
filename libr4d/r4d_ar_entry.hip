@@ -18,7 +18,6 @@
  * with a 60-second timeout and a named error.
  */
 
-#include "r4d_chain.h"
 #include "r4d_args.h"
 #include "r4d.h"
 #include "r4d_ar_shards.h"
@@ -29,6 +28,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <vector>
 #include <chrono>
@@ -76,22 +77,38 @@ struct Rendezvous {
     int  failed = 0;
 };
 
-Rendezvous g_rv;
+/* One rendezvous per tensor-parallel group. Several engines may run in one process
+ * (docs/MULTIMODEL.md), each with its own ranks 0..world-1, so the ranks that meet are the ranks of
+ * one group: the core names it in init's `tp_group` parameter (absent, the one group 0). Entries
+ * live for the process; a group's id is reused only by a later engine with the same ranks. */
+std::mutex                                       g_rv_mu;
+std::map<long long, std::unique_ptr<Rendezvous>> g_rvs;
+
+Rendezvous& rv_for(long long group) {
+    std::lock_guard<std::mutex> lk(g_rv_mu);
+    std::unique_ptr<Rendezvous>& r = g_rvs[group];
+    if (!r) r.reset(new Rendezvous());
+    return *r;
+}
 
 /* Sense-reversing barrier on a monotone epoch, so a rank that wakes and re-enters for the next
  * instance cannot be counted twice. The timeout is not recovery; it turns a startup deadlock into
  * a named error instead of a silent hang. */
-int rv_barrier(int world) {
-    std::unique_lock<std::mutex> lk(g_rv.m);
-    const int e = g_rv.epoch;
-    if (++g_rv.arrived == world) {
-        g_rv.arrived = 0;
-        g_rv.epoch++;
-        g_rv.cv.notify_all();
+int rv_barrier(Rendezvous& rv, int world) {
+    std::unique_lock<std::mutex> lk(rv.m);
+    const int e = rv.epoch;
+    if (++rv.arrived == world) {
+        rv.arrived = 0;
+        rv.epoch++;
+        rv.cv.notify_all();
         return RAD_OK;
     }
-    const bool ok = g_rv.cv.wait_for(lk, std::chrono::seconds(60),
-                                     [&] { return g_rv.epoch != e; });
+    const bool ok = rv.cv.wait_for(lk, std::chrono::seconds(60),
+                                   [&] { return rv.epoch != e; });
+    /* A rank that gave up takes its arrival back: a peer that failed before arriving would
+     * otherwise leave it counted, and the group's next engine (its id is reused) would be released
+     * one rank early. */
+    if (!ok) --rv.arrived;
     return ok ? RAD_OK : RAD_E_STATE;
 }
 
@@ -99,6 +116,7 @@ int rv_barrier(int world) {
  * ascending global rank with this rank removed (the order libr4d's wide entry points take). */
 struct ArInst {
     int  rank = 0, world = 0;
+    long long group = 0;      /* the tensor-parallel group it rendezvoused in (rv_for) */
     long my_scratch = 0, my_flags = 0, my_seq = 0, locpack = 0;
     /* A 2-rank host-mailbox instance's VRAM mirror of its slots, 0 otherwise (r4d_ar_seq.h). */
     long my_stage = 0;
@@ -183,18 +201,19 @@ long long ar8_pieces_for(const ArInst* in, long numel, long long asked) {
  * card's link, and after one barrier every rank derives the same weights from the same eight
  * entries. */
 int ar8_settle(ArInst* in, int rank, int world) {
+    Rendezvous& rv = rv_for(in->group);
     static std::once_flag said_links, said_unknown, said_set;
     const R4DAr8Settings set = ar8_settings();
     R4DArLink own;
     if (set.weights == R4D_AR8_WEIGHTS_AUTO && !ar8_own_link(&own)) own = R4DArLink();
     {
-        std::lock_guard<std::mutex> lk(g_rv.m);
-        g_rv.ar8_link[rank] = own;
+        std::lock_guard<std::mutex> lk(rv.m);
+        rv.ar8_link[rank] = own;
     }
-    const int rc = rv_barrier(world);
+    const int rc = rv_barrier(rv, world);
     if (rc != RAD_OK) return rc;
 
-    const R4DArLink* all = g_rv.ar8_link;
+    const R4DArLink* all = rv.ar8_link;
     in->pieces = set.pieces;
     in->weights_min = set.weights_min;
     in->pieces_min = set.pieces_min;
@@ -258,11 +277,13 @@ long kSeqWords(long nbw) { return 2L * nbw + 32; }
  *
  * Cost: at a 4096-token chunk on a 5120-wide residual, 40 MiB a slot and 80 MiB for the pair. One
  * set serves every op with the same (rank, world, dtype, bound); see the cache below. */
-int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, int host) {
+int build(ArInst* in, long long group, int rank, int world, long long max_numel, int dtype_code,
+          int host) {
     if (world < 2 || world > R4D_MAX_RANKS) return RAD_E_SHAPE;
     if (rank < 0 || rank >= world) return RAD_E_INVAL;
     if (max_numel <= 0) return RAD_E_INVAL;
 
+    in->group = group;
     in->rank = rank;
     in->world = world;
     in->host = host;
@@ -382,14 +403,15 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
     in->my_stage   = stg;
     in->gate_ctr   = sq + 2L * maxb * 4;   /* the word after the sequence counters (r4d_ar_seq.h) */
 
+    Rendezvous& rv = rv_for(group);
     {
-        std::lock_guard<std::mutex> lk(g_rv.m);
-        g_rv.scratch[rank] = sc;
-        g_rv.flags[rank]   = fl;
-        g_rv.seq[rank]     = sq;
-        g_rv.dev[rank]     = dev;
+        std::lock_guard<std::mutex> lk(rv.m);
+        rv.scratch[rank] = sc;
+        rv.flags[rank]   = fl;
+        rv.seq[rank]     = sq;
+        rv.dev[rank]     = dev;
     }
-    int rc = rv_barrier(world);
+    int rc = rv_barrier(rv, world);
     if (rc != RAD_OK) return rc;
 
     /* Peer access is per context, so each rank enables its own, after the publish barrier where
@@ -400,17 +422,17 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
     int j = 0;
     for (int r = 0; r < world; ++r) {
         if (r == rank) continue;
-        if (!g_rv.scratch[r] || !g_rv.flags[r]) return RAD_E_STATE;
-        in->peer_scratch[j] = g_rv.scratch[r];
-        in->peer_flags[j]   = g_rv.flags[r];
+        if (!rv.scratch[r] || !rv.flags[r]) return RAD_E_STATE;
+        in->peer_scratch[j] = rv.scratch[r];
+        in->peer_flags[j]   = rv.flags[r];
         ++j;
-        if (!host && g_rv.dev[r] != dev)
-            R4D_TRY("ar_ipc_enable_peer", r4d_ar_ipc_enable_peer((long)g_rv.dev[r]));
+        if (!host && rv.dev[r] != dev)
+            R4D_TRY("ar_ipc_enable_peer", r4d_ar_ipc_enable_peer((long)rv.dev[r]));
     }
 
     /* Second barrier: no rank may launch until every rank has enabled peer access, or the first
      * message would be pushed into a mapping the receiver has not opened. */
-    return rv_barrier(world);
+    return rv_barrier(rv, world);
 }
 
 /* ------------------------------------------------------------------ one world, shared
@@ -430,12 +452,13 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
  * The rendezvous stays symmetric because every rank declares the same graph in the same order:
  * the Nth all-reduce misses the cache on every rank or on none. */
 struct CacheKey {
+    long long group;          /* the tensor-parallel group: another engine's ranks never share */
     int       rank, world, dtype;
     long long numel;
     int       host;
     bool operator==(const CacheKey& o) const {
-        return rank == o.rank && world == o.world && dtype == o.dtype && numel == o.numel &&
-               host == o.host;
+        return group == o.group && rank == o.rank && world == o.world && dtype == o.dtype &&
+               numel == o.numel && host == o.host;
     }
 };
 
@@ -459,7 +482,7 @@ int acquire(const CacheKey& k, ArInst** out) {
      * rank has one declare thread, so no two builders race for one key. */
     ArInst* in = new (std::nothrow) ArInst();
     if (!in) return RAD_E_NOMEM;
-    int rc = build(in, k.rank, k.world, k.numel, k.dtype, k.host);
+    int rc = build(in, k.group, k.rank, k.world, k.numel, k.dtype, k.host);
     if (rc != RAD_OK) { delete in; return rc; }
     {
         std::lock_guard<std::mutex> lk(g_cache_mu);
@@ -515,7 +538,8 @@ static int ar_init(const RadParam* p, int n_p, int rank, int world, int host, vo
     if (numel <= 0) return RAD_E_INVAL;
 
     ArInst* in = nullptr;
-    int rc = acquire(CacheKey{ rank, world, dt, numel, host }, &in);
+    const long long group = pgeti_hi(p, n_p, "tp_group", 0);
+    int rc = acquire(CacheKey{ group, rank, world, dt, numel, host }, &in);
     if (rc != RAD_OK) return rc;
     *out = in;
     return RAD_OK;
@@ -542,7 +566,8 @@ static int ar_mn_acquire(const RadParam* p, int n_p, int rank, int world, int ho
     if (M <= 0 || K <= 0) return RAD_E_INVAL;
 
     ArInst* in = nullptr;
-    int rc = acquire(CacheKey{ rank, world, 0 /* bf16 */, M * K, host }, &in);
+    const long long group = pgeti_hi(p, n_p, "tp_group", 0);
+    int rc = acquire(CacheKey{ group, rank, world, 0 /* bf16 */, M * K, host }, &in);
     if (rc != RAD_OK) return rc;
     *out = in;
     return RAD_OK;
@@ -886,7 +911,7 @@ extern "C" int r4d_rad_ar_oneshot_2rank_exact(const RadArgs* a, RadStream s) {
                                    c.in->peer_flags[0], c.in->my_flags, c.in->my_seq,
                                    c.in->slot16, c.inp, c.out, c.numel, c.in->dtype,
                                    (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
-                                   c.in->my_stage));
+                                   c.in->my_stage, ar_chain(a, c.numel)));
     return RAD_OK;
 }
 
@@ -929,7 +954,7 @@ extern "C" int r4d_rad_ar_oneshot_2rank_wht6(const RadArgs* a, RadStream s) {
                                        c.in->peer_flags[0], c.in->my_flags, c.in->my_seq,
                                        c.in->slot16, c.inp, c.out, c.numel, c.in->dtype,
                                        (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
-                                       c.in->my_stage));
+                                       c.in->my_stage, ar_chain(a, c.numel)));
         return RAD_OK;
     }
 
@@ -1317,7 +1342,7 @@ extern "C" int r4d_rad_ar_ln_had_quant_i8(const RadArgs* a, RadStream s) {
  * size above --tp-wire-min-kb), and both ranks decide on the same T. A wire-6 chunk that would
  * straddle a row is refused as a shape. */
 /* `hi8`: ar_rmsnorm_had_quant_i8g, the same with had_quant_act_i8g's quantiser on the norm's pass
- * (int8 codes, K whole 128s, no post-norm). */
+ * (int8 codes, K whole scale groups of 128 or IQ8R's 256, no post-norm). */
 static int rad_ar_rmsnorm_quant(const RadArgs* a, RadStream s, bool hi8) {
     const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
     if (!in) return RAD_E_STATE;
@@ -1349,9 +1374,10 @@ static int rad_ar_rmsnorm_quant(const RadArgs* a, RadStream s, bool hi8) {
     /* A row must be whole 16B words, since a block pushes its rows as words. */
     if (K % 8) return RAD_E_SHAPE;
 
-    const long long grp = r4d_quant_act_fp8_group();
+    const long long g0 = r4d_quant_act_fp8_group();
+    const long long grp = r4d_geti_or(a, "group", g0);
+    if (grp != g0 && !(hi8 && grp == R4D_I8_GROUP_WIDE)) return RAD_E_SHAPE;
     const long long nkb = (K + grp - 1) / grp;
-    if (r4d_geti_or(a, "group", grp) != grp) return RAD_E_SHAPE;
     if (hi8 && K % grp) return RAD_E_SHAPE;
     if (r4d_numel(w) != K) return RAD_E_SHAPE;
     if (w->dtype != RAD_F32 && w->dtype != RAD_BF16) return RAD_E_DTYPE;
@@ -1422,7 +1448,8 @@ static int rad_ar_rmsnorm_quant(const RadArgs* a, RadStream s, bool hi8) {
               r4d_addr(sc), (int)M, (int)K, eps, wadd, w_f32,
               (int)rp, (int)yp, (int)qp, (int)sp,
               (long)(uintptr_t)s, nblocks, nthreads, cfgv.drain, cfgv.acq, wire,
-              in->locpack, in->slot_bytes / 2, in->my_stage)
+              in->locpack, in->slot_bytes / 2, in->my_stage, (int)grp,
+              r4d_geti_or(a, "chain", 0) != 0 ? 1 : 0)
         : r4d_ar_rmsnorm_quant_fp8(
               in->peer_scratch[0], in->my_scratch,
               in->peer_flags[0], in->my_flags, in->my_seq,
@@ -1510,7 +1537,7 @@ static int rad_ar_rmsnorm_quant_i8(const RadArgs* a, RadStream s, bool grp) {
         v.sl ? (v.sl->dtype == RAD_F32) : 0, r4d_addr(v.ob), r4d_addr(v.q), r4d_addr(v.sc), (int)M,
         (int)K, (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 0.0),
         v.w->dtype == RAD_F32, (int)v.rp, (int)v.yp, (long)(uintptr_t)s, nblocks, cfgv.drain,
-        cfgv.acq, grp ? 1 : 0, in->my_stage);
+        cfgv.acq, grp ? 1 : 0, in->my_stage, r4d_geti_or(a, "chain", 0) != 0 ? 1 : 0);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
@@ -1716,8 +1743,7 @@ extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
         sh ? r4d_addr(sh) : 0L, sh ? r4d_addr(sg) : 0L, (long)ye_ld, (long)ew_ld, (long)sh_ld,
         (long)sg_ld, (long)top_k, (long)sig, (long)(uintptr_t)s, nblocks, cfgv.nthreads,
         cfgv.drain, cfgv.acq, has_inv ? (long)(uintptr_t)a->scratch : 0L, early,
-        early ? in->gate_ctr : 0L, in->my_stage,
-        r4d_geti_or(a, "chain", 0) != 0 && r4d_chain_rows_ok(M) ? 1L : 0L);
+        early ? in->gate_ctr : 0L, in->my_stage, (long)r4d_geti_or(a, "chain", 0));
     if (rc != 0) return RAD_E_SHAPE;
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
@@ -1847,7 +1873,7 @@ extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
                         (long)M, (long)n, (long)hc, (long)irow, (long)hrow, (long)(uintptr_t)s,
                         nblocks, cfgv.nthreads, cfgv.drain, cfgv.acq, early,
                         early ? in->gate_ctr : 0L, in->my_stage,
-                        r4d_geti_or(a, "chain", 0) != 0 && r4d_chain_rows_ok(M) ? 1L : 0L));
+                        (long)r4d_geti_or(a, "chain", 0)));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 

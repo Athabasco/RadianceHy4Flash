@@ -103,14 +103,16 @@ struct Model {
 };
 
 /* Declare runs once per rank, in one process, on the rank's own thread (spec §1, §9), so the
- * model state is indexed by rank and read back in step() with rad_rank(). */
-static Model g_model[MAX_RANKS];
+ * model state is per instance: indexed by the instance's slot (unique across every engine in the
+ * process, rad_build_slot) and read back in step() with rad_slot(). */
+static Model g_model[MAX_SLOTS];
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
 
-    Model& m = g_model[ctx->rank];
+    Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     RAD_ARCH_TRY(geom_from(m.g, meta, ctx, "bf16", RAD_BF16));
@@ -479,7 +481,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    Model& m = g_model[rad_rank(c)];
+    Model& m = g_model[rad_slot(c)];
 
     /* An encoder pass runs only the vision tower (RadBatch::enc). */
     if (batch->enc) {
@@ -539,9 +541,23 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
 }
 
+/* Chained launches pay on the plain-bf16 trunk with a drafter and without one: every kernel of
+ * its decode step but the gated delta net's two and the vocabulary GEMM has a chained form
+ * (libr4d's rad_kernel_chain). Ms a decode step unchained / chained: Qwen3.5-0.8B on one R9700
+ * 3.89 / 3.60 at one sequence and 4.72 / 4.46 at four; Qwen3.8-27B as bf16 on two, where the
+ * bf16 GEMMs are nearly all of the step, 48.04 / 47.41 and 49.57 / 48.81. */
+static int probe(const RadModelMeta* meta, RadArchProbe* out) {
+    if (!meta || !out) return RAD_E_INVAL;
+    out->chain_pays = RAD_CHAIN_ALWAYS;
+    return RAD_OK;
+}
+
 }  /* namespace qwen35_bf16 */
 
 #ifndef RAD_ARCH_NO_EXPORTS
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
+RAD_ARCH_PROBE(qwen35_bf16)
 RAD_ARCH_PLUGIN(qwen35_bf16, "qwen35", "", "0.1.0",
                 "Qwen3.5 / 3.6 / 3.8 dense (0.8B..27B), bf16 weights and activations, gated "
                 "attention over paged KV every fourth layer and gated delta net between")

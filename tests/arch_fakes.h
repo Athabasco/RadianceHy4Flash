@@ -127,6 +127,8 @@ struct RadBuilder {
     int64_t        drafter_short = 0;     /* rad_drafter_short_block */
     /* A tree drafter's parents buffer (rad_drafter_tree), 0 for a chain. */
     rad_buf        drafter_parents = 0;
+    /* The routing counts' table (rad_route_table), 0 when the plugin declared none. */
+    rad_buf        route_table = 0;
 
     /* The buffers named to rad_buf_concurrent: the ones a second lane touches. */
     std::vector<rad_buf> concurrent;
@@ -531,6 +533,8 @@ extern "C" int rad_step_fail(RadCtx* c, const char* what) {
 }
 extern "C" const RadBatch* rad_batch(RadCtx* c)      { return c->batch; }
 extern "C" int             rad_rank(RadCtx* c)       { return c->rank; }
+/* One engine: the slot is the rank (RadBuildCtx::slot_base zero). */
+extern "C" int             rad_slot(RadCtx* c)       { return c->rank; }
 extern "C" int             rad_world_size(RadCtx* c) { return c->world; }
 extern "C" int             rad_ctx_wgp_count(RadCtx*) { return 32; }
 /* The context itself, so a copy issued on the step's stream is recorded in it (rad_memcpy_async). */
@@ -539,6 +543,11 @@ extern "C" int             rad_stream_sync(RadStream s) { (void)s; return RAD_OK
 extern "C" int rad_route_report(RadCtx* c, int layer, const RadRouting* r) {
     (void)r;
     c->routed_layers.push_back(layer);
+    return RAD_OK;
+}
+extern "C" int rad_route_table(RadBuilder* b, rad_buf table) {
+    if (!b || table == 0) return RAD_E_INVAL;
+    b->route_table = table;
     return RAD_OK;
 }
 /* No card-side histogram here, so a router writes and reports its own buffer. */

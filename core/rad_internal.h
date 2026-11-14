@@ -51,6 +51,25 @@ private:
     int prev_;
 };
 
+/* The engine a thread works for, in a process serving several models (docs/MULTIMODEL.md §3.3):
+ * its log lines carry the model's name, [name] or [name/r0] with rank tags, and the device layer
+ * files the thread's device allocations under the engine's owner id so they can be parked with it
+ * (rad_dev_page_out). EngineScope sets both for a scope; every thread an engine starts opens one.
+ * Owner 0 is no engine. Names show only once log_model_tags(true): a process of one model prints
+ * as it always has. */
+void log_model_tags(bool on);
+int  engine_owner();
+class EngineScope {
+public:
+    EngineScope(int owner, const char* model);
+    ~EngineScope();
+    EngineScope(const EngineScope&) = delete;
+    EngineScope& operator=(const EngineScope&) = delete;
+private:
+    int         prev_owner_;
+    const char* prev_model_;
+};
+
 #define RAD_LOG(lvl, ...)                                                        \
     do { if ((int)::rad::Log::lvl <= (int)::rad::log_level())                     \
              ::rad::log_emit(::rad::Log::lvl, __FILE__, __LINE__, __VA_ARGS__); } while (0)

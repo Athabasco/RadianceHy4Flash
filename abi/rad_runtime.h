@@ -936,6 +936,9 @@ int             rad_kv_stage_layer(RadCtx* c, rad_kvgroup group, const RadKVGrou
                                    int layer);
 int             rad_kv_stage_next(RadCtx* c, rad_kvgroup group, int layer);
 int             rad_rank(RadCtx* c);
+/* The instance's slot, rad_build_slot() of the declare that built it: what a plugin indexes its
+ * per-instance state by. */
+int             rad_slot(RadCtx* c);
 int             rad_world_size(RadCtx* c);
 /* Workgroups the current rank's card can run concurrently (HIP multiProcessorCount on RDNA;
  * 32 on the host backend or when the backend has no positive count). */

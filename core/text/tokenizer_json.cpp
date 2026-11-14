@@ -13,7 +13,7 @@
 #include "text/tokenizer_regex.h"
 #include "text/gguf.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <cstring>
 #include <fstream>
@@ -22,7 +22,7 @@
 
 namespace rad {
 
-using json = nlohmann::json;
+using json = Json;
 
 namespace {
 
@@ -388,11 +388,16 @@ int read_model(const json& m, VocabBuild& out, const char* origin, uint64_t id_l
             }
             max_id = std::max(max_id, id);
         }
+        /* Two texts on one id: the byte-greatest one holds it, whatever the file's order, as when
+         * the vocab was read through a key-sorted map. */
         out.tokens.assign((size_t)max_id + 1, std::string());
+        std::vector<bool> taken((size_t)max_id + 1, false);
         for (auto it = vocab->begin(); it != vocab->end(); ++it) {
             int32_t id = 0;
             read_id(it.value(), id_limit, &id);
-            out.tokens[(size_t)id] = it.key();
+            std::string& slot = out.tokens[(size_t)id];
+            if (!taken[(size_t)id] || slot < it.key()) slot = it.key();
+            taken[(size_t)id] = true;
         }
         out.types.assign(out.tokens.size(), (uint8_t)RAD_TT_NORMAL);
         return RAD_OK;
@@ -767,7 +772,7 @@ int interpret_tokenizer_json(const json& j, uint64_t id_limit, const char* origi
 int parse_tokenizer_json_buf(std::string_view text, const char* origin, VocabBuild& out) {
     json j;
     try {
-        j = json::parse(text.begin(), text.end());
+        j = json::parse(text);
     } catch (const std::exception& e) {
         RAD_ERR("%s: not valid JSON: %s", origin, e.what());
         return RAD_E_FORMAT;
@@ -779,7 +784,7 @@ int parse_tokenizer_json_buf(std::string_view text, const char* origin, VocabBui
      * larger one, and the bound keeps the token table proportional to the input. */
     const uint64_t id_limit = text.size();
 
-    /* nlohmann throws on the first get<>() of a value with the wrong JSON type. The reader checks
+    /* Json throws on the first get<>() of a value with the wrong JSON type. The reader checks
      * the shapes that decide where things are written; this turns any other mismatch into a
      * format error instead of std::terminate. */
     try {

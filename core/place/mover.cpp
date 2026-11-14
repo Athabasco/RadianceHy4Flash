@@ -560,6 +560,7 @@ int Mover::start_stage(int32_t unit, int64_t slab_slot) {
     if (!src) return RAD_E_STATE;
 
     RAD_TRY(rad_event_wait(mover_, gate_));
+    dev_page_invalidate(dst, us.bytes);
     RAD_TRY(rad_memcpy_async(dst, src, us.bytes, mover_));
     RAD_TRY(rad_event_record(moves_[(size_t)rec].ev, mover_));
 
@@ -1048,7 +1049,10 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
         }
         stats_.ssd_read_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now() - t0).count();
-        for (const Cp& c : cps) RAD_TRY(rad_memcpy_async(c.dst, win + c.wo, c.bytes, mover_));
+        for (const Cp& c : cps) {
+            dev_page_invalidate(c.dst, c.bytes);
+            RAD_TRY(rad_memcpy_async(c.dst, win + c.wo, c.bytes, mover_));
+        }
         RAD_TRY(rad_event_record(win_ev_[(size_t)w], mover_));
         win_rec_[(size_t)w] = 1;
     }
@@ -1167,7 +1171,8 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
 
 /* ------------------------------------------------------------------ the loan */
 static const char* lender_name(int lender) {
-    return lender == Mover::kLendKV ? "KV cache" : "activation arena";
+    return lender == Mover::kLendKV ? "KV cache" : lender == Mover::kLendArena ? "activation arena"
+                                                                             : "fleet's free VRAM";
 }
 
 static char* align_down_ptr(char* p) {
@@ -1272,6 +1277,21 @@ int Mover::lend_from(int lender, const std::vector<LoanStrip>& strips) {
              humanb(bytes_new).c_str());
     count_flex();
     return RAD_OK;
+}
+
+int64_t Mover::lendable_bytes() const {
+    if (!plan_ || !plan_->dynamic) return 0;
+    std::vector<int64_t> n(pools_.size(), 0);
+    for (size_t u = 0; u < unit_.size(); ++u) {
+        const UnitState& us = unit_[u];
+        if (us.klass < 0 || us.tier != Tier::HostPinned || us.pool_slot < 0) continue;
+        if (!plan_->units[u].movable) continue;
+        ++n[(size_t)us.klass];
+    }
+    int64_t b = 0;
+    for (size_t c = 0; c < pools_.size(); ++c)
+        if (pools_[c].stride > 0) b += n[c] * (pools_[c].stride + (int64_t)RAD_ALIGN_UNIT);
+    return b > 0 ? b + 2 * (int64_t)RAD_ALIGN_UNIT : 0;
 }
 
 int Mover::set_loan(int lender, int64_t amount) {
@@ -1709,6 +1729,7 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
             }
             const int64_t g = to < 0 ? cp.pool.take() : -1;
             if (to >= 0) {
+                dev_page_invalidate(cp.slot_ptr(to), us.bytes);
                 RAD_TRY(rad_memcpy_async(cp.slot_ptr(to), cp.slot_ptr(from), us.bytes, mover_));
                 us.slab_slot = to;
             } else if (g >= 0) {
@@ -1790,7 +1811,70 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
     return RAD_OK;
 }
 
+int Mover::drop_slab(HeatEngine* heat, std::vector<std::pair<const void*, int64_t>>* free_ranges) {
+    if (pools_.empty()) return RAD_OK;
+    if (!compute_ || !mover_) return RAD_OK;   /* nothing ever moved: the slab is as loaded */
+    RAD_TRY(flush_moves());
+    RAD_TRY(rad_stream_sync(mover_));
+    RAD_TRY(retire(heat));
+    RAD_TRY(rad_stream_sync(compute_));
+    RAD_TRY(retire(heat));
+    std::vector<std::pair<size_t, int64_t>> freed;
+    for (int32_t u = 0; u < (int32_t)unit_.size(); ++u) {
+        UnitState& us = unit_[(size_t)u];
+        if (us.klass < 0 || us.slab_slot < 0) continue;
+        ClassPools& cp = pools_[(size_t)us.klass];
+        if (cp.is_flex(us.slab_slot)) continue;   /* the loans were recalled; nothing is here */
+        if (us.pool_slot >= 0) {
+            us.tier = Tier::HostPinned;
+            us.site = Site::DeviceZeroCopy;
+        } else if (us.hot || ((size_t)u < file_ok_.size() && file_ok_[(size_t)u])) {
+            /* The container is its copy, and the file stager reads it back when routing needs it
+             * (a hot-cache unit, or one the stager covers). */
+            us.tier = Tier::SSD;
+            us.hot = false;
+        } else {
+            continue;   /* its only copy is this slot */
+        }
+        freed.push_back({ (size_t)us.klass, us.slab_slot });
+        us.slab_slot = -1;
+        republish(u);
+        ++stats_.dropped;
+        if (heat) {
+            heat->set_tier(u, us.tier);
+            heat->set_busy(u, false);
+        }
+    }
+    for (const auto& f : freed) pools_[f.first].slab.add_free(f.second);
+    {
+        int64_t kept = 0, gone = 0;
+        for (const UnitState& us : unit_)
+            if (us.slab_slot >= 0 && us.klass >= 0 && !pools_[(size_t)us.klass].is_flex(us.slab_slot)) kept += us.bytes;
+        for (const auto& f : freed) gone += pools_[f.first].stride;
+        RAD_INFO("mover: the slab gave back %s for a park; %s stays (units with no other copy)",
+                 humanb(gone).c_str(), humanb(kept).c_str());
+    }
+    /* What stays in a budgeted slot, per class; every other slot's stretch is free. */
+    for (size_t k = 0; k < pools_.size(); ++k) {
+        ClassPools& cp = pools_[k];
+        if (!cp.slab_base || cp.stride <= 0 || cp.n_fixed <= 0) continue;
+        std::vector<char> used((size_t)cp.n_fixed, 0);
+        for (const UnitState& us : unit_)
+            if ((size_t)us.klass == k && us.slab_slot >= 0 && us.slab_slot < cp.n_fixed) used[(size_t)us.slab_slot] = 1;
+        for (int64_t a = 0; a < cp.n_fixed;) {
+            if (used[(size_t)a]) { ++a; continue; }
+            int64_t b = a;
+            while (b < cp.n_fixed && !used[(size_t)b]) ++b;
+            free_ranges->push_back({ (char*)cp.slab_base + a * cp.stride, (b - a) * cp.stride });
+            a = b;
+        }
+    }
+    count_flex();
+    return RAD_OK;
+}
+
 void Mover::queue_move_copy(void* dst, const void* src, int64_t bytes, int rec) {
+    dev_page_invalidate(dst, bytes);   /* a parked copy of that slot is stale from here */
     move_segs_.push_back(RadCopySeg{ src, dst, bytes });
     move_recs_.push_back((int32_t)rec);
 }
@@ -1822,6 +1906,12 @@ int Mover::retire(HeatEngine* heat) {
 
         --copying_[(size_t)m.unit];
         UnitState& us = unit_[(size_t)m.unit];
+        /* The copy has landed: a parked copy of the slot made while it ran is stale too. */
+        {
+            ClassPools& cp = pools_[(size_t)us.klass];
+            if (m.slab_slot >= 0) dev_page_invalidate(cp.slot_ptr(m.slab_slot), cp.stride);
+            if (m.to_slot >= 0) dev_page_invalidate(cp.slot_ptr(m.to_slot), cp.stride);
+        }
         switch (m.kind) {
             case Move::Kind::Promote:
                 us.slab_slot = m.slab_slot;

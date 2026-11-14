@@ -175,15 +175,15 @@ attention sums its softmax over pages in table order, and float addition is not 
 
 **The score plane is the one buffer whose size is a product of the deployment's bounds** — a row
 of `max_ctx / ratio` floats a query, 512 MiB at a 2048-row step and 256K of context. Under
-`--prefill-span`, where every step that mixes sequences fits in a MoE pass
-(`RadBuildCtx::max_mixed_tok`), it is declared a pass tall instead of `--max-num-batched-tokens`
+`prefill-span`, where every step that mixes sequences fits in a MoE pass
+(`RadBuildCtx::max_mixed_tok`), it is declared a pass tall instead of `max-num-batched-tokens`
 rows: a wider step is one sequence, scored and selected in windows of the plane's rows, each handed
 as a sequence of its own rows. Every operand a query row reads is its own (query, position,
 selection), so a row is scored and selected exactly as in one pass, and a row two windows share is
 written twice with the same bytes.
 
 **The caller bounds the history.** Both ops size their grid from the declared width (the live count
-is device data), so a short prompt would otherwise launch for the whole `--max-model-len`. The
+is device data), so a short prompt would otherwise launch for the whole `max-model-len`. The
 architecture narrows the score operand's column count to a host-side ceiling from the batch, with
 the pitch unchanged. **Every term of the ceiling is generous**, because an underestimate silently
 drops blocks.

@@ -41,15 +41,15 @@ constexpr int64_t kEmbd = 256, kFF = 128, kExperts = 8, kTopK = 2, kHC = 4, kLow
 bool protected_expert(long long e) { return e == 3 || e == 5; }
 
 RadEncoding codebook(const char* dtype) {
-    const bool w5 = !std::strcmp(dtype, "w5nl64a8h"), bf = !std::strcmp(dtype, "w4nla8h");
-    const int64_t group = !std::strcmp(dtype, "w4nl32a8h") ? 32 : bf ? 128 : 64;
+    const bool w5 = !std::strcmp(dtype, "w5nl64a8h");
+    const int64_t group = !std::strcmp(dtype, "w4nl32a8h") ? 32 : 64;
     RadEncoding e;
     rad_enc_clear(&e);
     rad_enc_copy_str(e.scheme, "affine");
     rad_enc_copy_str(e.transform, "fwht128");
     rad_enc_add_plane(&e, "codes", w5 ? RAD_U5 : RAD_U4, 1, 1);
-    rad_enc_add_plane(&e, "scale", bf ? RAD_BF16 : RAD_F8E4M3, 1, group);
-    if (!bf) rad_enc_add_plane(&e, "scale.1", RAD_F32, 0, 0);
+    rad_enc_add_plane(&e, "scale", RAD_F8E4M3, 1, group);
+    rad_enc_add_plane(&e, "scale.1", RAD_F32, 0, 0);
     rad_enc_add_table(&e, "table", RAD_F32, 1, w5 ? 32 : 16);
     return e;
 }
@@ -131,9 +131,11 @@ int declare_layer(RadBuilder* b, MoeFP8* mlp, HyperConn* hc) {
     x.x = decl_b(b, nm.f("x"), RAD_BF16, { T, kEmbd });
     RAD_ARCH_TRY(x.declare_qs(b, nm, g, "x", kEmbd, 0, true));
     x.q8_fed = true;
-    RAD_ARCH_TRY(hr.declare_qs(b, nm, g, "moe_hr", kEmbd));
+    RAD_ARCH_TRY(hr.declare_qs(b, nm, g, "moe_hr", kEmbd, 0, true, false, RAD_FP8_BLOCK));
+    hr.q8_fed = hr.q8_rot = true;
     eff.x = decl_b(b, nm.f("moe_eff"), RAD_BF16, { ER, kFF });
-    RAD_ARCH_TRY(eff.declare_qs(b, nm, g, "moe_eff", kFF, ER));
+    RAD_ARCH_TRY(eff.declare_qs(b, nm, g, "moe_eff", kFF, ER, true, false, RAD_FP8_BLOCK));
+    eff.q8_fed = eff.q8_rot = true;
     sff.x = decl_b(b, nm.f("moe_sff"), RAD_BF16, { T, kFF });
     RAD_ARCH_TRY(sff.declare_qs(b, nm, g, "moe_sff", kFF, 0, true));
     sff.q8_fed = true;
@@ -142,8 +144,8 @@ int declare_layer(RadBuilder* b, MoeFP8* mlp, HyperConn* hc) {
     hw.h = decl_b(b, nm.f("h_wide"), RAD_BF16, { T, kHC * kEmbd });
     hw.x = x;
     hw.inj = decl_b(b, nm.f("hc_inj"), RAD_BF16, { T, kHC });
-    hw.rq = hr.q;
-    hw.rs = hr.s;
+    hw.rq = hr.cq();
+    hw.rs = hr.cs();
     HyperConn::Config hcfg;
     hcfg.hc = kHC;
     hcfg.lowrank = kLowRank;
@@ -190,7 +192,11 @@ TEST(flash_next_experts_declare_on_libavx_alone) {
     Registry reg;
     const int st = reg.load_dir(home() + "/kernels", { "libavx" });
     if (st == RAD_E_IO || !reg.plugin("libavx")) ARTIFACT_MISSING(home() + "/kernels/libavx.so");
-    for (const char* dtype : { "w4nla8h", "w4nl64a8h", "w4nl32a8h", "w5nl64a8h" }) {
+    /* The routed arm at int8 activations writes its gated product with gated_had_quant_i8g, which
+     * libavx has no row for. */
+    if (!reg.schema("gated_had_quant_i8g"))
+        SKIP("libavx declares no gated_had_quant_i8g, the int8 routed arm's gated quantiser");
+    for (const char* dtype : { "w4nl64a8h", "w4nl32a8h" }) {
         Builder b(reg, meta(), ctx());
         b.set_sources([dtype](const std::string& name, const Program&, WeightSource* out) {
             return sources(dtype, name, out);
@@ -226,7 +232,7 @@ TEST(flash_next_experts_declare_on_libavx_alone) {
             }
         }
         for (const char* want : { "hc_read", "hc_write", "gemm_nt", "router_topk", "moe_scatter",
-                                  "moe_gemm_q", "had_quant_act_fp8", "silu_mul", "moe_gemm",
+                                  "moe_gemm_q", "silu_mul", "moe_gemm",
                                   "gemm_nt_q", "moe_gather" })
             if (!ops.count(want)) {
                 fprintf(stderr, "    %s: the layer declares no '%s'\n", dtype, want);
@@ -247,8 +253,8 @@ TEST(flash_next_experts_declare_on_libavx_alone) {
                 CHECK(w.layout_tag.empty());
             }
         }
-        /* Six codebook experts, codes view and (but at w4nla8h) scale view, both projections. */
-        CHECK_EQ(joined, (std::strcmp(dtype, "w4nla8h") ? 4 : 2) * 6);
+        /* Six codebook experts, codes view and scale view, both projections. */
+        CHECK_EQ(joined, 4 * 6);
     }
 }
 

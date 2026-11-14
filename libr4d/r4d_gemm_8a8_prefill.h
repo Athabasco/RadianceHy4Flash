@@ -94,13 +94,19 @@ struct PrefillPlain {
 /* ROWF (RB 32): the weight's scale is one f32 a row times one f32 a 128-K block for all rows (an
  * IQR weight under kRowF32): the block's factor `Cf[kb]` is the fold's wave-uniform scale, as RB
  * 32's, and each row's `Rs[n]` scales its outputs at the store. */
-template <bool I8, int RB, class Pre, bool ROWF = false>
+/* SB (I8, RB 0): the K extent of one scale on both sides, 128 or IQ8R's 256. A block of SB
+ * columns is SB / kPFK staged tiles; the int32 sums run over all of them before the one fold
+ * (|sum| <= 256 * 127 * 127 < 2^24, exact in the f32 conversion), so at 256 the tile folds half as
+ * often. */
+template <bool I8, int RB, class Pre, bool ROWF = false, uint32_t SB = kBlock>
 __device__ __forceinline__ void gemm_8a8_prefill_body(
     const uint8_t* __restrict__ A, const float* __restrict__ Sa, const uint8_t* __restrict__ W,
     const uint16_t* __restrict__ Sw, uint16_t* __restrict__ C, uint32_t M, uint32_t K, uint32_t N,
     uint32_t a_ld, uint32_t sa_ld, uint32_t sw_ld, const Pre& pre,
     const float* __restrict__ Rs = nullptr, const float* __restrict__ Cf = nullptr) {
     static_assert(!ROWF || RB == 32, "a row's scale and a block's factor fold as RB 32's one scale");
+    static_assert(SB == kBlock || (I8 && RB == 0 && SB == 256u), "a 256 group is the per-row int8 tile's");
+    constexpr uint32_t kTPB = SB / kPFK;   // staged tiles a scale block
     constexpr uint32_t P = lds_pitch<kPFK>();
     static_assert(kPBM * 2u == kPWaves * kWave, "two threads stage an activation row");
     // Double-buffered: one barrier a staged tile, which publishes it.
@@ -129,7 +135,7 @@ __device__ __forceinline__ void gemm_8a8_prefill_body(
         bn = r / gm;
     }
     const uint32_t m0 = bm * kPBM, n0 = bn * kPBN;
-    const uint32_t ksuper = K / kSuperK, nkb = K / kBlock;
+    const uint32_t ksuper = K / kSuperK, nkb = K / SB;
     pre.begin(bm, bn, &s_a[0][0]);
 
     // Staging: two threads a row, 32 bytes each. Rows past M re-read row M-1, and every load is
@@ -176,20 +182,20 @@ __device__ __forceinline__ void gemm_8a8_prefill_body(
      * k steps from `cur`. The first k step of a block starts from a zero accumulator, so `raw` needs
      * no clearing after the fold. */
     auto tile = [&](uint32_t kb, uint32_t half, Stage8 (&cur)[kPTW], Stage8 (&nxt)[kPTW]) {
-        stage8_store<kPFK>(s_a[half], sr, sc, pa);
-        if (half == 1u) s_as[(kb + 1u) % 2u][tid % kPBM] = scn;
+        stage8_store<kPFK>(s_a[half % 2u], sr, sc, pa);
+        if (half == kTPB - 1u) s_as[(kb + 1u) % 2u][tid % kPBM] = scn;
         lds_barrier();
-        const uint32_t c1 = min(kb * kBlock + (half + 1u) * kPFK, K - kPFK);
+        const uint32_t c1 = min(kb * SB + (half + 1u) * kPFK, K - kPFK);
         pa = stage8_load(asrc + c1, true);
 #pragma unroll
         for (uint32_t i = 0; i < kPTW; ++i)
             nxt[i] = stage8_load(wsrc + ((size_t)i * ksuper + c1 / kSuperK) * kTileBytes, true);
-        if (half == 1u) scn = ssrc[min(kb + 2u, nkb - 1u)];
+        if (half == kTPB - 1u) scn = ssrc[min(kb + 2u, nkb - 1u)];
 #pragma unroll
         for (uint32_t ks = 0; ks < kPFK / kK; ++ks) {
             i2v bf[kPTA];
 #pragma unroll
-            for (uint32_t j = 0; j < kPTA; ++j) bf[j] = frag<kPFK>(s_a[half], arow + j * 16u, ks * kK, lane);
+            for (uint32_t j = 0; j < kPTA; ++j) bf[j] = frag<kPFK>(s_a[half % 2u], arow + j * 16u, ks * kK, lane);
 #pragma unroll
             for (uint32_t i = 0; i < kPTW; ++i) {
                 const i2v af = frag_of(cur[i], ks);
@@ -226,6 +232,10 @@ __device__ __forceinline__ void gemm_8a8_prefill_body(
         }
         tile(kb, 0u, w0, w1);
         tile(kb, 1u, w1, w0);
+        if constexpr (kTPB == 4u) {
+            tile(kb, 2u, w0, w1);
+            tile(kb, 3u, w1, w0);
+        }
         if constexpr (RB != 0) {
             if (kb % kRbFlush == 0u && kb) {   // the last kRbFlush blocks' bias, before this fold
 #pragma unroll

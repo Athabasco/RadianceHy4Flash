@@ -73,7 +73,7 @@ request (`<Picture 2>`, `<Video 1>`).
 - There is **no negative prompt**: MiniMax-H3 is guidance-distilled, one forward pass a step,
   and the server refuses a `negative_prompt`.
 - **lora 1, lora 2**: adapters the server offers (`GET /v1/loras`, files under its
-  `--lora-dir`), each with its own strength; `none` is off. The lists are fetched when the
+  `lora-dir`), each with its own strength; `none` is off. The lists are fetched when the
   node is created or loaded, when `server_url` changes, and by **refresh lora list**. ComfyUI's
   Load LoRA node does not apply here: the server applies adapters to the weights it serves.
 - **resolution, aspect**: the tier is the short side and the aspect gives the long side,
@@ -314,8 +314,8 @@ class RadianceMiniMax(io.ComfyNode):
                 io.Float.Input("lora_strength", default=1.0, min=0.0, max=2.0, step=0.05,
                                display_name="lora 1 strength"),
                 io.Combo.Input("lora2", options=["none"], default="none", display_name="lora 2",
-                               tooltip="a second adapter; the server needs --max-loras 2, "
-                                       "its default with --lora-dir"),
+                               tooltip="a second adapter; the server needs max-loras: 2, "
+                                       "its default with lora-dir"),
                 io.Float.Input("lora2_strength", default=1.0, min=0.0, max=2.0, step=0.05,
                                display_name="lora 2 strength"),
                 io.Combo.Input("task", options=["t2va", "i2va", "l2va", "fl2va", "ref2va"],

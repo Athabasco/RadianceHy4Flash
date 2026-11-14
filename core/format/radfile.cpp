@@ -711,6 +711,8 @@ int RadWriter::begin_append(const char* path, const RadFile& old) {
         fd_out_ = fd_spill_ = -1;
         return RAD_E_IO;
     }
+    kept_expert_layers_.clear();
+    new_expert_layers_.clear();
     append_ = true;
     began_  = true;
     return RAD_OK;
@@ -721,6 +723,16 @@ int64_t RadWriter::add_existing(const Weight& w, const RadFile& old, const RadFi
     if (w.name.empty() || names_.count(w.name)) {
         RAD_ERR("'%s': the container already holds a weight of this name", w.name.c_str());
         return RAD_E_INVAL;
+    }
+    if (w.expert >= 0) {
+        if (new_expert_layers_.count(w.layer)) {
+            RAD_ERR("'%s' is layer %d's expert %d, kept where it is, and this run writes other "
+                    "experts of that layer past the end: a layer's experts sit at a fixed stride "
+                    "from each other, so a layer is kept whole or written whole.",
+                    w.name.c_str(), w.layer, w.expert);
+            return RAD_E_INVAL;
+        }
+        kept_expert_layers_.insert(w.layer);
     }
     /* Bytes and encoding are the old entry's; provenance and movement group are the caller's. */
     RadFileEntry n = e;
@@ -886,11 +898,14 @@ int64_t RadWriter::add_weight(const Weight& w) {
             return RAD_E_INVAL;
         }
     if (append_ && w.expert >= 0) {
-        RAD_ERR("'%s' is layer %d's expert %d, and a container extended in place cannot take a "
-                "new expert: a layer's experts sit at a fixed stride from each other, and one "
-                "written past the end joins no layer. Convert to a new file instead.",
-                w.name.c_str(), w.layer, w.expert);
-        return RAD_E_INVAL;
+        if (kept_expert_layers_.count(w.layer)) {
+            RAD_ERR("'%s' is layer %d's expert %d, and the container extended in place keeps "
+                    "experts of that layer: a layer's experts sit at a fixed stride from each "
+                    "other, and one written past the end joins no layer. Write the layer's whole "
+                    "table again, or convert to a new file.", w.name.c_str(), w.layer, w.expert);
+            return RAD_E_INVAL;
+        }
+        new_expert_layers_.insert(w.layer);
     }
 
     /* Every entry starts on a movement-unit boundary (up to 4 KiB padding per matrix, tens of MB on

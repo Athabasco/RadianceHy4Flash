@@ -47,12 +47,20 @@ set(RAD_TESTS_WITH_LEGACY chatparse_test chatparse_gemma4_test)
 # recorded hash of the stored bytes. libr4d's layout sources are host-only, so they are compiled in,
 # with -ffp-contract=off as libr4d uses, so scale conversions round identically.
 # r4d_ar_links_test checks libr4d's header-only link reader, so it needs only the include path.
-set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test)
+# relayout_iqr_test holds the IQR relayout to the stored form r4d_iqr.h describes, so it also
+# compiles r4d_iqr_layout.cpp.
+set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test relayout_iqr_test)
+# Their relayouts' vector loops, at every CPU level (libr4d/r4d_hsimd.h), built for these tests
+# whether or not libr4d itself is.
+include(${CMAKE_SOURCE_DIR}/cmake/RadSimdLevels.cmake)
+rad_simd_level_objects(r4d_hsimd_test ${CMAKE_SOURCE_DIR}/libr4d/r4d_hsimd_kernels.cpp
+                       R4D_HSIMD_TEST_OBJS DEFINE R4D_HSIMD_LEVEL
+                       INCLUDES ${CMAKE_SOURCE_DIR}/libr4d)
 
 # ref2va_pack_test checks the Ref2VA sequence packing (arch/minimaxh3/rad_ref2va_pack.cpp, a
 # device-free TU of the plugin) against golden vectors generated from the reference implementation
 # by tests/data/ref2va/gen_golden.py. It is pure host arithmetic, so like arch_test it links no
-# core; nlohmann comes straight from vendor/, which core reaches the same way.
+# core; only rad_json (the JSON DOM its golden reader uses).
 set(RAD_TESTS_WITH_PACK ref2va_pack_test)
 
 # vae_geom_test checks the encode geometry (arch/minimaxh3/rad_vae_geom.cpp) the same way: golden
@@ -127,6 +135,7 @@ set(RAD_TEST_ENV ${RAD_TEST_CARD_ENV} "ROCR_VISIBLE_DEVICES=99")
 set(RAD_TEST_CPU_BUDGET_quant_ggml_test 25)  # llama.cpp's iq1_s and iq2_* grid searches, ~13 s
 set(RAD_TEST_CPU_BUDGET_tokenizer_test 20)  # the reference encoder over every corpus: ~3 s built by GCC 16, ~10.5 s by GCC 14 (the image's Ubuntu)
 set(RAD_TEST_CPU_BUDGET_arch_test 15)  # every plugin's graph declared; ~10.8 s with the batched-tower case
+set(RAD_TEST_CPU_BUDGET_device_test 30)  # on a card, the paging and remap cases spin in stream waits: ~10 s; with no card (the image's test stage) they copy, write and compare on the host: 17-19 s
 set(RAD_TEST_CPU_BUDGET_glm5next_test 20)  # GLM-5.3-Flash's graphs and op schemas: ~4.8 s built by GCC 16, ~10.1 s by GCC 14 (the image's Ubuntu)
 
 # Binaries whose OpenMP team is busy for most of their run, so a parallel ctest counts them as a
@@ -170,6 +179,7 @@ foreach(t ${RAD_TESTS})
     add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/core/util/rad_util.cpp)
     if(n STREQUAL "nemotron35_test")
       target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/core/mm/processor.cpp
+                                 ${CMAKE_SOURCE_DIR}/core/util/rowpool.cpp
                                  ${CMAKE_SOURCE_DIR}/core/mm/item.cpp
                                  ${CMAKE_SOURCE_DIR}/core/mm/media.cpp
                                  ${CMAKE_SOURCE_DIR}/core/server/nemotron35.cpp
@@ -181,7 +191,9 @@ foreach(t ${RAD_TESTS})
       file(GLOB NEMOTRON_TEST_TOKENIZER CONFIGURE_DEPENDS
            ${CMAKE_SOURCE_DIR}/core/text/tokenizer*.cpp ${CMAKE_SOURCE_DIR}/core/text/unicode_norm*.cpp)
       target_sources(${n} PRIVATE ${NEMOTRON_TEST_TOKENIZER})
-      target_link_libraries(${n} PRIVATE rad_vendor_llama)
+      # The tokenizer translation units call the dispatched SIMD helpers (core/util/simd.h),
+      # which the no-core link would otherwise lack. oai.cpp reads request bodies with yyjson.
+      target_link_libraries(${n} PRIVATE rad_vendor_llama rad_json rad_simd)
       target_link_libraries(${n} PRIVATE ${CMAKE_DL_LIBS})
       target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
       add_dependencies(${n} libref)
@@ -209,7 +221,8 @@ foreach(t ${RAD_TESTS})
     target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/tools)
   elseif(n IN_LIST RAD_TESTS_WITH_R4D_HOST)
     add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/libr4d/r4d_layout.cpp
-                            ${CMAKE_SOURCE_DIR}/libr4d/r4d_fp8_layout.cpp)
+                            ${CMAKE_SOURCE_DIR}/libr4d/r4d_fp8_layout.cpp
+                            ${CMAKE_SOURCE_DIR}/libr4d/r4d_hsimd.cpp ${R4D_HSIMD_TEST_OBJS})
     target_link_libraries(${n} PRIVATE ${RAD_TEST_CORE} ${CMAKE_DL_LIBS})
     target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr4d)
     target_compile_options(${n} PRIVATE -ffp-contract=off)
@@ -219,14 +232,19 @@ foreach(t ${RAD_TESTS})
       target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/tools/opshapes.cpp)
       target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/tools)
     endif()
+    if(n STREQUAL relayout_iqr_test)
+      target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr4d/r4d_iqr_layout.cpp)
+    endif()
   elseif(n IN_LIST RAD_TESTS_WITH_PACK)
     add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/arch/minimaxh3/rad_ref2va_pack.cpp)
+    target_link_libraries(${n} PRIVATE rad_json)
     target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/arch/minimaxh3
                                             ${CMAKE_SOURCE_DIR}/vendor)
     target_compile_definitions(${n} PRIVATE
       RAD_REF2VA_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/data/ref2va")
   elseif(n IN_LIST RAD_TESTS_WITH_VAE_GEOM)
     add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/arch/minimaxh3/rad_vae_geom.cpp)
+    target_link_libraries(${n} PRIVATE rad_json)
     target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/arch/minimaxh3
                                             ${CMAKE_SOURCE_DIR}/vendor)
     target_compile_definitions(${n} PRIVATE
@@ -310,6 +328,14 @@ if(RAD_HIP_FOUND)
       TIMEOUT ${RAD_TEST_TIMEOUT}
       ENVIRONMENT "${RAD_TEST_CARD_ENV}")
   endforeach()
+endif()
+
+# plugin_test's libr4d cases run against the shipped RDNA4 library. Only a build whose GPU
+# targets name an RDNA4 card makes one; the define tells the test which kind of build it is in,
+# so a one-card build for another family skips those cases instead of failing strict mode.
+if(TARGET libr4d)
+  target_compile_definitions(plugin_test PRIVATE RAD_TEST_HAS_LIBR4D=1)
+  add_dependencies(plugin_test libr4d)
 endif()
 
 # spechub_wiring_test dlopens the built spechub plugin and checks how its rows are classified: the
@@ -536,21 +562,18 @@ set(R4D_EMU ${CMAKE_CURRENT_SOURCE_DIR}/r4d_emu)
 set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_f32.hip
                 ${R4D_DIR}/r4d_norm_join_bf16.hip ${R4D_DIR}/r4d_expert_scale_bf16.hip
                 ${R4D_DIR}/r4d_qsa_select_bf16.hip ${R4D_DIR}/r4d_lora_bf16.hip ${R4D_DIR}/r4d_glm.hip
-                ${R4D_DIR}/r4d_mhc.hip ${R4D_DIR}/r4d_fp8_f32scale.hip ${R4D_DIR}/r4d_kda.hip
-                ${R4D_DIR}/r4d_moe_mxfp4.hip ${R4D_DIR}/r4d_mla.hip ${R4D_DIR}/r4d_quant_act_fp8.hip
+                ${R4D_DIR}/r4d_mhc.hip ${R4D_DIR}/r4d_kda.hip
+                ${R4D_DIR}/r4d_mla.hip ${R4D_DIR}/r4d_quant_act_fp8.hip
                 ${R4D_DIR}/r4d_kv_resolve.hip ${R4D_DIR}/r4d_dsa.hip
-                ${R4D_DIR}/r4d_gemm_m2xfp4a8_decode.hip ${R4D_DIR}/r4d_gemm_m2xfp4a8_tiled.hip
-                ${R4D_DIR}/r4d_lili.hip)
-# The M2XFP4 units' plugin entries call two cfg readers that r4d_rows.cpp defines, which is not in
-# this build: cfg_stub.cpp defines them at their axis defaults, in both arms below.
-set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
-                  dsa m2xfp4 lili)
+                ${R4D_DIR}/r4d_keyed.hip ${R4D_DIR}/r4d_lili.hip)
+set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc kda mla moefuse kvres
+                  dsa lili)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT RAD_ASAN AND NOT RAD_TSAN)
   set_source_files_properties(${R4D_EMU_HIP} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-x;c++")
-  add_library(r4d_emu_kernels OBJECT ${R4D_EMU_HIP} ${R4D_EMU}/ref_host.cpp ${R4D_EMU}/cfg_stub.cpp
+  add_library(r4d_emu_kernels OBJECT ${R4D_EMU_HIP} ${R4D_EMU}/ref_host.cpp
                                      ${R4D_EMU}/emu/emu.cpp)
   target_include_directories(r4d_emu_kernels PUBLIC ${R4D_EMU}/emu ${R4D_EMU} ${R4D_DIR})
   target_link_libraries(r4d_emu_kernels PUBLIC rad_abi)
@@ -582,11 +605,10 @@ else()
     foreach(src ${R4D_EMU_HIP} ${R4D_EMU}/ref_host.cpp ${R4D_EMU}/emu/emu.cpp
                 ${R4D_EMU}/test_attn.cpp ${R4D_EMU}/test_pick.cpp ${R4D_EMU}/test_norm.cpp
                 ${R4D_EMU}/test_escale.cpp ${R4D_EMU}/test_qsa.cpp ${R4D_EMU}/test_lora.cpp
-                ${R4D_EMU}/test_f32.cpp ${R4D_EMU}/test_mhc.cpp ${R4D_EMU}/test_fp8f32.cpp
-                ${R4D_EMU}/test_kda.cpp ${R4D_EMU}/test_moemx.cpp ${R4D_EMU}/test_mla.cpp
+                ${R4D_EMU}/test_f32.cpp ${R4D_EMU}/test_mhc.cpp
+                ${R4D_EMU}/test_kda.cpp ${R4D_EMU}/test_mla.cpp
                 ${R4D_EMU}/test_moefuse.cpp ${R4D_EMU}/test_kvres.cpp
-                ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_m2xfp4.cpp ${R4D_EMU}/test_lili.cpp
-                ${R4D_EMU}/cfg_stub.cpp)
+                ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_lili.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -623,7 +645,7 @@ else()
   endif()
 endif()
 if(R4D_EMU_BUILT)
-  foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 lili)
+  foreach(t pick norm escale qsa lora f32 mhc kda mla moefuse kvres dsa lili)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,
@@ -634,7 +656,7 @@ if(R4D_EMU_BUILT)
   endforeach()
   set_tests_properties(r4d_emu_attn_shard0 r4d_emu_attn_shard1 r4d_emu_attn_shard2 r4d_emu_pick
                        r4d_emu_norm r4d_emu_escale r4d_emu_qsa r4d_emu_lora r4d_emu_mla r4d_emu_moefuse
-                       r4d_emu_dsa r4d_emu_m2xfp4 r4d_emu_lili
+                       r4d_emu_dsa r4d_emu_lili
                        PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The LoRA pair has a libref oracle, and the test holds the emulated kernels to it when it can
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within
@@ -768,9 +790,12 @@ if(HALO_EMU_BUILT)
     set_tests_properties(halo_emu_attn_shard${k} PROPERTIES LABELS "halo_emu;fast"
                          TIMEOUT ${RAD_TEST_TIMEOUT})
   endforeach()
-  # libhalo's one MXFP4 expert kernel takes about 160 s here (libr4d's shape-specialised forms 30 s).
-  add_test(NAME halo_emu_moemx COMMAND ${CMAKE_BINARY_DIR}/tests/halo_emu_moemx)
-  set_tests_properties(halo_emu_moemx PROPERTIES LABELS "halo_emu;slow" TIMEOUT 900)
+  # libhalo's one MXFP4 expert kernel takes about 250 s here over the cases (libr4d's
+  # shape-specialised forms 30 s), so eight shards hold a case or two each.
+  foreach(k 0 1 2 3 4 5 6 7)
+    add_test(NAME halo_emu_moemx_shard${k} COMMAND ${CMAKE_BINARY_DIR}/tests/halo_emu_moemx --shard ${k}/8)
+    set_tests_properties(halo_emu_moemx_shard${k} PROPERTIES LABELS "halo_emu;slow" TIMEOUT 900)
+  endforeach()
   add_test(NAME halo_emu_attn_sweep COMMAND ${CMAKE_BINARY_DIR}/tests/halo_emu_attn sweep 40)
   set_tests_properties(halo_emu_attn_sweep PROPERTIES LABELS "halo_emu;slow" TIMEOUT 900)
 endif()
@@ -813,6 +838,16 @@ endif()
 # tools/rad-export. Its standard-library checks always run; the merge arithmetic runs where torch
 # and safetensors import, and the PEFT comparison where peft and transformers do too.
 find_program(RAD_PYTHON3 NAMES python3)
+
+# core/server/dashboard_page.h is the build of dashboard/, committed because the engine's build has
+# no Node. This fails while the page's sources and the header disagree.
+if(RAD_PYTHON3 AND EXISTS ${CMAKE_SOURCE_DIR}/dashboard/package.json)
+  add_test(NAME dashboard_page
+           COMMAND ${RAD_PYTHON3} ${CMAKE_SOURCE_DIR}/tools/dashboard_embed.py check)
+  set_tests_properties(dashboard_page PROPERTIES
+    LABELS "fast;unit"
+    TIMEOUT ${RAD_TEST_TIMEOUT})
+endif()
 if(RAD_PYTHON3)
   add_test(NAME rad_export_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/rad_export_test.py)
   set_tests_properties(rad_export_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})

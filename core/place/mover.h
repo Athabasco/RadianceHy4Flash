@@ -499,9 +499,17 @@ public:
      * segment, and they move independently, so every call names its lender.
      *
      * A unit in a lent slot keeps its host copy (weights never change), so giving the slot back
-     * is a change of address: a recall waits only for kernels to stop naming the slot. */
+     * is a change of address: a recall waits only for kernels to stop naming the slot.
+     *
+     * The fleet is the third lender (docs/MULTIMODEL.md §6.7): VRAM no model of the fleet holds,
+     * backed into a range the engine reserved for it and given back when the fleet needs it. */
 
-    enum Lender { kLendKV = 0, kLendArena = 1, kLenders = 2 };
+    enum Lender { kLendKV = 0, kLendArena = 1, kLendFleet = 2, kLenders = 3 };
+
+    /* The bytes one stretch must span for lend_from to cut a slot for every unit it would carve
+     * one for (each movable unit in the pinned pool), with each slot's alignment and the empty
+     * top unit. Sizes a lender whose memory is reserved for the purpose. */
+    int64_t lendable_bytes() const;
 
     /* Registers the stretches a lender may ever lend; once per lender, after its memory is
      * carved. Each stretch is cut into slots of each class's stride from the top down, so a small
@@ -521,6 +529,14 @@ public:
      * in hand (a request larger than the cache's buffer, a step larger than the arena allows). */
     int     reclaim(int lender, int64_t amount, HeatEngine* heat);
 
+    /* Empties the budgeted slab for a park (docs/MULTIMODEL.md §7): every unit in a budgeted slot
+     * that has a host copy is published at that copy, and a hot-cache unit (the container is its
+     * copy) goes back to the file tier; units with no other copy stay. Every loan must already be
+     * recalled (reclaim to 0). Appends the slab's free stretches to `free_ranges`: their contents
+     * need not be kept, and the heat engine fills the slots again as routing touches the units.
+     * A host wait, like reclaim(). */
+    int     drop_slab(HeatEngine* heat, std::vector<std::pair<const void*, int64_t>>* free_ranges);
+
     /* Bytes the lent slots hold, bytes the loans offer, and bytes every carved slot could hold.
      * The first two are stored because the HTTP thread reads them for the dashboard and only the
      * rank thread may walk the slot pools. */
@@ -532,6 +548,12 @@ public:
     int64_t turnover_slots() const {
         int64_t n = 0;
         for (const ClassPools& cp : pools_) n += cp.n_turn;
+        return n;
+    }
+    /* Their bytes. */
+    int64_t turnover_bytes() const {
+        int64_t n = 0;
+        for (const ClassPools& cp : pools_) n += cp.n_turn * cp.stride;
         return n;
     }
     /* The loan that covers every slot carved from this lender; more would sit empty. Zero when

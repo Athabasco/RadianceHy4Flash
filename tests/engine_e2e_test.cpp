@@ -20,13 +20,14 @@
  * Every child gets ROCR_VISIBLE_DEVICES=99, so a machine with a card still runs the host backend.
  */
 #include "rad_test.h"
+#include "e2e_config.h"
 #include "tiny_golden.h"
 #include "tiny_model.h"
 
 #include "mm/media.h"
 #include "server/oai.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -36,13 +37,15 @@
 #include <cerrno>
 #include <condition_variable>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 
-using json = nlohmann::json;
+using json = Json;
 
 namespace {
 
@@ -73,7 +76,7 @@ std::vector<std::string> engine_argv(const std::string& model,
     if (!kernels) { a.push_back("--kernels"); a.push_back("libref"); }
     if (ref) a.push_back("--debug-accept-reference-kernels");
     a.insert(a.end(), args.begin(), args.end());
-    return a;
+    return radtest::config_argv(a);
 }
 
 /* As a deployment runs: the arguments as given, so a reference library serves nothing. */
@@ -81,7 +84,7 @@ std::vector<std::string> serving_argv(const std::string& model,
                                       const std::vector<std::string>& args) {
     std::vector<std::string> a = { RAD_E2E_SERVER, "--model", model };
     a.insert(a.end(), args.begin(), args.end());
-    return a;
+    return radtest::config_argv(a);
 }
 
 /* The shape the preemption cases run in: four sequences of at most 512 tokens, 256 a step. Their
@@ -191,12 +194,11 @@ struct World {
     /* RAD_E2E_KEEP keeps the checkpoints for tests/mktinygolden.py, which reads them. */
     tiny::TempDir dir{ "e2e", std::getenv("RAD_E2E_KEEP") != nullptr };
     std::string qwen35, lfm2, gemma4, llama, llama_rad;
-    /* llama.rad with its lm head block fp8, and int8 per (row, 128 of K). */
-    std::string llama_fp8head, llama_i8head;
+    /* llama.rad with its lm head int8 per (row, 128 of K). */
+    std::string llama_i8head;
     /* The llama as an int4 W4A16 release with zero points (tiny_model.h, write_llama_ct_int4),
      * and its container through the import rule. */
     std::string llama_int4, llama_int4_rad;
-    std::string llama_mxfp4;   /* llama's trunk as OCP-MXFP4 */
     /* qwen35 and gemma4 with 4 KiB of KV a token (wider KV heads), for the preemption cases: a MiB
      * of device is then about 256 tokens of pool, fine enough for small_device() to land between
      * one request and four. */
@@ -232,11 +234,9 @@ struct World {
         gemma4 = dir / "gemma4";
         llama = dir / "llama";
         llama_rad = dir / "llama.rad";
-        llama_fp8head = dir / "llama_fp8head.rad";
         llama_i8head = dir / "llama_i8head.rad";
         llama_int4 = dir / "llama_int4";
         llama_int4_rad = dir / "llama_int4.rad";
-        llama_mxfp4 = dir / "llama_mxfp4.rad";
         qwen35_kv = dir / "qwen35_kv";
         gemma4_kv = dir / "gemma4_kv";
         qwen35_spec = dir / "qwen35_spec";
@@ -273,14 +273,11 @@ struct World {
             !tiny::write_gemma4(gemma4, {}) || !tiny::write_llama(llama, {}) ||
             !tiny::write_qwen35(qwen35_kv, qkv) || !tiny::write_gemma4(gemma4_kv, gkv) ||
             !tiny::write_qwen35(qwen35_spec, qspec) || !tiny::write_qwen3asr(qwen3asr, {}) ||
-            !tiny::write_text(dir / "llama.recipe", tiny::kLlamaFp8Recipe) ||
-            !tiny::write_text(dir / "llama_fp8head.recipe",
-                              std::string(tiny::kLlamaFp8Recipe) + tiny::kLlamaFp8HeadRule) ||
+            !tiny::write_text(dir / "llama.recipe", tiny::kLlamaI8Recipe) ||
             !tiny::write_text(dir / "llama_i8head.recipe",
-                              std::string(tiny::kLlamaFp8Recipe) + tiny::kLlamaI8HeadRule) ||
+                              std::string(tiny::kLlamaI8Recipe) + tiny::kLlamaI8HeadRule) ||
             !tiny::write_llama_ct_int4(llama_int4, {}, true) ||
             !tiny::write_text(dir / "llama_int4.recipe", tiny::kInt4ImportRecipe) ||
-            !tiny::write_text(dir / "llama_mxfp4.recipe", tiny::kLlamaMxfp4Recipe) ||
             !tiny::write_gemma4(g31, g31s) || !tiny::write_gemma4(g31w, g31ws) ||
             !tiny::write_dflash2(g31_draft, {}))
             return;
@@ -302,10 +299,8 @@ struct World {
 
         const struct { std::string out; const char* recipe; const std::string* ckpt; }
             kConverts[] = { { llama_rad, "llama.recipe", &llama },
-                            { llama_fp8head, "llama_fp8head.recipe", &llama },
                             { llama_i8head, "llama_i8head.recipe", &llama },
-                            { llama_int4_rad, "llama_int4.recipe", &llama_int4 },
-                            { llama_mxfp4, "llama_mxfp4.recipe", &llama } };
+                            { llama_int4_rad, "llama_int4.recipe", &llama_int4 } };
         for (const auto& [out, recipe, ckpt] : kConverts) {
             const int st = tiny::run({ RAD_E2E_CONVERT, *ckpt, "-o", out, "--recipe",
                                        dir / recipe },
@@ -473,6 +468,20 @@ struct Server {
         a.insert(a.end(), args.begin(), args.end());
         if (!child.start(serving ? serving_argv(model, a) : engine_argv(model, a), engine_env(env)))
             return false;
+        return listening();
+    }
+
+    /* A whole configuration file, for a process of several models. */
+    bool start_yaml(const std::string& yaml, const std::vector<std::string>& env = {}) {
+        static int seq = 0;
+        const std::string path = radtest::tmp_path("fleet." + std::to_string(seq++) + ".yaml");
+        std::ofstream(path) << yaml;
+        if (!child.start({ RAD_E2E_SERVER, "--config", path }, engine_env(env))) return false;
+        return listening();
+    }
+
+    /* Drains the child's output and waits for the listen line; the port it names. */
+    bool listening() {
         drain = std::thread([this] {
             char buf[4096];
             for (;;) {
@@ -772,22 +781,6 @@ TEST(a_checkpoint_store_the_host_cannot_hold_is_refused_at_startup) {
     CHECK(named);
 }
 
-/* --attn-prefill-fp8 is a permission an exact kernel also satisfies. The host libraries have no
- * e4m3 attention, so asked for it the start is refused by the flag's name instead of serving the
- * exact form under it. */
-TEST(an_attention_fp8_mode_no_kernel_takes_is_refused_at_startup) {
-    World& w = world();
-    REQUIRE(w.ok);
-    const Ran r = radiance(w.qwen35, { "--host", "127.0.0.1", "--port", "0",
-                                       "--attn-prefill-fp8", "both" }, {}, 120);
-    const bool named = has(r.log, "not starting: --attn-prefill-fp8 both, but no attention kernel");
-    if (r.status == 0 || r.status == 124 || !named)
-        fprintf(stderr, "    exited %d:\n%s\n", r.status, tail(r.log, 20).c_str());
-    CHECK(r.status != 0);
-    CHECK(r.status != 124);
-    CHECK(named);
-}
-
 /* The row split of a prefill's attention is a graph only a plugin that declares it can build, so
  * a plugin that does not (qwen35 here) is refused by the flag's name instead of serving the head
  * split under it. */
@@ -984,58 +977,6 @@ TEST(runtime_lora_scores_as_the_merged_checkpoint_does) {
     const double kl = base["all"]["kld"]["mean"].get<double>();
     fprintf(stderr, "    the base against the merged checkpoint: mean KL %.2g\n", kl);
     CHECK(kl > 0.05);
-}
-
-/* An MXFP4 trunk: its GEMM's `group` is the weight's 32-wide exponent block, while the
- * activation it reads is scaled per 128, and the adapter's shrink reads that activation at the
- * activation's grid. Against the merged checkpoint, the adapter takes the container from the
- * adapter's whole effect down to the MXFP4 rounding, on libref and on libavx. (The tiny llama's
- * MXFP4 container declares at one rank only.) */
-TEST(runtime_lora_reads_an_mxfp4_trunks_activation_at_its_own_grid) {
-    World& w = world();
-    REQUIRE(w.ok);
-    tiny::TempDir d("e2e_lora_mx");
-    const std::string adapter = d / "adapter", merged = d / "merged", ref = d / "ref";
-    const std::vector<std::string> targets = { "q_proj", "k_proj", "v_proj", "o_proj",
-                                               "gate_proj", "up_proj", "down_proj" };
-    REQUIRE(tiny::write_lora(adapter, w.llama, targets, 8, 16.0, 23, 0.25f, merged));
-    const std::vector<std::string> one = { "--max-num-batched-tokens", "512", "--max-num-seqs", "1" };
-    std::vector<std::string> rec = { "--kld-record", ref, "--kld-corpus", w.corpus_short };
-    rec.insert(rec.end(), one.begin(), one.end());
-    const Ran recorded = radiance(merged, rec);
-    REQUIRE_RAN(recorded);
-    auto score = [&](const std::vector<std::string>& args, const std::vector<std::string>& env) {
-        tiny::TempDir o("e2e_lora_mx_kld");
-        std::vector<std::string> a = { "--kld-ref", ref, "--kld-out", o / "kld.json" };
-        a.insert(a.end(), one.begin(), one.end());
-        a.insert(a.end(), args.begin(), args.end());
-        const Ran r = radiance(w.llama_mxfp4, a, env);
-        if (r.status != 0) {
-            fprintf(stderr, "    child exited %d:\n%s\n", r.status, tail(r.log).c_str());
-            return -1.0;
-        }
-        const json j = json::parse(tiny::read_text(o / "kld.json"), nullptr, false);
-        return j.is_object() && j.contains("all") ? j["all"]["kld"]["mean"].get<double>() : -1.0;
-    };
-    const double base = score({}, {});
-    fprintf(stderr, "    the MXFP4 base against the merged checkpoint: mean KL %.3g\n", base);
-    REQUIRE(base > 0.05);
-    const std::vector<std::string> ad = { "--lora", "ad=" + adapter, "--kld-lora", "ad" };
-    struct Arm { const char* what; std::vector<std::string> args, env; };
-    std::vector<Arm> arms = { { "libref", ad, {} } };
-#if defined(__x86_64__)
-    if (::access(RAD_E2E_HOME "/kernels/libavx.so", R_OK) == 0) {
-        std::vector<std::string> avx = { "--kernels", "libavx" };
-        avx.insert(avx.end(), ad.begin(), ad.end());
-        arms.push_back({ "libavx", avx, {} });
-    }
-#endif
-    for (const Arm& a : arms) {
-        const double kl = score(a.args, a.env);
-        fprintf(stderr, "    the MXFP4 container with the adapter, %s: mean KL %.3g\n", a.what, kl);
-        CHECK(kl >= 0);
-        CHECK(kl < base / 4);
-    }
 }
 
 /* Off is off: without --lora or --max-loras the declared graph names no adapter op, buffer or
@@ -1617,7 +1558,6 @@ TEST(libavx_alone_serves_a_quantised_head_within_rounding_of_libref) {
     REQUIRE(world().ok);
     World& w = world();
     const struct { const char* name; const std::string* model; } kRuns[] = {
-        { "llama, fp8 head, on libavx alone", &w.llama_fp8head },
         { "llama, int8 head, on libavx alone", &w.llama_i8head } };
     for (const auto& run : kRuns)
         check_within_rounding(run.name, score_against_reference(
@@ -1995,6 +1935,72 @@ json config_row(int port, const std::string& option) {
     return json();
 }
 
+/* Several models in one process (docs/MULTIMODEL.md): two architectures, and one architecture
+ * twice, each answering under its own name exactly what it answers alone, behind one listener. */
+TEST(several_models_in_one_process_answer_as_they_do_alone) {
+    REQUIRE(world().ok);
+    const json req = completion({ 1, 2, 3, 4, 5 }, 6);
+    auto alone = [&](const std::string& model) -> json {
+        Server s;
+        if (!s.start(model, { "--max-num-seqs", "4" })) return json::array();
+        int st = 0;
+        const json r = post(s.port, "/completion", req, &st);
+        CHECK_EQ(st, 200);
+        CHECK_EQ(s.stop(), 0);
+        return r.value("tokens", json::array());
+    };
+    const json q_alone = alone(world().qwen35), l_alone = alone(world().llama);
+    CHECK(!q_alone.empty() && !l_alone.empty());
+
+    const std::string common =
+        "server: {host: 127.0.0.1, port: 0, http-threads: 4, kernels: libref,\n"
+        "         debug-accept-reference-kernels: true}\n"
+        "defaults: {max-num-seqs: 4, gpu-memory-mib: 200}\n";
+    {
+        Server s;
+        REQUIRE(s.start_yaml(common + "models:\n  q: {model: " + world().qwen35 + ", aliases: [default]}\n"
+                             "  l: {model: " + world().llama + "}\n"));
+        int st = 0;
+        json named = req;
+        named["model"] = "q";
+        CHECK(post(s.port, "/completion", named, &st).value("tokens", json::array()) == q_alone);
+        CHECK_EQ(st, 200);
+        named["model"] = "l";
+        CHECK(post(s.port, "/completion", named, &st).value("tokens", json::array()) == l_alone);
+        CHECK_EQ(st, 200);
+        /* No model: the one aliased default. An unknown one: not found. */
+        CHECK(post(s.port, "/completion", req, &st).value("tokens", json::array()) == q_alone);
+        named["model"] = "nope";
+        post(s.port, "/completion", named, &st);
+        CHECK_EQ(st, 404);
+
+        Call c;
+        std::string body;
+        CHECK(c.send(s.port, "GET", "/v1/models", "") && c.read(&body) == 200);
+        std::set<std::string> ids;
+        for (const json& m : json::parse(body, nullptr, false).value("data", json::array()))
+            ids.insert(m.value("id", ""));
+        CHECK(ids == std::set<std::string>({ "q", "l", "default" }));
+        CHECK_EQ(s.stop(), 0);
+    }
+    {
+        /* One plugin, two instances: each keeps its own state (RadBuildCtx::slot_base). */
+        Server s;
+        REQUIRE(s.start_yaml(common + "models:\n  a: {model: " + world().qwen35 + "}\n"
+                             "  b: {model: " + world().qwen35 + "}\n"));
+        int st = 0;
+        json named = req;
+        for (const char* m : { "a", "b", "a" }) {
+            named["model"] = m;
+            CHECK(post(s.port, "/completion", named, &st).value("tokens", json::array()) == q_alone);
+            CHECK_EQ(st, 200);
+        }
+        post(s.port, "/completion", req, &st);
+        CHECK_EQ(st, 400);                                   /* several models, none named */
+        CHECK_EQ(s.stop(), 0);
+    }
+}
+
 /* --checkpoint-slots auto, the default, sizes the snapshot store from --max-num-seqs and what the
  * retention policy keeps for a --max-model-len session (the tiny hybrid's 4096 tokens are two
  * 2048-token intervals: 2 snapshots, 3 a sequence), says so on its startup line and reports the
@@ -2016,12 +2022,12 @@ TEST(the_snapshot_store_is_sized_by_auto_unless_a_count_is_given) {
           "geometric-backoff keeps 2 for a 4096-token session at a 2048-token interval",
           "checkpoint slots: auto: 12 linear-state snapshot(s) of " },
         { &World::qwen35, { "--max-num-seqs", "4", "--checkpoint-slots", "auto" }, "12",
-          "command line", "3 a sequence", "checkpoint slots: auto: 12 " },
+          "models.qwen35.checkpoint-slots", "3 a sequence", "checkpoint slots: auto: 12 " },
         { &World::qwen35,
           { "--max-num-seqs", "4", "--checkpoint-policy", "keep-all", "--checkpoint-interval", "256" },
           "68", "auto", "keep-all keeps 16 for a 4096-token session at a 256-token interval",
           "checkpoint slots: auto: 68 " },
-        { &World::qwen35, { "--max-num-seqs", "4", "--checkpoint-slots", "5" }, "5", "command line",
+        { &World::qwen35, { "--max-num-seqs", "4", "--checkpoint-slots", "5" }, "5", "models.qwen35.checkpoint-slots",
           "", "checkpoint slots: 5 linear-state snapshot(s) of " },
         { &World::qwen35, { "--max-num-seqs", "4", "--no-prefix-cache" }, "0", "auto",
           "prefix caching is off", "" },
@@ -2212,27 +2218,32 @@ TEST(preemption_by_recompute_continues_each_stream_exactly) {
 namespace {
 
 /* The tiny Qwen-Image pipeline (tiny_model.h: QwenImage) as rad-convert makes it containers, the
- * bf16 one and the one whose DiT linears are block fp8, written once per process. Empty when a
+ * bf16 one and the one whose DiT linears are rotated int8, written once per process. The text
+ * encoder is 128 wide so that its activations take the int8 pair's scale group too. Empty when a
  * step fails. */
 struct QwenImageContainers {
     tiny::TempDir dir{ "e2e_qimg", std::getenv("RAD_E2E_KEEP") != nullptr };
-    std::string pipeline, bf16, fp8;   /* the diffusers folder, and its two containers */
+    std::string pipeline, bf16, i8;   /* the diffusers folder, and its two containers */
     QwenImageContainers() {
         const std::string p = dir / "qwen_image";
-        if (!dir.ok() || mkdir(p.c_str(), 0755) != 0 || !tiny::write_qwen_image(p, {}) ||
-            !tiny::write_text(dir / "fp8.recipe", tiny::kQwenImageFp8Recipe))
+        tiny::QwenImage shape;
+        shape.te_hidden = 128;
+        shape.te_head_dim = 32;
+        shape.te_ffn = 256;
+        if (!dir.ok() || mkdir(p.c_str(), 0755) != 0 || !tiny::write_qwen_image(p, shape) ||
+            !tiny::write_text(dir / "i8.recipe", tiny::kQwenImageI8Recipe))
             return;
         for (const bool q : { false, true }) {
-            const std::string rad = dir / (q ? "qwen_image_fp8.rad" : "qwen_image.rad");
+            const std::string rad = dir / (q ? "qwen_image_i8.rad" : "qwen_image.rad");
             std::vector<std::string> argv = { RAD_E2E_CONVERT, p, "-o", rad };
-            if (q) { argv.push_back("--recipe"); argv.push_back(dir / "fp8.recipe"); }
+            if (q) { argv.push_back("--recipe"); argv.push_back(dir / "i8.recipe"); }
             std::string log;
             const int st = tiny::run(argv, engine_env(), &log);
             if (st != 0) {
                 fprintf(stderr, "    rad-convert exited %d:\n%s\n", st, tail(log).c_str());
                 return;
             }
-            (q ? fp8 : bf16) = rad;
+            (q ? i8 : bf16) = rad;
         }
         pipeline = p;
     }
@@ -2307,8 +2318,8 @@ double psnr(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
  * generator declares has a libavx row, the picture comes back, a seed repeats it byte for byte, and
  * it agrees with libref's within rounding (the two libraries round the DiT's and the decoder's
  * products in different orders). Another seed gives another picture, so the agreement is not two
- * constant images. Guidance runs a second, negative conditioning beside the first; the fp8
- * container takes the fused fp8 norm, the fp8 GEMMs and the int8 attention scores. */
+ * constant images. Guidance runs a second, negative conditioning beside the first; the int8
+ * container takes the fused int8 norm, the int8 GEMMs and the int8 attention scores. */
 TEST(qwen_image_generates_on_libavx_alone_as_on_libref) {
 #if defined(__x86_64__)
     NEED_ARTIFACT(RAD_E2E_HOME "/kernels/libavx.so");
@@ -2317,8 +2328,8 @@ TEST(qwen_image_generates_on_libavx_alone_as_on_libref) {
 #endif
     if (!rad::mm::decoder_available()) SKIP("this build has no image codec");
     const QwenImageContainers& q = qwen_image();
-    REQUIRE(!q.bf16.empty() && !q.fp8.empty());
-    for (const std::string* model : { &q.bf16, &q.fp8 })
+    REQUIRE(!q.bf16.empty() && !q.i8.empty());
+    for (const std::string* model : { &q.bf16, &q.i8 })
         for (const double cfg : { 0.0, 3.0 }) {
             const Picture a = generate(*model, { "libavx" }, false, 7, 3, cfg);
             const Picture b = generate(*model, { "libavx" }, false, 7, 3, cfg);
@@ -2328,7 +2339,7 @@ TEST(qwen_image_generates_on_libavx_alone_as_on_libref) {
             CHECK(a.png == b.png);
             const double same = psnr(a.rgba, ref.rgba), other = psnr(a.rgba, c.rgba);
             fprintf(stderr, "    %s, cfg %.0f: libavx against libref %.1f dB, against another "
-                    "seed %.1f dB\n", model == &q.fp8 ? "fp8" : "bf16", cfg, same, other);
+                    "seed %.1f dB\n", model == &q.i8 ? "int8" : "bf16", cfg, same, other);
             CHECK(same > 40.0);
             CHECK(other < 30.0);
         }

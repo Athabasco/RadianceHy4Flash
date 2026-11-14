@@ -191,11 +191,12 @@ rad_weight Builder::decl_weight(const char* name, const RadWeightDecl* d) {
             while (!role.empty() && role.front() == ' ') role.erase(role.begin());
             while (!role.empty() && role.back() == ' ') role.pop_back();
             const int k = rad_enc_find(&w.enc, role.c_str());
-            char e[256];
-            rad_enc_format(&w.enc, e, sizeof e);
-            if (k < 0)
+            if (k < 0) {
+                char e[256];
+                rad_enc_format(&w.enc, e, sizeof e);
                 return err(RAD_E_SHAPE, "weight '%s' takes plane '%s' of '%s', which is %s and has "
                                         "no such plane", n.c_str(), role.c_str(), w.source.c_str(), e);
+            }
             if (w.n_sel == RAD_ENC_MAX_PLANES)
                 return err(RAD_E_INVAL, "weight '%s': more than %d planes", n.c_str(),
                            RAD_ENC_MAX_PLANES);
@@ -214,14 +215,15 @@ rad_weight Builder::decl_weight(const char* name, const RadWeightDecl* d) {
                            (p0.dtype == RAD_BF16 || p0.dtype == RAD_F16);
         /* A bf16 readout head over an f32 checkpoint tensor: the loader rounds it to bf16. */
         const bool narrow = w.n_sel == 1 && d->dtype == RAD_BF16 && p0.dtype == RAD_F32;
-        char e[256];
-        rad_enc_format(&w.enc, e, sizeof e);
-        if (!widen && !narrow)
+        if (!widen && !narrow) {
+            char e[256];
+            rad_enc_format(&w.enc, e, sizeof e);
             return err(RAD_E_DTYPE, "weight '%s' is declared %s, and '%s' holds %s as %s: only an "
                                     "exact widening or narrowing is done at load; anything else "
                                     "is a quantisation, which a recipe does before the container "
                                     "is written (spec §4.4)", n.c_str(), rad_dtype_name(d->dtype),
                        w.source.c_str(), p0.role, e);
+        }
         w.widen = widen;
         w.narrow = narrow;
     }
@@ -269,7 +271,7 @@ rad_weight Builder::decl_weight(const char* name, const RadWeightDecl* d) {
         w.stored_shape[i] = i < d->rank ? d->shape[i] : 0;
     w.align        = RAD_ALIGN_UNIT;
 
-    prog_.weights.push_back(w);
+    prog_.weights.push_back(std::move(w));
     const rad_weight h = (rad_weight)(prog_.weights.size() - 1);
     weight_by_name_.emplace(prog_.weights.back().name, h);
     return h;
@@ -480,7 +482,8 @@ int64_t Builder::kv_layer_bytes(rad_kvgroup g) {
     const int64_t bs = kv_block_size(g);
     if (bs <= 0) return 0;
     const int64_t nh = gi.decl.n_head_kv > 0 ? gi.decl.n_head_kv : 1;
-    return rad_dtype_bytes(gi.decl.dtype, 2 * bs * nh * gi.decl.head_dim);
+    return rad_dtype_bytes(gi.decl.dtype,
+                           bs * nh * rad_kv_row_elems(gi.decl.dtype, gi.decl.head_dim));
 }
 
 /* ================================================================== ops */
@@ -2276,6 +2279,38 @@ int Builder::drafter_tree(rad_buf parents) {
     return RAD_OK;
 }
 
+/* The routing counts' storage (rad_builder.h). The row count is checked in Ctx::bind_routing,
+ * which knows the reporting layers. */
+int Builder::route_table(rad_buf table) {
+    if (finished_) {
+        err(RAD_E_STATE, "route_table after declare finished");
+        return RAD_E_STATE;
+    }
+    if (prog_.route_table != RAD_NULL_HANDLE) {
+        err(RAD_E_STATE, "route_table: buffer '%s' is already the routing table",
+            prog_.buffers[prog_.route_table].name.c_str());
+        return RAD_E_STATE;
+    }
+    if (table == RAD_NULL_HANDLE || (size_t)table >= prog_.buffers.size()) {
+        err(RAD_E_INVAL, "route_table: buffer %u is not a declared buffer", (unsigned)table);
+        return RAD_E_INVAL;
+    }
+    const BufferInfo& bi = prog_.buffers[table];
+    if (bi.decl.dtype != RAD_I32) {
+        err(RAD_E_DTYPE, "route_table: buffer '%s' is not i32", bi.name.c_str());
+        return RAD_E_DTYPE;
+    }
+    if (bi.decl.domain != RAD_DOMAIN_DEVICE || bi.decl.kind != RAD_BUF_PERSIST) {
+        err(RAD_E_INVAL, "route_table: buffer '%s' must be a RAD_BUF_PERSIST device buffer: the "
+                         "core reads its rows at the end of every pass and between passes, where a "
+                         "transient's bytes belong to whichever buffer shares them",
+            bi.name.c_str());
+        return RAD_E_INVAL;
+    }
+    prog_.route_table = table;
+    return RAD_OK;
+}
+
 void Builder::note_v(const char* f, va_list ap) {
     char msg[1024];
     vsnprintf(msg, sizeof msg, f ? f : "", ap);
@@ -2496,7 +2531,8 @@ void Builder::finish_kv_groups() {
             case RAD_KV_RING:
                 /* One block holds K and V for block_size tokens, the block manager's unit. */
                 gi.bytes_per_block =
-                    rad_dtype_bytes(d.dtype, 2 * gi.block_size * elem_n_head * d.head_dim) * n_bound;
+                    rad_dtype_bytes(d.dtype, gi.block_size * elem_n_head *
+                                             rad_kv_row_elems(d.dtype, d.head_dim)) * n_bound;
                 gi.bytes_per_state = 0;
                 break;
             case RAD_KV_LINEAR:
@@ -2836,6 +2872,11 @@ int rad_lora_alias(RadBuilder* b, const char* native, const char* from, const ch
 int rad_drafter_tree(RadBuilder* b, rad_buf parents) {
     if (!b) return RAD_E_INVAL;
     return B(b)->drafter_tree(parents);
+}
+
+int rad_route_table(RadBuilder* b, rad_buf table) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->route_table(table);
 }
 
 int rad_chain_on(void) { return rad_dev_chain_enabled(); }

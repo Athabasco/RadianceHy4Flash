@@ -19,6 +19,7 @@
 #include "ngram.h"
 
 #include <chrono>
+#include <condition_variable>
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
 #include <functional>
 #endif
@@ -201,6 +202,12 @@ public:
     /* `n` requests under one hold of the queue lock, each accepted or refused as add() would, with
      * its result in rc[i]. For the sequences of one API request, which must reach the same step. */
     void     add_all(std::unique_ptr<Request>* rs, size_t n, int* rc);
+    /* The step loop's idle wait. wake_seq() before a step() that finds nothing, then
+     * wait_idle(seen, max): it returns at once if anything woke the loop since `seen` (a request
+     * added or cancelled, or wake()), else after `max` at the latest. */
+    uint64_t wake_seq();
+    void     wait_idle(uint64_t seen, std::chrono::microseconds max);
+    void     wake();
     /* Frees blocks immediately rather than at completion (spec §14); otherwise the pool shrinks
      * under exactly the load that cancels. */
     int      cancel(uint64_t id);
@@ -309,6 +316,16 @@ public:
      * cache. Takes the step lock because the step path inserts into the map (live sequences hold
      * their own block references). See IScheduler::reset_prefix_cache. */
     int64_t  reset_prefix_cache();
+    /* Least recently used entries leave VRAM until `enough()` (called under the step lock) holds
+     * or the whole cache has gone; an entry with a host copy stays restorable as long as that
+     * gives enough room. Returns how many went.
+     * The step lock, with nothing in flight reading the blocks. */
+    int64_t  evict_prefix_until(const std::function<bool()>& enough);
+    /* Running requests go back to the queue by recompute, youngest first, their blocks freed,
+     * until `enough()` (called under the step lock) holds or none runs: the fleet takes a
+     * lower-priority model's cache while it is busy (docs/MULTIMODEL.md §6.4). Between steps
+     * only, with nothing in flight. Returns how many went back. */
+    int      preempt_until(const std::function<bool()>& enough);
     /* The end-of-generation ids the card's acceptance reads, for ends_every_request. Set once at
      * start; without them only max_tokens ends are predicted. */
     void     set_eog(std::vector<int32_t> ids);
@@ -638,6 +655,14 @@ private:
     static constexpr double kDebugMiss = 0.3;
 
     mutable std::mutex mu_;
+
+    /* wake_seq/wait_idle/wake. */
+
+    std::mutex              wake_mu_;
+
+    std::condition_variable wake_cv_;
+
+    uint64_t                wake_n_ = 0;
 
     SchedMetrics metrics_locked() const;
     int          requests_locked(ReqStat* out, int max) const;
