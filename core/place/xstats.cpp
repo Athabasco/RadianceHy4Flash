@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <fcntl.h>
 #include <set>
 #include <unistd.h>
 
@@ -347,9 +348,29 @@ std::string xs_json(const XsSnapshot& s) {
 
 int xs_write_atomic(const std::string& path, const std::string& text) {
     const std::string tmp = path + ".tmp." + std::to_string((long long)getpid());
-    FILE* f = std::fopen(tmp.c_str(), "w");
+    /* Created fresh, exclusive, never through a symlink. The name is predictable -- the PID
+     * is public -- and fopen("w") follows links and truncates: a local user pre-creating it
+     * as a symlink had the serving process overwrite whatever file the link named, as the
+     * serving user. An existing name, of any kind, is now a refusal. */
+    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (fd < 0 && errno == EEXIST) {
+        /* A crash can leave our own tmp name behind, and a reboot can reuse the PID; the
+         * name is then ours to clear, its contents nobody's to overwrite. The retry is
+         * exclusive again, so whoever else pre-created it wins only a refusal -- we never
+         * follow it, truncate it, or write through it. */
+        ::unlink(tmp.c_str());
+        fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    }
+    if (fd < 0) {
+        RAD_WARN("--expert-stats: cannot create %s: %s", tmp.c_str(), std::strerror(errno));
+        return RAD_E_IO;
+    }
+    FILE* f = ::fdopen(fd, "w");
     if (!f) {
-        RAD_WARN("--expert-stats: cannot write %s: %s", tmp.c_str(), std::strerror(errno));
+        const int err = errno;
+        ::close(fd);
+        ::unlink(tmp.c_str());
+        RAD_WARN("--expert-stats: cannot open %s: %s", tmp.c_str(), std::strerror(err));
         return RAD_E_IO;
     }
     const bool wrote = std::fwrite(text.data(), 1, text.size(), f) == text.size() &&
