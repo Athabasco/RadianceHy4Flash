@@ -178,15 +178,15 @@ vendor/cpp-httplib/httplib.h
 vendor/cpp-httplib/httplib.cpp
 vendor/cpp-httplib/LICENSE                   <- llama.cpp vendor/cpp-httplib/cpp-httplib/*
 
-    The HTTP library at cpp-httplib v0.64.0 SPLIT from upstream's single ~24,300-line header
-    into a .h/.cpp pair, so one translation unit pays for it. Apart from the split the pair
-    matches upstream exactly when it was lifted; the split itself drops two decorative
-    `// ----` separator comment lines, moves `inline` from definitions to declarations, and
-    adds the .cpp's `#include "httplib.h"` and namespace brace. The only other difference
-    from upstream is the PATH: llama.cpp nests it one directory deeper and puts the outer
-    directory on the include path. Flattening lets `<cpp-httplib/httplib.h>` resolve with
-    vendor/ alone on the path, which is the one include directory core/CMakeLists.txt
-    already adds.
+    The HTTP library at cpp-httplib v0.66.0, carried as the .h/.cpp SPLIT pair llama.cpp
+    distributes (v0.64.0 split upstream's single ~24,300-line header into a pair so that one
+    translation unit pays for it). Apart from the split mechanics the split itself introduced
+    (two decorative `// ----` separator lines dropped, `inline` moved from definitions to
+    declarations, the .cpp's `#include "httplib.h"` and namespace brace added) and patch 0022
+    below, the pair is llama.cpp's bytes at the recorded commit, byte for byte. The PATH is
+    ours: llama.cpp nests the pair one directory deeper; flattening lets
+    `<cpp-httplib/httplib.h>` resolve with vendor/ alone on the path, which is the one include
+    directory core/CMakeLists.txt already adds.
 
     cpp-httplib's own CMakeLists.txt is NOT carried. vendor/CMakeLists.txt builds httplib.cpp
     itself, because upstream's version reaches for llama.cpp's license and compile-flag helpers
@@ -195,24 +195,33 @@ vendor/cpp-httplib/LICENSE                   <- llama.cpp vendor/cpp-httplib/cpp
     vendor/CMakeLists.txt sets, so a future disagreement between them would have been invisible --
     the copy nobody builds is the copy nobody checks.
 
-    Upstream tracked: cpp-httplib tag v0.64.0 (yhirose/cpp-httplib); the split pair as carried by
-    llama.cpp commit 1ab23c33b ("vendor : update cpp-httplib to 0.64.0 (#31400)"). Earlier this pair
-    sat at v0.46.1 -- what llama.cpp carried at the lifted commit -- and carried patches/0022; the
-    bump retires most of that patch, because 0.64.0 natively closes the connection on every 4xx/5xx
-    response (the "Connection: close" option is honored by a scope_exit in write_response), skips
-    the keep-alive drain for any response that committed to close, bounds the drain that does run
-    (CPPHTTPLIB_UNREAD_PAYLOAD_MAX_LENGTH, the connection timeout as a total max_timeout, and a
-    close for a part-read body), and routes exceptions from the pre-routing handler and the
-    WebSocket upgrade through the exception handler. What survives is the budget the library still
-    ties to the connection's own timeout and cannot lower without capping uploads too: see below.
+    Upstream tracked: cpp-httplib tag v0.66.0 (yhirose/cpp-httplib); the split pair as carried by
+    llama.cpp commit b8abe41a5 ("vendor: update cpp-httplib to 0.66.0 (#32049)"). Earlier this pair
+    sat at v0.46.1 -- what llama.cpp carried at the lifted commit -- and carried patches/0022, and
+    at v0.64.0; the v0.64.0 bump retired most of that patch, because 0.64.0 natively closes the
+    connection on every 4xx/5xx response (the "Connection: close" option is honored by a scope_exit
+    in write_response), skips the keep-alive drain for any response that committed to close, bounds
+    the drain that does run (CPPHTTPLIB_UNREAD_PAYLOAD_MAX_LENGTH, the connection timeout as a
+    total max_timeout, and a close for a part-read body), and routes exceptions from the pre-routing
+    handler and the WebSocket upgrade through the exception handler. What survived is the budget the
+    library still ties to the connection's own timeout and cannot lower without capping uploads
+    too: see below. The v0.66.0 bump is the audit's upstream-currency finding: 0.66.0's ThreadPool
+    wraps the dynamic worker's creation in try/catch (std::system_error) and keeps the job queued
+    when the thread budget runs out, where 0.64.0 let the exception escape the accept loop into
+    std::terminate -- thread exhaustion was a process abort. radiance's socket gate and drain
+    budget narrowed that window; they never closed it.
 
     LOCAL CHANGES: patches/0022-httplib-the-drain-keeps-a-five-second-budget.patch
 
     On 0022: a response whose body the handler left unread drains on the keep-alive socket, and
-    0.64.0 bounds that drain only by the connection's read timeout -- the same knob that bounds a
+    upstream bounds that drain only by the connection's read timeout -- the same knob that bounds a
     whole request's reads, uploads included, so radiance cannot simply lower it. A client dribbling
     one byte per gap paces a worker for that full timeout after the response was already sent.
     0022 caps the drain's total budget at 5 s (or the connection timeout, whichever is smaller).
+    Re-verified against 0.66.0: the hunk lands at the same site with a +26-line offset and no
+    fuzz, and upstream changed nothing around it -- the drain is still bound only by the
+    connection's timeout, so the patch stands. The six CPPHTTPLIB_* defines vendor/CMakeLists.txt
+    passes were each re-checked as live knobs in the 0.66.0 pair.
 
 vendor/yyjson/yyjson.h
 vendor/yyjson/yyjson.c
