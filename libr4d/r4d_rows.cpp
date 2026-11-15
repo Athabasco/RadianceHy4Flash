@@ -6061,6 +6061,7 @@ static const RadConstraint cVsa[] = {
 static const RadConstraint cQuantCols[] = { C_DIV("n", 8), C_IN("dtype", "bf16") };
 
 static const RadConstraint cPixtralPatch[] = { C_IN("dtype","bf16"), C_EQ("K",588), C_GE("M",1), C_LE("M",2147483647), C_GE("N",1), C_LE("N",2147483647) };
+static const RadConstraint cMusePatch[] = { C_IN("dtype","bf16"), C_EQ("K",1176), C_GE("M",1), C_LE("M",2147483647), C_GE("N",1), C_LE("N",2147483647) };
 static const RadConstraint cNemotron[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 2147483647) };
 static const RadConstraint cNemotronMerge[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 2147483647), C_EQ("merge",2) };
 static const RadConstraint cNemotronRope64[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_LE("M", 2147483647), C_EQ("head_dim",64) };
@@ -6071,6 +6072,10 @@ static const RadKernelInfo kKernels[] = {
 { "gemm_bf16_pixtral_patch", "gemm_nt", "gemm", "RGB 14x14 patch projection with ordered f32 dots",
   "K=588, M<=INT_MAX, N<=INT_MAX, pitched bf16 rows", "bf16",
   RAD_DOMAIN_DEVICE, 10, ROW(cPixtralPatch), NOTUNE,
+  nullptr, nullptr, r4d_rad_pixtral_patch },
+{ "gemm_bf16_muse_patch", "gemm_nt", "gemm", "Muse Glimmer RGB 14x14x2 patch projection",
+  "K=1176, M<=INT_MAX, N<=INT_MAX, pitched bf16 rows", "bf16",
+  RAD_DOMAIN_DEVICE, 10, ROW(cMusePatch), NOTUNE,
   nullptr, nullptr, r4d_rad_pixtral_patch },
 { "position_scale_bf16", "position_scale", "attn", "Ministral rounded query scale", "pitched active rows, nonnegative i32 positions", "bf16",
   RAD_DOMAIN_DEVICE, 50, ROW(cNemotron), NOTUNE,
