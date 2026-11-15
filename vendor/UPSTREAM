@@ -253,6 +253,25 @@ vendor/shim/ryml_impl.cpp                    ours: defines RYML_SINGLE_HDR_DEFIN
     LOCAL CHANGES: none.
 
 
+vendor/shim/common.h                       ours -- NOT a lift -- but MIT-derived all the same:
+vendor/shim/ggml.h                             common.h transcribes, unchanged, the string helpers
+vendor/shim/llama.h                             the lifted chat and PEG-parser sources need from
+vendor/shim/log.h                              llama.cpp's common/common.{h,cpp} (06938ac12); the
+vendor/shim/llama_shim.cpp                     other four declare the small macros, types and log
+                                               surface those lifts reach for outside themselves.
+                                               Each file's own header says why the shim exists: the
+                                               lifts compile byte-for-byte without the CLI
+                                               argument machinery, the engine being replaced, or
+                                               upstream's logging subsystem. Recorded beside the
+                                               lifts because upstream's code or upstream's shape
+                                               lives in them -- this file is where lifted
+                                               provenance lives, and the manifest under which
+                                               vendor_sums hashes them is the tamper check.
+
+    LOCAL CHANGES: n/a -- maintained in place. A vendor refresh re-derives what the lifts expect
+                   of these headers (their comments enumerate the needs); nothing is re-copied.
+
+
 REWRITTEN INTO core/ INSTEAD
 ----------------------------
 
