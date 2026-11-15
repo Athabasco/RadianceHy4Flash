@@ -490,13 +490,18 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
         }
     }
 
+    /* The control-vector variant is a name of the served model, not an adapter: it takes no
+     * slot. */
+    const bool variant =
+        !opt_.control_vector_variant.empty() && r.model == opt_.control_vector_variant;
+
     /* Runtime LoRA: `model` picks the adapter. The served model's own name, or no name, is the
      * base; with adapters enabled anything else must be a loaded adapter, since a typo served by
      * the base would answer as the wrong model without a word. */
     int32_t  lora_slot = -1;
     uint64_t lora_uid = 0;
     std::shared_ptr<void> lora_hold;
-    if (opt_.lora_acquire && !r.model.empty() && r.model != opt_.model_id) {
+    if (opt_.lora_acquire && !r.model.empty() && r.model != opt_.model_id && !variant) {
         if (opt_.lora_acquire(r.model, &lora_slot, &lora_uid, &lora_hold) != RAD_OK) {
             std::string names = opt_.model_id;
             if (opt_.lora_names)
@@ -511,14 +516,22 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
         }
     }
 
-    /* The control vector: the request's own choice, else the deployment's runtime default. A
-     * deployment with no vector refuses the on state by name rather than serve the stock model. */
+    /* The control vector: the variant's name turns it on, else the request's own choice, else the
+     * deployment's runtime default. The variant's name with an explicit `false` is refused rather
+     * than served either way, since the request asks for both. A deployment with no vector refuses
+     * the on state by name rather than serve the stock model. */
     bool projection_on = false;
     {
         const bool named = r.control_vector >= 0;
-        projection_on = named
-            ? (r.control_vector == 1)
-            : (deps_.control_vector.get_default && deps_.control_vector.get_default());
+        if (variant && named && r.control_vector == 0) {
+            *err = err_bad("control_vector",
+                           "is false, but model '" + r.model + "' is the control-vector variant, "
+                           "which runs with the vector on; send one or the other");
+            return RAD_E_INVAL;
+        }
+        const bool by_default =
+            deps_.control_vector.get_default && deps_.control_vector.get_default();
+        projection_on = variant || (named ? r.control_vector == 1 : by_default);
         if (projection_on &&
             !(deps_.control_vector.available && deps_.control_vector.available())) {
             *err = err_bad("control_vector",
@@ -2302,7 +2315,8 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
     std::vector<std::string> adapters;
     if (opt_.lora_names) adapters = opt_.lora_names();
     const bool is_adapter = !id.empty() && std::find(adapters.begin(), adapters.end(), id) != adapters.end();
-    if (!id.empty() && id != opt_.model_id && !is_adapter) {
+    const bool is_variant = !id.empty() && id == opt_.control_vector_variant;
+    if (!id.empty() && id != opt_.model_id && !is_adapter && !is_variant) {
         ApiError e;
         e.status = 404;
         e.type = "not_found_error";
@@ -2325,6 +2339,15 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
     c.capabilities = capabilities().dump();
     metrics_.observe_http(200);
     std::vector<ModelCard> cards{ c };
+    /* The control-vector variant is listed as a child of the model, as an adapter is, so the front
+     * names it `base:name` and a client that only picks a model can find it. */
+    if (!opt_.control_vector_variant.empty()) {
+        ModelCard vc = c;
+        vc.id = opt_.control_vector_variant;
+        vc.parent = opt_.model_id;
+        cards.push_back(vc);
+        if (is_variant) return HttpResponse::json_body(200, model_body(vc));
+    }
     for (const std::string& a : adapters) {
         ModelCard ac = c;
         ac.id = a;
@@ -2383,6 +2406,10 @@ HttpResponse Server::handle_lora_admin(const HttpRequest& req, bool load) {
     const std::string name = j["lora_name"].get<std::string>();
     if (name.empty() || name == opt_.model_id)
         return fail(400, "invalid_request_error", "lora_name must be non-empty and not the served model's name");
+    if (load && !opt_.control_vector_variant.empty() && name == opt_.control_vector_variant)
+        return fail(400, "invalid_request_error",
+                    "lora_name '" + name + "' is this model's control-vector variant "
+                    "(--control-vector-variant), so a request naming it could mean either");
     std::string err;
     int s;
     int in_flight = 0;

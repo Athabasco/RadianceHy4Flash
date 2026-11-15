@@ -5057,6 +5057,106 @@ int status_with(Fixture& f, const std::string& ep, const std::string& key, const
 
 }  /* namespace */
 
+/* --control-vector-variant: the variant's name runs the vector whatever the default, the model's
+ * own name keeps the default, an explicit false beside the variant's name is refused as the
+ * contradiction it is, and the name is listed as a child of the model the way an adapter is. */
+TEST(the_control_vector_variant_runs_with_the_vector_and_is_listed) {
+    Fixture f(Fixture::Tweak{ [](ServerOptions& o, Deps& d) {
+        o.control_vector_variant = "uncensored";
+        d.control_vector.available   = [] { return true; };
+        d.control_vector.get_default = [] { return false; };
+    } });
+    HttpResponse r = f.post("/v1/chat/completions",
+                            R"({"model":"uncensored","messages":[{"role":"user","content":"hi"}],
+                                "max_tokens":4})");
+    if (r.streaming()) drain(r);
+    f.sched.join_all();
+    CHECK_EQ(r.status, 200);
+    CHECK(f.sched.last_sp.use_control_vector);
+
+    /* The model's own name runs the default, off here. */
+    HttpResponse r2 = f.post("/v1/chat/completions",
+                             R"({"model":"test-model","messages":[{"role":"user","content":"hi"}],
+                                 "max_tokens":4})");
+    if (r2.streaming()) drain(r2);
+    f.sched.join_all();
+    CHECK_EQ(r2.status, 200);
+    CHECK(!f.sched.last_sp.use_control_vector);
+
+    /* The variant's name with an explicit true is the same request; with false it asks for both. */
+    HttpResponse r3 = f.post("/v1/chat/completions",
+                             R"({"model":"uncensored","messages":[{"role":"user","content":"hi"}],
+                                 "max_tokens":4,"control_vector":true})");
+    if (r3.streaming()) drain(r3);
+    f.sched.join_all();
+    CHECK_EQ(r3.status, 200);
+    CHECK(f.sched.last_sp.use_control_vector);
+    HttpResponse r4 = f.post("/v1/chat/completions",
+                             R"({"model":"uncensored","messages":[{"role":"user","content":"hi"}],
+                                 "max_tokens":4,"control_vector":false})");
+    if (r4.streaming()) drain(r4);
+    f.sched.join_all();
+    CHECK_EQ(r4.status, 400);
+    CHECK(r4.body.find("control_vector") != std::string::npos);
+    CHECK(r4.body.find("uncensored") != std::string::npos);
+
+    /* Listed as a child of the model, and readable on its own. */
+    const json all = json::parse(f.get("/v1/models").body);
+    bool listed = false;
+    for (const json& m : all["data"])
+        if (m.value("id", std::string()) == "uncensored") {
+            listed = true;
+            CHECK_EQ(m.value("parent", std::string()), std::string("test-model"));
+        }
+    CHECK(listed);
+    const HttpResponse one = f.get("/v1/models/uncensored");
+    CHECK_EQ(one.status, 200);
+    CHECK_EQ(json::parse(one.body).value("id", std::string()), std::string("uncensored"));
+}
+
+/* With adapters enabled, every name but the model's own must be a loaded adapter. The variant is a
+ * name of the model, so it reaches the base without an adapter lookup, and no adapter may be
+ * loaded under it: `base:name` would then mean two things. */
+TEST(the_control_vector_variant_is_not_an_adapter) {
+    int lookups = 0;
+    Fixture f(Fixture::Tweak{ [&](ServerOptions& o, Deps& d) {
+        o.control_vector_variant = "uncensored";
+        o.lora_acquire = [&](const std::string&, int32_t*, uint64_t*, std::shared_ptr<void>*) {
+            ++lookups;
+            return (int)RAD_E_NOTFOUND;
+        };
+        o.lora_names = [] { return std::vector<std::string>{}; };
+        o.lora_load = [](const std::string&, const std::string&, std::string*) {
+            return (int)RAD_OK;
+        };
+        o.lora_unload = [](const std::string&, std::string*, int*) { return (int)RAD_OK; };
+        d.control_vector.available   = [] { return true; };
+        d.control_vector.get_default = [] { return false; };
+    } });
+    HttpResponse r = f.post("/v1/chat/completions",
+                            R"({"model":"uncensored","messages":[{"role":"user","content":"hi"}],
+                                "max_tokens":4})");
+    if (r.streaming()) drain(r);
+    f.sched.join_all();
+    CHECK_EQ(r.status, 200);
+    CHECK_EQ(lookups, 0);
+    CHECK(f.sched.last_sp.use_control_vector);
+
+    /* Any other name still goes to the adapters, which do not know it. */
+    HttpResponse r2 = f.post("/v1/chat/completions",
+                             R"({"model":"other","messages":[{"role":"user","content":"hi"}],
+                                 "max_tokens":4})");
+    if (r2.streaming()) drain(r2);
+    f.sched.join_all();
+    CHECK_EQ(r2.status, 404);
+    CHECK_EQ(lookups, 1);
+
+    const HttpResponse l = f.post("/v1/load_lora_adapter",
+                                  R"({"lora_name":"uncensored","lora_path":"/adapters/u"})");
+    CHECK_EQ(l.status, 400);
+    CHECK(l.body.find("control-vector variant") != std::string::npos);
+}
+
 /* The control vector: absent, the deployment's default applies; an explicit `true` on a
  * deployment with no vector is refused by name (serving the stock model while the client believes
  * otherwise would be a silent lie), and on one with a vector it reaches the engine's request. */
