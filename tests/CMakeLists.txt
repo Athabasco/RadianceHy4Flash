@@ -10,7 +10,7 @@
 #   fast     every test with none of slow, gpu, oot and perf, set at the end of this file: the
 #            inner loop (`ctest --preset fast`, or `ctest -L fast`)
 #
-# arch_test, bailing_hybrid_arch_test, flint_arch_test, glm5next_test, museglimmer_test, nemotron35_test, spark25_arch_test and nemotronh_test do not link rad_core: they supply
+# The tests named in RAD_TESTS_NO_CORE below do not link rad_core: they supply
 # their own recording fake of the declare-phase C ABI (arch_fakes.h), so plugins are tested without
 # depending on core/build/'s builder. With the archive linked, a new ABI call missing from the fake
 # would pull in rad_builder.cpp.o and collide on every rad_decl_* symbol; without it the error is a

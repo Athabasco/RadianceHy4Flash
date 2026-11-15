@@ -1316,7 +1316,6 @@ struct ReplyStream::Impl {
             if (think_text) { msg.reasoning += think_pend; think_pend.clear(); }
             return;
         }
-        touch(0);
         think_hold.append(p, n);
         flush_think_hold(false);
     }
