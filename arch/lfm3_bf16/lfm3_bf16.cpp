@@ -40,6 +40,7 @@
  * by name.
  */
 #include <arch/rad_arch.h>
+#include <arch/rad_fp8.h>
 
 #include <cmath>
 #include <sstream>
@@ -52,7 +53,9 @@ using namespace rad::arch;
 
 enum Kind { kConv = 0, kFull = 1, kSliding = 2 };
 
-/* One plain bf16 linear: its weight and the gemm_nt over it. */
+/* One plain bf16 linear: its weight and the gemm_nt over it. The attention gate is the one linear
+ * declared this way: its weight is gate_proj's rows repeated, which the shared LinearFP8 that
+ * serves every other linear does not map. */
 struct Linear {
     rad_weight w = 0;
     rad_op     op = 0;
@@ -71,16 +74,17 @@ struct Layer {
     rad_weight w_norm = 0, w_post_norm = 0, w_ffn_norm = 0, w_ffn_post_norm = 0;
     rad_op op_norm = 0, op_post_norm = 0, op_add = 0;
     /* conv */
-    Linear conv_in, conv_out;
+    LinearFP8 conv_in, conv_out;
     rad_weight w_conv = 0;
     rad_op op_gate_in = 0, op_conv = 0, op_gate_out = 0;
     /* attention */
-    Linear q, k, v, gate, out;
+    LinearFP8 q, k, v, out;
+    Linear gate;
     rad_weight w_q_norm = 0, w_k_norm = 0;
     rad_op op_q_norm = 0, op_k_norm = 0, op_rope_q = 0, op_rope_k = 0;
     rad_op op_store = 0, op_attn = 0, op_sigmoid = 0, op_gate_mul = 0;
     /* the feed-forward: norm, gate|up (w1 | w3), SiLU(gate) * up, down (w2), norm, residual add */
-    Linear gate_up, down;
+    LinearFP8 gate_up, down;
     rad_op op_ffn_norm = 0, op_act = 0, op_ffn_post_norm = 0, op_ffn_add = 0;
     /* The sandwich joins, fused: op_join is post_norm + add + ffn_norm, and op_ffn_join is
      * ffn_post_norm + ffn_add + the next layer's norm, which that layer then does not declare. */
@@ -97,6 +101,9 @@ struct Model {
     rad_buf b_x = 0, b_h = 0, b_arm = 0, b_bcx = 0, b_conv_in = 0, b_conv_out = 0;
     rad_buf b_q = 0, b_k = 0, b_v = 0, b_attn = 0, b_gate = 0, b_gate_up = 0, b_ffn = 0;
     rad_buf b_hout = 0, b_logits = 0;
+    /* The four activations a linear reads, as LinearFP8 takes them: the bf16 plane is the buffer
+     * above. */
+    ActFP8 a_h{}, a_attn{}, a_conv{}, a_ffn{};
 
     rad_weight w_tok = 0, w_out_norm = 0, w_lm_head = 0;
     rad_op op_embed = 0, op_gather = 0, op_final_norm = 0, op_logits = 0;
@@ -281,6 +288,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_hout     = decl_b(b, nm.f("h_out"),    RAD_BF16, {g.max_logit_rows, g.n_embd});
     m.b_logits   = decl_b(b, nm.f("logits"),   RAD_F32,  {g.max_logit_rows, g.n_vocab});
     RAD_ARCH_TRY(rad_declare_logits(b, m.b_logits));
+    /* Every linear reads a bf16 weight over its input's bf16 plane (LinearFP8's `gemm_nt`
+     * branch). */
+    g.w_bf16 = true;
+    m.a_h.x = m.b_h; m.a_attn.x = m.b_attn; m.a_conv.x = m.b_conv_out; m.a_ffn.x = m.b_ffn;
 
     /* ---- the vocabulary edges. The lm_head is tied but declared as its own weight: the
      * embedding may live in host memory (--embedding-placement) and the head on the card. */
@@ -336,11 +347,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         *w = layer_w(name, l, {n}, RAD_F32);
         return *w ? RAD_OK : RAD_E_INVAL;
     };
-    /* One linear over an already mapped weight; `parts` are the row parts of a fused one. */
-    auto linear = [&](Linear& lin, int l, const char* name, int64_t N, int64_t K, rad_buf in,
-                      rad_buf out, std::initializer_list<int64_t> parts) -> int {
+    /* The gate: one plain bf16 linear over an already mapped weight. */
+    auto plain_linear = [&](Linear& lin, int l, const char* name, int64_t N, int64_t K, rad_buf in,
+                            rad_buf out) -> int {
         lin.w = decl_w(b, nm.f(name, l), RAD_BF16, {N, K}, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
-                       grp_layer(l), 0, parts);
+                       grp_layer(l));
         if (!lin.w) return RAD_E_INVAL;
         lin.op = rw(b, RAD_OP(b, "gemm_nt",
                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", N), RAD_INT("K", K),
@@ -348,6 +359,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         RAD_WEIGHTS(lin.w)),
                     {in}, {out});
         return lin.op ? RAD_OK : RAD_E_INVAL;
+    };
+    /* One linear: `base` is the declared name without `.weight`, `src` its checkpoint tensor (or
+     * the tensors stacked along its rows, `parts` their row counts), `a` the activation it reads. */
+    auto linear = [&](LinearFP8& lin, int l, const char* base_fmt, int64_t N, int64_t K,
+                      std::initializer_list<const char*> src, const ActFP8& a, rad_buf y,
+                      std::initializer_list<int64_t> parts) -> int {
+        return lin.declare(b, nm, g, nm.f(base_fmt, l), N, K, RAD_SHARD_NONE, grp_layer(l), src, a,
+                           y, 0, parts);
     };
     /* q names its query heads; k is rotated as a q-only row of the kv heads (its own buffer).
      * The partial rotary is on the "head" ladder; over the whole head the ladders coincide and
@@ -403,14 +422,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             const AttnClass& c = m.cls(L);
             RAD_ARCH_TRY(rad_bind_layer_kv(b, l, c.kv));
             const char* a = "%s.layers.%d.self_attn.%s";
-            RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_q.weight", l),
-                                  nm.ckpt(a, pre, l, "q_proj.weight")));
-            RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_k.weight", l),
-                                  nm.ckpt(a, pre, l, "k_proj.weight")));
-            RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_v.weight", l),
-                                  nm.ckpt(a, pre, l, "v_proj.weight")));
-            RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_output.weight", l),
-                                  nm.ckpt(a, pre, l, "o_proj.weight")));
             /* The gate at the output's width: row h of gate_proj, head_dim times, for each head
              * in turn (see the head of the file). Successive ROWS maps extend the weight. */
             {
@@ -428,11 +439,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         RAD_ARCH_TRY(rad_decl_name_map(b, &mp));
                     }
             }
-            RAD_ARCH_TRY(linear(L.q, l, "blk.%d.attn_q.weight", g.q_dim(), g.n_embd, m.b_h, m.b_q, {}));
-            RAD_ARCH_TRY(linear(L.k, l, "blk.%d.attn_k.weight", g.kv_dim(), g.n_embd, m.b_h, m.b_k, {}));
-            RAD_ARCH_TRY(linear(L.v, l, "blk.%d.attn_v.weight", g.kv_dim(), g.n_embd, m.b_h, m.b_v, {}));
-            RAD_ARCH_TRY(linear(L.gate, l, "blk.%d.attn_gate.weight", g.q_dim(), g.n_embd, m.b_h,
-                                m.b_gate, {}));
+            RAD_ARCH_TRY(linear(L.q, l, "blk.%d.attn_q", g.q_dim(), g.n_embd,
+                                { nm.ckpt(a, pre, l, "q_proj.weight") }, m.a_h, m.b_q, {}));
+            RAD_ARCH_TRY(linear(L.k, l, "blk.%d.attn_k", g.kv_dim(), g.n_embd,
+                                { nm.ckpt(a, pre, l, "k_proj.weight") }, m.a_h, m.b_k, {}));
+            RAD_ARCH_TRY(linear(L.v, l, "blk.%d.attn_v", g.kv_dim(), g.n_embd,
+                                { nm.ckpt(a, pre, l, "v_proj.weight") }, m.a_h, m.b_v, {}));
+            RAD_ARCH_TRY(plain_linear(L.gate, l, "blk.%d.attn_gate.weight", g.q_dim(), g.n_embd,
+                                      m.b_h, m.b_gate));
             RAD_ARCH_TRY(norm_w(&L.w_q_norm, "blk.%d.attn_q_norm.weight", l,
                                 nm.ckpt(a, pre, l, "q_norm.weight"), g.head_dim));
             RAD_ARCH_TRY(norm_w(&L.w_k_norm, "blk.%d.attn_k_norm.weight", l,
@@ -474,19 +488,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                   RAD_NOWEIGHTS),
                               {m.b_gate}, {m.b_gate});
             L.op_gate_mul = mul({m.b_gate, m.b_attn}, m.b_attn, g.q_dim());
-            RAD_ARCH_TRY(linear(L.out, l, "blk.%d.attn_output.weight", g.n_embd, g.q_dim(),
-                                m.b_attn, m.b_arm, {}));
+            RAD_ARCH_TRY(linear(L.out, l, "blk.%d.attn_output", g.n_embd, g.q_dim(),
+                                { nm.ckpt(a, pre, l, "o_proj.weight") }, m.a_attn, m.b_arm, {}));
         } else {
             RAD_ARCH_TRY(rad_bind_layer_kv(b, l, m.kv_conv));
             const char* c = "%s.layers.%d.conv.%s";
             RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.conv.weight", l), nm.ckpt(c, pre, l, "conv.weight")));
-            RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.conv_in.weight", l),
-                                  nm.ckpt(c, pre, l, "in_proj.weight")));
-            RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.conv_out.weight", l),
-                                  nm.ckpt(c, pre, l, "out_proj.weight")));
             /* in_proj's row is [B | C | x]: conv(B * x), then C * that. */
-            RAD_ARCH_TRY(linear(L.conv_in, l, "blk.%d.conv_in.weight", 3 * g.n_embd, g.n_embd,
-                                m.b_h, m.b_bcx, {}));
+            RAD_ARCH_TRY(linear(L.conv_in, l, "blk.%d.conv_in", 3 * g.n_embd, g.n_embd,
+                                { nm.ckpt(c, pre, l, "in_proj.weight") }, m.a_h, m.b_bcx, {}));
             /* The checkpoint ships [n_embd, 1, width]; the depthwise group axis is squeezed at
              * convert, as LFM2's is. */
             L.w_conv = layer_w("blk.%d.conv.weight", l, {g.n_embd, m.width}, RAD_BF16);
@@ -497,8 +507,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                RAD_WEIGHTS(L.w_conv)),
                            {m.b_conv_in}, {m.b_conv_out});
             L.op_gate_out = mul({m.b_bcx, m.b_conv_out}, m.b_conv_out, g.n_embd);
-            RAD_ARCH_TRY(linear(L.conv_out, l, "blk.%d.conv_out.weight", g.n_embd, g.n_embd,
-                                m.b_conv_out, m.b_arm, {}));
+            RAD_ARCH_TRY(linear(L.conv_out, l, "blk.%d.conv_out", g.n_embd, g.n_embd,
+                                { nm.ckpt(c, pre, l, "out_proj.weight") }, m.a_conv, m.b_arm, {}));
         }
         /* the sandwich: the mixer's output is normed before it joins the stream, and the
          * feed-forward reads the norm of the sum */
@@ -511,20 +521,16 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
         /* ---- the feed-forward */
         const char* ffn = "%s.layers.%d.feed_forward.%s";
-        RAD_ARCH_TRY(map_concat(b, nm.f("blk.%d.ffn_gate_up.weight", l),
-                                { nm.ckpt(ffn, pre, l, "w1.weight"),
-                                  nm.ckpt(ffn, pre, l, "w3.weight") }));
-        RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.ffn_down.weight", l),
-                              nm.ckpt(ffn, pre, l, "w2.weight")));
-        RAD_ARCH_TRY(linear(L.gate_up, l, "blk.%d.ffn_gate_up.weight", 2 * g.n_ff, g.n_embd,
-                            m.b_h, m.b_gate_up, { g.n_ff, g.n_ff }));
+        RAD_ARCH_TRY(linear(L.gate_up, l, "blk.%d.ffn_gate_up", 2 * g.n_ff, g.n_embd,
+                            { nm.ckpt(ffn, pre, l, "w1.weight"), nm.ckpt(ffn, pre, l, "w3.weight") },
+                            m.a_h, m.b_gate_up, { g.n_ff, g.n_ff }));
         L.op_act = rw(b, RAD_OP(b, "silu_mul",
                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_ff),
                                      RAD_STR("dtype", g.dtype)),
                           RAD_NOWEIGHTS),
                       {m.b_gate_up}, {m.b_ffn});
-        RAD_ARCH_TRY(linear(L.down, l, "blk.%d.ffn_down.weight", g.n_embd, g.n_ff, m.b_ffn,
-                            m.b_arm, {}));
+        RAD_ARCH_TRY(linear(L.down, l, "blk.%d.ffn_down", g.n_embd, g.n_ff,
+                            { nm.ckpt(ffn, pre, l, "w2.weight") }, m.a_ffn, m.b_arm, {}));
         if (has_join && l + 1 < (int)m.layers.size())
             L.op_ffn_join = join(L.w_ffn_post_norm, m.layers[(size_t)l + 1].w_norm);
         if (!L.op_ffn_join) {
@@ -621,9 +627,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
         if (L.kind != kConv) {
             const rad_kvgroup grp = m.cls(L).kv;
             const RadKVGroupBatch* kv = kv_batch(batch, grp);
-            lin_step(c, L.q, m.b_h, m.b_q, T);
-            lin_step(c, L.k, m.b_h, m.b_k, T);
-            lin_step(c, L.v, m.b_h, m.b_v, T);
+            L.q.step(c, m.a_h, m.b_q, T);
+            L.k.step(c, m.a_h, m.b_k, T);
+            L.v.step(c, m.a_h, m.b_v, T);
             lin_step(c, L.gate, m.b_h, m.b_gate, T);
             RAD_ISSUE_N(c, L.op_q_norm, T * g.n_head, brows(m.b_q, T), RAD_W(L.w_q_norm),
                         brows(m.b_q, T));
@@ -643,15 +649,15 @@ static void step(RadCtx* c, const RadBatch* batch) {
                         brows(m.b_attn, T));
             RAD_ISSUE(c, L.op_sigmoid, brows(m.b_gate, T), brows(m.b_gate, T));
             RAD_ISSUE(c, L.op_gate_mul, brows(m.b_gate, T), brows(m.b_attn, T), brows(m.b_attn, T));
-            lin_step(c, L.out, m.b_attn, m.b_arm, T);
+            L.out.step(c, m.a_attn, m.b_arm, T);
         } else {
-            lin_step(c, L.conv_in, m.b_h, m.b_bcx, T);
+            L.conv_in.step(c, m.a_h, m.b_bcx, T);
             RAD_ISSUE(c, L.op_gate_in, bcol(m.b_bcx, 0, n, T), bcol(m.b_bcx, 2 * n, n, T),
                       brows(m.b_conv_in, T));
             conv_step(m, L, c, batch, l);
             RAD_ISSUE(c, L.op_gate_out, bcol(m.b_bcx, n, n, T), brows(m.b_conv_out, T),
                       brows(m.b_conv_out, T));
-            lin_step(c, L.conv_out, m.b_conv_out, m.b_arm, T);
+            L.conv_out.step(c, m.a_conv, m.b_arm, T);
         }
         if (L.op_join) {
             RAD_ISSUE(c, L.op_join, brows(m.b_arm, T), RAD_W(L.w_post_norm), brows(m.b_x, T),
@@ -662,9 +668,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
             RAD_ISSUE(c, L.op_add, brows(m.b_x, T), brows(m.b_arm, T), brows(m.b_x, T));
             RAD_ISSUE(c, L.op_ffn_norm, brows(m.b_x, T), RAD_W(L.w_ffn_norm), brows(m.b_h, T));
         }
-        lin_step(c, L.gate_up, m.b_h, m.b_gate_up, T);
+        L.gate_up.step(c, m.a_h, m.b_gate_up, T);
         RAD_ISSUE(c, L.op_act, brows(m.b_gate_up, T), brows(m.b_ffn, T));
-        lin_step(c, L.down, m.b_ffn, m.b_arm, T);
+        L.down.step(c, m.a_ffn, m.b_arm, T);
         if (L.op_ffn_join) {
             /* y is the next layer's input norm */
             RAD_ISSUE(c, L.op_ffn_join, brows(m.b_arm, T), RAD_W(L.w_ffn_post_norm),
