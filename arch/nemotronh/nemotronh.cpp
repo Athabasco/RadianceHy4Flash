@@ -720,16 +720,31 @@ static int declare_lilicorr(RadBuilder* b, const RadModelMeta* meta, const RadBu
     dw.attn    = decl_b(b, nm.f("df_attn"), A, {qr, qd});
     dw.gate_up = decl_b(b, nm.f("df_gate_up"), A, {qr, 2 * dg.n_ff});
     dw.ffn     = decl_b(b, nm.f("df_ffn"),  A, {qr, dg.n_ff});
-    dw.srcq    = decl_b(b, nm.f("df_srcq"), RAD_F8E4M3, {dg.max_tok, dc.n_taps * E});
-    dw.srcs    = decl_b(b, nm.f("df_srcs"), RAD_F32, {dg.max_tok, fp8_blocks(dc.n_taps * E)});
-    dw.cq      = decl_b(b, nm.f("df_cq"),   RAD_F8E4M3, {dg.max_tok, E});
-    dw.cs      = decl_b(b, nm.f("df_cs"),   RAD_F32,    {dg.max_tok, fp8_blocks(E)});
-    dw.h2q     = decl_b(b, nm.f("df_h2q"),  RAD_F8E4M3, {qr, E});
-    dw.h2s     = decl_b(b, nm.f("df_h2s"),  RAD_F32,    {qr, fp8_blocks(E)});
-    dw.atq     = decl_b(b, nm.f("df_atq"),  RAD_F8E4M3, {qr, qd});
-    dw.ats     = decl_b(b, nm.f("df_ats"),  RAD_F32,    {qr, fp8_blocks(qd)});
-    dw.ffq     = decl_b(b, nm.f("df_ffq"),  RAD_F8E4M3, {qr, dg.n_ff});
-    dw.ffs     = decl_b(b, nm.f("df_ffs"),  RAD_F32,    {qr, fp8_blocks(dg.n_ff)});
+    /* The codes the backbone's linears read: int8 with one f32 scale per (row, group) for linears
+     * stored rotated int8, which the drafter's `fc` tells (Dflash2::probe_i8, as gemma4_bf16 asks
+     * it); E4M3 with a scale per 128 for block fp8 or MXFP4 ones (rad_fp8.h's DenseFP8). radiance
+     * 2.0 serves no block fp8, so a 2.0 container's backbone is the int8 form. */
+    RAD_ARCH_TRY(Dflash2::probe_i8(b, nm, "draft", &dc.act_i8, &dc.act_g8));
+    dc.fc_mapped = true;
+    const uint32_t dqt = dc.act_i8 ? RAD_I8 : RAD_F8E4M3;
+    const int64_t  dqg = dc.act_i8 ? dc.act_g8 : (int64_t)RAD_FP8_BLOCK;
+    if (dc.act_i8 && ((dc.n_taps * E) % dqg || E % dqg || qd % dqg || dg.n_ff % dqg)) {
+        fprintf(stderr, "radiance: nemotronh: a rotated int8 LiLiCorr backbone takes widths in "
+                        "whole %lld-column scale groups; this one is n_embd %lld, q %lld, n_ff "
+                        "%lld\n", (long long)dqg, (long long)E, (long long)qd, (long long)dg.n_ff);
+        return RAD_E_INVAL;
+    }
+    auto dqs = [&](int64_t n) { return (n + dqg - 1) / dqg; };
+    dw.srcq    = decl_b(b, nm.f("df_srcq"), dqt,     {dg.max_tok, dc.n_taps * E});
+    dw.srcs    = decl_b(b, nm.f("df_srcs"), RAD_F32, {dg.max_tok, dqs(dc.n_taps * E)});
+    dw.cq      = decl_b(b, nm.f("df_cq"),   dqt,     {dg.max_tok, E});
+    dw.cs      = decl_b(b, nm.f("df_cs"),   RAD_F32, {dg.max_tok, dqs(E)});
+    dw.h2q     = decl_b(b, nm.f("df_h2q"),  dqt,     {qr, E});
+    dw.h2s     = decl_b(b, nm.f("df_h2s"),  RAD_F32, {qr, dqs(E)});
+    dw.atq     = decl_b(b, nm.f("df_atq"),  dqt,     {qr, qd});
+    dw.ats     = decl_b(b, nm.f("df_ats"),  RAD_F32, {qr, dqs(qd)});
+    dw.ffq     = decl_b(b, nm.f("df_ffq"),  dqt,     {qr, dg.n_ff});
+    dw.ffs     = decl_b(b, nm.f("df_ffs"),  RAD_F32, {qr, dqs(dg.n_ff)});
     dw.sel_h   = decl_b(b, nm.f("df_selh"), A, {sr, E});
     /* The proposal buffer (RadDrafterDecl::proposal), written by the walk. */
     dw.tokens  = decl_b(b, nm.f("dflash_tokens"), RAD_I32, {dg.max_seqs, dc.steps()});

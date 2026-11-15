@@ -120,13 +120,19 @@ struct Nemo {
     }
 };
 
-/* The weights as the release recipes store them: the drafter's linears and every trunk linear block
- * fp8, dt's rows of in_proj bf16 (32 a rank at four ranks, no whole scale block). The drafter's
- * keys come first: the fake answers the first key a name contains. */
+/* The weights as the 2.0 recipe stores them: the drafter's linears rotated int8 with a bf16 scale
+ * per (row, 128 of K), as the DFlash2 recipes do; every trunk linear int8 at 128, unrotated; the
+ * routed experts w4nl64; dt's rows of in_proj bf16 (32 a rank at four ranks, no whole scale block).
+ * The drafter's keys come first: the fake answers the first key a name contains. */
 void nemo_encs(RadBuilder& b) {
-    const RadEncoding fp8 = rad_enc_affine(RAD_F8E4M3, RAD_BF16, 128, 128);
-    b.encs = { { "dflash.fc.", fp8 }, { "dflash.blk.", fp8 }, { "ssm_dt", rad_enc_plain(RAD_BF16) },
-               { "blk.", fp8 } };
+    RadEncoding r8 = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+    rad_enc_copy_str(r8.transform, "fwht128");
+    RadEncoding nl = rad_enc_affine(RAD_U4, RAD_F8E4M3, 1, 64);
+    rad_enc_add_plane(&nl, "scale.1", RAD_F32, 0, 0);
+    rad_enc_add_table(&nl, "table", RAD_F32, 1, 16);
+    rad_enc_copy_str(nl.transform, "fwht128");
+    b.encs = { { "dflash.fc.", r8 }, { "dflash.blk.", r8 }, { "ssm_dt", rad_enc_plain(RAD_BF16) },
+               { "_exps", nl }, { "blk.", rad_enc_affine(RAD_I8, RAD_BF16, 1, 128) } };
 }
 
 int buf_named(const RadBuilder& b, const char* name) {
@@ -265,6 +271,47 @@ TEST(nemotronh_tp4_steps_lint_clean_with_the_lilicorr_drafter) {
         CHECK_EQ(count_issued(q, "attn_paged_sink"), 5);
         CHECK_EQ(count_issued(q, "kv_store"), 5);
         CHECK_EQ(count_issued(issued_ops(b, *v[1]), "kv_store"), 5);
+    }
+}
+
+/* The 2.0 recipe's drafter is rotated int8, and its backbone reads int8 codes: the five pairs its
+ * linears read (the taps, fc's output, the convolution's output, the attention and the feed-forward
+ * product) are int8 with an f32 scale per 128 of K, every GEMM over a `dflash.` weight runs at
+ * i8a8h, and no E4M3 quantiser writes a drafter buffer, at one, two and four ranks. Before, the
+ * backbone declared E4M3 pairs and a rotated int8 fc was refused at declare. */
+TEST(a_rotated_int8_lilicorr_backbone_reads_int8_codes) {
+    Nemo f;
+    const RadModelMeta meta = f.meta();
+    for (int world : { 1, 2, 4 }) {
+        RadBuilder b;
+        nemo_encs(b);
+        const RadBuildCtx ctx = nemo_ctx(world - 1, world);
+        REQUIRE_EQ(nemotronh::declare(&b, &meta, &ctx), RAD_OK);
+        for (const char* q : { "df_srcq", "df_cq", "df_h2q", "df_atq", "df_ffq" }) {
+            const int i = buf_named(b, q);
+            REQUIRE(i != 0);
+            CHECK_EQ((int)b.bufs[(size_t)i - 1].d.dtype, (int)RAD_I8);
+        }
+        const int cq = buf_named(b, "df_cq"), cs = buf_named(b, "df_cs");
+        REQUIRE(cq != 0 && cs != 0);
+        CHECK_EQ(b.bufs[(size_t)cs - 1].d.shape[1], b.bufs[(size_t)cq - 1].d.shape[1] / 128);
+        int fp8q = 0, gemms = 0, i8a8h = 0;
+        for (const RecOp& o : b.ops) {
+            if (o.op == "quant_act_fp8" || o.op == "had_quant_act_fp8")
+                for (rad_buf wb : o.writes)
+                    fp8q += b.bufs[(size_t)wb - 1].name.rfind("df_", 0) == 0;
+            if (o.op != "gemm_nt_q") continue;
+            bool df = false;
+            for (rad_weight wt : o.w)
+                df |= b.weights[(size_t)wt - 1].name.find("dflash.") != std::string::npos;
+            if (!df) continue;
+            ++gemms;
+            for (const RecParam& q : o.p)
+                if (q.key == "dtype") i8a8h += q.sval == "i8a8h";
+        }
+        CHECK_EQ(fp8q, 0);
+        CHECK(gemms > 0);
+        CHECK_EQ(i8a8h, gemms);
     }
 }
 
