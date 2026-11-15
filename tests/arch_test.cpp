@@ -4667,6 +4667,249 @@ TEST(lfm3_issues_a_mixed_step_through_both_attention_groups) {
     CHECK(!c2.step_fail.empty());
 }
 
+namespace {
+
+/* The rotated int8 trunk as data/recipes/lfm3-1.7b-iq8r.recipe states it: int8 codes rotated by
+ * fwht128 with a bf16 scale per [1 x 128] of K, the group every kernel library serves. */
+RadEncoding lfm3_iq8r() {
+    RadEncoding e = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+    rad_enc_copy_str(e.transform, "fwht128");
+    return e;
+}
+
+/* The same trunk at IQ8R's 256: a u8 scale per [1 x 256] of K under a bf16 scale a row. */
+RadEncoding lfm3_iq8r_256() {
+    RadEncoding e = rad_enc_affine(RAD_I8, RAD_U8, 1, 256);
+    rad_enc_add_plane(&e, "scale.1", RAD_BF16, 1, 0);
+    rad_enc_copy_str(e.transform, "fwht128");
+    return e;
+}
+
+const char* k_lfm3_trunk[] = { "attn_q.weight", "attn_k.weight", "attn_v.weight",
+                               "attn_output.weight", "conv_in.weight", "conv_out.weight",
+                               "ffn_gate_up.weight", "ffn_down.weight" };
+
+/* The recipe's encodings by declared name: the eight trunk linears as `enc`, every other weight
+ * (the gate among them) plain bf16. */
+void lfm3_trunk_encs(RadBuilder* b, const RadEncoding& enc) {
+    b->encs.clear();
+    for (const char* t : k_lfm3_trunk) b->encs.push_back({ t, enc });
+    b->encs.push_back({ "", rad_enc_plain(RAD_BF16) });
+}
+
+/* The four-layer model at widths a 128- and a 256-column scale group divide. */
+RadModelMeta lfm3_wide_meta() {
+    RadModelMeta m = lfm3_meta();
+    m.n_embd = 256; m.n_head = 16; m.n_head_kv = 4; m.head_dim = 16; m.n_ff = 512;
+    return m;
+}
+
+}  /* namespace */
+
+/* The IQ8R container: every trunk linear is one gemm_nt_q at i8a8h over its input's int8 codes at
+ * the weights' scale group (the recipe's 128, or 256), behind its own rotating quantiser of the
+ * bf16 plane; the gate is still gemm_nt over the norm's bf16 output; no E4M3 plane is declared;
+ * the rest of the graph is the bf16 model's. */
+TEST(lfm3_iq8r_container_declares_the_rotated_int8_trunk) {
+  const struct { RadEncoding enc; int64_t group; } forms[] = { { lfm3_iq8r(), 128 },
+                                                               { lfm3_iq8r_256(), 256 } };
+  for (const auto& form : forms) {
+    RadBuilder b;
+    b.undeclared.insert("norm_add_norm");
+    lfm3_trunk_encs(&b, form.enc);
+    RadModelMeta meta = lfm3_wide_meta();
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(lfm3_bf16::declare(&b, &meta, &ctx), RAD_OK);
+    const lfm3_bf16::Model& m = lfm3_bf16::g_model[0];
+    CHECK(m.q_i8);
+    CHECK(!m.g.w_bf16);
+    CHECK_EQ(m.g8, form.group);
+
+    /* conv layers: in, out, gate|up, down; attention layers: q, k, v, out, gate|up, down */
+    const int linears = 2 * 4 + 2 * 6;
+    CHECK_EQ(count_op(b, "gemm_nt_q"), linears);
+    CHECK_EQ(count_op(b, "had_quant_act_i8g"), linears);
+    CHECK_EQ(count_op(b, "quant_act_i8g"), 0);
+    CHECK_EQ(count_op(b, "gemm_nt"), 2);              /* the two gates */
+    for (int i = 0; i < linears; ++i) {
+        const RecOp* gq = find_op(b, "gemm_nt_q", i);
+        const RecOp* hq = find_op(b, "had_quant_act_i8g", i);
+        REQUIRE(gq != nullptr && hq != nullptr);
+        CHECK_EQ(pstr(gq, "dtype"), "i8a8h");
+        CHECK_EQ(pint(gq, "group"), form.group);
+        CHECK_EQ(pint(hq, "group"), form.group);
+        CHECK_EQ(pint(hq, "n"), pint(gq, "K"));
+    }
+    for (const auto& bf : b.bufs) {
+        CHECK(bf.d.dtype != RAD_F8E4M3);
+        if (bf.name == "h.q8" || bf.name == "attn_out.q8" || bf.name == "conv_out.q8" ||
+            bf.name == "ffn.q8")
+            CHECK_EQ(bf.d.dtype, (uint32_t)RAD_I8);
+    }
+    /* What stays bf16: the gate, the convolution, the head (tied to the embedding). */
+    for (const char* w : { "blk.1.attn_gate.weight", "blk.0.conv.weight", "output.weight",
+                           "token_embd.weight" }) {
+        const RecWeight* r = find_w(b, w);
+        REQUIRE(r != nullptr);
+        CHECK_EQ(r->d.dtype, (uint32_t)RAD_BF16);
+    }
+    CHECK_EQ(count_op(b, "causal_conv1d"), 2);
+    CHECK_EQ(count_op(b, "attn_paged"), 2);
+    CHECK_EQ(count_op(b, "rmsnorm"), 4 * 4 + 1);
+
+    /* A step issues each linear's quantiser before its GEMM. */
+    RadKVGroupBatch kv[3];
+    RadBatch mixed = lfm3_mixed_batch(kv);
+    RadCtx c{ .b = &b, .batch = &mixed };
+    lfm3_bf16::step(&c, &mixed);
+    CHECK_LINT(b, &c);
+    CHECK(c.step_fail.empty());
+    int quants = 0, gemms = 0;
+    bool quant_first = true;
+    for (size_t i = 0; i < c.issues.size(); ++i) {
+        const RecOp* o = b.op_of(c.issues[i].op);
+        if (!o) continue;
+        quants += o->op == "had_quant_act_i8g";
+        if (o->op != "gemm_nt_q") continue;
+        ++gemms;
+        const RecOp* before = i ? b.op_of(c.issues[i - 1].op) : nullptr;
+        quant_first &= before && before->op == "had_quant_act_i8g";
+    }
+    CHECK_EQ(gemms, linears);
+    CHECK_EQ(quants, linears);
+    CHECK(quant_first);
+
+    /* Each linear quantises the plane its input is and reads that plane's codes: the stream for
+     * the projections that open a mixer or the feed-forward, the mixer's own output for the one
+     * that closes it (the gated attention output, the gated convolution output), the SwiGLU
+     * product for the down projection. */
+    auto name_of = [&](const RadOperand& o) {
+        return o.kind == RAD_OPK_BUF && o.handle ? b.bufs[o.handle - 1].name : std::string("?");
+    };
+    std::vector<std::string> reads;
+    for (const auto& i : c.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (!o) continue;
+        if (o->op == "had_quant_act_i8g") {
+            reads.push_back(name_of(i.opd[0]));
+            CHECK_EQ(name_of(i.opd[1]), reads.back() + ".q8");
+        }
+        if (o->op == "gemm_nt_q") CHECK_EQ(name_of(i.opd[0]), reads.back() + ".q8");
+    }
+    const std::vector<std::string> conv = { "h", "conv_out", "h", "ffn" },
+                                   attn = { "h", "h", "h", "attn_out", "h", "ffn" };
+    std::vector<std::string> want;
+    for (bool att : { false, true, true, false }) append(want, att ? attn : conv);
+    CHECK_EQ(join(reads), join(want));
+  }
+}
+
+/* Plain int8 at one bf16 scale a 128 of K is the same trunk at i8a8 behind the unrotated
+ * quantiser; a bf16 container declares no code plane at all. */
+TEST(lfm3_int8_trunk_and_bf16_trunk_take_their_own_gemms) {
+    {
+        RadBuilder b;
+        lfm3_trunk_encs(&b, rad_enc_affine(RAD_I8, RAD_BF16, 1, 128));
+        RadModelMeta meta = lfm3_wide_meta();
+        RadBuildCtx ctx = build_ctx();
+        REQUIRE_EQ(lfm3_bf16::declare(&b, &meta, &ctx), RAD_OK);
+        CHECK_EQ(lfm3_bf16::g_model[0].g8, (int64_t)128);
+        CHECK_EQ(count_op(b, "gemm_nt_q"), 20);
+        CHECK_EQ(count_op(b, "quant_act_i8g"), 20);
+        CHECK_EQ(count_op(b, "had_quant_act_i8g"), 0);
+        CHECK_EQ(pstr(find_op(b, "gemm_nt_q"), "dtype"), "i8a8");
+    }
+    {
+        RadBuilder b;
+        b.encs = { { "", rad_enc_plain(RAD_BF16) } };
+        RadModelMeta meta = lfm3_wide_meta();
+        RadBuildCtx ctx = build_ctx();
+        REQUIRE_EQ(lfm3_bf16::declare(&b, &meta, &ctx), RAD_OK);
+        CHECK(lfm3_bf16::g_model[0].g.w_bf16);
+        CHECK_EQ(count_op(b, "gemm_nt_q"), 0);
+        CHECK_EQ(count_op(b, "gemm_nt"), 22);
+        for (const auto& bf : b.bufs) CHECK(bf.d.dtype != RAD_I8);
+    }
+}
+
+/* Rotation is each linear's own: at one scale group a plain int8 linear in a rotated trunk keeps
+ * the unrotated quantiser and i8a8, and the others keep theirs. */
+TEST(lfm3_plain_int8_linear_in_a_rotated_trunk_keeps_its_own_quantiser) {
+    RadBuilder b;
+    lfm3_trunk_encs(&b, lfm3_iq8r());
+    b.encs.insert(b.encs.begin(), { "attn_output.weight", rad_enc_affine(RAD_I8, RAD_BF16, 1, 128) });
+    RadModelMeta meta = lfm3_wide_meta();
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(lfm3_bf16::declare(&b, &meta, &ctx), RAD_OK);
+    CHECK_EQ(count_op(b, "quant_act_i8g"), 2);            /* the two attention layers' outputs */
+    CHECK_EQ(count_op(b, "had_quant_act_i8g"), 18);
+    int plain = 0, rotated = 0;
+    for (int i = 0; i < 20; ++i) {
+        const RecOp* gq = find_op(b, "gemm_nt_q", i);
+        REQUIRE(gq != nullptr);
+        plain += pstr(gq, "dtype") == "i8a8";
+        rotated += pstr(gq, "dtype") == "i8a8h";
+    }
+    CHECK_EQ(plain, 2);
+    CHECK_EQ(rotated, 18);
+    RadKVGroupBatch kv[3];
+    RadBatch mixed = lfm3_mixed_batch(kv);
+    RadCtx c{ .b = &b, .batch = &mixed };
+    lfm3_bf16::step(&c, &mixed);
+    CHECK(c.step_fail.empty());
+    for (size_t i = 1; i < c.issues.size(); ++i) {
+        const RecOp* o = b.op_of(c.issues[i].op);
+        const RecOp* before = b.op_of(c.issues[i - 1].op);
+        if (!o || o->op != "gemm_nt_q") continue;
+        REQUIRE(before != nullptr);
+        CHECK_EQ(before->op, pstr(o, "dtype") == "i8a8" ? "quant_act_i8g" : "had_quant_act_i8g");
+    }
+}
+
+/* What an 8-bit container may not be: a trunk of mixed formats, a quantised gate, a block-fp8
+ * trunk, a narrower rotated form, or widths the scale group does not divide. */
+TEST(lfm3_refuses_trunks_it_does_not_serve) {
+    auto declare_with = [](const std::function<void(RadBuilder*)>& encs, RadModelMeta meta) {
+        RadBuilder b;
+        encs(&b);
+        RadBuildCtx ctx = build_ctx();
+        return lfm3_bf16::declare(&b, &meta, &ctx);
+    };
+    const RadEncoding iq = lfm3_iq8r();
+    CHECK_OK(declare_with([&](RadBuilder* b) { lfm3_trunk_encs(b, iq); }, lfm3_wide_meta()));
+    /* one linear left bf16 in an int8 trunk, and one quantised in a bf16 trunk */
+    CHECK_EQ(declare_with([&](RadBuilder* b) {
+                 lfm3_trunk_encs(b, iq);
+                 b->encs.insert(b->encs.begin(), { "ffn_down.weight", rad_enc_plain(RAD_BF16) });
+             }, lfm3_wide_meta()), RAD_E_DTYPE);
+    CHECK_EQ(declare_with([&](RadBuilder* b) {
+                 b->encs = { { "ffn_down.weight", iq }, { "", rad_enc_plain(RAD_BF16) } };
+             }, lfm3_wide_meta()), RAD_E_DTYPE);
+    /* the two rotated groups in one trunk */
+    CHECK_EQ(declare_with([&](RadBuilder* b) {
+                 lfm3_trunk_encs(b, iq);
+                 b->encs.insert(b->encs.begin(), { "attn_output.weight", lfm3_iq8r_256() });
+             }, lfm3_wide_meta()), RAD_E_DTYPE);
+    /* IQ8R's 256 beside plain 128-group int8 */
+    CHECK_EQ(declare_with([&](RadBuilder* b) {
+                 lfm3_trunk_encs(b, lfm3_iq8r_256());
+                 b->encs.insert(b->encs.begin(),
+                                { "attn_output.weight", rad_enc_affine(RAD_I8, RAD_BF16, 1, 128) });
+             }, lfm3_wide_meta()), RAD_E_DTYPE);
+    /* the gate */
+    CHECK_EQ(declare_with([&](RadBuilder* b) {
+                 lfm3_trunk_encs(b, iq);
+                 b->encs.insert(b->encs.begin(), { "attn_gate.weight", iq });
+             }, lfm3_wide_meta()), RAD_E_DTYPE);
+    /* block fp8 */
+    CHECK_EQ(declare_with([&](RadBuilder* b) {
+                 lfm3_trunk_encs(b, rad_enc_affine(RAD_F8E4M3, RAD_BF16, 128, 128));
+             }, lfm3_wide_meta()), RAD_E_DTYPE);
+    /* a 64-wide stream under a 128-column group */
+    CHECK_EQ(declare_with([&](RadBuilder* b) { lfm3_trunk_encs(b, iq); }, lfm3_meta()),
+             RAD_E_UNSUPPORTED);
+}
+
 /* The sandwich joins. Where a library serves `norm_add_norm`, a layer's post norm, add and
  * feed-forward norm are one launch, and so are its feed-forward's post norm, add and the next
  * layer's norm, which that layer then neither declares nor issues; the last layer's feed-forward

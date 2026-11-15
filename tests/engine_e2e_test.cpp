@@ -1202,6 +1202,68 @@ TEST(runtime_lora_refuses_targets_it_cannot_serve_at_startup) {
     CHECK(has(s.log, "has the served model's own name"));
 }
 
+/* LFM3's IQ8R container (data/recipes/lfm3-1.7b-iq8r.recipe) beside the bf16 container of the same
+ * checkpoint, a tiny LFM3 at widths the recipe's scale group divides: the recipe quantises the
+ * eight trunk linears of every layer and nothing else, the engine serves it, and its record stays
+ * near the bf16 one. On random weights of this size rounding to int8 moves an agreed top token's
+ * log-probability by up to 0.2 and changes the top token at one position in sixteen; a rotation
+ * applied on one side only, or a scale plane read at the wrong group, leaves no resemblance. */
+TEST(lfm3_iq8r_container_tracks_the_bf16_one) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("e2e_lfm3_iq8r");
+    tiny::Lfm3 spec;
+    spec.hidden = 256; spec.heads = 4; spec.kv_heads = 2; spec.ffn = 512;
+    const std::string ckpt = d / "ckpt";
+    REQUIRE_EQ(mkdir(ckpt.c_str(), 0755), 0);
+    REQUIRE(tiny::write_lfm3(ckpt, spec));
+    REQUIRE(World::write_corpus(d / "corpus.jsonl", { kTinyGoldPrompt }));
+    auto convert = [&](const std::string& out, bool iq8r, std::string* log) {
+        std::vector<std::string> argv = { RAD_E2E_CONVERT, d / "ckpt", "-o", out };
+        if (iq8r) {
+            argv.push_back("--recipe");
+            argv.push_back(RAD_E2E_RECIPES "/lfm3-1.7b-iq8r.recipe");
+        }
+        const int st = tiny::run(argv, engine_env({}), log);
+        if (st != 0) fprintf(stderr, "    rad-convert exited %d:\n%s\n", st, tail(*log).c_str());
+        return st;
+    };
+    std::string blog, qlog;
+    REQUIRE_EQ(convert(d / "bf16.rad", false, &blog), 0);
+    REQUIRE_EQ(convert(d / "iq8r.rad", true, &qlog), 0);
+    /* 2 conv layers x 4 linears and 2 attention layers x 6; the gate is not among them */
+    CHECK(qlog.find("20 quantised by the recipe") != std::string::npos);
+
+    struct Top { int32_t id; float lp; };
+    const size_t row = 16 * sizeof(Top);
+    auto record = [&](const char* name) {
+        const std::string out = d / (std::string(name) + ".rec");
+        Ran r = radiance(d / (std::string(name) + ".rad"),
+                         { "--kld-record", out, "--kld-corpus", d / "corpus.jsonl" });
+        if (r.status != 0) fprintf(stderr, "    %s:\n%s\n", name, tail(r.log).c_str());
+        return r.status == 0 ? tiny::read_text(out + "/top.bin") : std::string();
+    };
+    const std::string a = record("bf16"), q = record("iq8r");
+    REQUIRE(!a.empty());
+    REQUIRE_EQ(q.size(), a.size());
+    REQUIRE(a != q);                                   /* the int8 trunk is what ran */
+    const int n = (int)(a.size() / row);
+    int same = 0;
+    double worst = 0;
+    for (int p = 0; p < n; ++p) {
+        Top x, y;
+        std::memcpy(&x, a.data() + (size_t)p * row, sizeof x);
+        std::memcpy(&y, q.data() + (size_t)p * row, sizeof y);
+        if (x.id != y.id) continue;
+        ++same;
+        worst = std::max(worst, (double)std::fabs(x.lp - y.lp));
+    }
+    fprintf(stderr, "    lfm3 iq8r against bf16: %d of %d top tokens equal, worst |dlogp| %.4f\n",
+            same, n, worst);
+    CHECK(same * 10 >= n * 9);
+    CHECK(worst < 0.5);
+}
+
 /* ================================================================== against transformers */
 
 /* Each family's forward pass against transformers' own, run in float32 over the same weights
