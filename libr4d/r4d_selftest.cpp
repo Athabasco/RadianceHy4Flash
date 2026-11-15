@@ -14986,6 +14986,75 @@ static void fused_quant_fp8_numeric(const Plugin& pl) {
         else same("gate_quant_fp8 at int8 codes is byte-identical to sigmoid + mul + quant_act_i8g");
     }
 
+    /* Rotated E4M3 gated output: compare its bf16 product to silu_mul and its FWHT and
+     * quantised values against an independent host butterfly. */
+    if (const RadKernelInfo* ghf = find(pl, "gated_had_quant_fp8")) {
+        rc = launch_row(smu, { T(d_gu, RAD_BF16, { M, 2 * K }), T(d_y[0], RAD_BF16, { M, K }) },
+                        { PI("M", M), PI("n", K), PS("dtype", "bf16") });
+        if (rc == RAD_OK)
+            rc = launch_row(ghf, { T(d_gu, RAD_BF16, { M, 2 * K }),
+                                   T(d_q[1], RAD_F8E4M3, { M, K }),
+                                   T(d_s[1], RAD_F32, { M, nkb }),
+                                   T(d_y[1], RAD_BF16, { M, K }) },
+                            { PI("M", M), PI("n", K), PI("group", 128),
+                              PS("dtype", "bf16"), PS("act", "silu") });
+        if (rc != RAD_OK) {
+            ok("gated_had_quant_fp8 vs host FWHT", false, "rc=" + std::to_string(rc));
+        } else {
+            std::vector<uint16_t> ref((size_t)(M * K)), out(ref.size());
+            std::vector<uint8_t> codes((size_t)(M * K));
+            std::vector<float> scales((size_t)(M * nkb));
+            st_memcpy(ref.data(), d_y[0], ref.size() * 2, hipMemcpyDeviceToHost);
+            st_memcpy(out.data(), d_y[1], out.size() * 2, hipMemcpyDeviceToHost);
+            st_memcpy(codes.data(), d_q[1], codes.size(), hipMemcpyDeviceToHost);
+            st_memcpy(scales.data(), d_s[1], scales.size() * 4, hipMemcpyDeviceToHost);
+            size_t bad_product = 0, bad_scale = 0, bad_code = 0;
+            for (size_t i = 0; i < ref.size(); ++i) bad_product += ref[i] != out[i];
+            for (int64_t r = 0; r < M; ++r) for (int64_t b = 0; b < nkb; ++b) {
+                float v[128];
+                for (int i = 0; i < 128; ++i) v[i] = rad_bf16_to_f32(ref[(size_t)(r*K+b*128+i)]);
+                for (int step = 1; step < 128; step *= 2)
+                    for (int i = 0; i < 128; i += 2 * step)
+                        for (int j = 0; j < step; ++j) {
+                            const float x = v[i+j], y = v[i+j+step];
+                            v[i+j] = x+y; v[i+j+step] = x-y;
+                        }
+                float mx = 0.0f;
+                for (float x : v) mx = std::max(mx, std::fabs(x));
+                const float want = mx > 0 ? mx / 448.0f : 1.0f;
+                const float got = scales[(size_t)(r*nkb+b)];
+                bad_scale += !std::isfinite(got) || std::fabs(got-want) > std::max(1e-7f, want*1e-5f);
+                for (int i = 0; i < 128; ++i) {
+                    const size_t at = (size_t)(r*K+b*128+i);
+                    const float decoded = rad_load_f32(codes.data(), RAD_F8E4M3, at) * got;
+                    bad_code += !std::isfinite(decoded) || std::fabs(decoded-v[i]) > std::max(1e-6f, mx*0.065f);
+                }
+            }
+            ok("gated_had_quant_fp8 matches host FWHT and E4M3 tolerance",
+               !bad_product && !bad_scale && !bad_code,
+               "product=" + std::to_string(bad_product) + " scale=" + std::to_string(bad_scale) +
+               " code=" + std::to_string(bad_code));
+            const auto saved_codes = codes;
+            const auto saved_scales = scales;
+            rc = launch_row(ghf, { T(d_gu, RAD_BF16, { M, 2 * K }),
+                                   T(d_q[1], RAD_F8E4M3, { M, K }),
+                                   T(d_s[1], RAD_F32, { M, nkb }), T(nullptr, RAD_BF16, {}) },
+                            { PI("M", M), PI("n", K), PI("group", 128),
+                              PS("dtype", "bf16"), PS("act", "silu") });
+            st_memcpy(codes.data(), d_q[1], codes.size(), hipMemcpyDeviceToHost);
+            st_memcpy(scales.data(), d_s[1], scales.size() * 4, hipMemcpyDeviceToHost);
+            ok("gated_had_quant_fp8 without bf16 output keeps codes and scales",
+               rc == RAD_OK && codes == saved_codes && scales == saved_scales);
+        }
+        rc = launch_row(ghf, { T(d_gu, RAD_BF16, { M, 2 * K }), T(d_q[1], RAD_I8, { M, K }),
+                               T(d_s[1], RAD_F32, { M, nkb }), T(nullptr, RAD_BF16, {}) },
+                        { PI("M", M), PI("n", K), PI("group", 128),
+                          PS("dtype", "bf16"), PS("act", "silu") });
+        ok("gated_had_quant_fp8 refuses int8 codes", rc != RAD_OK);
+    } else {
+        ok("gated_had_quant_fp8 is registered", false, "row absent");
+    }
+
     /* --- the rotated int8 twins, against their producer and had_quant_act_i8g ---
      *
      * For a trunk stored at i8a8h: the bf16 output must not move (it is unrotated), and codes and
@@ -33226,7 +33295,8 @@ static void device_phase(const Plugin& pl) {
     /* The fused quantisers are checked against the kernels they replace, gated on their own
      * rows. */
     if (sel("rmsnorm_quant_fp8") || sel("gated_quant_fp8") || sel("gate_quant_fp8") ||
-        sel("rmsnorm_had_quant_i8g") || sel("gated_had_quant_i8g")) {
+        sel("gated_had_quant_fp8") || sel("rmsnorm_had_quant_i8g") ||
+        sel("gated_had_quant_i8g")) {
         if (!g_case) std::printf("\nthe fp8 fusions, against the pair each one replaces\n");
         fused_quant_fp8_numeric(pl);
     }
