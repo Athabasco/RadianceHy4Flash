@@ -296,8 +296,10 @@ struct LatentMoe {
         RAD_ARCH_TRY(fc1.declare(b, nm, g, nm.f("blk.%d.ffn_latent_in", l), s.latent, g.n_embd,
                                  RAD_SHARD_NONE, grp,
                                  { nm.ckpt("%s.fc1_latent_proj.weight", pre) }, w.h, w.lat.x));
-        /* The routed arm reads the latent's codes unless its experts are bf16. */
-        if (!ms.cfg.expert_bf16) RAD_ARCH_TRY(lat_in.declare(b, g, w.lat, s.latent));
+        /* The routed arm reads the latent's E4M3 codes unless its experts are bf16 or rotated
+         * (rotated ones read the int8 copy MoeFP8 writes, `hr`). */
+        if (!ms.cfg.expert_bf16 && !ms.cfg.expert_rot)
+            RAD_ARCH_TRY(lat_in.declare(b, g, w.lat, s.latent));
         Geom ge = g;
         ge.n_embd = s.latent;
         ge.n_ff_all = s.ff[(size_t)l];
@@ -319,6 +321,9 @@ struct LatentMoe {
                                        RAD_SHARD_ROW, grp,
                                        { nm.ckpt("%s.shared_experts.up_proj.weight", pre) }, w.h,
                                        w.sup, 0, {}, sh_lo, sh_hi));
+            /* A down projection that reads the bf16 plane (an int8 one quantises it itself) takes
+             * the product alone, without codes no op would read. */
+            sh_act.silu_only = sh_down.reads_x;
             RAD_ARCH_TRY(sh_act.declare(b, g, w.sup, w.sff, sh_w, "relu2", 0, true, false));
             RAD_ARCH_TRY(sh_down.declare(b, nm, g, dn, g.n_embd, sh_w, RAD_SHARD_COL, grp,
                                          { nm.ckpt("%s.shared_experts.down_proj.weight", pre) },
@@ -519,6 +524,9 @@ static int buffers(RadBuilder* b, Model& m) {
     m.x = bf("residual", { T, E });
     m.y = bf("mixer_delta", { T, E });
     m.act.x = bf("normed", { T, E });
+    /* An int8 trunk's linears read the int8 pair, each quantising the bf16 plane itself, so the
+     * activations below declare no E4M3 pair. The block norms still write E4M3 codes here, which
+     * no linear of an int8 trunk reads: NormQuantFP8 has no unrotated int8 form. */
     RAD_ARCH_TRY(m.act.declare_qs(b, nm, g, "normed", E, 0, m.trunk_i8, true, m.trunk_g8));
     m.final_hidden = decl_b(b, nm.f("final_hidden"), RAD_BF16, { T, E }, RAD_BUF_PERSIST);
     m.logit_input = bf("logit_input", { g.max_logit_rows, E });
@@ -534,7 +542,7 @@ static int buffers(RadBuilder* b, Model& m) {
     mw.dt = bf("ssm_dt", { T, H });
     mw.y = bf("ssm_y", { T, W });
     mw.core_out.x = bf("ssm_out", { T, W });
-    RAD_ARCH_TRY(mw.core_out.declare_qs(b, nm, g, "ssm_out", W, 0, m.trunk_i8, true,
+    RAD_ARCH_TRY(mw.core_out.declare_qs(b, nm, g, "ssm_out", W, 0, m.trunk_i8, !m.trunk_i8,
                                         m.trunk_g8));
 
     auto& aw = m.aw;
@@ -543,7 +551,7 @@ static int buffers(RadBuilder* b, Model& m) {
     aw.qkv = bf("attn_qkv", { T, g.qkv_dim() });
     aw.q = bf("attn_q", { T, g.q_dim() });
     aw.attn.x = bf("attn_out", { T, g.q_dim() });
-    RAD_ARCH_TRY(aw.attn.declare_qs(b, nm, g, "attn_out", g.q_dim(), 0, m.trunk_i8, true,
+    RAD_ARCH_TRY(aw.attn.declare_qs(b, nm, g, "attn_out", g.q_dim(), 0, m.trunk_i8, !m.trunk_i8,
                                     m.trunk_g8));
     return RAD_OK;
 }
@@ -560,13 +568,16 @@ static int moe_buffers(RadBuilder* b, Model& m, const std::vector<MoeFP8::Src>& 
     };
     auto& ew = m.ew;
     ew.h = m.act;
+    /* The latent keeps its E4M3 pair on an int8 trunk too: MoeFP8 takes it as a prepared input
+     * and checks that it carries codes, also where rotated experts read their own copy `hr`
+     * and lat_in writes none. */
     ew.lat.x = bf("latent", { T, L });
     RAD_ARCH_TRY(ew.lat.declare_qs(b, nm, g, "latent", L, 0, m.trunk_i8, true, m.trunk_g8));
     ew.routed = m.y;
     if (sh_w > 0) {
         ew.sup = bf("shared_up", { T, sh_w });
         ew.sff.x = bf("shared_ff", { T, sh_w });
-        RAD_ARCH_TRY(ew.sff.declare_qs(b, nm, g, "shared_ff", sh_w, 0, m.trunk_i8, true,
+        RAD_ARCH_TRY(ew.sff.declare_qs(b, nm, g, "shared_ff", sh_w, 0, m.trunk_i8, !m.trunk_i8,
                                        m.trunk_g8));
         ew.sout = bf("shared_out", { T, E });
     }

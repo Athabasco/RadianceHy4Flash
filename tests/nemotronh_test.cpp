@@ -403,4 +403,33 @@ TEST(the_routed_arm_reads_rotated_int8_codes) {
     }
 }
 
+/* An int8 trunk quantises no activation to E4M3 that no op reads: in Bolt's nine-block cut, with its
+ * latent, at one, two and four ranks, no quant_act_fp8 is declared or issued, and the out
+ * projections' inputs and the shared expert's product have no E4M3 plane. The relu^2 product is
+ * written once, in bf16. The block norms' E4M3 codes remain (rmsnorm_quant_fp8 has no unrotated
+ * int8 form), and the latent's plane is declared for MoeFP8's prepared input but not written. */
+TEST(an_int8_trunk_quantises_nothing_to_e4m3_that_no_op_reads) {
+    Nemo f;
+    const RadModelMeta meta = f.meta();
+    for (int world : { 1, 2, 4 }) {
+        RadBuilder b;
+        int8_trunk_encs(b);
+        const RadBuildCtx ctx = build_ctx(world - 1, world);
+        REQUIRE_EQ(nemotronh::declare(&b, &meta, &ctx), RAD_OK);
+        int fp8q = 0, relu = 0;
+        for (const RecOp& o : b.ops) {
+            fp8q += o.op == "quant_act_fp8";
+            relu += o.op == "act_mul";
+        }
+        CHECK_EQ(fp8q, 0);
+        CHECK(relu > 0);
+        for (const char* n : { "attn_out.q", "ssm_out.q", "shared_ff.q" })
+            CHECK_EQ(buf_named(b, n), 0);
+        auto trunk = kit(b, { 1, 1 }, { 8 });
+        auto v = run_passes(b, nemotronh::step, { trunk.get() }, world - 1, world);
+        CHECK_PASSES(b, v);
+        CHECK_EQ(count_issued(issued_ops(b, *v[0]), "quant_act_fp8"), 0);
+    }
+}
+
 RAD_TEST_MAIN()
