@@ -518,15 +518,22 @@ int xs_profile_load(const std::string& path, std::vector<RadFileProfile>* out, i
     int64_t kept = 0;
     for (size_t l = 0; l < rows.size(); ++l) {
         if (!rows[l].is_array()) continue;
+        /* Counts are unsigned. The facade's arithmetic read casts -- a negative read as
+         * uint64_t wraps to 2^64-ish, and a wrapped count reads as a ~100% share, steering the
+         * planner's pinning at whatever the file's author named. Under the old JSON library a
+         * negative threw its way out of here; refuse the file by name instead. */
+        for (size_t e = 0; e < rows[l].size(); ++e)
+            if (!rows[l][e].is_number_unsigned()) {
+                RAD_ERR("--expert-profile: %s carries a negative or fractional count at decode "
+                        "layer %zu expert %zu; the format's counts are unsigned",
+                        path.c_str(), l, e);
+                return RAD_E_INVAL;
+            }
         uint64_t sum = 0;
-        for (const auto& c : rows[l])
-            if (c.is_number_unsigned() || c.is_number_integer())
-                sum += c.get<uint64_t>();
+        for (const auto& c : rows[l]) sum += c.get<uint64_t>();
         if (sum == 0) continue;
         for (size_t e = 0; e < rows[l].size(); ++e) {
-            const auto& c = rows[l][e];
-            if (!(c.is_number_unsigned() || c.is_number_integer())) continue;
-            const uint64_t n = c.get<uint64_t>();
+            const uint64_t n = rows[l][e].get<uint64_t>();
             if (n == 0) continue;
             RadFileProfile p{};
             p.layer = (int32_t)l;
