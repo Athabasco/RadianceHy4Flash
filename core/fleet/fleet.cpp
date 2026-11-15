@@ -2824,6 +2824,12 @@ int Fleet::run() {
         if (required) preload.push_back(e.name);
     }
     front_.set_demand([this](const std::string& n) { demand(n); });
+    /* The guarded routes wake models only for callers their own handlers would admit: the
+     * same three-leg rule add_routes' guard reads (fleet.cpp), keyed deployments always. */
+    front_.set_operator_rule([this](const server::HttpRequest& q) {
+        const Config& c = fc_.models.front().cfg;
+        return !c.api_key.empty() || server::local_operator(q, c.host, c.allow_hosts);
+    });
     front_.set_describe([this](const std::string& n) { return describe(n); });
     front_.set_metrics([this] { return metrics(); });
     add_routes();

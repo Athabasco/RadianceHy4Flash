@@ -447,7 +447,7 @@ Front::Entry* Front::resolve(const std::string& model) {
 
 Front::Got Front::lease(const std::string& model, const std::string& path, int64_t wait_ms,
                         uint64_t* until_ns, Entry** out, std::shared_ptr<void>* held,
-                        HttpResponse* refusal) {
+                        HttpResponse* refusal, bool operator_ok) {
     std::unique_lock<std::mutex> lk(mu_);
     *out = nullptr;
     Entry* e = resolve(model);
@@ -490,8 +490,11 @@ Front::Got Front::lease(const std::string& model, const std::string& path, int64
         return Got::Refused;
     }
     if (e->state == State::Failed) {
+        /* The failure prose quotes fetch errors and filesystem paths: operator-facing. A
+         * stranger learns the model failed -- that is public anyway -- never WHY (A-05). */
         *refusal = refuse(path, 503, "service_unavailable",
-                          "model '" + e->name + "' could not be loaded: " + e->why);
+                          "model '" + e->name + "' could not be loaded" +
+                              (operator_ok ? ": " + e->why : std::string()));
         const uint64_t t = rad_mono_ns();
         refusal->set_header("Retry-After",
                             std::to_string(e->retry_ns > t ? (e->retry_ns - t) / 1000000000ull + 1 : 1));
@@ -550,10 +553,39 @@ std::vector<std::pair<Front::Entry*, std::shared_ptr<void>>> Front::hold_open() 
     return held;
 }
 
+/* The path Router::match actually dispatches on: split_path (http.cpp) drops empty segments,
+ * so "//stats" and "/stats/" ARE the route "/stats". Every guard that compares path text must
+ * read the canonical form, or a slash turns any exact match into a bypass. */
+static std::string path_canonical(const std::string& p) {
+    std::string out;
+    out.reserve(p.size());
+    for (const char c : p)
+        if (c != '/' || out.empty() || out.back() != '/') out += c;
+    if (out.size() > 1 && out.back() == '/') out.pop_back();
+    return out;
+}
+
 bool Front::dashboard_read(const HttpRequest& q) {
     if (q.method != "GET") return false;
-    return q.path == "/stats" || q.path == "/sessions" || q.path == "/graph" ||
-           q.path == "/server_info" || q.path == "/admin/control-vector";
+    const std::string p = path_canonical(q.path);
+    return p == "/stats" || p == "/sessions" || p == "/graph" ||
+           p == "/server_info" || p == "/admin/control-vector";
+}
+
+/* The routes Server::register_routes guards with local_operator when no key is configured.
+ * handle_control_vector guards BOTH verbs the router registers for its path, so GET counts too:
+ * a keyless GET /admin/control-vector for a parked model used to wake it for a 403 alone. */
+bool Front::guarded_route(const HttpRequest& q) {
+    const std::string p = path_canonical(q.path);
+    if (q.method == "GET")    return p == "/diagnostics" || p == "/admin/control-vector";
+    if (q.method == "POST")   return p == "/reset_prefix_cache" || p == "/admin/control-vector" ||
+                                     p == "/v1/load_lora_adapter" || p == "/v1/unload_lora_adapter";
+    if (q.method == "DELETE")
+        /* Both shapes the router registers and the handler guards: /sessions and its :label
+         * form (server.cpp registers DELETE /sessions/:label next to DELETE /sessions). */
+        return p == "/sessions" || (p.size() > 10 && p.compare(0, 10, "/sessions/") == 0 &&
+                                    p.find('/', 10) == std::string::npos);
+    return false;
 }
 
 void Front::keep_job(const std::string& id, int64_t expires_at, int64_t max_kept, Handler answer) {
@@ -631,6 +663,19 @@ HttpResponse Front::forward(HttpRequest q) {
     Entry* e = nullptr;
     std::shared_ptr<void> l;
     HttpResponse refusal;
+    /* A guarded route asked by someone the handler will refuse brings its model back for a
+     * 403 alone: the wake fetched, evicted, and charged for nothing. Answer the not-open
+     * state here and the stranger's request never touches the scheduler. An open model still
+     * dispatches -- its handler is the guard that answers -- and so does everything once the
+     * operator asks, rule or no rule. */
+    if (guarded_route(q) && operator_rule_ && !operator_rule_(q)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        Entry* r = resolve(model);
+        if (r && r->state != State::Open)
+            return refuse(q.path, 409, "model_not_open", "model '" + r->name + "' is " +
+                                                             state_name(r->state) +
+                                                             "; this request does not bring it back");
+    }
     /* A streaming request for a model that is not open gets its event stream at once. */
     if (keepalive_ms_ > 0 && wants_stream(q)) {
         bool open = false;
@@ -641,7 +686,7 @@ HttpResponse Front::forward(HttpRequest q) {
         }
         if (!open) return forward_waiting(std::move(q), model);
     }
-    const Got g = lease(model, q.path, -1, nullptr, &e, &l, &refusal);
+    const Got g = lease(model, q.path, -1, nullptr, &e, &l, &refusal, caller_is_operator(q));
     if (g != Got::Leased) {
         if (model.empty() && id_route(q.path) && refusal.status == 400) {
             /* Every loaded model that might hold the job, in turn; the first that knows it
@@ -690,7 +735,8 @@ HttpResponse Front::forward_waiting(HttpRequest q, const std::string& model) {
         }
         Entry* e = nullptr;
         HttpResponse refusal;
-        const Got g = lease(w->model, w->q.path, keepalive_ms_, &w->until, &e, &w->lease, &refusal);
+        const Got g = lease(w->model, w->q.path, keepalive_ms_, &w->until, &e, &w->lease, &refusal,
+                            caller_is_operator(w->q));
         if (g == Got::Waiting) {
             chunk = ": loading model " + w->model + "\n\n";
             return true;
@@ -724,7 +770,7 @@ void Front::forward_socket(const HttpRequest& q, WsConn& c) {
     Entry* e = nullptr;
     std::shared_ptr<void> l;
     HttpResponse refusal;
-    if (lease(model, q.path, -1, nullptr, &e, &l, &refusal) != Got::Leased) {
+    if (lease(model, q.path, -1, nullptr, &e, &l, &refusal, caller_is_operator(q)) != Got::Leased) {
         c.close(1008, model.empty() ? "name a model with ?model=" : "model '" + model + "' is not served here");
         return;
     }
