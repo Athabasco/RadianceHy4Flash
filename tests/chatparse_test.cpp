@@ -32,7 +32,7 @@
 #include "text/chatfmt.h"
 #include "text/chatparse.h"
 
-#include "../arch/museglimmer/chat.h"
+#include <arch/rad_museglimmer_chat.h>
 #include <arch/rad_deepseek41_chat.h>
 
 #include "util/json.h"
@@ -2673,7 +2673,7 @@ TEST(a_long_reply_holds_a_constant_number_of_bytes) {
  *
  * The model opens its own channel after `<|start|>assistant`: ` to=self<|message|>` reasoning
  * first, or ` to=user<|message|>` straight into the answer when it does not reason
- * (arch/museglimmer/chat.h). The header of an answer that follows reasoning is reasoning_close's;
+ * (arch/rad_museglimmer_chat.h). The header of an answer that follows reasoning is reasoning_close's;
  * the header of an answer that does not is content_open's. */
 
 static std::shared_ptr<const ReplyParser> muse_parser(bool tools, bool extract = true) {

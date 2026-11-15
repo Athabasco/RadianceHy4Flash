@@ -29,7 +29,7 @@
 #include <arch/rad_block_museglimmer_vision.h>
 #include <arch/rad_block_muse_dflash.h>
 #include <arch/rad_calib_full.h>
-#include "../museglimmer/chat.h"
+#include <arch/rad_museglimmer_chat.h>
 
 #include <cmath>
 #include <cstdlib>
