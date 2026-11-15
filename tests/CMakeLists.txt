@@ -851,6 +851,12 @@ if(RAD_PYTHON3 AND EXISTS ${CMAKE_SOURCE_DIR}/dashboard/package.json)
     LABELS "fast;unit"
     TIMEOUT ${RAD_TEST_TIMEOUT})
 endif()
+# The header's digest proves sources and its own claim agree, nothing more: it cannot catch a
+# tamper of the committed served bytes that rewrites that digest to match. This hashes the
+# artifacts themselves from outside, so tampering with one alone fails.
+add_test(NAME artifact_sums
+         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/artifact_sums.sh ${CMAKE_SOURCE_DIR})
+set_tests_properties(artifact_sums PROPERTIES LABELS "fast;unit" TIMEOUT 120)
 if(RAD_PYTHON3)
   add_test(NAME rad_export_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/rad_export_test.py)
   set_tests_properties(rad_export_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
