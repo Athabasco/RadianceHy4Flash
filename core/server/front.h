@@ -168,7 +168,12 @@ public:
      * request that woke its model first churned the fleet for nothing -- wake, HF fetch,
      * eviction of residents -- and churn priced by a stranger is a DoS. Kept in step with
      * Server::register_routes. */
-    static bool guarded_route(const HttpRequest& q);
+    /* Whether the front's route for this request was registered guarded -- i.e. its handler
+     * answers the local operator only keyless -- so a stranger's call does not wake a parked
+     * model just to be refused. Derived from the router's own guarded marks (set at each route's
+     * registration in Server::register_routes), so the front and the handler cannot drift: the
+     * matcher that decides here is the one that reaches the handler. */
+    bool guarded_route(const HttpRequest& q) const;
     /* Which requests speak for the machine's operator -- the fleet sets this to its admin
      * guard's predicate. Set, the guarded routes above bring a cold or parked model back only
      * for those callers; unset, they wake as any request does (no fleet, no guards to precede). */

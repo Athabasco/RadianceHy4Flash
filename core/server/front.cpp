@@ -226,7 +226,10 @@ void Front::install_routes(const Router& model_router) {
         bool fleet = method == "GET" && (path == "/" || path == "/dashboard");
         for (const auto& [p, fn] : own) fleet |= method == "GET" && path == p;
         if (fleet) continue;
-        router_.add(method, path, [this](const HttpRequest& q) { return forward(q); });
+        /* Copy the guarded mark with the route: the front's wake-guard then reads the same fact
+         * the engine's registration set, through the same matcher. */
+        router_.add(method, path, [this](const HttpRequest& q) { return forward(q); },
+                    model_router.guarded(method, path));
     }
     for (const auto& [p, fn] : own)
         router_.get(p, [this, fn = fn](const HttpRequest& q) { return (this->*fn)(q); });
@@ -572,20 +575,13 @@ bool Front::dashboard_read(const HttpRequest& q) {
            p == "/server_info" || p == "/admin/control-vector";
 }
 
-/* The routes Server::register_routes guards with local_operator when no key is configured.
- * handle_control_vector guards BOTH verbs the router registers for its path, so GET counts too:
- * a keyless GET /admin/control-vector for a parked model used to wake it for a 403 alone. */
-bool Front::guarded_route(const HttpRequest& q) {
-    const std::string p = path_canonical(q.path);
-    if (q.method == "GET")    return p == "/diagnostics" || p == "/admin/control-vector";
-    if (q.method == "POST")   return p == "/reset_prefix_cache" || p == "/admin/control-vector" ||
-                                     p == "/v1/load_lora_adapter" || p == "/v1/unload_lora_adapter";
-    if (q.method == "DELETE")
-        /* Both shapes the router registers and the handler guards: /sessions and its :label
-         * form (server.cpp registers DELETE /sessions/:label next to DELETE /sessions). */
-        return p == "/sessions" || (p.size() > 10 && p.compare(0, 10, "/sessions/") == 0 &&
-                                    p.find('/', 10) == std::string::npos);
-    return false;
+/* The routes Server::register_routes marks guarded are the ones whose handlers answer the local
+ * operator only keyless. The front reads that mark back off its own copied routes (each guarded
+ * at registration in server.cpp) rather than re-listing it: one source, and the match is the
+ * router's -- so slash forms and the DELETE /sessions/:label shape decide exactly as the handler
+ * is reached, and a route cannot be guarded in one place and not the other. */
+bool Front::guarded_route(const HttpRequest& q) const {
+    return router_.guarded(q.method, q.path);
 }
 
 void Front::keep_job(const std::string& id, int64_t expires_at, int64_t max_kept, Handler answer) {

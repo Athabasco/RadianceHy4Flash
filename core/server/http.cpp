@@ -250,8 +250,8 @@ static std::vector<std::string> split_path(const std::string& p) {
     return out;
 }
 
-void Router::add(std::string method, std::string path, Handler h) {
-    routes_.push_back(Route{std::move(method), split_path(path), std::move(h)});
+void Router::add(std::string method, std::string path, Handler h, bool guarded) {
+    routes_.push_back(Route{std::move(method), split_path(path), std::move(h), guarded});
 }
 
 void Router::socket(std::string path, SocketHandler h) {
@@ -344,6 +344,12 @@ const Router::Route* Router::match(const std::string& method, const std::vector<
 bool Router::allows(const std::string& method, const std::string& path) const {
     bool path_matched = false;
     return match(method, split_path(path), nullptr, &path_matched) != nullptr;
+}
+
+bool Router::guarded(const std::string& method, const std::string& path) const {
+    bool path_matched = false;
+    const Route* r = match(method, split_path(path), nullptr, &path_matched);
+    return r && r->guarded;
 }
 
 HttpResponse Router::dispatch(HttpRequest req) const {

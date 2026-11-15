@@ -156,8 +156,8 @@ void Server::register_routes() {
     router_.get ("/v1/models",           [this](const HttpRequest& q) { return handle_models(q); });
     router_.get ("/v1/loras",            [this](const HttpRequest& q) { return handle_loras(q); });
     router_.get ("/v1/models/*id",       [this](const HttpRequest& q) { return handle_models(q); });
-    router_.post("/v1/load_lora_adapter",   [this](const HttpRequest& q) { return handle_lora_admin(q, true); });
-    router_.post("/v1/unload_lora_adapter", [this](const HttpRequest& q) { return handle_lora_admin(q, false); });
+    router_.post_guarded("/v1/load_lora_adapter",   [this](const HttpRequest& q) { return handle_lora_admin(q, true); });
+    router_.post_guarded("/v1/unload_lora_adapter", [this](const HttpRequest& q) { return handle_lora_admin(q, false); });
     /* The same routes without /v1, as llama-server answers them, for clients whose base URL is
      * the bare host. */
     router_.post("/chat/completions",    [this](const HttpRequest& q) { return handle_chat(q); });
@@ -212,13 +212,13 @@ void Server::register_routes() {
     router_.get ("/version",             [this](const HttpRequest& q) { return handle_version(q); });
     router_.get ("/server_info",         [this](const HttpRequest& q) { return handle_server_info(q); });
     router_.get ("/props",               [this](const HttpRequest& q) { return handle_props(q); });
-    router_.get ("/diagnostics",         [this](const HttpRequest& q) { return handle_diagnostics(q); });
+    router_.get_guarded ("/diagnostics",         [this](const HttpRequest& q) { return handle_diagnostics(q); });
 
     router_.post("/tokenize",            [this](const HttpRequest& q) { return handle_tokenize(q); });
     router_.post("/detokenize",          [this](const HttpRequest& q) { return handle_detokenize(q); });
     router_.get ("/get_tokenizer_info",  [this](const HttpRequest& q) { return handle_tokenizer_info(q); });
 
-    router_.post("/reset_prefix_cache",  [this](const HttpRequest& q) { return handle_reset_prefix_cache(q); });
+    router_.post_guarded("/reset_prefix_cache",  [this](const HttpRequest& q) { return handle_reset_prefix_cache(q); });
 
     /* The dashboard, also at `/`, since that is what a person with the host and port types. */
     router_.get ("/",                    [this](const HttpRequest& q) { return handle_dashboard(q); });
@@ -227,17 +227,20 @@ void Server::register_routes() {
     router_.get ("/graph",               [this](const HttpRequest& q) { return handle_graph(q); });
     router_.get ("/sessions",            [this](const HttpRequest& q) { return handle_sessions(q); });
     /* The control vector's switch, for the dashboard's Model view and for automation: a
-     * deployment with no vector found answers 404 here. */
-    router_.get ("/admin/control-vector",
+     * deployment with no vector found answers 404 here. Both verbs answer the local operator
+     * only keyless (handle_control_vector enforces it); registered guarded so the front reads
+     * that fact here too and will not wake a parked model for a stranger's GET. */
+    router_.get_guarded ("/admin/control-vector",
                  [this](const HttpRequest& q) { return handle_control_vector(q); });
-    router_.post("/admin/control-vector",
+    router_.post_guarded("/admin/control-vector",
                  [this](const HttpRequest& q) { return handle_control_vector(q); });
     /* Forget one stored conversation: by its client label in the path (or `?label=`, for a
-     * label the path cannot carry), or by engine id with `?id=`. */
+     * label the path cannot carry), or by engine id with `?id=`. Guarded like the other admin
+     * writes -- and both shapes, so the front does not wake a model to be refused. */
     router_.add ("DELETE", "/sessions/:label",
-                 [this](const HttpRequest& q) { return handle_session_release(q); });
+                 [this](const HttpRequest& q) { return handle_session_release(q); }, true);
     router_.add ("DELETE", "/sessions",
-                 [this](const HttpRequest& q) { return handle_session_release(q); });
+                 [this](const HttpRequest& q) { return handle_session_release(q); }, true);
 }
 
 /* Workers beyond the admission ceiling. A generation holds its connection's worker for its whole

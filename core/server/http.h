@@ -162,9 +162,15 @@ using SocketHandler = std::function<void(const HttpRequest&, WsConn&)>;
  * entry's route ends in "*id"). No regex and no priority rules. */
 class Router {
 public:
-    void add(std::string method, std::string path, Handler h);
+    void add(std::string method, std::string path, Handler h, bool guarded = false);
     void get(std::string path, Handler h)  { add("GET",  std::move(path), std::move(h)); }
     void post(std::string path, Handler h) { add("POST", std::move(path), std::move(h)); }
+    /* Registering a route whose handler answers the local operator only (no api key configured):
+     * the guard itself lives in the handler; marking it here lets the front read the SAME fact
+     * (see guarded()) so a guarded route is declared once, at its registration, and cannot be
+     * listed by the front's wake-guard without also being registered guarded -- and vice versa. */
+    void get_guarded(std::string path, Handler h)  { add("GET",  std::move(path), std::move(h), true); }
+    void post_guarded(std::string path, Handler h) { add("POST", std::move(path), std::move(h), true); }
     /* A WebSocket route, exact path. An upgrade request to it becomes a connection the handler
      * is given; a plain GET to the same path is whatever add() registered there, if anything. */
     void socket(std::string path, SocketHandler h);
@@ -182,6 +188,10 @@ public:
 
     /* Whether a route takes `method` on `path`, as dispatch would match it. */
     bool allows(const std::string& method, const std::string& path) const;
+    /* Whether the route taking `method` on `path` was registered guarded (get_guarded /
+     * post_guarded / add(..., true)), as dispatch would match it -- so slash and `:label` forms
+     * decide the same way the handler is reached. False when no route matches. */
+    bool guarded(const std::string& method, const std::string& path) const;
 
     std::vector<std::string> routes() const;
 
@@ -190,6 +200,7 @@ private:
         std::string method;
         std::vector<std::string> segs;   /* ":name" is any one segment, a final "*name" the rest */
         Handler h;
+        bool guarded = false;            /* answered the local operator only (see add) */
     };
     /* The route taking `method` on the path `segs`, with its captures; null when none.
      * `*path_matched` says whether a route takes the path under any method. */
