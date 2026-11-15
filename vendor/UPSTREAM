@@ -139,6 +139,12 @@ vendor/llama/common/regex-partial.{h,cpp}    <- llama.cpp common/*
     adds a size test, two empty-container guards, and a did-we-consume-a-byte test at the bottom
     of the loop, each recording an error the existing check_errors() already turns into a throw.
 
+    Added 2026-11 on 0003's footing: the same client `pattern` can also KILL the worker by
+    recursion -- transform() calls itself once per nested '(', no cap anywhere, and no JSON
+    depth bound helps because the brackets are string content, not JSON nesting. A pattern of
+    tens of KB of '(' is an uncatchable stack overflow. A nesting counter caps the recursion
+    at 64 groups and records one more error the existing check_errors() turns into a refusal.
+
     On 0004: three things upstream ACCEPTS and then gets wrong, each now refused by name.
     A remote $ref is fetched through a callback the public entry point stubs out, so it silently
     degrades into "accepts any object" -- we refuse and fetch nothing, because a sampler that
