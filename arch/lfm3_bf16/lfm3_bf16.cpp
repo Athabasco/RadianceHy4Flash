@@ -1,4 +1,4 @@
-/* lfm3_bf16 -- LiquidAI's LFM3, bf16 weights and activations, one rank.
+/* lfm3_bf16 -- LiquidAI's LFM3, bf16 activations over bf16 or int8 (IQ8R) linears, one rank.
  *
  * ============================== THE SHAPE ==============================
  *
@@ -33,11 +33,23 @@
  * there). It costs n_embd * (q_dim - n_head) stored weights an attention layer, 2.6% of the
  * container at 1.7B.
  *
+ * ============================== 8-BIT LINEARS ==============================
+ *
+ * Every linear but the gate is a LinearFP8 (rad_fp8.h), as lfm2_bf16's are, so the container's
+ * encoding of each weight decides the GEMM: plain bf16 is `gemm_nt` over the bf16 activation,
+ * exactly as a bf16 model runs; int8 (`codes=i8 group=128 scale=bf16`) is `gemm_nt_q` at i8a8, and
+ * the rotated form (those codes under the 128-wide Hadamard, data/recipes/lfm3-1.7b-iq8r.recipe,
+ * or IQ8R's scale per 256 of K) the same at i8a8h, each linear quantising its input from
+ * the bf16 plane. The trunk's format is read off layer 0's first linear and every linear must
+ * match it. The gate stays bf16 in every container (n_head distinct rows; its product is a hard
+ * multiplier on a whole head), as do the convolution, the norms, the joins and attention. The
+ * lm_head is read at its stored codes.
+ *
  * ============================== WHAT IT DOES NOT SERVE ==============================
  *
- * Tensor parallelism (the model needs one card), 8-bit linears, a drafter, media, conv bias, a
- * checkpoint without the sandwich norms, or a rotary other than the default type: each is refused
- * by name.
+ * Tensor parallelism (the model needs one card), block-fp8 or narrower linears, a trunk that mixes
+ * formats, a quantised gate, a drafter, media, conv bias, a checkpoint without the sandwich norms,
+ * or a rotary other than the default type: each is refused by name.
  */
 #include <arch/rad_arch.h>
 #include <arch/rad_fp8.h>
@@ -104,6 +116,10 @@ struct Model {
     /* The four activations a linear reads, as LinearFP8 takes them: the bf16 plane is the buffer
      * above. */
     ActFP8 a_h{}, a_attn{}, a_conv{}, a_ffn{};
+    /* An int8 trunk (i8a8, or IQ8R at i8a8h), and its scale group along K, which the activations'
+     * int8 pairs share (ActFP8::g8). */
+    bool    q_i8 = false;
+    int64_t g8 = RAD_FP8_BLOCK;
 
     rad_weight w_tok = 0, w_out_norm = 0, w_lm_head = 0;
     rad_op op_embed = 0, op_gather = 0, op_final_norm = 0, op_logits = 0;
@@ -288,10 +304,45 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_hout     = decl_b(b, nm.f("h_out"),    RAD_BF16, {g.max_logit_rows, g.n_embd});
     m.b_logits   = decl_b(b, nm.f("logits"),   RAD_F32,  {g.max_logit_rows, g.n_vocab});
     RAD_ARCH_TRY(rad_declare_logits(b, m.b_logits));
-    /* Every linear reads a bf16 weight over its input's bf16 plane (LinearFP8's `gemm_nt`
-     * branch). */
-    g.w_bf16 = true;
+    /* ---- the trunk's format, read off layer 0's first linear before any activation is declared
+     * (probe() makes its name map and reads its encoding). Plain bf16, or no encoding yet, is a
+     * bf16 trunk: every linear is `gemm_nt` over its input's bf16 plane. An int8 weight makes the
+     * activations carry int8 codes beside it. */
+    {
+        Layer& L0 = m.layers[0];
+        const bool at = L0.kind != kConv;
+        LinearFP8& first = at ? L0.q : L0.conv_in;
+        const char* base0 = nm.f(at ? "blk.%d.attn_q" : "blk.%d.conv_in", 0);
+        RAD_ARCH_TRY(first.probe(b, nm, g, base0,
+                                 { nm.ckpt(at ? "%s.layers.%d.self_attn.%s" : "%s.layers.%d.conv.%s",
+                                           pre, 0, at ? "q_proj.weight" : "in_proj.weight") }));
+        RadEncoding enc{};
+        const bool known = weight_enc(b, nm.f("%s.weight", base0), &enc);
+        const bool plain = !known || (rad_enc_is(&enc, "plain") && enc.n_planes == 1 &&
+                                      enc.plane[0].dtype == RAD_BF16);
+        g.w_bf16 = plain;
+        m.q_i8 = !plain && first.probed_i8;
+        if (m.q_i8) m.g8 = first.probed_g8;
+        if (!plain && !m.q_i8) {
+            char en[256];
+            rad_enc_format(&enc, en, sizeof en);
+            fprintf(stderr, "radiance: lfm3: '%s.weight' is %s; this plugin serves a bf16 trunk or "
+                            "an int8 one (codes=i8 group=128, or IQ8R)\n", base0, en);
+            return RAD_E_DTYPE;
+        }
+    }
+    if (m.q_i8 && (g.n_embd % m.g8 || g.q_dim() % m.g8 || g.n_ff % m.g8)) {
+        fprintf(stderr, "radiance: lfm3: the int8 trunk keeps one scale a %lld of K, which does not "
+                        "divide this model's widths (hidden %lld, attention %lld, feed-forward "
+                        "%lld)\n",
+                (long long)m.g8, (long long)g.n_embd, (long long)g.q_dim(), (long long)g.n_ff);
+        return RAD_E_UNSUPPORTED;
+    }
     m.a_h.x = m.b_h; m.a_attn.x = m.b_attn; m.a_conv.x = m.b_conv_out; m.a_ffn.x = m.b_ffn;
+    RAD_ARCH_TRY(m.a_h.declare_qs(b, nm, g, "h", g.n_embd, 0, m.q_i8, false, m.g8));
+    RAD_ARCH_TRY(m.a_attn.declare_qs(b, nm, g, "attn_out", g.q_dim(), 0, m.q_i8, false, m.g8));
+    RAD_ARCH_TRY(m.a_conv.declare_qs(b, nm, g, "conv_out", g.n_embd, 0, m.q_i8, false, m.g8));
+    RAD_ARCH_TRY(m.a_ffn.declare_qs(b, nm, g, "ffn", g.n_ff, 0, m.q_i8, false, m.g8));
 
     /* ---- the vocabulary edges. The lm_head is tied but declared as its own weight: the
      * embedding may live in host memory (--embedding-placement) and the head on the card. */
@@ -303,8 +354,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                      RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
     m.w_out_norm = decl_w(b, nm.f("output_norm.weight"), RAD_F32, {g.n_embd},
                           RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
-    m.w_lm_head = decl_w(b, nm.f("output.weight"), RAD_BF16, {g.n_vocab, g.n_embd},
-                         RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
+    /* The head at its codes' dtype: bf16, or int8 where a recipe made it so. */
+    m.w_lm_head = decl_w(b, nm.f("output.weight"),
+                         weight_codes_dtype(b, nm.f("output.weight"), RAD_BF16),
+                         {g.n_vocab, g.n_embd}, RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
 
     m.op_embed = rw(b, RAD_OP(b, "embed_lookup",
                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n_embd", g.n_embd),
@@ -347,9 +400,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         *w = layer_w(name, l, {n}, RAD_F32);
         return *w ? RAD_OK : RAD_E_INVAL;
     };
-    /* The gate: one plain bf16 linear over an already mapped weight. */
+    /* The gate: one plain bf16 linear over an already mapped weight, in every container. */
     auto plain_linear = [&](Linear& lin, int l, const char* name, int64_t N, int64_t K, rad_buf in,
                             rad_buf out) -> int {
+        RadEncoding enc{};
+        if (weight_enc(b, nm.f(name, l), &enc) &&
+            !(rad_enc_is(&enc, "plain") && enc.n_planes == 1 && enc.plane[0].dtype == RAD_BF16)) {
+            char en[256];
+            rad_enc_format(&enc, en, sizeof en);
+            fprintf(stderr, "radiance: lfm3: '%s' is %s; the attention gate stays bf16 (leave "
+                            "gate_proj out of the recipe)\n", nm.f(name, l), en);
+            return RAD_E_DTYPE;
+        }
         lin.w = decl_w(b, nm.f(name, l), RAD_BF16, {N, K}, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
                        grp_layer(l));
         if (!lin.w) return RAD_E_INVAL;
@@ -365,8 +427,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     auto linear = [&](LinearFP8& lin, int l, const char* base_fmt, int64_t N, int64_t K,
                       std::initializer_list<const char*> src, const ActFP8& a, rad_buf y,
                       std::initializer_list<int64_t> parts) -> int {
-        return lin.declare(b, nm, g, nm.f(base_fmt, l), N, K, RAD_SHARD_NONE, grp_layer(l), src, a,
-                           y, 0, parts);
+        const char* base = nm.f(base_fmt, l);
+        RAD_ARCH_TRY(lin.declare(b, nm, g, base, N, K, RAD_SHARD_NONE, grp_layer(l), src, a, y, 0,
+                                 parts));
+        /* Every linear has the trunk's format. LinearFP8 refuses a quantised weight in a bf16
+         * trunk; this refuses a bf16 or narrower one in an int8 trunk. */
+        if (g.w_bf16 ? !lin.bf16 : !(lin.i8 && !lin.iqr)) {
+            fprintf(stderr, "radiance: lfm3: '%s.weight' is not in the trunk's format (%s); "
+                            "quantise every linear of the trunk alike\n",
+                    base, g.w_bf16 ? "bf16" : "int8");
+            return RAD_E_DTYPE;
+        }
+        return RAD_OK;
     };
     /* q names its query heads; k is rotated as a q-only row of the kv heads (its own buffer).
      * The partial rotary is on the "head" ladder; over the whole head the ladders coincide and
