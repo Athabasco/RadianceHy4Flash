@@ -34,6 +34,7 @@
 
 #include "build/startup.h"
 #include "device/device.h"
+#include "place/xstats.h"
 #include "server/adapters.h"
 #include "server/sink.h"
 
@@ -693,21 +694,18 @@ int Engine::run_diagnose() {
     }
 
     const fs::path dir(cfg_.diagnose);
-    {
-        std::ofstream f(dir / "diagnose.json");
-        f << rep.dump(2) << "\n";
-        if (!f) {
-            RAD_ERR("diagnose: cannot write %s", (dir / "diagnose.json").c_str());
-            return RAD_E_IO;
-        }
+    /* Both reports go through the expert-stats writer's discipline (xstats.h): a temp file and a
+     * rename, the link not followed. A report dir is shared in practice -- /srv/reports, a peer's
+     * mount -- where a plain ofstream let a pre-created symlink make the run overwrite some other
+     * file, and a reader polling the dir saw half a report. */
+    if (const int rc = xs_write_atomic((dir / "diagnose.json").string(), rep.dump(2) + "\n")) {
+        RAD_ERR("diagnose: cannot write %s", (dir / "diagnose.json").c_str());
+        return rc;
     }
-    {
-        std::ofstream f(dir / "diagnose.md");
-        f << diag::render_markdown(rep);
-        if (!f) {
-            RAD_ERR("diagnose: cannot write %s", (dir / "diagnose.md").c_str());
-            return RAD_E_IO;
-        }
+    if (const int rc =
+            xs_write_atomic((dir / "diagnose.md").string(), diag::render_markdown(rep))) {
+        RAD_ERR("diagnose: cannot write %s", (dir / "diagnose.md").c_str());
+        return rc;
     }
     RAD_INFO("diagnose: report in %s", (dir / "diagnose.md").c_str());
     return problems.empty() && parity_ok ? RAD_OK : RAD_E_STATE;
