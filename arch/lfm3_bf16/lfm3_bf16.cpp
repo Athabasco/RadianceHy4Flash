@@ -773,7 +773,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
 /* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
 RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(lfm3_bf16, "lfm3", "", "0.1.0",
-                "LiquidAI LFM3, bf16: short gated convolutions, full and sliding-window GQA "
+                "LiquidAI LFM3, bf16 or IQ8R: short gated convolutions, full and sliding-window GQA "
                 "attention with a partial rotary and a gate per head, sandwich norms, in the "
                 "checkpoint's own schedule, one rank")
 #endif

@@ -30,7 +30,7 @@ plugin claims.
 | `arch/bailing_hybrid_gguf_q6k` | `bailinghybrid` | `gguf_ftype_18` | the same tiny family, Q6_K GGUF release, served whole |
 | `arch/nemotronh` | `nemotronh` | *(empty)* | Nemotron-3.5-Bolt-74B-A9B (`nemotron_h_omni` around `nemotron_h_puzzle`), its language model from the bf16 checkpoint: 40 Mamba-2, 40 latent-MoE and 8 NoPE attention blocks in the order `layers_block_type` gives, 240 to 496 ungated relu^2 experts a layer in a 1024-wide latent with a relu^2 shared expert; linears and experts as the recipe stores them; pictures and video through its C-RADIO tower (`arch/nemotronh/radio.h`); bf16 KV |
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16 or IQ8R, one rank |
-| `arch/lfm3_bf16` | `lfm3` | *(empty)* | LiquidAI's LFM3 (LFM3-1.7B), bf16, one rank: LFM2's short convolutions with full and sliding-window (256) GQA attention, sandwich norms, a partial rotary on the full layers and a sigmoid gate per query head. Text only; bf16 linears |
+| `arch/lfm3_bf16` | `lfm3` | *(empty)* | LiquidAI's LFM3 (LFM3-1.7B), bf16 or IQ8R, one rank: LFM2's short convolutions with full and sliding-window (256) GQA attention, sandwich norms, a partial rotary on the full layers and a sigmoid gate per query head. Text only |
 | `arch/spark25_bf16` | `spark25` | *(empty)* | Spark X2.6, bf16 checkpoint, mixed sliding/full attention, TP1 or TP with exact collectives ([geometry](#spark25-spark-x26)). Optional DSpark drafter when the container already holds `draft.*` tensors, TP1 only. |
 | `arch/spark25_w8a8` | `spark25` | `w8a8_fwht128` | the same with rotated int8 weights and activations (`data/recipes/spark-x26-4b-iq8r.recipe`); an optional DSpark drafter stays bf16 |
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
@@ -1864,7 +1864,8 @@ is one 800-token translation run four times).
 
 # `lfm3`: LiquidAI's LFM3
 
-`arch/lfm3_bf16` serves `Lfm3ForCausalLM`, text only, bf16 linears, one rank. It is `lfm2_bf16`'s
+`arch/lfm3_bf16` serves `Lfm3ForCausalLM`, text only, one rank, from a bf16 container or an IQ8R
+one (`data/recipes/lfm3-1.7b-iq8r.recipe`). It is `lfm2_bf16`'s
 graph (short gated convolutions between attention layers, SwiGLU, a tied head) with LFM3's
 differences. transformers has no LFM3 class; the reference is the modelling code LiquidAI ships
 with the checkpoint (`modeling_lfm3.py`, `lfm3_conv.py`).
@@ -1910,6 +1911,23 @@ Traps:
   reference's own code in bf16 included, departs from float32 by far more than it does behind
   BOS. Start a raw prompt with `<|startoftext|>`, or set `"add_bos_token": true` in
   `tokenizer_config.json` before `rad-convert`: the server then puts exactly one BOS in front.
+
+8-bit linears. The trunk's format is read off layer 0's first linear, as `lfm2_bf16` reads it, and
+every trunk linear must have it: `in_proj` and `out_proj` of a convolution, `q_proj`, `k_proj`,
+`v_proj` and `out_proj` of an attention layer, `w1|w3` and `w2`. An int8 trunk (codes at a bf16
+scale a 128 of K, plain or rotated by `fwht128`; or IQ8R's u8 scale a 256 of K under a bf16 scale
+a row) is `gemm_nt_q` at `i8a8` or `i8a8h` behind the matching activation quantiser; a bf16 trunk
+declares no code plane and is the graph above, byte for byte. The recipe is the rotated form at
+group 128, the one libr4d, libhalo and the host libraries all serve; libhalo has no row for the
+rotated quantiser at 256, so a container at IQ8R's group runs on libr4d and the host libraries
+only. Three things stay bf16 in an 8-bit
+container: the gate (`gate_proj` is 16 rows; its sigmoid scales a whole head, so the recipe
+leaves it out and the plugin refuses it quantised), the convolution kernel, and the tied head
+with the embedding (libavx and libref carry no `logits_gemm_i8`, and this container is meant to
+run on every library). The recipe is round to nearest, without calibration data:
+`lfm3-1.7b-iq8r.rad` is 2.6 GB for bf16's 4.1 GB. LFM3's widths (2048, 7680) divide both groups;
+a model whose widths do not is refused, as are a trunk that mixes bf16 and int8 linears or the two
+scale groups, and block fp8.
 
 Refused at declare, not ignored: `conv_bias`, `use_sandwich_norm: false`, a `rope_type` other than
 `default`, a layer kind other than the three, a `conv_L_cache` outside 2..8, sliding layers
