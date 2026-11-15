@@ -856,7 +856,7 @@ endif()
 # artifacts themselves from outside, so tampering with one alone fails.
 add_test(NAME artifact_sums
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/artifact_sums.sh ${CMAKE_SOURCE_DIR})
-set_tests_properties(artifact_sums PROPERTIES LABELS "fast;unit" TIMEOUT 120)
+set_tests_properties(artifact_sums PROPERTIES LABELS "fast;unit" TIMEOUT ${RAD_TEST_TIMEOUT})
 if(RAD_PYTHON3)
   add_test(NAME rad_export_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/rad_export_test.py)
   set_tests_properties(rad_export_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
@@ -1035,4 +1035,4 @@ endif()
 # machine state, so it runs wherever the suite runs.
 add_test(NAME vendor_sums
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/vendor_sums.sh ${CMAKE_SOURCE_DIR})
-set_tests_properties(vendor_sums PROPERTIES LABELS "fast;unit" TIMEOUT 120)
+set_tests_properties(vendor_sums PROPERTIES LABELS "fast;unit" TIMEOUT ${RAD_TEST_TIMEOUT})
