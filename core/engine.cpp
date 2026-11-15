@@ -1993,6 +1993,26 @@ int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so,
         score_ids_.erase(std::unique(score_ids_.begin(), score_ids_.end()), score_ids_.end());
     }
     bool host_failed = false;
+    /* Step-wide sibling of the scheduler's kMaxScoredCandidates: that cap bounds one request's
+     * candidate list; nothing bounded the step's UNION, which grows toward the whole vocabulary.
+     * The pinned readback's size used to be discovered by ATTEMPTING it -- the cancel path below
+     * fired only when a gigabyte-scale page-locked allocation failed, so on a box that survives
+     * the attempt the bytes stay pinned forever (the buffer is grow-only). The cap is sixteen
+     * maximally-loaded requests -- d1's questions name a few dozen ids each, so every real
+     * scored step lands far under it. A step past it is refused the way an allocation failure
+     * refuses: the scored requests cancel, the engine does not, and the box is never asked to
+     * pin anything to find out. */
+    static const size_t kMaxScoredStepIds = 1u << 16;
+    if (score_only_ && score_ids_.size() > kMaxScoredStepIds) {
+        RAD_ERR("scored rows: the step names %zu candidate rows, over the step budget of %zu; "
+                "cancelling the scored requests, not the engine",
+                score_ids_.size(), kMaxScoredStepIds);
+        cancel.insert(cancel.end(), scored.begin(), scored.end());
+        score_rows_.clear();
+        score_only_ = false;
+        score_ids_.clear();
+        return RAD_OK;
+    }
     int64_t failed_rows = 0;
     for (auto& rk : ranks_) {
         const int64_t width = rk->sampler.config().n_vocab_local;
