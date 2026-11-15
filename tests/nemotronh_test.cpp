@@ -135,6 +135,19 @@ void nemo_encs(RadBuilder& b) {
                { "_exps", nl }, { "blk.", rad_enc_affine(RAD_I8, RAD_BF16, 1, 128) } };
 }
 
+/* The IQ8R recipe's forms: every trunk linear IQ8R (int8 codes with a u8 scale per (row, 256 of K)
+ * under a bf16 one a row, each 128 of K rotated), the routed experts and the drafter's linears
+ * rotated int8 at 128, dt's rows bf16. */
+void iq8r_encs(RadBuilder& b) {
+    RadEncoding iq8r = rad_enc_affine(RAD_I8, RAD_U8, 1, 256);
+    rad_enc_add_plane(&iq8r, "scale.1", RAD_BF16, 1, 0);
+    rad_enc_copy_str(iq8r.transform, "fwht128");
+    RadEncoding r8 = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+    rad_enc_copy_str(r8.transform, "fwht128");
+    b.encs = { { "dflash.fc.", r8 }, { "dflash.blk.", r8 }, { "ssm_dt", rad_enc_plain(RAD_BF16) },
+               { "_exps", r8 }, { "blk.", iq8r } };
+}
+
 int buf_named(const RadBuilder& b, const char* name) {
     for (size_t i = 0; i < b.bufs.size(); ++i)
         if (b.bufs[i].name == name) return (int)(i + 1);
@@ -310,6 +323,40 @@ TEST(a_rotated_int8_lilicorr_backbone_reads_int8_codes) {
         CHECK_EQ(fp8q, 0);
         CHECK(gemms > 0);
         CHECK_EQ(i8a8h, gemms);
+    }
+}
+
+/* An IQ8R trunk keeps one scale a 256 columns, and the shared expert's down projection reads its
+ * rank's slice along K, so every slice is whole 256-column groups: Bolt's 5376 is 21 of them, 11
+ * and 10 at two ranks, 6, 5, 5 and 5 at four. Every rank declares, the slices cover the expert
+ * once, and a speculative step at two ranks is lint-clean. Sliced in 128-column blocks, two ranks
+ * held 2688 columns each and the down projection was refused. */
+TEST(an_iq8r_trunk_slices_the_shared_expert_in_whole_256_column_groups) {
+    Nemo f;
+    const RadModelMeta meta = f.meta();
+    for (int world : { 1, 2, 4 }) {
+        int64_t total = 0;
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuilder b;
+            iq8r_encs(b);
+            const RadBuildCtx ctx = nemo_ctx(rank, world);
+            REQUIRE_EQ(nemotronh::declare(&b, &meta, &ctx), RAD_OK);
+            const int up = buf_named(b, "shared_up");
+            REQUIRE(up != 0);
+            const int64_t w = b.bufs[(size_t)up - 1].d.shape[1];
+            CHECK_EQ(w % 256, (int64_t)0);
+            total += w;
+            if (world != 2) continue;
+            auto trunk = kit(b, { 8, 8 }, {});
+            auto cpass = context_pass(b, *trunk);
+            auto qpass = query_pass(b, 2, 8, 7);
+            std::vector<int32_t> anchors = { 7, 15 };   /* each sequence's last committed row */
+            qpass->b.anchor_rows = anchors.data();
+            auto v = run_passes(b, nemotronh::step, { trunk.get(), cpass.get(), qpass.get() }, rank,
+                                world);
+            CHECK_PASSES(b, v);
+        }
+        CHECK_EQ(total, (int64_t)5376);
     }
 }
 

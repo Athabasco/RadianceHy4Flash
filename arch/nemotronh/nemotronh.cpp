@@ -897,17 +897,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             c.n_ff_exp = s.ff[(size_t)l];
             for (int q = 0; q < 4; ++q) c.ff_lo4[q] = c.ff_hi4[q] = 0;
         }
-    /* The shared expert's slice: even, or slice_of's whole blocks. */
-    int64_t sh_lo = 0, sh_hi = 0, sh_w = s.ff_shared / world;
-    {
-        const int64_t sb = s.ff_shared / RAD_FP8_BLOCK;
-        if (sb % world) {
-            slice_of(sb, world, g.rank, 0, &sh_lo, &sh_hi);
-            sh_lo *= RAD_FP8_BLOCK;
-            sh_hi *= RAD_FP8_BLOCK;
-            sh_w = sh_hi - sh_lo;
-        }
-    }
     /* Whether the trunk is int8, from the first Mamba block's out projection, before the
      * activations are declared: an int8 linear reads an int8 pair its input must hold. The probe
      * makes that linear's name map, so Mamba::declare does not probe it again. */
@@ -921,6 +910,26 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.trunk_i8 = out.probed_i8;
         m.trunk_g8 = out.probed_g8;
         break;
+    }
+    /* The shared expert's slice: even, or slice_of's whole scale groups. Its down projection
+     * reads the slice along K, and an int8 trunk keeps one scale a group of K there: 128 columns,
+     * or IQ8R's 256 (asked after the probe above). Bolt's 5376 is 42 blocks of 128 but 21 groups
+     * of 256, so two ranks hold 11 and 10 groups, not 2688 columns each. */
+    const int64_t sg = m.trunk_i8 ? m.trunk_g8 : (int64_t)RAD_FP8_BLOCK;
+    if (s.ff_shared % sg) {
+        fprintf(stderr, "radiance: nemotronh: the shared expert's %lld columns are not whole "
+                        "%lld-column scale groups\n", (long long)s.ff_shared, (long long)sg);
+        return RAD_E_UNSUPPORTED;
+    }
+    int64_t sh_lo = 0, sh_hi = 0, sh_w = s.ff_shared / world;
+    {
+        const int64_t sb = s.ff_shared / sg;
+        if (sb % world) {
+            slice_of(sb, world, g.rank, 0, &sh_lo, &sh_hi);
+            sh_lo *= sg;
+            sh_hi *= sg;
+            sh_w = sh_hi - sh_lo;
+        }
     }
     RAD_ARCH_TRY(buffers(b, m));
     RAD_ARCH_TRY(moe_buffers(b, m, msrc, sh_w));
