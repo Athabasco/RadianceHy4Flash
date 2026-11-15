@@ -652,19 +652,37 @@ int Engine::run_diagnose() {
 
     bool parity_ok = true;
     if (!cfg_.diagnose_baseline.empty()) {
-        std::ifstream f(cfg_.diagnose_baseline);
-        const json base = json::parse(f, nullptr, /*allow_exceptions=*/false);
+        /* A baseline is a report written by another run -- often on another machine, pasted
+         * between people: read it like a supplied file (capped read, bounded parse), and treat
+         * structure the comparison does not expect as a refusal, not as a crash. compare_outputs
+         * reads its baseline with throwing accessors, and nothing between here and main catches:
+         * a structurally hostile baseline used to abort a run that had already done its work. */
         std::string why;
         json cmp;
-        if (!f.is_open() || base.is_discarded()) {
+        std::string base_text;
+        const json base = read_text_file(cfg_.diagnose_baseline, base_text, kMaxContainerFile) == RAD_OK
+                              ? json::parse_container(base_text)
+                              : json();
+        if (base.is_discarded()) {
             why = "the baseline file is not readable JSON";
-        } else if (diag::compare_outputs(rep, base, &cmp, &why) == RAD_OK) {
-            cmp["baseline"] = "an earlier report";
-            rep["parity"] = cmp;
-            parity_ok = cmp["verdict"] == "identical" && cmp["acceptance_verdict"] == "no drop";
-            RAD_INFO("diagnose: parity %s, %lld of %lld requests identical; draft acceptance: %s",
-                     cmp["verdict"].get<std::string>().c_str(), (long long)cmp["identical"].get<int64_t>(),
-                     (long long)cmp["compared"].get<int64_t>(), cmp["acceptance_verdict"].get<std::string>().c_str());
+        } else {
+            int cmp_rc = RAD_E_FORMAT;
+            try {
+                cmp_rc = diag::compare_outputs(rep, base, &cmp, &why);
+            } catch (const json::exception& e) {
+                why = std::string("the baseline is not shaped like a report: ") + e.what();
+                cmp_rc = RAD_E_FORMAT;
+            }
+            if (cmp_rc == RAD_OK) {
+                cmp["baseline"] = "an earlier report";
+                rep["parity"] = cmp;
+                parity_ok = cmp["verdict"] == "identical" && cmp["acceptance_verdict"] == "no drop";
+                RAD_INFO("diagnose: parity %s, %lld of %lld requests identical; draft acceptance: %s",
+                         cmp["verdict"].get<std::string>().c_str(),
+                         (long long)cmp["identical"].get<int64_t>(),
+                         (long long)cmp["compared"].get<int64_t>(),
+                         cmp["acceptance_verdict"].get<std::string>().c_str());
+            }
         }
         if (!why.empty()) {
             rep["parity"] = { { "baseline", "an earlier report" },
