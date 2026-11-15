@@ -477,6 +477,10 @@ private:
     std::string reload();
     void   stop_all();
     void   add_routes();
+    /* Whether `q`'s caller may reach the fleet's admin routes: everyone who pays the api key, or
+     * -- keyless -- the local operator on the three-leg rule (loopback, no foreign Origin, pinned
+     * Host). One predicate, read by add_routes' guard and the front's operator rule alike. */
+    bool   operator_ok(const server::HttpRequest& q) const;
     json   status();
     void   history_loop();
     json   placement(const std::string& name);
@@ -2580,14 +2584,18 @@ json Fleet::status() {
                 { "cards", cards }, { "groups", groups }, { "host", host }, { "warm_up", warm } };
 }
 
+bool Fleet::operator_ok(const server::HttpRequest& q) const {
+    const Config& c = fc_.models.front().cfg;
+    return !c.api_key.empty() || server::local_operator(q, c.host, c.allow_hosts);
+}
+
 void Fleet::add_routes() {
     /* The fleet's own routes. Without a bearer key they answer the local operator only, on the
      * very rule the engine's other admin routes apply: loopback socket, no foreign Origin, and a
      * Host that names this box. The socket alone forges -- a rebinding page or a localhost proxy
      * is loopback for any caller -- so all three legs are read here too (docs/GUIDE.md). */
     auto guard = [this](const server::HttpRequest& q) -> std::optional<server::HttpResponse> {
-        const Config& c = fc_.models.front().cfg;
-        if (!c.api_key.empty() || server::local_operator(q, c.host, c.allow_hosts))
+        if (operator_ok(q))
             return std::nullopt;
         return server::HttpResponse::json_body(
             403, server::error_body(q.path, 403, "permission_error",
@@ -2824,12 +2832,9 @@ int Fleet::run() {
         if (required) preload.push_back(e.name);
     }
     front_.set_demand([this](const std::string& n) { demand(n); });
-    /* The guarded routes wake models only for callers their own handlers would admit: the
-     * same three-leg rule add_routes' guard reads (fleet.cpp), keyed deployments always. */
-    front_.set_operator_rule([this](const server::HttpRequest& q) {
-        const Config& c = fc_.models.front().cfg;
-        return !c.api_key.empty() || server::local_operator(q, c.host, c.allow_hosts);
-    });
+    /* The guarded routes wake models only for callers their own handlers would admit: the same
+     * operator_ok predicate add_routes' guard reads, keyed deployments always. */
+    front_.set_operator_rule([this](const server::HttpRequest& q) { return operator_ok(q); });
     front_.set_describe([this](const std::string& n) { return describe(n); });
     front_.set_metrics([this] { return metrics(); });
     add_routes();
