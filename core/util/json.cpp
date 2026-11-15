@@ -249,6 +249,14 @@ Json Json::parse_bounded(std::string_view text, int64_t budget, int max_depth, b
     return out;
 }
 
+Json Json::parse_container(std::string_view text, bool* over, bool* deep) {
+    bool o = false, d = false;
+    Json j = parse_bounded(text, 1LL << 24, 256, &o, &d);
+    if (over) *over = o;
+    if (deep) *deep = d;
+    return j;
+}
+
 Json Json::parse(std::string_view text) { return parse(text, nullptr, true, false); }
 
 Json Json::parse(std::istream& in) {
