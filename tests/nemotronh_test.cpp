@@ -329,4 +329,51 @@ TEST(nemotronh_probe_names_lilicorrs_depth) {
     CHECK_EQ(pr.draft_depth_fixed, 1);
 }
 
+/* An int8 trunk: with the trunk linears stored int8 (a bf16 scale a [1 x 128]) and the routed
+ * experts w4nl64, every block linear of Bolt's nine-block cut runs at i8a8 behind a quant_act_i8g of
+ * its own over the bf16 plane, and no linear stays block fp8. The bf16 rows of dt in in_proj run as
+ * a plain GEMM, one a Mamba block. The deployment declares no drafter, so no LiLiCorr linear is
+ * counted. */
+void int8_trunk_encs(RadBuilder& b) {
+    RadEncoding nl = rad_enc_affine(RAD_U4, RAD_F8E4M3, 1, 64);
+    rad_enc_add_plane(&nl, "scale.1", RAD_F32, 0, 0);
+    rad_enc_add_table(&nl, "table", RAD_F32, 1, 16);
+    rad_enc_copy_str(nl.transform, "fwht128");
+    b.encs = { { "ssm_dt", rad_enc_plain(RAD_BF16) }, { "_exps", nl },
+               { "blk.", rad_enc_affine(RAD_I8, RAD_BF16, 1, 128) } };
+}
+
+TEST(an_int8_trunk_runs_every_block_linear_at_i8a8) {
+    Nemo f;
+    const RadModelMeta meta = f.meta();
+    for (int world : { 1, 2, 4 }) {
+        RadBuilder b;
+        int8_trunk_encs(b);
+        const RadBuildCtx ctx = build_ctx(world - 1, world);
+        REQUIRE_EQ(nemotronh::declare(&b, &meta, &ctx), RAD_OK);
+        int i8a8 = 0, fp8a8 = 0, q8 = 0, plain = 0, dt = 0;
+        for (const RecOp& o : b.ops) {
+            if (o.op == "quant_act_i8g") ++q8;
+            if (o.op == "gemm_nt") {
+                ++plain;
+                for (rad_weight wt : o.w)
+                    dt += b.weights[(size_t)wt - 1].name.find("ssm_dt") != std::string::npos;
+            }
+            if (o.op != "gemm_nt_q") continue;
+            for (const RecParam& q : o.p) {
+                if (q.key != "dtype") continue;
+                i8a8 += q.sval == "i8a8";
+                fp8a8 += q.sval == "fp8a8";
+            }
+        }
+        /* four Mamba blocks of three linears, the attention's two, and for each of the four MoE
+         * blocks the shared expert's two and the latent's two */
+        CHECK_EQ(i8a8, 30);
+        CHECK_EQ(q8, 30);
+        CHECK_EQ(fp8a8, 0);
+        CHECK_EQ(plain, 4);
+        CHECK_EQ(dt, 4);
+    }
+}
+
 RAD_TEST_MAIN()

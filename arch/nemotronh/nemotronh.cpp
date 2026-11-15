@@ -217,7 +217,8 @@ struct Mamba {
         if (!op_conv || !op_prefill || !op_verify || !op_gate || !op_norm || !op_gain)
             return RAD_E_INVAL;
         const char* on = nm.f("blk.%d.ssm_out", l);
-        RAD_ARCH_TRY(output.probe(b, nm, g, on, { nm.ckpt("%s.out_proj.weight", pre) }));
+        if (!output.mapped)
+            RAD_ARCH_TRY(output.probe(b, nm, g, on, { nm.ckpt("%s.out_proj.weight", pre) }));
         if (!output.reads_x) RAD_ARCH_TRY(out_quant.declare(b, g, w.core_out, W));
         RAD_ARCH_TRY(output.declare(b, nm, g, on, g.n_embd, W, RAD_SHARD_COL, grp,
                                     { nm.ckpt("%s.out_proj.weight", pre) }, w.core_out, w.out));
@@ -367,6 +368,11 @@ struct Model {
     rad_kvgroup kv_attn = 0, kv_state = 0, kv_conv = 0;
     rad_buf x = 0, y = 0, final_hidden = 0, logit_input = 0, logits = 0;
     ActFP8 act{};
+    /* An int8 trunk (i8 codes with a bf16 scale a [1 x 128], or IQ8R's 256): every activation a
+     * trunk linear reads declares the int8 pair too, which that linear's own quant_act_i8g writes
+     * from the bf16 plane. From the first Mamba block's out projection, probed in declare(). */
+    bool    trunk_i8 = false;
+    int64_t trunk_g8 = RAD_FP8_BLOCK;
     Mamba::Wire mw{};
     AttnFP8::Wire aw{};
     LatentMoe::Wire ew{};
@@ -513,7 +519,7 @@ static int buffers(RadBuilder* b, Model& m) {
     m.x = bf("residual", { T, E });
     m.y = bf("mixer_delta", { T, E });
     m.act.x = bf("normed", { T, E });
-    RAD_ARCH_TRY(m.act.declare_qs(b, nm, g, "normed", E));
+    RAD_ARCH_TRY(m.act.declare_qs(b, nm, g, "normed", E, 0, m.trunk_i8, true, m.trunk_g8));
     m.final_hidden = decl_b(b, nm.f("final_hidden"), RAD_BF16, { T, E }, RAD_BUF_PERSIST);
     m.logit_input = bf("logit_input", { g.max_logit_rows, E });
     m.logits = decl_b(b, nm.f("logits"), RAD_F32, { g.max_logit_rows, g.n_vocab });
@@ -528,7 +534,8 @@ static int buffers(RadBuilder* b, Model& m) {
     mw.dt = bf("ssm_dt", { T, H });
     mw.y = bf("ssm_y", { T, W });
     mw.core_out.x = bf("ssm_out", { T, W });
-    RAD_ARCH_TRY(mw.core_out.declare_qs(b, nm, g, "ssm_out", W));
+    RAD_ARCH_TRY(mw.core_out.declare_qs(b, nm, g, "ssm_out", W, 0, m.trunk_i8, true,
+                                        m.trunk_g8));
 
     auto& aw = m.aw;
     aw.x = m.x;
@@ -536,7 +543,8 @@ static int buffers(RadBuilder* b, Model& m) {
     aw.qkv = bf("attn_qkv", { T, g.qkv_dim() });
     aw.q = bf("attn_q", { T, g.q_dim() });
     aw.attn.x = bf("attn_out", { T, g.q_dim() });
-    RAD_ARCH_TRY(aw.attn.declare_qs(b, nm, g, "attn_out", g.q_dim()));
+    RAD_ARCH_TRY(aw.attn.declare_qs(b, nm, g, "attn_out", g.q_dim(), 0, m.trunk_i8, true,
+                                    m.trunk_g8));
     return RAD_OK;
 }
 
@@ -553,12 +561,13 @@ static int moe_buffers(RadBuilder* b, Model& m, const std::vector<MoeFP8::Src>& 
     auto& ew = m.ew;
     ew.h = m.act;
     ew.lat.x = bf("latent", { T, L });
-    RAD_ARCH_TRY(ew.lat.declare_qs(b, nm, g, "latent", L));
+    RAD_ARCH_TRY(ew.lat.declare_qs(b, nm, g, "latent", L, 0, m.trunk_i8, true, m.trunk_g8));
     ew.routed = m.y;
     if (sh_w > 0) {
         ew.sup = bf("shared_up", { T, sh_w });
         ew.sff.x = bf("shared_ff", { T, sh_w });
-        RAD_ARCH_TRY(ew.sff.declare_qs(b, nm, g, "shared_ff", sh_w));
+        RAD_ARCH_TRY(ew.sff.declare_qs(b, nm, g, "shared_ff", sh_w, 0, m.trunk_i8, true,
+                                       m.trunk_g8));
         ew.sout = bf("shared_out", { T, E });
     }
     Geom gl = g;
@@ -865,6 +874,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             sh_w = sh_hi - sh_lo;
         }
     }
+    /* Whether the trunk is int8, from the first Mamba block's out projection, before the
+     * activations are declared: an int8 linear reads an int8 pair its input must hold. The probe
+     * makes that linear's name map, so Mamba::declare does not probe it again. */
+    m.layers.resize((size_t)s.n_layer);
+    for (int l = 0; l < (int)s.n_layer; ++l) {
+        if (s.kind[(size_t)l] != kMamba) continue;
+        LinearFP8& out = m.layers[(size_t)l].mamba.output;
+        RAD_ARCH_TRY(out.probe(b, nm, g, nm.f("blk.%d.ssm_out", l),
+                               { nm.ckpt("language_model.backbone.layers.%d.mixer.out_proj.weight",
+                                         l) }));
+        m.trunk_i8 = out.probed_i8;
+        m.trunk_g8 = out.probed_g8;
+        break;
+    }
     RAD_ARCH_TRY(buffers(b, m));
     RAD_ARCH_TRY(moe_buffers(b, m, msrc, sh_w));
     {
@@ -942,7 +965,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
     }
 
-    m.layers.resize((size_t)s.n_layer);
     for (int l = 0; l < (int)s.n_layer; ++l) {
         Layer& lay = m.layers[(size_t)l];
         lay.kind = s.kind[(size_t)l];
