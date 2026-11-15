@@ -3581,4 +3581,43 @@ TEST(single_files_merge_by_name_and_read_their_metadata_elsewhere) {
     CHECK_EQ(ck.tok_dir(), meta);
 }
 
+TEST(a_bailing_gguf_must_promise_a_walkable_layer_count) {
+    /* bailingmoe3_layouts rebuilds the release layout by walking every layer the container
+     * claims, on the open path and before any plugin runs. A GGUF naming 2^62 layers is
+     * therefore not a slow load but a permanent hang -- and a negative dense prefix opens a
+     * second loop of the same order. Both must refuse at open, quickly, RAD_E_FORMAT. */
+    const std::string dir = fresh_dir();
+    auto bailing_kvs = [](int64_t layers, int64_t dense) {
+        return std::vector<GKv>{
+            { "general.architecture", 8, 0, { "bailingmoe3" } },
+            { "bailingmoe3.block_count", 10, (double)layers, {} },
+            { "bailingmoe3.embedding_length", 4, 64, {} },
+            { "bailingmoe3.attention.head_count", 4, 4, {} },
+            { "bailingmoe3.feed_forward_length", 4, 128, {} },
+            { "bailingmoe3.context_length", 4, 4096, {} },
+            { "bailingmoe3.kda.head_dim", 4, 128, {} },
+            { "bailingmoe3.rope.dimension_count", 4, 64, {} },
+            { "bailingmoe3.attention.key_length_mla", 4, 192, {} },
+            { "bailingmoe3.attention.value_length_mla", 4, 128, {} },
+            { "bailingmoe3.attention.kv_lora_rank", 4, 512, {} },
+            { "bailingmoe3.expert_feed_forward_length", 4, 256, {} },
+            { "bailingmoe3.leading_dense_block_count", 10, (double)dense, {} },
+        };
+    };
+    const std::string huge = dir + "/huge.gguf";
+    write_gguf(huge, bailing_kvs(4611686018427387904LL, 0), {});
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(huge), RAD_E_FORMAT);
+    const std::string neg = dir + "/neg.gguf";
+    write_gguf(neg, bailing_kvs(4, -4611686018427387904LL), {});
+    Checkpoint ck2;
+    REQUIRE_EQ(ck2.open(neg), RAD_E_FORMAT);
+    /* The bound must not bite the honest: a small stack opens (no tensors, so the walk finds
+     * nothing to rebuild, and open returns OK exactly as before). */
+    const std::string sane = dir + "/sane.gguf";
+    write_gguf(sane, bailing_kvs(4, 1), {});
+    Checkpoint ck3;
+    REQUIRE_EQ(ck3.open(sane), RAD_OK);
+}
+
 RAD_TEST_MAIN()

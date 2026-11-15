@@ -3622,7 +3622,14 @@ int Checkpoint::bailingmoe3_layouts() {
     const int64_t emb = meta_.m.n_embd;
     const char* nexp_s = meta_.get("num_experts");
     const int64_t n_expert = nexp_s ? std::stoll(nexp_s) : 0;
-    if (n_layer < 1 || group < 2 || heads < 1 || latent < 1 || ff < 1 || emb < 1)
+    /* Every loop below walks to n_layer on the open path, so the counts must be bounded HERE:
+     * a GGUF claiming 2^62 layers would spend centuries in name probes, never answering, never
+     * refusing -- a hostile container's hang, not a slow load. No real model of this family is
+     * near 4096 layers. And the MoE suffix loop starts at the dense prefix, so the prefix must
+     * lie inside the stack: negative opens a walk of twice the range, beyond the end is a
+     * container that means nothing by it. */
+    if (n_layer < 1 || n_layer > 4096 || dense < 0 || dense > n_layer ||
+        group < 2 || heads < 1 || latent < 1 || ff < 1 || emb < 1)
         return RAD_E_FORMAT;
 
     /* Decode a whole source tensor to f32: a block type row by row, a plain one a copy. */
