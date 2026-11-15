@@ -93,6 +93,18 @@ vendor/llama/common/jinja/                   <- llama.cpp common/jinja/
                    hot paths: parts are moved instead of copied through the gather, appends no
                    longer return a copy, the parts join is one compaction pass, the flat render
                    is gathered without a parts list, and loop/member lookups stop rehashing.
+                   Added 2026-11: budgets. A container's chat template is server-side attacker
+                   data and the engine ran it without any: parse_any and parse_expression
+                   recursed once per nesting block/paren with no bound -- tens of KB of `{{ (((`
+                   or `{% if %}{% if %}` stack-overflowed whoever parsed, the capability probe
+                   or the first render, past every catch -- so both now share one 128-level cap
+                   whose throw is the same exception class a malformed template already raises.
+                   And range() emitted one array element per step uncapped -- `range(4000000000)`
+                   OOMed per render -- so it refuses above 65536 values, far past any template
+                   that exists. String repetition is that cap's sibling -- `'x' * 4000000000`
+                   appended one step at a time, uncapped, and chained repetitions multiply past
+                   any bound -- so a repetition whose result passes 64 MiB throws the same
+                   exception, at any step of the chain.
 
 vendor/llama/common/chat.{h,cpp}
 vendor/llama/common/chat-auto-parser.h
