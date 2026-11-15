@@ -376,4 +376,31 @@ TEST(an_int8_trunk_runs_every_block_linear_at_i8a8) {
     }
 }
 
+/* The routed arm of w4nl64 experts reads rotated int8 codes: in each of Bolt's four MoE blocks the
+ * rotated copy of the latent and the relu^2 product are written by had_quant_act_i8g, and both
+ * grouped GEMMs run at w4nl64a8i8h, at one, two and four ranks. No op is had_quant_act_fp8, which
+ * this build's kernels do not declare. */
+TEST(the_routed_arm_reads_rotated_int8_codes) {
+    Nemo f;
+    const RadModelMeta meta = f.meta();
+    for (int world : { 1, 2, 4 }) {
+        RadBuilder b;
+        int8_trunk_encs(b);
+        const RadBuildCtx ctx = build_ctx(world - 1, world);
+        REQUIRE_EQ(nemotronh::declare(&b, &meta, &ctx), RAD_OK);
+        int hq_i8 = 0, hq_fp8 = 0, gemm_i8 = 0, gemm_other = 0;
+        for (const RecOp& o : b.ops) {
+            if (o.op == "had_quant_act_i8g") ++hq_i8;
+            if (o.op == "had_quant_act_fp8") ++hq_fp8;
+            if (o.op.rfind("moe_gemm_q", 0) != 0) continue;
+            for (const RecParam& q : o.p)
+                if (q.key == "dtype") (q.sval == "w4nl64a8i8h" ? gemm_i8 : gemm_other) += 1;
+        }
+        CHECK_EQ(hq_i8, 8);
+        CHECK_EQ(hq_fp8, 0);
+        CHECK_EQ(gemm_i8, 8);
+        CHECK_EQ(gemm_other, 0);
+    }
+}
+
 RAD_TEST_MAIN()

@@ -589,12 +589,20 @@ static int moe_buffers(RadBuilder* b, Model& m, const std::vector<MoeFP8::Src>& 
         w.sorted = decl_b(b, nm.f("%s.expert_sorted", tag), RAD_I32, { rows * k });
         w.egu = bf(nm.f("%s.expert_up", tag), { rows * k, F });
         w.eff.x = bf(nm.f("%s.expert_ff", tag), { rows * k, F });
-        RAD_ARCH_TRY(w.eff.declare_qs(b, nm, gl, nm.f("%s.expert_ff", tag), F, rows * k));
+        /* Rotated experts (w4nl64a8i8h and its kin) read rotated int8 codes, a scale per 128: the
+         * block input's rotated copy `hr` and the relu^2 product, each written by
+         * had_quant_act_i8g. This build has no rotated E4M3 quantiser. */
+        const bool i8arm = c.expert_rot != 0;
+        RAD_ARCH_TRY(w.eff.declare_qs(b, nm, gl, nm.f("%s.expert_ff", tag), F, rows * k, i8arm,
+                                      !i8arm, RAD_FP8_BLOCK));
+        w.eff.q8_fed = w.eff.q8_rot = i8arm;
         w.edn = bf(nm.f("%s.expert_down", tag), { rows * k, L });
-        if (c.expert_rot) {
-            w.hr.q = decl_b(b, nm.f("%s.latent_rot.q", tag), RAD_F8E4M3, { T, L });
-            w.hr.s = decl_b(b, nm.f("%s.latent_rot.s", tag), RAD_F32, { T, L / RAD_FP8_BLOCK });
-            if (!w.hr.q || !w.hr.s) return RAD_E_INVAL;
+        if (i8arm) {
+            w.hr.q8 = decl_b(b, nm.f("%s.latent_rot.q8", tag), RAD_I8, { T, L });
+            w.hr.s8 = decl_b(b, nm.f("%s.latent_rot.s8", tag), RAD_F32, { T, L / RAD_FP8_BLOCK });
+            w.hr.g8 = RAD_FP8_BLOCK;
+            w.hr.q8_fed = w.hr.q8_rot = true;
+            if (!w.hr.q8 || !w.hr.s8) return RAD_E_INVAL;
         }
         if (!w.logits || !w.ids || !w.ew || !w.eoff || !w.ecnt || !w.sorted || !w.egu ||
             !w.eff.x || !w.edn)
