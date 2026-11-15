@@ -1082,8 +1082,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                 if (a >= b || pm.items[(size_t)run.item].item->kind == mm::Kind::Audio) continue;
                 if (a < prev_b) {
                     static std::atomic<bool> said{false};
-                    bool expected = false;
-                    if (said.compare_exchange_strong(expected, true))
+                    if (log_once(said))
                         RAD_WARN("step batch: a rope layout overlaps at token %lld; that run is "
                                  "not staged bidirectionally (first of possibly many)",
                                  (long long)a);
@@ -1094,8 +1093,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                     /* Belt: the disjoint check makes this unreachable; the slice says so
                      * rather than letting an overrun reach the card. */
                     static std::atomic<bool> said2{false};
-                    bool expected = false;
-                    if (said2.compare_exchange_strong(expected, true))
+                    if (log_once(said2))
                         RAD_WARN("step batch: bidi runs overflowed the %lld-token plane "
                                  "(first of possibly many)", (long long)T);
                     break;

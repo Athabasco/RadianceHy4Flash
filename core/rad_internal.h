@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <cstdarg>
+#include <atomic>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -34,6 +35,14 @@ uint64_t log_last_line_ns();
  * unfiltered newline forges a line while an ESC sequence drives the terminal that reads it.
  * Multi-byte UTF-8 is left alone; only control bytes are replaced. */
 std::string log_sanitize(const std::string& s);
+
+/* The once-log idiom: true on the first call for this flag, false forever after -- a warning
+ * that would otherwise repeat every step logs its first occurrence and stays quiet. Thread-safe
+ * by compare_exchange, so exactly one thread wins. */
+inline bool log_once(std::atomic<bool>& flag) {
+    bool expected = false;
+    return flag.compare_exchange_strong(expected, true);
+}
 
 /* The whole text of a file, refused BEFORE it is read when it is bigger than `cap`. Files a
  * container supplies are screened by size as well as by JSON budget: the bounded read counts
