@@ -229,6 +229,45 @@ TEST(a_concatenated_string_equals_its_text) {
 
 /* Tool-call arguments sent as an object reach a template that only takes them as text as their
  * compact JSON, as when the request sent that text. */
+TEST(a_refused_request_cannot_grow_an_unbounded_dom_in_its_tool_call_arguments) {
+    /* bad_arguments runs on the !served path -- template refused, merge refused -- and probes the
+     * arguments strings as JSON to name the offender. Probing with the unbounded parser let a
+     * client that had already failed the template hand the probe a few million flat values to
+     * grow into a DOM nothing would read. The probe is bounded now; these bounds reject the
+     * oversized and over-deep strings as the refusal they name, and a real call is unaffected. */
+    ChatTemplate t;
+    CHECK_OK(t.load(
+        "{%- for m in messages %}"
+        "{%- if m.role == 'system' and not loop.first %}"
+        "{{- raise_exception('System message must be at the beginning.') }}{%- endif %}"
+        "{%- if m.role == 'user' and m.content == 'boom' %}{{- raise_exception('no boom') }}{%- endif %}"
+        "<{{ m.role }}>{{ m.content }}</{{ m.role }}>"
+        "{%- endfor %}", "", ""));
+    ChatOptions opt;
+    opt.quiet = true;
+    auto with_args = [](const std::string& args) {
+        return json::parse(R"([{"role":"system","content":"s1"},{"role":"system","content":"s2"},)"
+                           R"({"role":"user","content":"boom"},)"
+                           R"({"role":"assistant","content":"","tool_calls":[{"id":"c","type":"function",)"
+                           R"("function":{"name":"f","arguments":)" + json(args).dump() + R"(}}]}])");
+    };
+    ChatPrompt huge_p;
+    std::string many = "[";
+    for (int v = 0; v < 1100000; ++v) many += v ? ",1" : "1";
+    many += "]";
+    const int huge_rc = t.apply(with_args(many), json(), opt, &huge_p);
+    CHECK(huge_rc < 0);
+    CHECK(huge_p.error.find("carries far more values") != std::string::npos);
+    ChatPrompt deep_p;
+    CHECK(t.apply(with_args(std::string(1200, '[') + std::string(1200, ']')), json(), opt, &deep_p) < 0);
+    CHECK(deep_p.error.find("nests far deeper") != std::string::npos);
+    /* An honest refusal of an honest call still comes back in the template's own words. */
+    ChatPrompt ok_p;
+    CHECK(t.apply(with_args("{\"z\":1}"), json(), opt, &ok_p) < 0);
+    CHECK(ok_p.error.find("chat template refused") != std::string::npos);
+    CHECK(ok_p.error.find("function.arguments") == std::string::npos);
+}
+
 TEST(object_arguments_reach_a_string_only_template_as_compact_json) {
     ChatTemplate t;
     REQUIRE(t.load(
