@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -513,17 +514,34 @@ int xs_profile_load(const std::string& path, std::vector<RadFileProfile>* out, i
     }
     std::string text;
     char buf[1 << 16];
-    while (const size_t n = std::fread(buf, 1, sizeof buf, f)) text.append(buf, n);
+    /* Capped WHILE reading. A profile is a handful of integers per layer and expert even for
+     * the largest shipped MoE; anything far past that is not a profile, and the old loop
+     * grew memory with any file it was pointed at before any check ran. */
+    static const size_t kMaxProfileBytes = 64u << 20;
+    bool too_big = false;
+    while (const size_t n = std::fread(buf, 1, sizeof buf, f)) {
+        text.append(buf, n);
+        if (text.size() > kMaxProfileBytes) { too_big = true; break; }
+    }
     const bool bad = std::ferror(f) != 0;
     std::fclose(f);
+    if (too_big) {
+        RAD_ERR("--expert-profile: %s is past %zu MiB; an expert profile is a handful of "
+                "integers per layer and expert, and this is not one",
+                path.c_str(), (size_t)(kMaxProfileBytes >> 20));
+        return RAD_E_INVAL;
+    }
     if (bad) {
         RAD_ERR("--expert-profile: reading %s failed", path.c_str());
         return RAD_E_IO;
     }
-    Json j;
-    try { j = Json::parse(text); }
-    catch (const Json::exception& e) {
-        RAD_ERR("--expert-profile: %s is not JSON: %s", path.c_str(), e.what());
+    /* A file like any other the container or a colleague supplies: bounded read, so a hostile
+     * one is refused during the read instead of grown into a tree. */
+    bool over = false, deep = false;
+    Json j = Json::parse_container(text, &over, &deep);
+    if (over || deep || j.is_discarded()) {
+        RAD_ERR("--expert-profile: %s is not JSON (%s)", path.c_str(),
+                over ? "far too many values" : deep ? "nests far too deep" : "malformed");
         return RAD_E_INVAL;
     }
     if (!j.is_object() || j.value("format", "") != "radiance-expert-stats/1" ||
@@ -533,8 +551,18 @@ int xs_profile_load(const std::string& path, std::vector<RadFileProfile>* out, i
                 path.c_str());
         return RAD_E_INVAL;
     }
-    if (n_trunk && j.contains("n_trunk_layers") && j["n_trunk_layers"].is_number_integer())
-        *n_trunk = j["n_trunk_layers"].get<int32_t>();
+    if (n_trunk && j.contains("n_trunk_layers") && j["n_trunk_layers"].is_number_integer()) {
+        /* int64, range-checked: read through int32, a value that wraps past 2^32 can land on
+         * exactly the layer count the "this profile is another model" refusal compares
+         * against -- the check the file would be escaping. */
+        const int64_t t = j["n_trunk_layers"].get<int64_t>();
+        if (t < 0 || t > INT32_MAX) {
+            RAD_ERR("--expert-profile: %s carries n_trunk_layers %lld, outside 0..%d",
+                    path.c_str(), (long long)t, (int)INT32_MAX);
+            return RAD_E_INVAL;
+        }
+        *n_trunk = (int32_t)t;
+    }
     const auto& rows = j["counts"]["decode"];
     int64_t kept = 0;
     for (size_t l = 0; l < rows.size(); ++l) {
