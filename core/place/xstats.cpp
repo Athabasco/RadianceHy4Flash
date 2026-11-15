@@ -541,7 +541,7 @@ int xs_profile_load(const std::string& path, std::vector<RadFileProfile>* out, i
     Json j = Json::parse_container(text, &over, &deep);
     if (over || deep || j.is_discarded()) {
         RAD_ERR("--expert-profile: %s is not JSON (%s)", path.c_str(),
-                over ? "far too many values" : deep ? "nests far too deep" : "malformed");
+                Json::bound_why(over, deep));
         return RAD_E_INVAL;
     }
     if (!j.is_object() || j.value("format", "") != "radiance-expert-stats/1" ||

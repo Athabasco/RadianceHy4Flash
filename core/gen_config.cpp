@@ -99,8 +99,7 @@ bool gen_sampling_parse(const std::string& json_text, const char* src, GenSampli
     bool over = false, deep = false;
     Json j = Json::parse_container(json_text, &over, &deep);
     if (over || deep) {
-        RAD_WARN("%s: %s; ignoring it", src,
-                 over ? "carries far too many JSON values" : "nests far too deep");
+        RAD_WARN("%s: %s; ignoring it", src, Json::bound_why(over, deep));
         return false;
     }
     if (j.is_discarded()) { RAD_WARN("%s: not valid JSON; ignoring it", src); return false; }
@@ -222,8 +221,7 @@ bool gen_sampling_from_kv(const std::function<const char*(const char*)>& get, Ge
             if (over || deep)
                 RAD_WARN("the container states generation.%s as \"%s\", which is not a JSON "
                          "array of ids (%s); ignoring it",
-                         k, log_sanitize(v).c_str(),
-                         over ? "it carries far too many values" : "it nests far too deep");
+                         k, log_sanitize(v).c_str(), Json::bound_why(over, deep));
             else if (!w.is_discarded()) j[k] = std::move(w);
             else
                 RAD_WARN("the container states generation.%s as \"%s\", which is not a JSON "

@@ -815,8 +815,7 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
     bool over = false, deep = false;
     const ojson cfg = ojson::parse_container(text, &over, &deep);
     if (over || deep)
-        return fail(err, RAD_E_FORMAT,
-                    cfg_path + (over ? ": carries far too many JSON values" : ": nests far too deep"));
+        return fail(err, RAD_E_FORMAT, cfg_path + ": " + ojson::bound_why(over, deep));
     if (cfg.is_discarded() || !cfg.is_object())
         return fail(err, RAD_E_FORMAT, cfg_path + ": not a JSON object");
     auto truthy = [&](const char* k) {

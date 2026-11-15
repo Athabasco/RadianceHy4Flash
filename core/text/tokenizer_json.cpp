@@ -587,9 +587,7 @@ void read_config_json(const std::string& dir, VocabBuild& out) {
     json c = json::parse_container(text, &over, &deep);
     if (over || deep || c.is_discarded()) {
         RAD_WARN("tokenizer: %s did not read as a bounded JSON document (%s); ids left unset",
-                 path.c_str(),
-                 over ? "it carries far too many values"
-                      : deep ? "it nests far too deep" : "it does not parse");
+                 path.c_str(), json::bound_why(over, deep));
         return;
     }
     std::unordered_map<std::string, int32_t> id_of;
@@ -793,9 +791,10 @@ int parse_tokenizer_json_buf(std::string_view text, const char* origin, VocabBui
     bool over = false, deep = false;
     json j = json::parse_container(text, &over, &deep);
     if (over || deep) {
-        RAD_ERR("%s: %s; a tokenizer file may not carry more than 2^24 values or nest more "
-                "than 256 levels",
-                origin, over ? "carries far too many values" : "nests far too deep");
+        RAD_ERR("%s: %s; a tokenizer file may not carry more than %lld values or nest more "
+                "than %d levels",
+                origin, json::bound_why(over, deep),
+                (long long)json::kContainerBudget, json::kContainerDepth);
         return RAD_E_FORMAT;
     }
     if (j.is_discarded()) {
