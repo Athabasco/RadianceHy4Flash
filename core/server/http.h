@@ -89,6 +89,12 @@ bool cidr_valid(const std::string& cidr);
  * happens to embed it. */
 bool ip_in_cidr(const std::string& addr, const std::string& cidr);
 
+/* The identity the keyless "loopback only" guards accept -- the three legs the engine's admin
+ * routes read (see the definition in http.cpp for why the socket alone forges). Every guard that
+ * answers loopback callers keyless reads this, the fleet's front included. */
+bool local_operator(const HttpRequest& req, const std::string& bind_host,
+                    const std::vector<std::string>& local_hosts);
+
 /* The caller a proxy chain vouches for. `raw_addr` is the socket peer (no port), `xff` the
  * request's X-Forwarded-For value ("" when there is none), `trusted` the vouched CIDRs.
  * Nothing is read from the header unless the socket itself belongs to a vouched CIDR -- an

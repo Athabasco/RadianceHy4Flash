@@ -579,6 +579,36 @@ bool HttpRequest::host_is_loopback() const {
     return inet_pton(AF_INET6, h.c_str(), &v6) == 1 && IN6_IS_ADDR_LOOPBACK(&v6);
 }
 
+/* The identity the keyless "loopback only" guards accept: the socket is loopback, the request
+ * carries no foreign Origin, and the Host names the loopback, one of `local_hosts` (--allow-host),
+ * or the address `bind_host` names. Two ways forge the socket alone: a DNS-rebinding page is
+ * same-origin with the server and its victim's browser *is* the loopback peer -- only the Host
+ * still tells which page asked for it -- and a localhost TLS proxy puts every remote client
+ * behind the loopback socket, carrying the public Host. An attacker at the console of this
+ * machine is a local user either way, and stays admitted. Server::local_operator is the member
+ * form; the fleet's front calls this one directly (fleet.cpp). */
+bool local_operator(const HttpRequest& req, const std::string& bind_host,
+                    const std::vector<std::string>& local_hosts) {
+    if (!req.peer_is_loopback() || req.is_cross_origin()) return false;
+    if (req.host_is_loopback()) return true;
+    const std::string host = req.host_authority();
+    if (host.empty()) return false;   /* a socket always carries a Host; the in-process case
+                                         passed host_is_loopback on its empty peer */
+    for (const std::string& a : local_hosts) {
+        std::string want = a;
+        for (char& ch : want) ch = (char)std::tolower((unsigned char)ch);
+        if (want == host) return true;
+    }
+    /* Bound to one concrete address, the box answers to that name on itself. */
+    std::string bind = bind_host;
+    for (char& ch : bind) ch = (char)std::tolower((unsigned char)ch);
+    if (!bind.empty() && bind.front() == '[' && bind.back() == ']')
+        bind = bind.substr(1, bind.size() - 2);
+    if (!bind.empty() && bind != "0.0.0.0" && bind != "::" && bind != "*")
+        return bind == host;
+    return false;
+}
+
 /* The API key a browser's socket carries. A browser cannot set a header on a WebSocket, so
  * OpenAI's browser clients offer it as a subprotocol, `openai-insecure-api-key.<key>`, beside
  * `realtime`; the subprotocol chosen is never that one. Compared in constant time, as the header

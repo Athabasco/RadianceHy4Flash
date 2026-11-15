@@ -257,13 +257,8 @@ public:
     /* Renders each --reasoning-effort-map target as a request's effort. Empty when the template
      * takes all of them; otherwise the first refusal, naming the target. */
     std::string check_reasoning_effort_map() const;
-    /* The identity the keyless "loopback only" guards accept: the socket is loopback, the
-     * request carries no foreign Origin, and the Host names the loopback, one of
-     * ServerOptions::local_hosts, or the address --host names. Two ways forge the socket alone:
-     * a DNS-rebinding page is same-origin with the server and its victim's browser *is* the
-     * loopback peer — only the Host still tells which page asked for it — and a localhost TLS
-     * proxy puts every remote client behind the loopback socket, carrying the public Host. An
-     * attacker at the console of this machine is a local user either way, and stays admitted. */
+    /* The identity the keyless "loopback only" guards accept: loopback socket, no foreign
+     * Origin, and a Host that names this box (server::local_operator, http.cpp). */
     bool local_operator(const HttpRequest& req) const;
     void stop();
     /* stop() without the transport: for a server behind a Front (front.h), which owns the socket.

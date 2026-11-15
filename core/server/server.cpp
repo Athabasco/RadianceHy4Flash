@@ -62,24 +62,9 @@ Server::Server(const Deps& d, const ServerOptions& o)
 }
 
 bool Server::local_operator(const HttpRequest& req) const {
-    if (!req.peer_is_loopback() || req.is_cross_origin()) return false;
-    if (req.host_is_loopback()) return true;
-    const std::string host = req.host_authority();
-    if (host.empty()) return false;   /* a socket always carries a Host; the in-process case
-                                         passed host_is_loopback on its empty peer */
-    for (const std::string& a : opt_.local_hosts) {
-        std::string want = a;
-        for (char& ch : want) ch = (char)std::tolower((unsigned char)ch);
-        if (want == host) return true;
-    }
-    /* Bound to one concrete address, the box answers to that name on itself. */
-    std::string bind = opt_.host;
-    for (char& ch : bind) ch = (char)std::tolower((unsigned char)ch);
-    if (!bind.empty() && bind.front() == '[' && bind.back() == ']')
-        bind = bind.substr(1, bind.size() - 2);
-    if (!bind.empty() && bind != "0.0.0.0" && bind != "::" && bind != "*")
-        return bind == host;
-    return false;
+    /* The three-leg rule itself lives beside the request it reads (server::local_operator,
+     * http.cpp) so the fleet's front applies the very same one. */
+    return server::local_operator(req, opt_.host, opt_.local_hosts);
 }
 
 Server::~Server() { stop(); }

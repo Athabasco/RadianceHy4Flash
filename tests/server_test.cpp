@@ -2896,6 +2896,36 @@ TEST(the_models_root_path_follows_the_key) {
              std::string("/models/m.rad"));
 }
 
+/* The predicate every keyless "loopback only" guard reads -- hoisted so the fleet's front applies
+ * the very rule the engine's routes do (fleet.cpp: the admin/fleet guard). The three legs:
+ * loopback socket, no foreign Origin, a Host that names this box. */
+TEST(local_operator_reads_all_three_legs) {
+    const std::vector<std::string> pinned = {"box.example"};
+    auto ask = [&](const char* peer, const char* host, const char* origin,
+                  const char* bind) {
+        HttpRequest q;
+        q.peer = q.raw_peer = peer;
+        if (host) q.headers["Host"] = host;
+        if (origin) q.headers["Origin"] = origin;
+        return local_operator(q, bind, pinned);
+    };
+    /* The machine dialling itself: loopback socket, loopback Host. */
+    CHECK(ask("127.0.0.1:50122", "localhost:8000", nullptr, "0.0.0.0"));
+    /* A pinned --allow-host name and a concrete --host bind answer for the box. */
+    CHECK(ask("127.0.0.1:50122", "box.example:8000", nullptr, "0.0.0.0"));
+    CHECK(ask("127.0.0.1:50122", "10.3.1.5", nullptr, "10.3.1.5"));
+    /* The rebinding page: same-origin with itself, so no Origin leg fires -- the Host leg is
+     * what refuses it. */
+    CHECK(!ask("127.0.0.1:50122", "evil.test:8000", "http://evil.test:8000", "0.0.0.0"));
+    /* The localhost proxy: every remote client arrives on a loopback socket carrying the
+     * public Host, and no leg names that name. */
+    CHECK(!ask("127.0.0.1:50122", "public.example:8000", nullptr, "0.0.0.0"));
+    /* A foreign Origin never rides a loopback socket into a guard, whatever the Host says. */
+    CHECK(!ask("127.0.0.1:50122", "localhost:8000", "http://evil.test", "0.0.0.0"));
+    /* A remote socket is no operator, however it names itself. */
+    CHECK(!ask("192.168.1.20:50122", "localhost:8000", nullptr, "0.0.0.0"));
+}
+
 TEST(the_model_entry_and_server_info_report_the_same_capabilities) {
     Fixture f;
     const json info = json::parse(f.get("/server_info").body)["capabilities"];
