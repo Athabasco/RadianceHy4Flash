@@ -356,7 +356,12 @@ HttpResponse Router::dispatch(HttpRequest req) const {
     bool path_matched = false;
     std::map<std::string, std::string> caps;
     if (const Route* r = match(req.method, split_path(req.path), &caps, &path_matched)) {
-        req.params.insert(caps.begin(), caps.end());
+        /* The captures of the route that matched replace any of the same name the request already
+         * carries. The front matches a request once and hands it to the model's router with the
+         * path rewritten -- `base:adapter` as `adapter`, an alias as the model's name -- and the
+         * model must read what its own route captured: kept, the front's `id` made
+         * /v1/models/base:adapter and /v1/models/ALIAS a 404. */
+        for (auto& [k, v] : caps) req.params[k] = std::move(v);
         return r->h(req);
     }
 

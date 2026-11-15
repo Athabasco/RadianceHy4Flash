@@ -2694,6 +2694,20 @@ TEST(the_adaptive_draft_window_is_exposed_only_while_it_is_on) {
     CHECK_NEAR(value("radiance:draft_verify_depth_total" + L + ",depth=\"6\"}"), -1.0, 1e-9);
 }
 
+/* The front matches /v1/models/ID itself and hands the request on with the path rewritten: an
+ * alias becomes the model's name, `base:adapter` the adapter's. The model's router reads the id its
+ * own route captured, not the front's, so the request still carries the front's capture here. */
+TEST(a_request_handed_on_reads_the_capture_of_the_route_that_matched_it) {
+    Fixture f;
+    HttpRequest q;
+    q.method = "GET";
+    q.path = "/v1/models/test-model";
+    q.params["id"] = "an-alias";
+    const HttpResponse r = f.srv->router().dispatch(q);
+    CHECK_EQ(r.status, 200);
+    CHECK_EQ(json::parse(r.body).value("id", std::string()), std::string("test-model"));
+}
+
 TEST(models_and_health_answer) {
     Fixture f;
     HttpResponse r = f.get("/v1/models");
