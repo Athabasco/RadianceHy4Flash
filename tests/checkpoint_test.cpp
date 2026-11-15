@@ -3587,19 +3587,19 @@ TEST(a_bailing_gguf_must_promise_a_walkable_layer_count) {
      * therefore not a slow load but a permanent hang -- and a negative dense prefix opens a
      * second loop of the same order. Both must refuse at open, quickly, RAD_E_FORMAT. */
     const std::string dir = fresh_dir();
-    auto bailing_kvs = [](int64_t layers, int64_t dense) {
+    auto bailing_kvs = [](int64_t layers, int64_t dense, int64_t heads = 4, int64_t latent = 512) {
         return std::vector<GKv>{
             { "general.architecture", 8, 0, { "bailingmoe3" } },
             { "bailingmoe3.block_count", 10, (double)layers, {} },
             { "bailingmoe3.embedding_length", 4, 64, {} },
-            { "bailingmoe3.attention.head_count", 4, 4, {} },
+            { "bailingmoe3.attention.head_count", 10, (double)heads, {} },
             { "bailingmoe3.feed_forward_length", 4, 128, {} },
             { "bailingmoe3.context_length", 4, 4096, {} },
             { "bailingmoe3.kda.head_dim", 4, 128, {} },
             { "bailingmoe3.rope.dimension_count", 4, 64, {} },
             { "bailingmoe3.attention.key_length_mla", 4, 192, {} },
             { "bailingmoe3.attention.value_length_mla", 4, 128, {} },
-            { "bailingmoe3.attention.kv_lora_rank", 4, 512, {} },
+            { "bailingmoe3.attention.kv_lora_rank", 10, (double)latent, {} },
             { "bailingmoe3.expert_feed_forward_length", 4, 256, {} },
             { "bailingmoe3.leading_dense_block_count", 10, (double)dense, {} },
         };
@@ -3618,6 +3618,16 @@ TEST(a_bailing_gguf_must_promise_a_walkable_layer_count) {
     write_gguf(sane, bailing_kvs(4, 1), {});
     Checkpoint ck3;
     REQUIRE_EQ(ck3.open(sane), RAD_OK);
+    /* The widths the layout products are built from are bounded too: past the caps they are
+     * vector sizes and wrapped row products, not geometry. */
+    const std::string wide = dir + "/wide.gguf";
+    write_gguf(wide, bailing_kvs(4, 1, 4611686018427387904LL), {});
+    Checkpoint ck4;
+    REQUIRE_EQ(ck4.open(wide), RAD_E_FORMAT);
+    const std::string deep_rank = dir + "/deep_rank.gguf";
+    write_gguf(deep_rank, bailing_kvs(4, 1, 4, 4611686018427387904LL), {});
+    Checkpoint ck5;
+    REQUIRE_EQ(ck5.open(deep_rank), RAD_E_FORMAT);
 }
 
 RAD_TEST_MAIN()

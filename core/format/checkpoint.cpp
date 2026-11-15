@@ -452,8 +452,14 @@ int meta_from_gguf(GgufFile& g, MetaOwn* out) {
          * config.json names, so the reader re-spells them here and one plugin serves both
          * formats. eps and rope_theta take the generic paths above. Four of the family's
          * design choices the GGUF does not carry are Ling 3.0's, stated as constants. */
-        if (gi("kda.head_dim", 0) <= 0 || gi("rope.dimension_count", 0) <= 0 ||
-            gi("attention.key_length_mla", 0) <= gi("rope.dimension_count", 0))
+        /* Bounds on the family gates too (see bailingmoe3_layouts): the layout rebuild's
+         * products -- heads * (nope + rope) rows, the fused kv's heads * 256 * latent -- are
+         * int64 products of these values handed to sized allocations, so the widths they are
+         * built from may not roam free. 128/64 is the shipped geometry. */
+        if (gi("kda.head_dim", 0) <= 0 || gi("kda.head_dim", 0) > 512 ||
+            gi("rope.dimension_count", 0) <= 0 || gi("rope.dimension_count", 0) > 256 ||
+            gi("attention.key_length_mla", 0) <= gi("rope.dimension_count", 0) ||
+            gi("attention.key_length_mla", 0) > 65536)
             return RAD_E_FORMAT;
         out->kv("num_attention_heads", fmt("%lld", (long long)m.n_head));
         /* The typed head_dim the generic pass fell back to (the MLA query width) is not the
@@ -3627,9 +3633,15 @@ int Checkpoint::bailingmoe3_layouts() {
      * refusing -- a hostile container's hang, not a slow load. No real model of this family is
      * near 4096 layers. And the MoE suffix loop starts at the dense prefix, so the prefix must
      * lie inside the stack: negative opens a walk of twice the range, beyond the end is a
-     * container that means nothing by it. */
+     * container that means nothing by it. The head and rank caps are the same discipline one
+     * order down: the rebuild's products (heads * (nope + rope) rows, heads * 256 * latent
+     * bytes of fused kv) are computed in int64 and handed to vectors sized through size_t --
+     * on the 32-bit tier an overflowed product truncates to a small allocation the copy then
+     * overruns. No family model is near 4096 heads or ranks; 256 rope dimensions is already
+     * far past what the rope kernel addresses. */
     if (n_layer < 1 || n_layer > 4096 || dense < 0 || dense > n_layer ||
-        group < 2 || heads < 1 || latent < 1 || ff < 1 || emb < 1)
+        group < 2 || group > n_layer || heads < 1 || heads > 4096 ||
+        latent < 1 || latent > 4096 || ff < 1 || emb < 1)
         return RAD_E_FORMAT;
 
     /* Decode a whole source tensor to f32: a block type row by row, a plain one a copy. */
@@ -3700,9 +3712,14 @@ int Checkpoint::bailingmoe3_layouts() {
         const char* nps = meta_.get("qk_nope_head_dim"), *rps = meta_.get("qk_rope_head_dim");
         const int64_t qn = nps ? std::stoll(nps) : 0, qr = rps ? std::stoll(rps) : 0;
         const SrcTensor* qb = find(fmt("blk.%lld.attn_q_b.weight", (long long)l));
+        /* The row product is checked, not trusted: heads and the two rope widths arrive from
+         * the container, and a wrapped product that happened to equal the tensor's rows would
+         * run the split at the wrong per-head boundary. */
+        int64_t w = 0, qb_rows = 0;
         if (qb && qb->shape.size() == 2 && qb->shape[1] > 0 && qn > 0 && qr > 0 &&
-            qb->shape[0] == heads * (qn + qr)) {
-            const int64_t ql = qb->shape[1], w = qn + qr;
+            !__builtin_add_overflow(qn, qr, &w) && !__builtin_mul_overflow(heads, w, &qb_rows) &&
+            qb->shape[0] == qb_rows) {
+            const int64_t ql = qb->shape[1];
             std::vector<float> q3, nblk, rblk;
             RAD_TRY(whole(qb, q3));
             nblk.assign((size_t)(heads * qn) * ql, 0.0f);
