@@ -1087,15 +1087,20 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         const bool pair = w.eff.q8 && w.eff.s8 && w.eff.q8_rot && w.eff.g8 == RAD_FP8_BLOCK;
         const bool down_supported = down_w5_fp8 ? (w.eff.q && w.eff.s && kServed[fmt[1]])
                                                 : kServed8[fmt[1]] != nullptr;
+        /* A clamped layer is served too: GateQuantFP8 clamps into the bf16 plane, then
+         * quantises it into the rotated codes. Not before a W5NL down projection, which reads
+         * rotated E4M3: no clamp writes those codes. */
+        const bool clamp_w5 = down_w5_fp8 && c.swiglu_limit > 0;
         if (!pair || !c.expert_rot || !kServed8[fmt[0]] || !down_supported || c.calib ||
-            c.swiglu_limit > 0) {
+            clamp_w5) {
             fprintf(stderr, "radiance: layer %d: int8 activations meet rotated experts (int8, "
                             "four-bit, or the codebook at E4M3 scales a 64 or 32 of K) through "
-                            "rotated codes at one scale a 128 of K, unclamped, outside "
-                            "calibration; these are %s / %s%s\n", l,
+                            "rotated codes at one scale a 128 of K, outside calibration; these "
+                            "are %s / %s%s%s\n", l,
                     kServed[fmt[0]] ? kServed[fmt[0]] : kServed8[fmt[0]],
                     kServed[fmt[1]] ? kServed[fmt[1]] : kServed8[fmt[1]],
-                    pair ? "" : ", and the gated product's int8 pair is not that");
+                    pair ? "" : ", and the gated product's int8 pair is not that",
+                    clamp_w5 ? ", and a W5NL down projection is served unclamped only" : "");
             return RAD_E_UNSUPPORTED;
         }
     }

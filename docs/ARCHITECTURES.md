@@ -22,7 +22,7 @@ plugin claims.
 | `arch/clef_fp8` | `clef` | `fp8_e4m3` | the same over `qwen35_fp8`'s trunk |
 | `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert (`data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe`) or an AutoRound int4 release (`qwen4exp-autoround-i8-hc8m.recipe`) |
 | `arch/glm5next` | `glm5next` | *(empty)* | GLM-5.3-Flash: four mHC residual streams over 34 KDA and 11 sparse latent-attention (MLA) layers with a DSA indexer, 288 experts at top-8 under sigmoid routing, attention and dense layers as the container stores them; its MTP layer is a serial drafter. Pictures through its vision tower (`arch/common/rad_block_glm_vision.h`); bf16 KV |
-| `arch/bailing_hybrid` | `bailinghybrid` | *(empty)* | Ling-3.0-flash and its fine-tunes (Ling-3.0-flash-Sante) from the bf16 checkpoint: 35 KDA and 7 dense latent-attention (MLA) layers with a rotary part and a head-wise gate, 512 experts at top-8 under group-limited sigmoid routing with an ungated shared expert, the routed experts as the recipe stores them (`data/recipes/ling3-w4a8-rtn.recipe`); its MTP layer is a serial drafter; Ling-3.0-tiny from its bf16 checkpoint with an IQ8R trunk and rotated int8 experts (`data/recipes/ling-3.0-tiny-iq8r.recipe`, TP1/2; flash's clamped SwiGLU layers have no int8 form); bf16 KV |
+| `arch/bailing_hybrid` | `bailinghybrid` | *(empty)* | Ling-3.0-flash and its fine-tunes (Ling-3.0-flash-Sante) from the bf16 checkpoint: 35 KDA and 7 dense latent-attention (MLA) layers with a rotary part and a head-wise gate, 512 experts at top-8 under group-limited sigmoid routing with an ungated shared expert, the routed experts as the recipe stores them (`data/recipes/ling3-w4a8-rtn.recipe`); its MTP layer is a serial drafter; Ling-3.0-tiny from its bf16 checkpoint with an IQ8R trunk and rotated int8 experts (`data/recipes/ling-3.0-tiny-iq8r.recipe`, TP1/2), and flash on the same trunk with rotated experts (its clamped layers clamp, then quantise); bf16 KV |
 | `arch/bailing_hybrid_gguf` | `bailinghybrid` | `gguf_ftype_25` | Ling-3.0-tiny (24 layers, MLA every fourth with a 256-wide query LoRA, 128 experts of 512 at top-8) as the IQ4_NL GGUF release, its experts re-quantised by `data/recipes/ling-3.0-tiny-iq4.recipe`; no MTP; bf16 KV |
 | `arch/bailing_hybrid_gguf_q80` | `bailinghybrid` | `gguf_ftype_7` | the same tiny family, Q8_0 GGUF release, served whole |
 | `arch/bailing_hybrid_gguf_q4km` | `bailinghybrid` | `gguf_ftype_15` | the same tiny family, Q4_K_M GGUF release, served whole |
@@ -1149,8 +1149,10 @@ shards the same way; its norms take no collective (each block's all-reduce stays
 `all_reduce` before the residual add), so no `ar_` norm is declared at two ranks.
 
 **The trunk's form** is read from layer 0's fused q|k|v. A rotated int8 trunk needs rotated
-experts (int8 or a rotated four-bit form) and no SwiGLU clamp: the int8 gated products have no
-clamped form, so flash's clamped layers (routed 35-41, shared 34-41) are refused on it by name.
+experts (int8 or a rotated four-bit form). Flash's clamped layers (routed 35-41, shared 34-41)
+write the clamped bf16 product (`swiglu_step`) and quantise it with `had_quant_act_i8g` at the
+group of the down projection that reads it: one launch more than the unclamped
+`gated_had_quant_i8g`, in those layers only.
 Rotated int8 experts under an unrotated trunk are refused too. Where no loaded library serves
 `rmsnorm_had_quant_i8g` (a CPU-only engine), each int8 linear quantises the norm's bf16 output
 itself and the routed experts read a rotated int8 copy written once a layer.
