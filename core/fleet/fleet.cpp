@@ -485,6 +485,8 @@ private:
     void   history_loop();
     json   placement(const std::string& name);
     std::string describe(const std::string& name);
+    /* Adapters a resident model serves from memory: the names /v1/models lists as its cards. */
+    std::vector<std::string> adapters_of(const std::string& name);
     std::string metrics();
     std::vector<std::string> group_partners(const std::string& name, Group::Kind kind) const;
     void   keep_partners(const Model& m, std::vector<Resident>* res) const;
@@ -2388,6 +2390,15 @@ std::string Fleet::describe(const std::string& name) {
     return "{}";
 }
 
+/* The adapter names a resident model serves from memory. A parked or loading engine serves none
+ * through this name: nothing answers a request to a child while the parent is not open. */
+std::vector<std::string> Fleet::adapters_of(const std::string& name) {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (auto& mp : models_)
+        if (mp->entry.name == name && mp->resident && mp->engine) return mp->engine->lora_names();
+    return {};
+}
+
 /* What /admin/fleet says beyond describe(), which also feeds every /v1/models card: where the
  * model's bytes are, its file and the policy it was configured with. */
 json Fleet::placement(const std::string& name) {
@@ -2540,6 +2551,21 @@ json Fleet::status() {
         if (j.contains("waiting_for") && a.state != server::Front::State::Open) j["state"] = "waiting";
         if (const std::string caps = front_.capabilities(n); !caps.empty()) j["capabilities"] = json::parse(caps, nullptr, false);
         models.push_back(j);
+        /* Runtime LoRA: an adapter is a model as far as choosing one goes, and /v1/models lists
+         * each as a child under `base:adapter` (server.cpp). The fleet view must say the same,
+         * or a view built on it is blind to what this machine answers to. A child owns nothing:
+         * no cards, no bytes, no policy of its own; its state and counters are the parent's,
+         * because the parent is what serves it. */
+        for (const std::string& a : adapters_of(n)) {
+            json ad;
+            ad["id"]        = n + ":" + a;
+            ad["parent"]    = n;
+            ad["adapter"]   = true;
+            ad["state"]     = j["state"];
+            ad["in_flight"] = j["in_flight"];
+            ad["waiting"]   = j["waiting"];
+            models.push_back(std::move(ad));
+        }
     }
     json cards = json::array();
     for (int c : cards_) {

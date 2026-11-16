@@ -46,7 +46,9 @@ it in tree.
 A runtime adapter is selected by the model name, `"<base>:<adapter>"` (the per-request `loras`
 field is image/video only; chat routes by `model`). Strength is fixed per card at load -- not
 settable per request in this build. A single resident container serves both the base and the
-adapted card.
+adapted card. Loaded adapters are children in the fleet view too -- `/admin/fleet` (and so the
+built-in dashboard) lists each as id `base:adapter` with `parent` set and no bytes of its own;
+an adapter is not a model one parks or unloads, the parent carries it.
 
 ## 4. Architecture note
 
