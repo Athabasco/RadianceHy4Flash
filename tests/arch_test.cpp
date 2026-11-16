@@ -5734,17 +5734,20 @@ TEST(a_gemma4_moe_trunk_declares_both_arms_and_the_joins) {
 
 /* The sliding group is RAD_KV_FULL with the window on the attention op, since a window group is
  * not prefix-cached (arch/gemma4/gemma4.cpp, the KV groups). */
-TEST(gemma4_moe_kv_groups_are_both_full_and_the_window_rides_the_op) {
+TEST(gemma4_moe_kv_groups_are_window_and_full_and_the_window_rides_the_op) {
     RadBuilder b;
     RadModelMeta meta = gemma4_moe_meta();
     RadBuildCtx  ctx  = build_ctx();
     CHECK_OK(gemma4::declare(&b, &meta, &ctx));
 
+    /* The sliding group is a window group: the pool caps at what attn_paged_qrow can read. */
     REQUIRE((int)b.kv_groups.size() == 2);
-    for (const auto& g : b.kv_groups) {
-        CHECK_EQ((int)g.d.kind, RAD_KV_FULL);
-        CHECK_EQ(g.d.window, 0);
-    }
+    CHECK_EQ(b.kv_groups[0].name, std::string("kv_swa"));
+    CHECK_EQ((int)b.kv_groups[0].d.kind, RAD_KV_WINDOW);
+    CHECK_EQ(b.kv_groups[0].d.window, 1024);
+    CHECK_EQ(b.kv_groups[1].name, std::string("kv_full"));
+    CHECK_EQ((int)b.kv_groups[1].d.kind, RAD_KV_FULL);
+    CHECK_EQ(b.kv_groups[1].d.window, 0);
     const RecOp* sl = find_op(b, "attn_paged_qrow", 0);
     REQUIRE(sl != nullptr);
     CHECK_EQ(pint(sl, "head_dim"), 256);
@@ -11361,10 +11364,10 @@ struct ArchCases {
             nullptr, 0, {}, 0x7be4844610b039d8ull);
         add("gemma4", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 0); return gemma4::declare(b, &g4m, &c); },
-            gemma4::step, 0, {}, 0x0f227f5853b6488cull);
+            gemma4::step, 0, {}, 0xfe8442fba92e5d6dull);
         add("gemma4 + DFlash", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 15); return gemma4::declare(b, &g4df, &c); },
-            gemma4::step, 15, {}, 0x37bffcc9bd749b88ull);
+            gemma4::step, 15, {}, 0x5d420566673e5a19ull);
         add("embgemma2", [this](RadBuilder* b) {
                 auto c = eg2_ctx(); return embgemma2::declare(b, eg2.meta(), &c); },
             embgemma2::step, 0, {}, 0xac72c705bc97d2b3ull);
