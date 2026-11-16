@@ -17255,7 +17255,7 @@ static void dsa_perf(const Plugin& pl, int64_t ctx, int64_t M, int iters) {
  * Every form (run-aligned prefill, (tile, run) decode, uniform prefill grid) runs on the same bytes
  * and must match the first byte for byte, since all keep each element's accumulation order. */
 static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512, int64_t top_k = 10,
-                     int pool_pct = 0) {
+                     int pool_pct = 0, bool w6_only = false) {
     if (iters <= 0) iters = 20;
     const RadKernelInfo* r = find(pl, "moe_gemm_w4a8");
     if (!r) { std::printf("--perfmoe: row moe_gemm_w4a8 absent\n"); return; }
@@ -17288,9 +17288,10 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
         sorted.insert(sorted.end(), by_e[(size_t)e].begin(), by_e[(size_t)e].end());
         rmin = std::min(rmin, n); rmax = std::max(rmax, n); rows_c[e & 1] += n;
     }
-    std::printf("moe_gemm_w4a8 at a %lld-token chunk: Tr=%lld routed rows over %lld experts, a run "
-                "%lld..%lld rows (mean %.1f), %d launches\n", (long long)Mtok, (long long)Tr,
-                (long long)E, (long long)rmin, (long long)rmax, (double)Tr / (double)E, iters);
+    std::printf("%s at a %lld-token chunk: Tr=%lld routed rows over %lld experts, a run "
+                "%lld..%lld rows (mean %.1f), %d launches\n", w6_only ? "W5NL/W6NL down" : "moe_gemm_w4a8",
+                (long long)Mtok, (long long)Tr, (long long)E, (long long)rmin, (long long)rmax,
+                (double)Tr / (double)E, iters);
 
     void* d_s = dalloc((size_t)Tr * 4);
     void* d_o = dalloc((size_t)(E + 1) * 4);
@@ -17303,8 +17304,9 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
     /* Form 4, where pinnable, is the decode form at two 128-wide K blocks per pass (the timing
      * kMoeGuFk256Rows is set from). Only gate_up has it (K a multiple of 256 and a format that
      * folds scale groups); elsewhere it runs as form 2. */
-    const int nforms = pl.pin_moe ? (pl.pin_fk ? 4 : 3) : 1;
+    const int nforms = (pl.pin_moe ? (pl.pin_fk ? 4 : 3) : 1) + (w6_only && pl.pin_moe ? 1 : 0);
     for (const Proj& P : projs) {
+        if (w6_only && !P.srt) continue;
         const int64_t N = std::max(P.N0, P.N1), K = std::max(P.K0, P.K1), kb = K / group;
         const int64_t Ma = P.srt ? Tr : Mtok;
         const int64_t nec[2] = { E / 2, E / 2 };
@@ -17372,8 +17374,23 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
             d_ws[c] = dalloc(wsc.size() * 2);
             st_memcpy(d_ws[c], wsc.data(), wsc.size() * 2, hipMemcpyHostToDevice);
         }
+        /* A separate six-bit allocation: do not overread the five-bit experts. Its independent
+         * deterministic generator also leaves the pre-existing benchmark's RNG stream alone. */
+        void* d_w6[2] = { nullptr, nullptr };
+        if (w6_only) for (int c = 0; c < 2; ++c) {
+            const size_t bytes = (size_t)(nec[c] * Nc[c] * Kc[c] / 8 * 6);
+            d_w6[c] = dalloc(bytes);
+            hb.resize(bytes);
+            uint64_t seed = 0xd1b54a32d192ed03ull ^ (uint64_t)c;
+            for (size_t i = 0; i < bytes; ++i) {
+                seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                hb[i] = (uint8_t)seed;
+            }
+            if (d_w6[c]) st_memcpy(d_w6[c], hb.data(), bytes, hipMemcpyHostToDevice);
+        }
         void* d_y = dalloc((size_t)(Tr * N * 2));
-        if (!d_s || !d_o || !d_a || !d_as || !d_w[0] || !d_w[1] || !d_ws[0] || !d_ws[1] || !d_y) {
+        if (!d_s || !d_o || !d_a || !d_as || !d_w[0] || !d_w[1] || !d_ws[0] || !d_ws[1] || !d_y ||
+            (w6_only && (!d_w6[0] || !d_w6[1]))) {
             std::printf("  alloc failed\n");
             return;
         }
@@ -17410,6 +17427,9 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
         }
         const double flop = 2.0 * ((double)rows_c[0] * P.N0 * P.K0 + (double)rows_c[1] * P.N1 * P.K1);
         const double welems = (double)nec[0] * P.N0 * P.K0 + (double)nec[1] * P.N1 * P.K1;
+        double live_welems = 0;
+        if (w6_only) for (int64_t e = 0; e < E; ++e)
+            if (!by_e[(size_t)e].empty()) live_welems += (double)Nc[e & 1] * Kc[e & 1];
         std::vector<uint16_t> first((size_t)(Tr * N)), got((size_t)(Tr * N));
         /* Every scale grid over the same bytes: w4a8h's bf16 per (row, 128 of K), w4nl64a8h's two
          * E4M3 per 128 and w4nl32a8h's four (timing only the extra accumulators and fold), and
@@ -17419,16 +17439,17 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
          * activation bytes, the int8 levels and the iu8 WMMA. The five-bit form has no such row. */
         const RadKernelInfo* r8 = find(pl, "moe_gemm_w4a8i8");
         for (int a8 = 0; a8 < (r8 ? 2 : 1); ++a8)
-        for (const int sub : { 1, 2, 4, 5 }) {
-        const bool g64 = sub > 1, w5 = sub == 5;
-        if (w5 && (a8 || d_tab[0] || d_tab[1])) continue;
+        for (const int sub : { 1, 2, 4, 5, 6 }) {
+        const bool g64 = sub > 1, w5 = sub == 5, w6 = sub == 6;
+        if ((w6_only && !w5 && !w6) || (!w6_only && w6)) continue;
+        if ((w5 || w6) && (a8 || d_tab[0] || d_tab[1])) continue;
         const RadKernelInfo* ra = a8 ? r8 : r;
         ts[0] = T(d_a, a8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3, { Ma, K });
-        const int64_t sg = w5 ? 2 : sub;
-        ts[2] = T(d_tab[0] ? d_tab[0] : d_w[0], w5 ? R4D_DT_MOEW5 : R4D_DT_MOEW4,
-                  { nec[0], P.N0, P.K0 });
-        ts[6] = T(d_tab[1] ? d_tab[1] : d_w[1], w5 ? R4D_DT_MOEW5 : R4D_DT_MOEW4,
-                  { nec[1], P.N1, P.K1 });
+        const int64_t sg = (w5 || w6) ? 2 : sub;
+        ts[2] = T(w6 ? d_w6[0] : d_tab[0] ? d_tab[0] : d_w[0],
+                  w6 ? R4D_DT_MOEW6 : w5 ? R4D_DT_MOEW5 : R4D_DT_MOEW4, { nec[0], P.N0, P.K0 });
+        ts[6] = T(w6 ? d_w6[1] : d_tab[1] ? d_tab[1] : d_w[1],
+                  w6 ? R4D_DT_MOEW6 : w5 ? R4D_DT_MOEW5 : R4D_DT_MOEW4, { nec[1], P.N1, P.K1 });
         if (d_tab[0]) ts[2].stride[0] = 0;
         if (d_tab[1]) ts[6].stride[0] = 0;
         ts[3] = g64 ? T(d_ws[0], RAD_F8E4M3, { nec[0], P.N0, sg * P.K0 / group })
@@ -17436,16 +17457,19 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
         ts[7] = g64 ? T(d_ws[1], RAD_F8E4M3, { nec[1], P.N1, sg * P.K1 / group })
                     : T(d_ws[1], RAD_BF16, { nec[1], P.N1, P.K1 / group });
         ps.back().sval = a8 ? (sub == 4 ? "w4nl32a8i8h" : g64 ? "w4nl64a8i8h" : "w4a8i8h")
-                            : w5 ? "w5nl64a8h" : sub == 4 ? "w4nl32a8h" : g64 ? "w4nl64a8h" : "w4a8h";
-        const double wbytes = welems * (w5 ? 0.625 : 0.5);
-        const std::string pname = std::string(P.name) + (w5 ? " w5" : sub == 4 ? " g32"
+                            : w6 ? "w6nl64a8h" : w5 ? "w5nl64a8h" : sub == 4 ? "w4nl32a8h"
+                            : g64 ? "w4nl64a8h" : "w4a8h";
+        const double wbytes = (w6_only ? live_welems : welems) * (w6 ? 0.75 : w5 ? 0.625 : 0.5);
+        const std::string pname = std::string(P.name) + (w6 ? " w6" : w5 ? " w5" : sub == 4 ? " g32"
                                                          : g64 ? " g64" : "") + (a8 ? " i8" : "");
         for (int f = 0; f < nforms; ++f) {
-            if (pl.pin_moe) pl.pin_moe(f == 3 ? 2 : f + 1);
-            if (pl.pin_fk) pl.pin_fk(f == 3 ? 2 : 1);
+            const int pinned = w6_only && pl.pin_moe ? f - 1 : f;
+            const std::string form = pinned < 0 ? "auto" : std::to_string(pinned + 1);
+            if (pl.pin_moe) pl.pin_moe(pinned < 0 ? 0 : pinned == 3 ? 2 : pinned + 1);
+            if (pl.pin_fk) pl.pin_fk(pinned < 0 ? 0 : pinned == 3 ? 2 : 1);
             const int rc = ra->launch(&a, nullptr);
             if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
-                std::printf("  %-12s form %d  rc=%d (not served)\n", pname.c_str(), f + 1, rc);
+                std::printf("  %-12s form %-4s  rc=%d (not served)\n", pname.c_str(), form.c_str(), rc);
                 continue;
             }
             {
@@ -17474,12 +17498,13 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
             } else {
                 int64_t diff = 0;
                 for (size_t i = 0; i < got.size(); ++i) diff += got[i] != first[i];
-                same = diff ? ("  " + std::to_string(diff) + " elements differ from form 1")
-                            : "  byte-identical to form 1";
+                const char* reference = w6_only && pl.pin_moe ? "auto" : "form 1";
+                same = diff ? ("  " + std::to_string(diff) + " elements differ from " + reference)
+                            : std::string("  byte-identical to ") + reference;
             }
-            std::printf("  %-12s form %d  %9.1f us  %6.1f TFLOP/s useful  %6.1f GB/s of weight%s\n",
-                        pname.c_str(), f + 1, us, flop / (us * 1e6), wbytes / (us * 1e3),
-                        same.c_str());
+            std::printf("  %-12s form %-4s  %9.1f us  %6.1f TFLOP/s useful  %6.1f GB/s of %sweight%s\n",
+                        pname.c_str(), form.c_str(), us, flop / (us * 1e6), wbytes / (us * 1e3),
+                        w6_only ? "live-expert " : "", same.c_str());
         }
         }
         if (pl.pin_moe) pl.pin_moe(0);
@@ -33990,6 +34015,8 @@ static void usage(void) {
                 "             an M-token chunk (512 experts, top 10 by default); every form, each\n"
                 "             compared with the first. pooled%% of the experts are read out of\n"
                 "             pinned host memory through a pointer table, as the engine's are.\n"
+                "  --perfw6nl M [iters] [experts] [top_k]: W5NL and W6NL down at that TP2\n"
+                "             geometry and routing, synthetic resident weights; auto and pinned forms.\n"
                 "  --perfmoeiqr M [iters] [experts] [top_k] [draw] [routings]:  --perfmoe's IQR\n"
                 "             rows alone (moe_gemm_iqr at Qwen3.8-Flash-Next's per-rank shapes); the\n"
                 "             routing draws from `draw` of the experts (0 or default: all), fewer\n"
@@ -34099,6 +34126,7 @@ int main(int argc, char** argv) {
     int hy_it = 100;
     int moe_pool = 0;
     int moe_it = 20;
+    bool perf_w6nl = false;
     long long m16_m = 0, m16_e = 256, m16_k = 10, m16_d = 0;
     int m16_it = 20;
     int video_it = 0;
@@ -34249,14 +34277,18 @@ int main(int argc, char** argv) {
             if (hy_m < 1 || hy_m > 256 || hy_it < 1) {
                 std::fprintf(stderr, "--perfhyv3moe: M 1..256, iters > 0\n"); return 2;
             }
-        } else if (!std::strcmp(argv[i], "--perfmoe")) {
-            /* The routed-expert GEMM at a prefill chunk of M tokens, every prefill form. */
+        } else if (!std::strcmp(argv[i], "--perfmoe") || !std::strcmp(argv[i], "--perfw6nl")) {
+            /* The routed-expert GEMM at a chunk of M tokens, every launch form. */
+            perf_w6nl = !std::strcmp(argv[i], "--perfw6nl");
             if (i + 1 >= argc) { usage(); return 2; }
             moe_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) moe_it = (int)std::strtol(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) moe_e = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) moe_k = std::strtoll(argv[++i], nullptr, 0);
-            if (i + 1 < argc && argv[i + 1][0] != 0x2d) moe_pool = (int)std::strtol(argv[++i], nullptr, 0);
+            if (!perf_w6nl && i + 1 < argc && argv[i + 1][0] != 0x2d) moe_pool = (int)std::strtol(argv[++i], nullptr, 0);
+            if (perf_w6nl && (moe_m < 1 || moe_it < 1 || moe_e < 2 || moe_e % 2 || moe_k < 1 || moe_k > moe_e)) {
+                std::fprintf(stderr, "--perfw6nl: M/iters > 0, experts even >= 2, top_k 1..experts\n"); return 2;
+            }
         } else if (!std::strcmp(argv[i], "--perfmoeiqr")) {
             /* The IQR rows of --perfmoe alone, and how many experts its routing draws from. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -34502,9 +34534,9 @@ int main(int argc, char** argv) {
     if (moe_m) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
-        moe_perf(pl, moe_m, moe_it, moe_e, moe_k, moe_pool);
+        moe_perf(pl, moe_m, moe_it, moe_e, moe_k, moe_pool, perf_w6nl);
         dfree_all();
-        moe_iqr_perf(pl, moe_m, moe_it, moe_e, moe_k);
+        if (!perf_w6nl) moe_iqr_perf(pl, moe_m, moe_it, moe_e, moe_k);
 #else
         skip("routed-expert GEMM timing", "built without HIP");
 #endif

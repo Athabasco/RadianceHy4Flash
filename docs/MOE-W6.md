@@ -24,4 +24,6 @@ The host tests cover W6NL GPTQ on a synthetic BF16-domain Gram, all 64 code valu
 
 A `rad-convert --plan-only` pass over the BF16 checkpoint declared 51,489 weights and estimated about 170.26 GiB for the candidate recipe. The plan used placeholder calibration paths and wrote no model: it validates neither the downloaded Grams nor conversion.
 
-These tests are not an end-to-end model validation. No full W6 model has been converted or scored; mixed-model inference, throughput, placement, and speculative parity remain to be measured. The main calibration directory must be reassembled and verified before conversion, with the separate draft Gram directory supplied as `MTP_CALIB`.
+For a synthetic TP2-shaped down-projection latency comparison, run `r4d_selftest /path/to/libr4d.so --perfw6nl M [iters] [experts] [top_k]`. It compares W5NL and W6NL using the same routing and resident, synthetic weights, with automatic and pinned launch forms; byte-parity checks compare launch forms **within** each format, not W5 values to W6 values. Repeated synthetic kernel timing is not end-to-end model throughput.
+
+These tests are not an end-to-end model validation. No full W6 model has been converted or scored; mixed-model inference, model throughput, placement, and speculative parity require separate validation. The main calibration directory must be reassembled and verified before conversion, with the separate draft Gram directory supplied as `MTP_CALIB`.
