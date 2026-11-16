@@ -638,6 +638,10 @@ int find_unsupported_uses(const Program& prog, const TargetSet& targets,
     for (size_t i = 1; i < prog.ops.size(); ++i) {
         const OpInfo& op = prog.ops[i];
         if (op.weights.empty() || !op_live(op)) continue;
+        /* A prefetch only stages a weight's planes for the GEMMs that read them; the adapter's
+         * delta is applied at the site's expand op, so staging the base planes stays correct.
+         * A prefetch neither carries nor invalidates an adapter. */
+        if (op.op == "prefetch") continue;
         rad_weight b = 0;
         std::string why;
         const bool site = op_is_site(prog, op, &b, &why);
