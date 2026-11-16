@@ -2519,6 +2519,12 @@ void Fleet::history_loop() {
             if (body.empty()) continue;
             const json s = json::parse(body, nullptr, false);
             if (!s.is_object()) continue;
+            /* status() lists each adapter of this model as a child; a child owns no engine, and
+             * the parent's stats are exactly what a request to the child runs on -- the same
+             * tokens, the same queue, the same seconds. Sample the child under its own name with
+             * the parent's body so the child's charts draw what its name actually drives. */
+            for (const std::string& a : adapters_of(n))
+                history_.model_sample(n + ":" + a, s, t, body);
             history_.model_sample(n, s, t, std::move(body));
             open.insert(n);
         }
