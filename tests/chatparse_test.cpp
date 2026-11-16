@@ -1479,6 +1479,39 @@ TEST(the_chat_bridge_derives_the_whole_request_from_one_format) {
 }
 
 /* The declared format preserves HYV3's outer section and all of its argument markers. */
+/* A container that names the tool-call close end-of-generation cannot serve a second call, or
+ * a reply that quotes the tag: the turn ends the moment the call does. The bridge finds the ids
+ * this format writes as its own delimiters and the engine drops them from the stop set, leaving
+ * the real turn terminator alone. */
+TEST(a_call_delimiter_is_not_a_turn_terminator) {
+    VocabBuild vb;
+    vb.tokens = { "a", "<|im_end|>", "<tool_call>", "</tool_call>" };
+    vb.types  = { RAD_TT_NORMAL, RAD_TT_CONTROL, RAD_TT_CONTROL, RAD_TT_CONTROL };
+    vb.eos    = 1;
+    vb.eos_ids = { 3 };                   /* the close, declared terminal by the container */
+    vb.chat_template = fixture("glm53");
+    auto v = std::make_shared<Vocab>();
+    REQUIRE(v->load(std::move(vb)) >= 0);
+    REQUIRE(v->is_eog(3));
+
+    server::ChatTemplateBridge br;
+    REQUIRE(br.init(*v) >= 0);
+    CHECK(br.supports_tools());
+    REQUIRE(br.eog_call_markers().size() == 1);
+    CHECK_EQ(br.eog_call_markers()[0], 3);
+    /* The terminator the template writes stays one; the engine demotes only what the bridge
+     * reports (core/engine.cpp). */
+    CHECK(v->is_eog(1));
+
+    /* A template with no tool calls has no call delimiters to report. */
+    std::shared_ptr<Vocab> plain_v = vocab_with("");
+    REQUIRE(plain_v != nullptr);
+    server::ChatTemplateBridge plain;
+    REQUIRE(plain.init(*plain_v) >= 0);
+    CHECK(!plain.supports_tools());
+    CHECK(plain.eog_call_markers().empty());
+}
+
 TEST(hyv3_plugin_format_runs_through_the_chat_template_bridge) {
     std::shared_ptr<Vocab> v = vocab_with(fixture("hyv3"));
     REQUIRE(v != nullptr);
