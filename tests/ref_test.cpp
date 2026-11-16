@@ -4907,12 +4907,66 @@ TEST(op_moe_gemm_q_mod4) {
  * (w4nl64a8h/w5nl64a8h) or 32 (w4nl32a8h). The oracle inverts a relaid weight into exactly this
  * description (core/runtime/oracle.cpp). The final case is one last-class expert at K = 128 whose
  * 64-wide halves scale by 2 and 3 under one 0.5 activation scale; any other grid reads differently. */
+TEST(op_moe_gemm_q_reads_six_bit_codebook_experts) {
+    constexpr int64_t N = 2, K = 128;
+    T codes0(RAD_U6, {N, K}), codes1(RAD_U6, {N, K});
+    T table(RAD_F32, {1, 64}), scale(RAD_F8E4M3, {N, 2}), level(RAD_F32, {1, 1});
+    std::vector<float> levels(64);
+    for (int c = 0; c < 64; ++c) levels[(size_t)c] = c < 32 ? (float)(c + 1) : (float)(31 - c);
+    table.f(levels); scale.f({ 1, 2, 2, 1 }); level.f({ 0.5f });
+    for (int64_t n = 0; n < N; ++n) for (int64_t k = 0; k < K; ++k) {
+        const int base = (int)((k % 32 + (k / 64) * 32 + n * 5) % 64);
+        rad_store_code(codes0.mem.data() + n * (K * 6 / 8), RAD_U6, k, base);
+        rad_store_code(codes1.mem.data() + n * (K * 6 / 8), RAD_U6, k, (base + 3) % 64);
+    }
+    RadEncoding enc{};
+    rad_enc_clear(&enc);
+    rad_enc_copy_str(enc.scheme, "affine");
+    rad_enc_copy_str(enc.transform, "fwht128");
+    rad_enc_add_plane(&enc, "codes", RAD_U6, 1, 1);
+    rad_enc_add_plane(&enc, "scale", RAD_F8E4M3, 1, 64);
+    rad_enc_add_plane(&enc, "scale.1", RAD_F32, 0, 0);
+    rad_enc_add_table(&enc, "table", RAD_F32, 1, 64);
+    const int cs[] = { 0, 3 }, ss[] = { 1, 2 };
+    RadTensor cp0[] = { codes0.t, table.t }, cp1[] = { codes1.t, table.t }, sp[] = { scale.t, level.t };
+    RadLayout cl{}, sl{};
+    REQUIRE_EQ(rad_planes_layout(&enc, cs, cp0, 2, &cl), RAD_OK);
+    REQUIRE_EQ(rad_planes_layout(&enc, ss, sp, 2, &sl), RAD_OK);
+    std::vector<uint8_t> even((size_t)cl.bytes), odd((size_t)cl.bytes), scales((size_t)sl.bytes);
+    REQUIRE_EQ(rad_planes_relayout(&enc, cs, cp0, 2, even.data(), cl.bytes), RAD_OK);
+    REQUIRE_EQ(rad_planes_relayout(&enc, cs, cp1, 2, odd.data(), cl.bytes), RAD_OK);
+    REQUIRE_EQ(rad_planes_relayout(&enc, ss, sp, 2, scales.data(), sl.bytes), RAD_OK);
+    T input(RAD_F32, {2, K}), as(RAD_F32, {2, 1}), sorted(RAD_I32, {2});
+    T off(RAD_I32, {3}), out(RAD_F32, {2, N});
+    T w0(RAD_U6, {1, N, K}), w1(RAD_U6, {1, N, K});
+    T s0(RAD_F8E4M3, {1, N, K}), s1(RAD_F8E4M3, {1, N, K});
+    input.f(std::vector<float>((size_t)(2 * K), 1.0f)); as.f({1, 1});
+    sorted.n({0, 1}); off.n({0, 1, 2});
+    A a;
+    a.t(input).t(as).t(w0).t(s0).t(sorted).t(off).t(w1).t(s1).t(out)
+     .i("M", 2).i("N", N).i("K", K).i("n_expert", 2).i("top_k", 1).i("group", 128)
+     .s("a_order", "token").s("dtype", "w6nl64a8h");
+    void* p0[] = { even.data() }, *p1[] = { odd.data() }, *ps[] = { scales.data() };
+    a.ts[2].data = p0; a.ts[3].data = ps; a.ts[6].data = p1; a.ts[7].data = ps;
+    for (int i : { 2, 3, 6, 7 }) a.ts[(size_t)i].stride[0] = 0;
+    REQUIRE_EQ(run("moe_gemm_q", a), RAD_OK);
+    for (int e = 0; e < 2; ++e) for (int n = 0; n < N; ++n) {
+        float want = 0;
+        for (int k = 0; k < K; ++k) {
+            const int code = ((k % 32 + (k / 64) * 32 + n * 5) + e * 3) % 64;
+            const float subscale = n == 0 ? (k < 64 ? 1.0f : 2.0f) : (k < 64 ? 2.0f : 1.0f);
+            want += levels[(size_t)code] * subscale * 0.5f;
+        }
+        CHECK_EQ(out.at(e * N + n), want);
+    }
+}
+
 TEST(op_moe_gemm_q_scale_grid_by_dtype) {
     struct Want { const char* dt; int64_t rows, cols; };
     /* N 256, K 512, group 128; the last class at N 128, K 256. */
     const Want wants[] = { { "fp8a8", 2, 4 },      { "w4a8", 256, 4 },     { "w4a8h", 256, 4 },
                            { "w4nla8h", 256, 4 },  { "w4nl64a8h", 256, 8 }, { "w5nl64a8h", 256, 8 },
-                           { "w4nl32a8h", 256, 16 }, { "mxfp4a8", 256, 16 } };
+                           { "w6nl64a8h", 256, 8 }, { "w4nl32a8h", 256, 16 }, { "mxfp4a8", 256, 16 } };
     for (const char* op : { "moe_gemm_q", "moe_gemm_q_mod4" }) {
         const RadKernelInfo* k = kern(op);
         REQUIRE(k != nullptr && k->opd_shape != nullptr);

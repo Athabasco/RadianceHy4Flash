@@ -5109,7 +5109,7 @@ static const RadConstraint cMoeMx[] = {
 static const RadConstraint cMoeGemmW4[] = {
     C_GE("M", 1), C_DIV("N", 64), C_DIV("K", 128), C_GE("n_expert", 1), C_LE("n_expert", 65536),
     C_GE("top_k", 1), C_EQ("group", 128),
-    C_IN("dtype", "w4a8 w4a8h w4nla8h w4nl64a8h w4nl32a8h w5nl64a8h"),
+    C_IN("dtype", "w4a8 w4a8h w4nla8h w4nl64a8h w4nl32a8h w5nl64a8h w6nl64a8h"),
 };
 /* The op against an int8 activation with an f32 scale per (row, 128 of K): int8 experts with a
  * bf16 scale per (row, 128 of K), `i8a8h` rotated 128 wide along K as its activation is; and the

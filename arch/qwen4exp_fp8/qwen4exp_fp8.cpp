@@ -812,7 +812,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * (MoeFP8::a8), which the rotated four-bit plane, the codebook at E4M3 scales a 64 or 32 of K
      * and rotated int8 experts have. The codebook at a bf16 scale a 128 and the five-bit one do
      * not: under them the connections keep E4M3 codes, as for unrotated experts. */
-    const bool exp8 = m.moecfg.expert_rot && !m.moecfg.expert_w5 &&
+    const bool exp8 = m.moecfg.expert_rot && !m.moecfg.expert_w5 && !m.moecfg.expert_w6 &&
                       (!m.moecfg.expert_nl || m.moecfg.expert_g64);
     m.hccfg.codes_i8 = (m.trunk_i8 && (exp8 || m.moecfg.expert_bf16)) ? 1 : 0;
     m.a_x.q8_fed     = m.hccfg.codes_i8 != 0;

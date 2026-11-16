@@ -2327,15 +2327,15 @@ static Planes nl_planes(const std::vector<float>& w, int64_t N, int64_t K, int64
  * the stored scale. Planes: codes, scale (E4M3 [1 x gs]), scale.1 (f32 constant), table. With
  * `w5`, w5nl64a8h's: u5 codes into kW5nlTable, whose largest entry is 30. */
 static Planes nl64_planes(const std::vector<float>& w, int64_t N, int64_t K, int64_t gs = 64,
-                          bool w5 = false) {
-    const float* tab = w5 ? kW5nlTable : kW4nlTable;
-    const int nt = w5 ? 32 : 16;
-    const float top = w5 ? 30.0f : 22.0f;
+                          int w5 = 0) {
+    const float* tab = w5 == 2 ? kW6nlTable : w5 ? kW5nlTable : kW4nlTable;
+    const int nt = w5 == 2 ? 64 : w5 ? 32 : 16;
+    const float top = w5 == 2 ? 64.0f : w5 ? 30.0f : 22.0f;
     Planes p;
     rad_enc_clear(&p.enc);
     rad_enc_copy_str(p.enc.scheme, "affine");
     rad_enc_copy_str(p.enc.transform, "fwht128");
-    rad_enc_add_plane(&p.enc, "codes", w5 ? RAD_U5 : RAD_U4, 1, 1);
+    rad_enc_add_plane(&p.enc, "codes", w5 == 2 ? RAD_U6 : w5 ? RAD_U5 : RAD_U4, 1, 1);
     rad_enc_add_plane(&p.enc, "scale", RAD_F8E4M3, 1, gs);
     rad_enc_add_plane(&p.enc, "scale.1", RAD_F32, 0, 0);
     rad_enc_add_table(&p.enc, "table", RAD_F32, 1, nt);
@@ -2362,7 +2362,8 @@ static Planes nl64_planes(const std::vector<float>& w, int64_t N, int64_t K, int
                     int best = 0;
                     for (int c = 1; c < nt; ++c)
                         if (std::fabs(u - tab[c]) < std::fabs(u - tab[best])) best = c;
-                    rad_store_code(p.data[0].data() + n * crow, w5 ? RAD_U5 : RAD_U4,
+                    rad_store_code(p.data[0].data() + n * crow,
+                                   w5 == 2 ? RAD_U6 : w5 ? RAD_U5 : RAD_U4,
                                    g * 128 + h * gs + j, best);
                 }
             }
@@ -22850,15 +22851,15 @@ static void moe_aligned_down_tile(const Plugin& pl, const RadKernelInfo* row, Ra
  * it (`moe_gemm_i8a8`), each with its own four-class twin. */
 static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int sub = 0,
                         bool w5 = false, bool four = false, int64_t top_k = 2, int act8 = 0,
-                        int64_t ag = 128) {
+                        int64_t ag = 128, bool w6 = false) {
     const bool g64 = sub > 1, w8 = act8 == 2;
     /* Against an int8 activation the codebook is read at its int8 levels (r4d_args.h's kW4nlI8). */
     float tab_i8[16];
     for (int i = 0; i < 16; ++i)
         tab_i8[i] = (float)(i < 8 ? kW4nlI8[i] : -kW4nlI8[i - 8]) * kW4nlI8Unit;
-    const float* tab = w5 ? kW5nlTable : act8 ? tab_i8 : kW4nlTable;
+    const float* tab = w6 ? kW6nlTable : w5 ? kW5nlTable : act8 ? tab_i8 : kW4nlTable;
     const char* const rname = w8 ? "moe_gemm_i8a8" : act8 ? "moe_gemm_w4a8i8" : "moe_gemm_w4a8";
-    if (act8 && (w5 || (w8 && sub))) {
+    if ((w6 && (w5 || sub != 2)) || (act8 && (w5 || w6 || (w8 && sub)))) {
         ok((std::string(rname) + " (" + sh.name + ")").c_str(), false, "no such int8 form");
         return;
     }
@@ -22871,7 +22872,8 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     }
     const char* dt = w8 ? "i8a8"
                    : act8 ? (sub == 4 ? "w4nl32a8i8h" : g64 ? "w4nl64a8i8h" : "w4a8i8")
-                   : w5 ? "w5nl64a8h" : sub == 4 ? "w4nl32a8h" : g64 ? "w4nl64a8h" : "w4a8";
+                   : w6 ? "w6nl64a8h" : w5 ? "w5nl64a8h"
+                   : sub == 4 ? "w4nl32a8h" : g64 ? "w4nl64a8h" : "w4a8";
     const std::string what = std::string(rname) + " vs a host decode (T=" +
                              std::to_string(Tr) + ", " + sh.name +
                              (g64 || act8 ? std::string(", ") + dt : std::string()) +
@@ -22900,7 +22902,8 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     for (int c = 0; c < 2; ++c) {
         const int ow = c ? 6 : 2, os = c ? 7 : 3;
         const int64_t kbc = Kc[c] / group;
-        const int64_t wbytes = w8 ? Nc[c] * Kc[c] : w5 ? Nc[c] * Kc[c] / 8 * 5 : Nc[c] * Kc[c] / 2;
+        const int64_t wbytes = w8 ? Nc[c] * Kc[c] : w6 ? Nc[c] * Kc[c] / 4 * 3
+                                  : w5 ? Nc[c] * Kc[c] / 8 * 5 : Nc[c] * Kc[c] / 2;
         wq[c].assign((size_t)(nec[c] * wbytes), 0);
         ws[c].assign((size_t)(nec[c] * Nc[c] * kbc * (sub == 4 ? 2 : 1)), 0);
         std::vector<float> wsrc((size_t)(Nc[c] * Kc[c]));
@@ -22911,8 +22914,16 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
                     wsrc[(size_t)(n * Kc[c] + k)] =
                         (float)(((e * 7 + n * 31 + k * 17) % 61) - 30) / 37.0f;
             cp[c].push_back(w8 ? int8_planes(wsrc, Nc[c], Kc[c], RAD_BF16)
-                            : g64 ? nl64_planes(wsrc, Nc[c], Kc[c], 128 / sub, w5)
+                            : g64 ? nl64_planes(wsrc, Nc[c], Kc[c], 128 / sub, w6 ? 2 : w5)
                                   : int4_planes(wsrc, Nc[c], Kc[c], group, RAD_BF16, false));
+            if (w6) {
+                /* Exercise every six-bit code, not only the levels the source happened to pick. */
+                Planes& p = cp[c].back();
+                for (int64_t n = 0; n < Nc[c]; ++n)
+                    for (int64_t k = 0; k < Kc[c]; ++k)
+                        rad_store_code(p.data[0].data() + n * p.row_bytes(0), RAD_U6, k,
+                                       (int)((k + n * 17 + e * 13) % 64));
+            }
             std::vector<uint8_t> w, sc;
             const int rw = g64 ? stored(r, lp, ow, cp[c].back(), { "codes", "table" }, &w)
                                : stored(r, lp, ow, cp[c].back(), { "codes" }, &w);
@@ -22990,13 +23001,15 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     std::vector<RadTensor> ts = {
         T(d_a,     act8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3, { M, K }),
         T(d_as,    RAD_F32,      { M, kb }),
-        T(d_w[0],  w8 ? (uint32_t)RAD_I8 : w5 ? (uint32_t)R4D_DT_MOEW5 : (uint32_t)R4D_DT_MOEW4,
+        T(d_w[0],  w8 ? (uint32_t)RAD_I8 : w6 ? (uint32_t)R4D_DT_MOEW6
+                    : w5 ? (uint32_t)R4D_DT_MOEW5 : (uint32_t)R4D_DT_MOEW4,
           { nec[0], sh.N0, sh.K0 }),
         g64 ? T(d_ws[0], RAD_F8E4M3, { nec[0], sh.N0, sub * sh.K0 / group })
             : T(d_ws[0], RAD_BF16,   { nec[0], sh.N0, sh.K0 / group }),
         T(d_s,     RAD_I32,      { Tr }),
         T(d_o,     RAD_I32,      { ne + 1 }),
-        T(d_w[1],  w8 ? (uint32_t)RAD_I8 : w5 ? (uint32_t)R4D_DT_MOEW5 : (uint32_t)R4D_DT_MOEW4,
+        T(d_w[1],  w8 ? (uint32_t)RAD_I8 : w6 ? (uint32_t)R4D_DT_MOEW6
+                    : w5 ? (uint32_t)R4D_DT_MOEW5 : (uint32_t)R4D_DT_MOEW4,
           { nec[1], sh.N1, sh.K1 }),
         g64 ? T(d_ws[1], RAD_F8E4M3, { nec[1], sh.N1, sub * sh.K1 / group })
             : T(d_ws[1], RAD_BF16,   { nec[1], sh.N1, sh.K1 / group }),
@@ -23146,7 +23159,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
         hi->stride[0] = t.stride[0] * 2;
         hi->data = (char*)t.data + t.stride[0] * bits / 8;
     };
-    const int wbits = w8 ? 8 : w5 ? 5 : 4, sbits = g64 ? 8 : 16;
+    const int wbits = w8 ? 8 : w6 ? 6 : w5 ? 5 : 4, sbits = g64 ? 8 : 16;
     RadTensor c4w[4], c4s[4];
     halves(ts[2], wbits, &c4w[0], &c4w[2]);
     halves(ts[3], sbits, &c4s[0], &c4s[2]);
@@ -23188,6 +23201,20 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     moe_aligned_down_tile(pl, r4, a4, d_y, d_map, map_bytes, (size_t)(Tr * N), two_cls[1],
                           dn_wide, ne, what4);
     moe_dec_variants(pl, r4, a4, d_y, (size_t)(Tr * N), fk2, what4);
+}
+
+static void moe_w6_cases(const Plugin& pl) {
+    const MoeW4Shape sh[] = {
+        { "w6 gate/up", 256, 256, 128, 256, 2, 5 },
+        { "w6 down sorted", 256, 256, 256, 128, 1, 6, true },
+    };
+    for (const auto& s : sh)
+        for (int64_t t : { (int64_t)24, (int64_t)200 })
+            moe_w4_gemm(pl, t, s, 2, false, true, 2, 0, 128, true);
+    /* Flash-Next TP2's actual down geometry, including the odd width and top-k=10. */
+    const MoeW4Shape qfn = { "Flash-Next TP2 down", 2560, 384, 2560, 256, 1, 20, true };
+    for (int64_t t : { (int64_t)10, (int64_t)200 })
+        moe_w4_gemm(pl, t, qfn, 2, false, true, 10, 0, 128, true);
 }
 
 /* The four-class grouped GEMM, each class at its own geometry, against a host decode.
@@ -32911,7 +32938,11 @@ static void device_phase(const Plugin& pl) {
             for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 })
                 moe_w4_gemm(pl, t, sh, 2, true);
         }
+        moe_w6_cases(pl);
     }
+
+    /* Also expose the W6 tests alone while retaining them in the normal W4 row's test. */
+    if (sel("moe_gemm_w6nl")) moe_w6_cases(pl);
 
     /* The grouped GEMM against an int8 activation: the same shapes through each row's forms. */
     {

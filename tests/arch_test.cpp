@@ -2663,12 +2663,24 @@ TEST(flashnext_trellis_gate_and_w5nl_down_use_separate_activation_formats) {
     rad_enc_copy_str(r8.transform, "fwht128");
     REQUIRE(rad_enc_valid(&r8));
 
+    for (int gate_bits : { 4, 5 }) for (int down_bits : { 5, 6 }) {
+    RadEncoding gateq = tq, downq = w5;
+    gateq.plane[0].dtype = gate_bits == 4 ? RAD_U4 : RAD_U5;
+    downq.plane[0].dtype = down_bits == 5 ? RAD_U5 : RAD_U6;
+    downq.plane[3].extent[1] = 1 << down_bits;
+    REQUIRE(rad_enc_valid(&gateq));
+    REQUIRE(rad_enc_valid(&downq));
     for (int rank = 0; rank < 2; ++rank) {
         RadModelMeta meta = qwen4exp_meta();
         RadBuildCtx c = build_ctx(rank, 2);
         c.max_tok = 64; c.max_seqs = 2; c.max_spec = 0; c.max_ctx = 4096;
         RadBuilder b;
-        b.encs = { { "ffn_gate_up_exps", tq }, { "ffn_down_exps", w5 },
+        const RadEncoding plain = rad_enc_plain(RAD_BF16);
+        b.encs = { { "blk.1.ffn_gate_up_exps.3.weight", plain },
+                   { "blk.1.ffn_down_exps.3.weight", plain },
+                   { "blk.1.ffn_gate_up_exps.10.weight", plain },
+                   { "blk.1.ffn_down_exps.10.weight", plain },
+                   { "ffn_gate_up_exps", gateq }, { "ffn_down_exps", downq },
                    { "ssm_inz.weight", tq }, { "attn_qg.weight", tq } };
         for (const char* name : { "qsa_qk.weight", "attn_k.weight", "attn_v.weight",
                                   "attn_output.weight", "ssm_out.weight",
@@ -2678,7 +2690,10 @@ TEST(flashnext_trellis_gate_and_w5nl_down_use_separate_activation_formats) {
         const auto& m = qwen4exp_fp8::g_model[rank];
         const auto& moe = m.layers[0].mlp;
         CHECK_EQ(moe.fmt[0], 11);
-        CHECK_EQ(moe.fmt[1], 7);
+        CHECK_EQ(moe.fmt[1], down_bits == 5 ? 7 : 12);
+        CHECK_EQ(m.layers[1].mlp.prot.size(), (size_t)2);
+        CHECK_EQ(m.layers[1].mlp.fmt[0], 11);
+        CHECK_EQ(m.layers[1].mlp.fmt[1], down_bits == 5 ? 7 : 12);
         CHECK(m.a_eff.q && m.a_eff.s && m.a_eff.q8 && m.a_eff.s8);
         CHECK_EQ(moe.gq_exp.a.cq(), m.a_eff.q);
         CHECK_EQ(moe.gq_exp.a.cs(), m.a_eff.s);
@@ -2691,7 +2706,8 @@ TEST(flashnext_trellis_gate_and_w5nl_down_use_separate_activation_formats) {
         CHECK_EQ(down->reads[0], m.a_eff.q);
         bool gate_i8 = false, down_w5 = false;
         for (const auto& p : gate->p) gate_i8 |= p.key == "dtype" && p.sval == "i8a8h";
-        for (const auto& p : down->p) down_w5 |= p.key == "dtype" && p.sval == "w5nl64a8h";
+        for (const auto& p : down->p)
+            down_w5 |= p.key == "dtype" && p.sval == (down_bits == 5 ? "w5nl64a8h" : "w6nl64a8h");
         CHECK(gate_i8);
         CHECK(down_w5);
 
@@ -2723,6 +2739,7 @@ TEST(flashnext_trellis_gate_and_w5nl_down_use_separate_activation_formats) {
         CHECK_EQ(dn_issue->opd[0].offset, quant_issue->opd[1].offset);
         CHECK_EQ(dn_issue->opd[1].offset, quant_issue->opd[2].offset);
         CHECK(gu_issue->opd[0].handle != quant_issue->opd[1].handle);
+    }
     }
 }
 
