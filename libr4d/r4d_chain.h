@@ -34,6 +34,7 @@ struct R4dUnchained { static constexpr bool on = false; };
 /* The host SIMT emulator (tests/r4d_emu) compiles some of these sources as C++: no engine record
  * ever reaches a launch there, so a chained form is its plain form. */
 __device__ __forceinline__ void r4d_chain_wait() {}
+__device__ __forceinline__ void r4d_chain_wait_vec() {}
 __device__ __forceinline__ void r4d_chain_done() {}
 #else
 
@@ -80,9 +81,9 @@ __device__ __forceinline__ const R4dChainRec* r4d_chain_rec() {
 // The acquire behind a chained wait: the vector caches by the fence, the scalar data cache by
 // hand, which the fence leaves (see the head of this file). Every wave, for the compute unit it
 // runs on.
-__device__ __forceinline__ void r4d_chain_acquire() {
+__device__ __forceinline__ void r4d_chain_acquire(bool scalar = true) {
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
-    asm volatile("s_dcache_inv" ::: "memory");
+    if (scalar) asm volatile("s_dcache_inv" ::: "memory");
 }
 
 #ifndef R4D_CHAIN_TINY
@@ -94,7 +95,9 @@ __device__ __forceinline__ void r4d_chain_acquire() {
 #ifndef R4D_CHAIN_MID
 #define R4D_CHAIN_MID 4
 #endif
-__device__ __forceinline__ void r4d_chain_wait() {
+// The wait itself; `Scalar` false leaves the scalar data cache alone (see r4d_chain_wait_vec).
+template <bool Scalar>
+__device__ __forceinline__ void r4d_chain_wait_impl() {
     const R4dChainRec* r = r4d_chain_rec();
     if (!r) return;
     if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
@@ -116,8 +119,30 @@ __device__ __forceinline__ void r4d_chain_wait() {
         }
     }
     __syncthreads();
-    r4d_chain_acquire();
+    r4d_chain_acquire(Scalar);
 }
+
+// The wait every kernel uses unless it has been shown not to need the scalar half of the acquire.
+#ifdef R4D_CHAIN_SURVEY_NO_SCALAR
+// Audit builds only (tests/chain_scalar_audit.py): every wait skips the instruction, so the audit
+// lists the kernels that do scalar loads behind it.
+__device__ __forceinline__ void r4d_chain_wait() { r4d_chain_wait_impl<false>(); }
+#else
+__device__ __forceinline__ void r4d_chain_wait() { r4d_chain_wait_impl<true>(); }
+#endif
+
+// The wait of a kernel that reads nothing a launch in front wrote through a scalar load: no
+// operand or scale of it is a value all lanes share and the compiler loads through the scalar
+// data cache. Then the fence's vector-cache acquire is all the wait needs and `s_dcache_inv`
+// (a scalar-cache flush and the refetch of every kernel argument after it) is left out. The
+// kernel's instantiations all have to be free of such loads: tests/chain_scalar_audit.py
+// compiles every unit and fails on a kernel that skips the instruction and has one, and
+// R4D_CHAIN_SCINV_ALWAYS builds the library with the instruction behind every wait again.
+#ifdef R4D_CHAIN_SCINV_ALWAYS
+__device__ __forceinline__ void r4d_chain_wait_vec() { r4d_chain_wait_impl<true>(); }
+#else
+__device__ __forceinline__ void r4d_chain_wait_vec() { r4d_chain_wait_impl<false>(); }
+#endif
 
 // After the block's last write: release, then one add a block.
 __device__ __forceinline__ void r4d_chain_done() {
