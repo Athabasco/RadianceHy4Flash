@@ -2582,6 +2582,199 @@ TEST(qsa_without_a_stream_the_selection_is_never_resolved) {
     CHECK_EQ(attn, selects);
 }
 
+/* At or below the exactness bound nothing reads the selection, so the indexer issues none of its
+ * query side (docs/QSA.md, "Below the bound"; AttnGatedFP8::qsa_use, QsaIndexer::step): a step of
+ * several rows a sequence -- a chain verify -- attends densely over the block table, and a step of
+ * one row a sequence issues the sparse row's launch over the sequence's own table and length. The
+ * stateful half (work list, block keys, tail) runs on every step either way. Above the bound, by
+ * the rounded context bound, both score and select per layer and attend over the selection. */
+TEST(qsa_below_the_exact_bound_the_indexer_issues_no_query_score_or_select) {
+    RadModelMeta meta = qwen4exp_meta();
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 64; c.max_seqs = 4; c.max_spec = 3; c.max_ctx = 200000;
+    RadBuilder b;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+    const qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[0];
+    size_t full = 0;
+    for (const auto& l : m.layers) full += l.full ? 1 : 0;
+    REQUIRE(full > 0);
+
+    struct Seen { size_t work = 0, bkey = 0, tail = 0, score = 0, select = 0, qprep = 0;
+                  size_t attn = 0, by_table = 0, by_sel = 0, dense = 0; };
+    auto look = [&](const Kit& k) {
+        RadCtx ctx;
+        ctx.b = &b;
+        ctx.batch = &k.b;
+        qwen4exp_fp8::step(&ctx, &k.b);
+        Seen s;
+        for (const RecIssue& i : ctx.issues) {
+            const RecOp* o = b.op_of(i.op);
+            if (!o) continue;
+            if (o->op == "qsa_work") ++s.work;
+            else if (o->op == "qsa_block_key") ++s.bkey;
+            else if (o->op == "qsa_tail_store") ++s.tail;
+            else if (o->op == "qsa_score") ++s.score;
+            else if (o->op == "qsa_select") ++s.select;
+            else if (o->op == "attn_paged" || o->op == "attn_paged_gate_quant") {
+                ++s.attn;
+                const RadOperand& t = i.opd[2];
+                const RadOperand& u = i.opd[3];
+                if (t.kind == RAD_OPK_BUF && t.handle == m.qsaw.sel) {
+                    ++s.by_sel;
+                    CHECK(u.kind == RAD_OPK_BUF && u.handle == m.qsaw.sequ);
+                } else {
+                    CHECK(t.kind == RAD_OPK_RAW && t.raw == (void*)k.table.data());
+                    CHECK(u.kind == RAD_OPK_RAW && u.raw == (void*)k.used.data());
+                    /* the sparse row's launch (q_len 1, a row a sequence) or the dense one */
+                    if (o->op == "attn_paged_gate_quant" || (i.opd.size() > 6 && i.opd[6].kind == RAD_OPK_NONE))
+                        ++s.by_table;
+                    else
+                        ++s.dense;
+                }
+            }
+            for (const auto& l : m.layers)
+                if (l.full && l.qsa.op_qprep && i.op == l.qsa.op_qprep) ++s.qprep;
+        }
+        return s;
+    };
+
+    /* A chain verify of two sequences, 4 rows each, at contexts 40 and 47. */
+    {
+        const auto k = kit(b, { 4, 4 }, {});
+        const Seen s = look(*k);
+        CHECK_EQ(s.work, full); CHECK_EQ(s.bkey, full); CHECK_EQ(s.tail, full);
+        CHECK_EQ(s.score, (size_t)0); CHECK_EQ(s.select, (size_t)0); CHECK_EQ(s.qprep, (size_t)0);
+        CHECK_EQ(s.attn, full); CHECK_EQ(s.dense, full);
+        CHECK_EQ(s.by_sel, (size_t)0);
+    }
+    /* A plain decode step: one row a sequence, the sparse row over the block table. */
+    {
+        const auto k = kit(b, { 1, 1, 1 }, {});
+        const Seen s = look(*k);
+        CHECK_EQ(s.work, full); CHECK_EQ(s.bkey, full); CHECK_EQ(s.tail, full);
+        CHECK_EQ(s.score, (size_t)0); CHECK_EQ(s.select, (size_t)0); CHECK_EQ(s.qprep, (size_t)0);
+        CHECK_EQ(s.attn, full); CHECK_EQ(s.by_table, full);
+        CHECK_EQ(s.by_sel, (size_t)0); CHECK_EQ(s.dense, (size_t)0);
+    }
+    /* The same two steps past the bound by the rounded context bound: everything, per layer, and
+     * the attention over the selection. */
+    for (int rows : { 4, 1 }) {
+        const auto k = kit(b, { rows, rows }, {});
+        k->b.max_ctx_len = 3072;
+        const Seen s = look(*k);
+        CHECK_EQ(s.work, full); CHECK_EQ(s.bkey, full); CHECK_EQ(s.tail, full);
+        CHECK_EQ(s.score, full); CHECK_EQ(s.select, full); CHECK_EQ(s.qprep, full);
+        CHECK(s.attn >= full);
+        CHECK_EQ(s.by_sel, s.attn); CHECK_EQ(s.dense, (size_t)0); CHECK_EQ(s.by_table, (size_t)0);
+    }
+    /* One row a sequence is the table's only where every sequence has one: a sequence with no
+     * row beside one with two is the same T == n_seq and attends over a selection, which at or
+     * below the bound is the first full-attention layer's for the whole pass. */
+    {
+        const auto k = kit(b, { 1, 1 }, {});
+        k->b.max_q_len = 2;
+        const Seen s = look(*k);
+        CHECK_EQ(s.select, (size_t)1); CHECK_EQ(s.score, (size_t)1); CHECK_EQ(s.qprep, (size_t)1);
+        CHECK_EQ(s.work, full); CHECK_EQ(s.bkey, full); CHECK_EQ(s.tail, full);
+        CHECK_EQ(s.by_sel, s.attn); CHECK_EQ(s.by_table, (size_t)0);
+    }
+}
+
+/* Whether a step is within the indexer's budget is read from the attention group's exact host
+ * ceiling where the batch carries it (RadBatch::kv_used_max_h), not from the context bound rounded
+ * up to 1024 tokens: a 4-row verify at 1500 tokens of context is within it though
+ * max_ctx_len + max_q_len (2048 + 4) is past it. The kernel does not move with that -- such a step
+ * keeps the sparse row a query, as before, because the dense and the sparse kernel agree on the
+ * keys and not on the last bit -- but its selection is every block, the same bytes at every layer,
+ * so the pass's first full-attention layer issues it as always and the others issue none
+ * (kQsaOnce). The pass key carries the side, so the two are two recordings
+ * (qwen4exp_fp8::pass_key). */
+TEST(qsa_reads_the_exact_host_bound_and_keys_its_side_of_the_exact_bound) {
+    RadModelMeta meta = qwen4exp_meta();
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 64; c.max_seqs = 4; c.max_spec = 3; c.max_ctx = 200000;
+    RadBuilder b;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+    const qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[0];
+    const int64_t exact_to = m.qsacfg.budget + m.qsacfg.ratio - 1;
+    REQUIRE(exact_to > 1024);
+    size_t full = 0;
+    for (const auto& l : m.layers) full += l.full ? 1 : 0;
+    REQUIRE(full > 1);
+
+    struct Seen { size_t score = 0, select = 0, work = 0, attn = 0, by_sel = 0, first_sel = 0, first_attn = 0; };
+    auto look = [&](const Kit& k) {
+        RadCtx ctx;
+        ctx.b = &b;
+        ctx.batch = &k.b;
+        qwen4exp_fp8::step(&ctx, &k.b);
+        CHECK(ctx.step_fail.empty());
+        Seen s;
+        size_t at = 0;
+        for (const RecIssue& i : ctx.issues) {
+            ++at;
+            const RecOp* o = b.op_of(i.op);
+            if (!o) continue;
+            if (o->op == "qsa_score") ++s.score;
+            else if (o->op == "qsa_work") ++s.work;
+            else if (o->op == "qsa_select") {
+                ++s.select;
+                if (!s.first_sel) s.first_sel = at;
+            } else if (o->op == "attn_paged" || o->op == "attn_paged_gate_quant") {
+                ++s.attn;
+                if (!s.first_attn) s.first_attn = at;
+                if (i.opd[2].kind == RAD_OPK_BUF && i.opd[2].handle == m.qsaw.sel) ++s.by_sel;
+            }
+        }
+        return s;
+    };
+    const auto k = kit(b, { 4 }, {});
+    k->b.max_ctx_len = 2048;                                  /* 1500 rounded up */
+    std::vector<int32_t> umax((size_t)k->b.n_kv_groups, 0);
+    /* No host ceiling: the rounded bound decides, and 2048 + 4 is past the bound. */
+    {
+        const Seen s = look(*k);
+        CHECK_EQ(s.score, full); CHECK_EQ(s.select, full); CHECK_EQ(s.work, full);
+        CHECK(s.attn >= full); CHECK_EQ(s.by_sel, s.attn);
+    }
+    RadCtx kc;
+    kc.b = &b;
+    kc.batch = &k->b;
+    const uint64_t key_none = qwen4exp_fp8::pass_key(&kc, &k->b, nullptr);
+    /* 1504 rows of context at most: within the bound. The same sparse launches, every layer's,
+     * over the first layer's selection; the stateful half still at every layer. */
+    for (auto& u : umax) u = 1504;
+    k->b.kv_used_max_h = umax.data();
+    {
+        const Seen s = look(*k);
+        CHECK_EQ(s.score, (size_t)1); CHECK_EQ(s.select, (size_t)1); CHECK_EQ(s.work, full);
+        CHECK(s.attn >= full); CHECK_EQ(s.by_sel, s.attn);
+        CHECK(s.first_sel > 0 && s.first_sel < s.first_attn);
+    }
+    const uint64_t key_in = qwen4exp_fp8::pass_key(&kc, &k->b, umax.data());
+    /* The last step within it, and the first past it. */
+    for (auto& u : umax) u = (int32_t)exact_to;
+    CHECK_EQ(look(*k).score, (size_t)1);
+    CHECK_EQ(qwen4exp_fp8::pass_key(&kc, &k->b, umax.data()), key_in);
+    for (auto& u : umax) u = (int32_t)exact_to + 1;
+    CHECK_EQ(look(*k).score, full);
+    const uint64_t key_out = qwen4exp_fp8::pass_key(&kc, &k->b, umax.data());
+    CHECK(key_in != 0 && key_out != 0);
+    CHECK(key_in != key_out);
+    CHECK_EQ(key_out, key_none);
+    /* One row a sequence at the same context is the block table's whatever the rounded bound
+     * says: no selection at all. */
+    {
+        const auto k1 = kit(b, { 1 }, {});
+        k1->b.max_ctx_len = 2048;
+        std::vector<int32_t> u1((size_t)k1->b.n_kv_groups, 1501);
+        k1->b.kv_used_max_h = u1.data();
+        const Seen s = look(*k1);
+        CHECK_EQ(s.score, (size_t)0); CHECK_EQ(s.select, (size_t)0); CHECK_EQ(s.work, full);
+        CHECK_EQ(s.attn, full); CHECK_EQ(s.by_sel, (size_t)0);
+    }
+}
+
 /* The plugin declares by each weight's stored encoding. Flash-Next's experts, gated-residual
  * mixing matrices, MTP fc and 2-bit draft head each have a recipe-chosen format the plugin reads
  * from rad_weight_encoding, at convert and at load alike. With int4-rotated, E4M3-row and u2
@@ -13123,11 +13316,16 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
         uint64_t graph, steps;
     };
     const Case cases[] = {
-        { "qwen4exp_fp8", 1, 0, 0x64fffe1f970fe9a3ull, 0x7215c4b326f1908dull },
-        { "qwen4exp_fp8", 2, 0, 0xe616c803347c8d63ull, 0xbc2ee0bd2f930ffaull },
-        { "qwen4exp_fp8", 2, 1, 0x5551ab9dbf8f611cull, 0xff6eee327db26cdcull },
-        { "qwen4exp_fp8", 4, 0, 0x015eb0ed4d0951a1ull, 0x7342ae88d275d694ull },
-        { "qwen4exp_fp8", 4, 3, 0x0e4fc56b33d75da3ull, 0x46d8d1d25e99bae2ull },
+        /* Flash-Next's step hashes moved once, with the graphs unchanged: the fingerprint's
+         * decode step, verify, history pass and round are below the indexer's exactness bound,
+         * where the indexer now issues no query, score or select and a one-row sequence attends
+         * over its block table (docs/QSA.md, "Below the bound"). Its prefill and mixed steps,
+         * past the bound, are issued as before. */
+        { "qwen4exp_fp8", 1, 0, 0x64fffe1f970fe9a3ull, 0x65d43fc170c2c598ull },
+        { "qwen4exp_fp8", 2, 0, 0xe616c803347c8d63ull, 0x521774d19f34781full },
+        { "qwen4exp_fp8", 2, 1, 0x5551ab9dbf8f611cull, 0x3afe8bf2df1eaa7bull },
+        { "qwen4exp_fp8", 4, 0, 0x015eb0ed4d0951a1ull, 0xe78350c7803a9437ull },
+        { "qwen4exp_fp8", 4, 3, 0x0e4fc56b33d75da3ull, 0xdb6d50824b015389ull },
         { "qwen35_fp8", 1, 0, 0x0f08ba5027cba71aull, 0xa7ec3cf6252cd441ull },
         { "qwen35_fp8", 2, 1, 0xe7780f241685a18bull, 0xdd5d65ef158c4136ull },
         { "qwen35moe_fp8", 1, 0, 0xb1e6173bd121dc2aull, 0x2b5989b2a6dbc7dfull },

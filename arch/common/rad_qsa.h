@@ -9,7 +9,8 @@
  * Contents: the projection and query path, the block-key path with its two states, and the score
  * and selection. Below `budget + ratio - 1` tokens of context every visible block is selected, so
  * the sparse path must reproduce the dense path's text byte for byte; that is the test for any
- * change here.
+ * change here. A step entirely at or below that bound therefore needs no selection at all, and
+ * step() issues only the block-key path for it (its `use`; docs/QSA.md, "Below the bound").
  */
 #ifndef RAD_QSA_H
 #define RAD_QSA_H
@@ -121,9 +122,16 @@ struct QsaIndexer {
     int declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Config& cfg,
                 const Wire& wire, const ActFP8& in, rad_kvgroup* bk);
     /* `win_cu`, device: {0, plane_rows}, the one sequence of a window of a step wider than the
-     * score plane (Config::plane_rows); null where no step is. */
+     * score plane (Config::plane_rows); null where no step is.
+     *
+     * `use` is what the layer's attention reads of the selection this step (QsaUse, rad_arch.h;
+     * AttnGatedFP8::qsa_use): the default issues the query, the scores and the selection as every
+     * step did before. `first` is whether this is the first full-attention layer the pass issues:
+     * at or below the bound the selection is made there once and read by every layer after it (the
+     * buffers are the model's, live across its layers, and nothing else writes them). The default
+     * makes it at every layer. */
     void step(RadCtx* c, const ActFP8& in, const RadBatch* batch,
-              const int32_t* win_cu = nullptr) const;
+              const int32_t* win_cu = nullptr, int use = kQsaSelect, bool first = true) const;
     /* Stores the pass's block keys and tail exactly as step() does, with no query, score or
      * selection (see AttnGatedFP8::store_kv). */
     void store(RadCtx* c, const ActFP8& in, const RadBatch* batch) const;
@@ -319,13 +327,31 @@ inline void QsaIndexer::store(RadCtx* c_, const ActFP8& in, const RadBatch* batc
 }
 
 inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch,
-                             const int32_t* win_cu) const {
+                             const int32_t* win_cu, int use, bool first) const {
     if (!on()) return;
     const int64_t T = batch->n_tok, S = batch->n_seq;
     const int64_t qw = c.heads * c.head_dim;
     const int64_t nw = (c.heads + 1) * c.head_dim;
 
+    /* What the attention reads this step (QsaUse); anything asked of a step that cannot give it is
+     * the full issue, which every reader accepts.
+     *
+     * kQsaOnce: the attention reads a selection on a step entirely at or below the exactness
+     * bound. A row there has at most `topk` complete blocks, so qsa_select takes every one whose
+     * key is not 0 -- every block with a page and a score that is a number, whatever the number --
+     * and what it writes (the pages in block order, the partial page, their count, seqused) is a
+     * function of the positions and the block table: the same bytes from every layer's scores. So
+     * the pass's first full-attention layer issues the selection exactly as it always did, and
+     * every later layer reads that one and issues none of its own: no query, no score. */
+    if (use == kQsaOnce) use = first ? kQsaSelect : kQsaUnread;
+    if (use != kQsaUnread) use = kQsaSelect;
+    /* RADIANCE_DEBUG_QSA_EAGER: the issue sequence as it was, every layer its own. */
+    if (qsa_eager()) use = kQsaSelect;
+
+    /* The projection always: its raw-key head is the block keys' and the tail's. */
     proj.step(c_, in, w.qk, T);
+    /* The query heads are read by the score alone. */
+    if (use == kQsaSelect) {
     /* One fused launch or `heads` + 1 unfused. The fused form takes the whole projection at its
      * row pitch and writes the query heads contiguous and rotated. `n_head` 0 is the k-only form:
      * no q_gate, q_w or q_out, and `gate_out` absent. `T <= qprep_rows` is a correctness bound
@@ -342,8 +368,10 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
                         bcol_at(w.q,  0, qw, h * c.head_dim, c.head_dim, T));
         RAD_ISSUE_N(c_, op_rope, T, brows(w.q, T), rope_posmc(g, batch, T));
     }
+    }
 
-    /* The keys first: the selection below reads the blocks they complete. */
+    /* The keys first: the selection below reads the blocks they complete. The stateful half runs
+     * whatever the attention reads: later steps score the block keys and build on the tail. */
     const RadKVGroupBatch* bkb = kv_batch(batch, kv_bk);
     const RadKVGroupBatch* atb = kv_batch(batch, c.kv_attn);
     if (!atb || !store_keys(c_, batch)) return;
@@ -352,6 +380,10 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
      * is a query row, so each query of a prefill chunk selects from the shared history, as the
      * checkpoint does. */
     if (!c.emit_sel) return;
+    /* Nothing reads a selection of this layer's: the step is at or below the exactness bound and
+     * its attention reads the block table, or the selection the pass's first full-attention layer
+     * made (AttnGatedFP8::qsa_use). */
+    if (use == kQsaUnread) return;
 
     /* Narrow the score columns to the live history. Both kernels size their grid from the
      * operand's width (the live count is device data), so the full `max_ctx` width would make a
