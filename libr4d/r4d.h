@@ -745,6 +745,16 @@ long long r4d_hc_rcp_check(unsigned lo, unsigned hi, long long* far);
 // the tiled up-mix's passes unpipelined). Bit-identical; r4d_selftest compares their bytes
 // and --perfhc times both.
 void r4d_hc_read_pin_decode(int form);
+// Test hooks: the sparse attention launch's prefill form at twelve queries a KV head
+// (r4d_attn_usel.h). `form` 0 is the rule of a process started with R4D_ATTN_USEL=1 (tiles of rows
+// from 256 launch rows of q_len 1), 1 the decode kernel a row at every row count (what a process
+// starts with), 2 the tiled form at every row count; `lim` the
+// union past which a tile is handed back to the decode kernel (0: the launcher's; 2^20 or more:
+// never, nor for sharing too little). Bits 8 and up of `form` leave launches out, for timing.
+// r4d_attn_usel_gqa12_geom picks one of the tiled kernel's built geometries and returns its rows a
+// tile (-1 past the last; a negative index asks for the one in force).
+void r4d_attn_usel_gqa12_pin(int form, int lim);
+int  r4d_attn_usel_gqa12_geom(int idx, int* desc);
 // Test hook: pins the MLA matrix row's key load. 0 is the launcher's rule (sixteen-byte vectors
 // wherever the cache rows are aligned to them), 1 the element-wise load the rule falls back to.
 // Bit-identical; r4d_selftest compares them and --perfmla times both.
