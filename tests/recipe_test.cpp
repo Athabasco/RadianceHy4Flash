@@ -538,4 +538,75 @@ TEST(the_ling_tiny_iq8r_recipe_decides_the_model_it_was_written_for) {
     for (const char* n : kept) CHECK(r.match(n) == nullptr);
 }
 
+/* The Ling-3.0-flash recipe as it ships, over arch/bailing_hybrid's declared names: the trunk as the
+ * tiny IQ8R recipe (KDA projections, MLA out, the two dense layers' pair, the shared expert's
+ * gate/up IQ8R; the shared expert's down projection rotated int8 at a bf16 scale a (row, 128 of
+ * K)), the 512 routed experts of a layer rotated four-bit codes into the w4nl codebook at an E4M3
+ * scale a (row, 64 of K). Flash's MLA has no query LoRA, so no q_a norm is cast. The KDA beta, the
+ * MLA's q parts, kv projections and head gate, the convolution taps, the embedding and the head
+ * match no rule and keep the checkpoint's bf16. The experts name their statistics through $CALIB, so the test
+ * sets it. */
+TEST(the_ling_flash_iq8r_w4nl64_recipe_decides_the_model_it_was_written_for) {
+    ::setenv("CALIB", "/data/calib", 1);
+    const std::string dir = std::string(__FILE__).substr(
+                                0, std::string(__FILE__).find_last_of('/')) + "/../data/recipes";
+    std::ifstream in(dir + "/ling-3.0-flash-iq8r-w4nl64.recipe");
+    REQUIRE(in.good());
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    Recipe r;
+    std::string why;
+    REQUIRE_EQ(r.add_text(text, "ling-3.0-flash-iq8r-w4nl64.recipe", &why), RAD_OK);
+    CHECK_EQ(r.rules().size(), (size_t)18);
+    const char* iq8r[] = { "blk.0.attn_qkv.weight", "blk.40.attn_forget.weight",
+                           "blk.1.attn_gate.weight", "blk.2.attn_output.weight",
+                           "blk.5.attn_output.weight", "blk.0.ffn_gate_up.weight",
+                           "blk.1.ffn_down.weight", "blk.2.ffn_gate_up_shexp.weight",
+                           "blk.41.ffn_gate_up_shexp.weight" };
+    for (const char* n : iq8r) {
+        const RecipeRule* m = r.match(n);
+        REQUIRE(m != nullptr);
+        CHECK_EQ(m->quantizer, std::string("rtn"));
+        CHECK(has_opt(m, "codes", "i8"));
+        CHECK(has_opt(m, "group", "256"));
+        CHECK(has_opt(m, "scale", "u8"));
+        CHECK(has_opt(m, "scale2", "bf16"));
+        CHECK(has_opt(m, "transform", "fwht128"));
+    }
+    const char* w4nl[] = { "blk.2.ffn_gate_up_exps.0.weight", "blk.41.ffn_down_exps.511.weight" };
+    for (const char* n : w4nl) {
+        const RecipeRule* m = r.match(n);
+        REQUIRE(m != nullptr);
+        CHECK_EQ(m->quantizer, std::string("gptq"));
+        CHECK(has_opt(m, "table", "w4nl"));
+        CHECK(has_opt(m, "group", "64"));
+        CHECK(has_opt(m, "scale", "fp8_e4m3"));
+        CHECK(has_opt(m, "transform", "fwht128"));
+        CHECK(has_opt(m, "calib", "/data/calib"));
+    }
+    {
+        const RecipeRule* m = r.match("blk.7.ffn_down_shexp.weight");
+        REQUIRE(m != nullptr);
+        CHECK_EQ(m->quantizer, std::string("rtn"));
+        CHECK(has_opt(m, "codes", "i8"));
+        CHECK(has_opt(m, "group", "128"));
+        CHECK(has_opt(m, "scale", "bf16"));
+        CHECK(has_opt(m, "transform", "fwht128"));
+    }
+    const char* f32[] = { "blk.0.attn_norm.weight", "blk.5.attn_kv_a_norm.weight",
+                          "blk.2.ffn_norm.weight", "blk.0.ssm_norm.weight", "blk.0.ssm_a",
+                          "blk.0.ssm_dt_bias", "blk.2.glm_router.weight",
+                          "blk.2.glm_router.correction", "output_norm.weight" };
+    for (const char* n : f32) {
+        const RecipeRule* m = r.match(n);
+        REQUIRE(m != nullptr);
+        CHECK_EQ(m->quantizer, std::string("cast"));
+        CHECK(has_opt(m, "dtype", "f32"));
+    }
+    const char* kept[] = { "blk.0.attn_beta.weight", "blk.5.attn_q_rope.weight",
+                           "blk.5.attn_q_nope.weight", "blk.5.attn_kv_a.weight",
+                           "blk.5.attn_kv_b.weight", "blk.5.attn_head_gate.weight",
+                           "blk.0.ssm_conv.weight", "token_embd.weight", "output.weight" };
+    for (const char* n : kept) CHECK(r.match(n) == nullptr);
+}
+
 RAD_TEST_MAIN()

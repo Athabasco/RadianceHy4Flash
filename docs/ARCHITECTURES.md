@@ -22,7 +22,7 @@ plugin claims.
 | `arch/clef_fp8` | `clef` | `fp8_e4m3` | the same over `qwen35_fp8`'s trunk |
 | `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert (`data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe`) or an AutoRound int4 release (`qwen4exp-autoround-i8-hc8m.recipe`) |
 | `arch/glm5next` | `glm5next` | *(empty)* | GLM-5.3-Flash: four mHC residual streams over 34 KDA and 11 sparse latent-attention (MLA) layers with a DSA indexer, 288 experts at top-8 under sigmoid routing, attention and dense layers as the container stores them; its MTP layer is a serial drafter. Pictures through its vision tower (`arch/common/rad_block_glm_vision.h`); bf16 KV |
-| `arch/bailing_hybrid` | `bailinghybrid` | *(empty)* | Ling-3.0-flash and its fine-tunes (Ling-3.0-flash-Sante) from the bf16 checkpoint: 35 KDA and 7 dense latent-attention (MLA) layers with a rotary part and a head-wise gate, 512 experts at top-8 under group-limited sigmoid routing with an ungated shared expert, the routed experts as the recipe stores them (`data/recipes/ling3-w4a8-rtn.recipe`); its MTP layer is a serial drafter; Ling-3.0-tiny from its bf16 checkpoint with an IQ8R trunk and rotated int8 experts (`data/recipes/ling-3.0-tiny-iq8r.recipe`, TP1/2), and flash on the same trunk with rotated experts (its clamped layers clamp, then quantise); bf16 KV |
+| `arch/bailing_hybrid` | `bailinghybrid` | *(empty)* | Ling-3.0-flash and its fine-tunes (Ling-3.0-flash-Sante) from the bf16 checkpoint: 35 KDA and 7 dense latent-attention (MLA) layers with a rotary part and a head-wise gate, 512 experts at top-8 under group-limited sigmoid routing with an ungated shared expert, the routed experts as the recipe stores them (`data/recipes/ling3-w4a8-rtn.recipe`); its MTP layer is a serial drafter; Ling-3.0-tiny from its bf16 checkpoint with an IQ8R trunk and rotated int8 experts (`data/recipes/ling-3.0-tiny-iq8r.recipe`, TP1/2), and flash on the same trunk with rotated four-bit experts (`data/recipes/ling-3.0-flash-iq8r-w4nl64.recipe`; its clamped layers clamp, then quantise); bf16 KV |
 | `arch/bailing_hybrid_gguf` | `bailinghybrid` | `gguf_ftype_25` | Ling-3.0-tiny (24 layers, MLA every fourth with a 256-wide query LoRA, 128 experts of 512 at top-8) as the IQ4_NL GGUF release, its experts re-quantised by `data/recipes/ling-3.0-tiny-iq4.recipe`; no MTP; bf16 KV |
 | `arch/bailing_hybrid_gguf_q80` | `bailinghybrid` | `gguf_ftype_7` | the same tiny family, Q8_0 GGUF release, served whole |
 | `arch/bailing_hybrid_gguf_q4km` | `bailinghybrid` | `gguf_ftype_15` | the same tiny family, Q4_K_M GGUF release, served whole |
@@ -1089,6 +1089,12 @@ IQ8R (tiny, `data/recipes/ling-3.0-tiny-iq8r.recipe`): the KDA q|k|v, forget, ga
   at 128. The KDA beta, the MLA's q_a, q_b parts, kv_a, kv_b and head gate, the taps, the router,
   the embedding and the head stay bf16. TP1 and TP2 (at TP4 the dense 1152-column slice cuts a
   256-column group and is refused).
+
+IQ8R with four-bit experts (flash, `data/recipes/ling-3.0-flash-iq8r-w4nl64.recipe`): the trunk
+  as above; the routed experts rotated four-bit codes into the w4nl codebook at an E4M3 scale a
+  (row, 64) (`moe_gemm_q` at `w4nl64a8i8h`), read against the trunk's rotated int8 codes.
+  The clamped layers write `swiglu_step`'s bf16 product and quantise it with `had_quant_act_i8g`.
+  Declared at one, two and four ranks; served on two and four cards.
 
 GGUF releases (tiny): IQ4_NL, Q8_0, Q4_K_M, Q5_K_M, Q6_K -- the file's `general.file_type` is
   the claim (`gguf_ftype_25`, `_7`, `_15`, `_17`, `_18`); the release files carry their
