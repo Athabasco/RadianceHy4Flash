@@ -45,6 +45,10 @@ extern "C" void rad_dev_host_wrote(void);
  * plugin measured a gain (RadArchProbe::chain_pays): with its drafter decoding speculatively, or
  * with and without one (rad_dev_chain_infer, from the engine before any row resolves). */
 extern "C" int  rad_dev_chain_enabled(void);
+/* VRAM the runtime keeps resident as queue scratch on `props`' card once a kernel with a private
+ * segment has run (0 on the host backend and on unified memory). Charged to the VRAM budget with
+ * the hardware queues. */
+extern "C" int64_t rad_dev_resident_scratch_bytes(const RadDeviceProps* props);
 extern "C" void rad_dev_chain_infer(int pays);
 
 /* One range of a ranged copy: `bytes` from source offset `src` to destination offset `dst`, all

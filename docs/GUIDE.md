@@ -1068,7 +1068,8 @@ one for one with the key); a larger headroom that lost part of itself is reporte
 What the engine allocates after reading the card is charged before the split, not to the headroom:
 the step staging, the KV tiers' copy staging and the hardware queues. The driver backs each queue
 with VRAM beyond its ring (33 MiB on an R9700), so startup measures one and the receipt's `hardware
-queues` line shows the count and price.
+queues` line shows the count and price. It also includes the queue scratch the runtime keeps once a kernel with a private
+segment has run (5 MiB a compute unit, 160 MiB on an R9700).
 
 ### 4.4 Long context
 
