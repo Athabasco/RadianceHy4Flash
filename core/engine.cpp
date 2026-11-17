@@ -757,6 +757,7 @@ Engine::Readback::~Readback() {
 }
 
 Engine::~Engine() {
+    depth_log_stats("final");
     /* The control vector's per-rank direction copies. Uploaded at declare, outside any arena, so
      * nothing else frees them; each rank's copy is freed with that rank's device bound, since the
      * allocator is per device. */
@@ -1225,7 +1226,9 @@ int Engine::issue_ahead(const RadBatch** out) {
     if (flex_pending_.load(std::memory_order_acquire) || quiet_pending_.load(std::memory_order_acquire))
         return RAD_OK;
     for (int i = 0; i < serial_rows_ && serial_done_ > 0; ++i)
-        sched_.expect_draft(serial_row_[(size_t)i].seq, serial_done_);
+        /* --draft-depth adaptive: the row's own chain (Engine::depth_row_nodes); else the rounds
+         * every row ran. */
+        sched_.expect_draft(serial_row_[(size_t)i].seq, depth_row_nodes(i));
     for (int i = 0; i < block_rows_; ++i)
         sched_.expect_draft(block_row_[(size_t)i].seq, block_steps_);
     const RadBatch* nb = sched_.step_next();

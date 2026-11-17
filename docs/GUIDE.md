@@ -1625,6 +1625,47 @@ the head's window. At temperature 0 the text
 is that of a fixed depth wherever fixed depths agree; above 0 it is distribution-exact.
 `radiance:draft_depth_adaptive` and `radiance:draft_verify_depth_total` (§6.3) show the windows.
 
+**Adaptive chain depth: `draft-depth: adaptive`.** `draft-window: adaptive` picks the window of the
+next step from the acceptance and the cost of the steps before it. A coupled serial head can also
+stop the chain of a step within that step, from the head's own laws: a fixed chain drafts N tokens
+every step and its verify pays for N + 1 rows whatever the head thought of them. With `draft-depth:
+adaptive` (`draft-coupling: on` and a serial head; `draft-window` stays `fixed`, since both decide
+the depth and the engine refuses them together) `num-speculative-tokens` (or `draft-depth-max`) is
+the deepest chain, and round j runs only while the product of the earlier rounds' probabilities is at
+least `draft-depth-stop` -- each round's largest probability (`draft-depth-stat: top`, the default)
+or the probability of the token it drew (`path`). The next verify then carries exactly the drafts
+made (1 to N, each row count its own recorded pass), so a step whose head is unsure costs one or two
+rows and a confident one drafts deep.
+
+```yaml
+    num-speculative-tokens: 5      # the deepest chain
+    draft-coupling: on
+    draft-verify: traversal
+    draft-depth: adaptive
+    draft-depth-stop: 0.85
+```
+
+The next verify is issued before the drafts exist (it runs behind them on the card), so its row count
+has to be known when it is issued. The host therefore reads one state row back after a round and
+decides the round after the next one (`draft-depth-lag: 1`, the default): the card is running the
+round in between, so the readback, the decision and the issue of the next round or of the verify
+(about 0.1 ms to the first packet) hide behind it and nothing waits. `draft-depth-lag: 0` decides
+every round from all the rounds before it; the card then waits for the host between two rounds. The
+step's tokens are streamed after the chain's last decision rather than right after the sampler (up
+to a millisecond or so later; the rate is the same). The rule reads the draft's side only -- the laws
+the rounds drew from and, for `path`, the tokens drawn before the one a decision admits -- never the
+target and never the admitted token itself, so the row-wise and the traversal verify stay exact
+(`core/sched/draft_depth.h` has the argument, `tests/mtp_rrs_test.cpp` the chi-square and the two
+rules that fail it). A greedy request has no law to read and drafts min(3, N). Shutdown logs the
+depths taken, and per depth the card's cycle and the drafts its verify accepted (`draft depth
+adaptive (final)`). On Qwen3.8-Flash-Next (2x R9700, traversal verify) a cap of 5 at stop 0.85 took
+2.79 tokens a step where the fixed chain of 3 took 2.70, at the same mean of 3.0 drafts and a step
+0.7% longer: +3.0% tokens a second (95% interval +1.0 to +5.0%) over temperatures 0.7 and 1.0; a
+cap of 7 gained no more, a deep verify row costing more than a shallow one. The stop is not
+sensitive between 0.80 and 0.90. The engine keeps 48 recorded passes instead of 24 (an adaptive
+chain makes more pass shapes than 24 hold: 3352 recordings per benchmark became 1472, +1.7% tokens a
+second for this mode); the other modes touch no more than they did.
+
 **Chained launches.** Where the model's plugin measured its step faster with them, the AQL backend
 lets a kernel that depends on the one before it on its queue wait in its own prologue instead of
 behind the packet processor's barrier bit, which saves most of the launch gap between dependent
@@ -2421,6 +2462,12 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `spec-ngram: K` | 0 | prompt lookup alone: up to K drafts a step from the sequence's own n-grams, each proposal verified when it pays at the measured step cost; a container that declares a draft head is refused; sets the window to K (§4.6) |
 | `spec-ngram-min: N`, `spec-ngram-max: N` | 2, 4 | the pattern lengths prompt lookup tries, longest first (at most 15), wherever it drafts |
 | `draft-window: MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, for a serial draft head or prompt lookup alone (§4.6) |
+| `draft-depth: MODE` | fixed | `adaptive` stops a coupled serial chain within the step once the product of the head's probabilities along it falls below `draft-depth-stop`; the next verify carries only the drafts made (§4.6). Needs `draft-coupling: on` and `draft-window: fixed` |
+| `draft-depth-max: N` | auto | `draft-depth: adaptive`: the deepest chain (auto: `num-speculative-tokens`) |
+| `draft-depth-min: N` | 1 | `draft-depth: adaptive`: rounds that always run |
+| `draft-depth-stop: P` | 0.85 | `draft-depth: adaptive`: the chain goes on while its confidence is at least P |
+| `draft-depth-lag: K` | 1 | `draft-depth: adaptive`: rounds the decision trails the chain (0 or 1); 1 hides the host's decision behind a running round |
+| `draft-depth-stat: S` | top | `draft-depth: adaptive`: `top` multiplies each round's largest probability, `path` the probability of the token it drew |
 | `draft-short-from: N` | auto | a block drafter that declares a shorter block runs it from N decoding sequences on, its own block again two below or at one sequence; 0 never; auto never for a chain and 2 for a tree drafter, which then verifies the short block's nodes (§4.6) |
 | `draft-coupling: MODE` | off | `on`: a linear MTP drafter with a 2-bit candidate head (Qwen3.8-Flash-Next) samples each proposal from its reranked top-8 and the sampler maximally couples the target's draw to it. The output distribution is unchanged and a fixed seed yields other tokens than `off`. The head's law is taken at temperature 1, so it pays at high request temperatures and costs at low ones: on Flash-Next TP2 at 2x R9700, tokens per decode step +18% at temperature 1.0 and c1, +11% at 0.7 and c4, -4% at 0.3. Greedy rows are unchanged. A DFlash2 drafter (Qwen3.5/3.8) couples its candidate walk instead: each position is sampled from the softmax of the walk's own scores over its best eight candidates, at temperature 0.6 (fixed in `qwen35_fp8`, where acceptance peaked); on Qwen3.8-27B MXFP4 TP2 at 2x R9700 and request temperature 1, tokens per verify step +8% on held-out prompts at c4 (3.53 to 3.82) and decode +2..8% per stream at c1/c4. Any other drafter is refused at startup |
 | `draft-verify: MODE` | token | how a coupled draft chain is verified: `token` decides each row on its own (maximal coupling); `block` decides the whole chain at once (Block Verification, arXiv 2403.10444) and switches `draft-coupling` on; `traversal` walks the chain bottom-up (Traversal Verification, arXiv 2505.12398) and needs `draft-coupling: on`. The output distribution is the same in all three, every draft a step accepts is one the target's own law would have produced, and `block` and `traversal` accept at least as many drafts a step as `token`. Sampled rows only: a greedy row is verified as before. The verify runs as one workgroup a request, with no scratch (§6) |

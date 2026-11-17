@@ -223,6 +223,21 @@ static const Flag g_flags[] = {
     "                                    root-to-leaf path bottom-up (Traversal Verification, arXiv\n"
     "                                    2505.12398; needs --draft-coupling on). The same output law in\n"
     "                                    every mode, more drafts accepted per step in block and traversal" },
+    { "--draft-depth",        "MODE",   "fixed (default) | adaptive -- a coupled serial chain stops within\n"
+    "                                    the step once the product of the head's probabilities along it falls\n"
+    "                                    below --draft-depth-stop, and the next verify carries only the drafts\n"
+    "                                    made (1 .. --draft-depth-max). Same output law (the rule reads the\n"
+    "                                    draft's own laws only); needs --draft-coupling on and --draft-window\n"
+    "                                    fixed (both choose the depth, so they are not served together)" },
+    { "--draft-depth-max",    "N",      "--draft-depth adaptive: the deepest chain (default 0 =\n"
+                                        "num-speculative-tokens)" },
+    { "--draft-depth-min",    "N",      "--draft-depth adaptive: rounds that always run (default 1)" },
+    { "--draft-depth-stop",   "P",      "--draft-depth adaptive: the chain goes on while its confidence\n"
+                                        "is at least P (default 0.85)" },
+    { "--draft-depth-lag",    "K",      "--draft-depth adaptive: rounds the decision trails the chain,\n"
+                                        "0 or 1 (default 1: the host decides while the next round runs)" },
+    { "--draft-depth-stat",   "S",      "--draft-depth adaptive: top (default, each round's largest\n"
+                                        "probability) | path (the probability of the token it drew)" },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
 
     { "--host",               "ADDR",   "listen address" },
@@ -924,6 +939,37 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
         }
+        else if (S("--draft-depth")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "fixed"))    c->draft_depth_adaptive = false;
+            else if (!std::strcmp(v, "adaptive")) c->draft_depth_adaptive = true;
+            else {
+                RAD_ERR("--draft-depth takes fixed or adaptive, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-depth-max"))       { if (!num(0, 16, &c->draft_depth_max)) return RAD_E_INVAL; }
+        else if (S("--draft-depth-min"))       { if (!num(1, 16, &c->draft_depth_min)) return RAD_E_INVAL; }
+        else if (S("--draft-depth-lag"))       { if (!num(0, 1, &c->draft_depth_lag)) return RAD_E_INVAL; }
+        else if (S("--draft-depth-stop")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            double d = 0;
+            if (!parse_num(a.c_str(), v, &d)) return RAD_E_INVAL;
+            if (!(d >= 0.0 && d <= 1.0)) {
+                RAD_ERR("--draft-depth-stop must be a probability in [0, 1], not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->draft_depth_stop = d;
+        }
+        else if (S("--draft-depth-stat")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "top"))  c->draft_depth_stat = 0;
+            else if (!std::strcmp(v, "path")) c->draft_depth_stat = 1;
+            else {
+                RAD_ERR("--draft-depth-stat takes top or path, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
         else if (S("--draft-model")) {
             /* Refused, not ignored: separate draft models are not supported (spec §10), and the
              * drafter comes from the container (rad-convert --draft-model merges one in; an MTP
@@ -1431,6 +1477,29 @@ int config_parse(int argc, char** argv, Config* c) {
         RAD_ERR("--video-min-pixels is above --video-max-pixels"); return RAD_E_INVAL; }
     if (c->video_min_frames && c->video_max_frames && *c->video_min_frames > *c->video_max_frames) {
         RAD_ERR("--video-min-frames is above --video-max-frames"); return RAD_E_INVAL; }
+    /* --draft-depth adaptive reads the coupled chain's laws and chooses the chain's depth itself. */
+    if (c->draft_depth_adaptive) {
+        if (c->given.count("--draft-coupling") && !c->draft_coupling) {
+            RAD_ERR("--draft-depth adaptive needs the coupled drafting (--draft-coupling on): the "
+                    "stop rule reads the law each draft was drawn from");
+            return RAD_E_INVAL;
+        }
+        if (c->draft_window == DraftWindow::Adaptive) {
+            RAD_ERR("--draft-depth adaptive and --draft-window adaptive both choose the chain's "
+                    "depth; serve one of them");
+            return RAD_E_INVAL;
+        }
+        if (c->draft_verify_block) {
+            RAD_ERR("--draft-depth adaptive is verified token by token or by traversal "
+                    "(--draft-verify token | traversal), not as a fixed block");
+            return RAD_E_INVAL;
+        }
+        if (c->draft_depth_min > 1 && c->draft_depth_max > 0 && c->draft_depth_min > c->draft_depth_max) {
+            RAD_ERR("--draft-depth-min is above --draft-depth-max");
+            return RAD_E_INVAL;
+        }
+        c->draft_coupling = true;
+    }
     /* --draft-verify block verifies a linear chain with the coupled drafting's states, so it
      * switches the coupling on; traversal needs it and says so rather than switching it on. */
     if (c->draft_verify_block) {
@@ -1573,6 +1642,13 @@ const ShowRow kShow[] = {
     { "--draft-coupling",     [](const Config& c) { return onoff(c.draft_coupling); } },
     { "--draft-verify",       [](const Config& c) {
           return std::string(c.draft_verify_block ? "block" : c.draft_verify_traversal ? "traversal" : "token"); } },
+    { "--draft-depth",        [](const Config& c) { return std::string(c.draft_depth_adaptive ? "adaptive" : "fixed"); } },
+    { "--draft-depth-max",    [](const Config& c) {
+          return c.draft_depth_max > 0 ? num(c.draft_depth_max) : std::string("auto"); } },
+    { "--draft-depth-min",    [](const Config& c) { return num(c.draft_depth_min); } },
+    { "--draft-depth-stop",   [](const Config& c) { return fnum(c.draft_depth_stop); } },
+    { "--draft-depth-lag",    [](const Config& c) { return num(c.draft_depth_lag); } },
+    { "--draft-depth-stat",   [](const Config& c) { return std::string(c.draft_depth_stat == 1 ? "path" : "top"); } },
     { "--draft-model",        [](const Config&) { return std::string("not implemented (the container's own drafter)"); } },
     { "--host",               [](const Config& c) { return c.host; } },
     { "--port",               [](const Config& c) { return num(c.port); } },

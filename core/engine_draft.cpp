@@ -100,6 +100,7 @@ int Engine::step_state_init() {
             return RAD_E_STATE;
         }
         couple_rows_ = sd.shape[1];
+        couple_planes_ = sd.shape[0];
         /* One entry per card slot, indexed by StepEntry::card as slots_host_ is. */
         couple_by_card_.assign((size_t)n_slot, RadMtpCoupleDraw{});
         couple_draw_stage_ = static_cast<RadMtpCoupleDraw*>(
@@ -115,6 +116,49 @@ int Engine::step_state_init() {
             RAD_INFO("MTP coupled LIVE: %d linear round(s), x~Q from the final reranked top8, "
                      "maximal coupling at the verify; fixed-seed tokens are NOT preserved",
                      drafter_.depth);
+    }
+
+    /* --draft-depth adaptive: the rule, the per-round readback of the chain's states and one host
+     * event a round. Refused wherever the chain it stops does not exist, rather than served fixed. */
+    depth_cfg_ = DraftDepthCfg{};
+    if (cfg_.draft_depth_adaptive) {
+        if (!mtp_couple_ || drafter_.kind != RAD_DRAFT_SERIAL) {
+            RAD_ERR("--draft-depth adaptive needs a coupled serial draft chain (--draft-coupling on, a "
+                    "serial head); this deployment's drafter is '%s'",
+                    drafter_.name ? drafter_.name : "(none)");
+            return RAD_E_INVAL;
+        }
+        /* --draft-window adaptive picks a window from the acceptance and the cost of the steps
+         * before (sched/draft.h); this rule picks the depth inside the step from the head's laws.
+         * Two controllers on one chain would fight over it. */
+        if (cfg_.draft_window == DraftWindow::Adaptive) {
+            RAD_ERR("--draft-depth adaptive and --draft-window adaptive both choose the chain's "
+                    "depth; serve one of them");
+            return RAD_E_INVAL;
+        }
+        depth_cfg_.on   = true;
+        depth_cfg_.max  = (int)std::min<int64_t>(drafter_.depth, couple_planes_);
+        if (cfg_.draft_depth_max > 0) depth_cfg_.max = std::min(depth_cfg_.max, cfg_.draft_depth_max);
+        depth_cfg_.max  = std::min(depth_cfg_.max, (int)RAD_MTP_COUPLE_MAX_ROUNDS);
+        depth_cfg_.min  = std::min(std::max(cfg_.draft_depth_min, 1), depth_cfg_.max);
+        depth_cfg_.lag  = cfg_.draft_depth_lag;
+        depth_cfg_.stat = cfg_.draft_depth_stat;
+        depth_cfg_.stop = cfg_.draft_depth_stop;
+        depth_cfg_.lawless = std::min(3, depth_cfg_.max);
+        depth_rb_ = static_cast<RadMtpCoupleState*>(rad_dev_alloc(
+            (int64_t)RAD_MTP_COUPLE_MAX_ROUNDS * couple_rows_ * (int64_t)sizeof(RadMtpCoupleState),
+            RAD_MEM_HOST_PINNED));
+        if (!depth_rb_) return RAD_E_NOMEM;
+        for (RadEvent& e : depth_ev_)
+            RAD_TRY(rad_event_create_as(&e, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
+        depth_row_.assign((size_t)n_slot, DraftDepthRow{});
+        depth_of_.assign((size_t)n_slot, 0);
+        if (const char* e = std::getenv("RADIANCE_DEPTH_SPIN_US")) depth_spin_us_ = std::atoll(e);
+        RAD_INFO("draft depth adaptive: 1..%d draft(s) a step, the chain goes on while the product of "
+                 "the head's %s probabilities is >= %.3f (decided %d round(s) behind, %d round(s) "
+                 "always run); a row with no law drafts %d",
+                 depth_cfg_.max, depth_cfg_.stat == DRAFT_DEPTH_PATH ? "drawn-token" : "top",
+                 depth_cfg_.stop, depth_cfg_.lag, depth_cfg_.min, depth_cfg_.lawless);
     }
 
     RAD_TRY(rad_event_create_as(&step_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
@@ -136,6 +180,9 @@ void Engine::step_state_fini() {
     if (couple_readback_) rad_dev_free(couple_readback_, RAD_MEM_HOST_PINNED);
     couple_draw_stage_ = nullptr;
     couple_readback_ = nullptr;
+    if (depth_rb_) rad_dev_free(depth_rb_, RAD_MEM_HOST_PINNED);
+    depth_rb_ = nullptr;
+    for (RadEvent& e : depth_ev_) { if (e) rad_event_destroy(e); e = nullptr; }
     if (step_end_) rad_event_destroy(step_end_);
     step_end_ = nullptr;
     if (tok_end_) rad_event_destroy(tok_end_);
@@ -244,6 +291,144 @@ int Engine::tree_compact(int rows) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ --draft-depth adaptive
+ *
+ * The chain's depth is decided while it is drafted (sched/draft_depth.h), so the rounds cannot all
+ * be queued behind the step as a fixed chain's are: round j is issued once the statistic of round
+ * j - 1 - lag is known. That costs the host one tiny readback a round (the round's state rows of
+ * the drafting sequences, rank 0's copy; every rank holds the same) and a wait for it. With lag 1
+ * the card is running round j - 1 meanwhile, so nothing idles as long as the host answers within a
+ * round (about 0.5 ms; reading the row and issuing a recorded pass takes about 0.1 ms). The next
+ * verify is issued the same way, right after the chain's last decision, with exactly the rows the
+ * chain has (Engine::issue_ahead): each row count is its own recorded pass.
+ *
+ * The commit of the step in flight moves behind those decisions (the step loop collects after
+ * issue_ahead), so its tokens are streamed up to the chain's rounds later than with a fixed chain;
+ * the card is not held up by that. */
+int Engine::depth_row_nodes(int i) const {
+    if (!depth_cfg_.on) return serial_done_;
+    if (i < 0 || (size_t)i >= depth_of_.size()) return 0;
+    return depth_of_[(size_t)i];
+}
+
+/* Behind the pass of round `round`: its state rows of the `n` drafting sequences to the host, and
+ * the event the driver waits on. */
+int Engine::depth_readback_issue(int round, int n) {
+    if (round < 1 || round > (int)RAD_MTP_COUPLE_MAX_ROUNDS || round > (int)couple_planes_ || n <= 0)
+        return RAD_OK;
+    Rank& r0 = *ranks_[0];
+    const char* state = static_cast<const char*>(r0.ctx.buf_ptr(couple_state_buf_));
+    if (!state) return RAD_E_STATE;
+    const int64_t plane = couple_rows_ * (int64_t)sizeof(RadMtpCoupleState);
+    RAD_TRY(rad_memcpy_async(depth_rb_ + (int64_t)(round - 1) * couple_rows_,
+                             state + (int64_t)(round - 1) * plane,
+                             (int64_t)n * (int64_t)sizeof(RadMtpCoupleState), r0.ctx.stream()));
+    RAD_TRY(rad_event_record(depth_ev_[round - 1], r0.ctx.stream()));
+    depth_issued_[round - 1] = true;
+    return RAD_OK;
+}
+
+/* Waits for the statistics of every round up to `round` and feeds them to the rows. A round whose
+ * readback was never issued (its pass did not run) leaves the rows without a law. */
+int Engine::depth_observe_upto(int round, int n, const StepOut& so) {
+    while (depth_seen_ < round) {
+        const int r = depth_seen_ + 1;
+        const bool have = r <= (int)RAD_MTP_COUPLE_MAX_ROUNDS && depth_issued_[r - 1];
+        if (have) {
+            RadEvent ev = depth_ev_[r - 1];
+            const auto t0 = std::chrono::steady_clock::now();
+            int q = rad_event_query(ev);
+            if (q < 0) return q;
+            if (q == 0) {
+                /* The ids' copy sits ahead of every draft pass: block for it (the trunk's whole
+                 * forward pass may be in front), then poll, which answers within a microsecond of
+                 * the card where an interrupt takes tens. */
+                if (so.early && depth_seen_ == 0) RAD_TRY(rad_event_sync(tok_end_));
+                const auto t1 = std::chrono::steady_clock::now();
+                bool blocked = false;
+                for (uint32_t spin = 0;; ++spin) {
+                    q = rad_event_query(ev);
+                    if (q != 0) break;
+                    if ((spin & 255u) == 255u &&
+                        std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t1)
+                                .count() > (double)depth_spin_us_) {
+                        blocked = true;
+                        break;
+                    }
+#if defined(__x86_64__) || defined(__i386__)
+                    __builtin_ia32_pause();
+#endif
+                }
+                if (q < 0) return q;
+                if (blocked) ++depth_stats_.blocked;
+                ++depth_stats_.waits;
+            } else {
+                /* Already there: the host was behind the card by the time it asked. */
+                ++depth_stats_.late;
+            }
+            /* The wait proper: what a host wait does to the fences of the dispatches that follow
+             * (the copy wrote host memory), and the block when the poll gave up. */
+            RAD_TRY(rad_event_sync(ev));
+            const auto t2 = std::chrono::steady_clock::now();
+            depth_stats_.wait_us += std::chrono::duration<double, std::micro>(t2 - t0).count();
+            /* The card's cycle by the last step's depth: the host waits for every step's first
+             * statistic, so two of them in a row are one cycle apart. A gap of 30 ms or more is
+             * no decode cycle (an idle engine, or the next request's prefill, in between). */
+            if (r == 1) {
+                const double us = std::chrono::duration<double, std::micro>(t2 - depth_e1_).count();
+                if (q == 1 && depth_last_ >= 1 && depth_last_ <= (int)RAD_MTP_COUPLE_MAX_ROUNDS &&
+                    us > 0 && us < 30000.0) {
+                    depth_stats_.cyc_us[depth_last_] += us;
+                    ++depth_stats_.cyc_n[depth_last_];
+                }
+                depth_e1_ = t2;
+            }
+        }
+        for (int i = 0; i < n; ++i) {
+            DraftDepthRow& row = depth_row_[(size_t)i];
+            double st = -1.0;
+            if (have && !row.lawless) {
+                const RadMtpCoupleState& cs = depth_rb_[(int64_t)(r - 1) * couple_rows_ + i];
+                /* this step's draw for this row, or a stale plane: no law */
+                if (!std::memcmp(&cs.draw, &couple_draw_stage_[(size_t)i], sizeof cs.draw))
+                    st = draft_depth_stat(cs, r, depth_cfg_.stat);
+            }
+            draft_depth_observe(&row, r, st);
+        }
+        depth_seen_ = r;
+    }
+    return RAD_OK;
+}
+
+/* The adaptive chain's tuning line: the shares of each depth and what the host waits cost, then
+ * by the drafts a step made, the card's cycle and the drafts its verify accepted. Logged every
+ * 4096 drafting rows and at shutdown. */
+void Engine::depth_log_stats(const char* when) {
+    const DepthStats& ds = depth_stats_;
+    if (!depth_cfg_.on || ds.rows == 0 || (depth_logged_ == ds.rows && !std::strcmp(when, "final"))) return;
+    depth_logged_ = ds.rows;
+    std::string h;
+    for (int d2 = 1; d2 <= depth_cfg_.max; ++d2)
+        h += fmt("%s%d:%.3f", d2 > 1 ? " " : "", d2, (double)ds.hist[d2] / (double)ds.rows);
+    RAD_INFO("draft depth adaptive (%s): %llu drafting step(s), drafts/row %.3f, rounds/step %.3f, "
+             "depth shares [%s], lawless rows %llu; host waits %llu (%.1f us each, %llu ended "
+             "blocked), statistics already there %llu",
+             when, (unsigned long long)ds.steps, (double)ds.drafts / (double)ds.rows,
+             (double)ds.rounds / (double)ds.steps, h.c_str(), (unsigned long long)ds.lawless,
+             (unsigned long long)ds.waits,
+             ds.waits + ds.late ? ds.wait_us / (double)(ds.waits + ds.late) : 0.0,
+             (unsigned long long)ds.blocked, (unsigned long long)ds.late);
+    std::string by;
+    for (int d2 = 1; d2 <= depth_cfg_.max; ++d2)
+        by += fmt("%s%d: %.0f us (%llu), %.3f accepted (%llu)", d2 > 1 ? "; " : "", d2,
+                 ds.cyc_n[d2] ? ds.cyc_us[d2] / (double)ds.cyc_n[d2] : 0.0,
+                 (unsigned long long)ds.cyc_n[d2],
+                 ds.acc_n[d2] ? (double)ds.acc[d2] / (double)ds.acc_n[d2] : 0.0,
+                 (unsigned long long)ds.acc_n[d2]);
+    RAD_INFO("draft depth adaptive (%s): by drafts made, the card's cycle and the drafts the "
+             "verify accepted -- %s", when, by.c_str());
+}
+
 /* Issue the step's draft passes behind it, without waiting. After the trunk's ranks join: the
  * acceptance on every rank, the sampled-id readback (before a round can overwrite them), the
  * history pass and every round, then the final proposal into the slots and their readback.
@@ -263,6 +448,8 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     RAD_TRY(collect_issue(so, /*fence=*/true));
 
     int rounds = drafter_.depth;
+    /* --draft-depth-max below the head's declared depth: no round past it is ever asked for. */
+    if (depth_cfg_.on && rounds > depth_cfg_.max) rounds = depth_cfg_.max;
     serial_row_.resize((size_t)cfg_.max_seqs);
     /* `n` counts rows that can draft. It can be zero while the history pass still has work (a
      * mid-prompt sequence has hidden states the head needs but no token to propose from). */
@@ -280,9 +467,30 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     static double a_batch = 0, a_samp = 0, a_rel = 0, a_iss = 0;
     static long   n_pass = 0;
 
+    /* --draft-depth adaptive: every row starts a chain; a greedy row (no draw) has no law. */
+    const bool adepth = depth_cfg_.on && n > 0;
+    if (adepth) {
+        depth_seen_ = 0;
+        for (bool& b : depth_issued_) b = false;
+        for (int i = 0; i < n; ++i) {
+            draft_depth_begin(depth_cfg_, &depth_row_[(size_t)i], couple_draw_stage_[(size_t)i].mode != 1);
+            depth_of_[(size_t)i] = 0;
+        }
+    }
+
     /* Pass 0, then rounds 2..rounds: round 1 has no pass of its own. */
     for (int rd = 0; rd <= rounds; rd += rd == 0 ? 2 : 1) {
         if (rd > 0 && n <= 0) break;
+        /* The adaptive chain: round rd runs only for a row whose confidence up to round
+         * rd - 1 - lag holds (sched/draft_depth.h); the pass runs while any row goes on. */
+        if (adepth && rd >= 2) {
+            const int need = draft_depth_need(depth_cfg_, rd);
+            if (need >= 1) RAD_TRY(depth_observe_upto(need, n, so));
+            bool any = false;
+            for (int i = 0; i < n; ++i)
+                any = draft_depth_go(depth_cfg_, &depth_row_[(size_t)i], rd) || any;
+            if (!any) break;
+        }
         const auto tA = std::chrono::steady_clock::now();
         const RadBatch* db = sched_.serial_batch(rd, step);
         if (!db) { if (rd == 0) continue; break; }
@@ -335,8 +543,31 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
         }
         if (rd > 0) serial_done_ = rd;
         else if (drafted > 0) serial_done_ = 1;
+        /* This round's states to the host, when a later round's decision reads them. */
+        if (adepth && serial_done_ == (rd > 0 ? rd : 1) &&
+            serial_done_ <= draft_depth_need(depth_cfg_, rounds))
+            RAD_TRY(depth_readback_issue(serial_done_, n));
     }
     if (serial_done_ <= 0 || n <= 0) return RAD_OK;
+    if (adepth) {
+        DepthStats& ds = depth_stats_;
+        ++ds.steps;
+        ds.rounds += (uint64_t)serial_done_;
+        for (int i = 0; i < n; ++i) {
+            const DraftDepthRow& row = depth_row_[(size_t)i];
+            const int d = std::max(1, std::min(row.depth, serial_done_));
+            depth_of_[(size_t)i] = d;
+            ++ds.rows;
+            ds.drafts += (uint64_t)d;
+            ds.lawless += row.lawless;
+            ++ds.hist[std::min(d, (int)RAD_MTP_COUPLE_MAX_ROUNDS)];
+        }
+        depth_last_ = 0;
+        for (int i = 0; i < n; ++i) depth_last_ = std::max(depth_last_, (int)depth_of_[(size_t)i]);
+        if (ds.rows >= depth_logged_ + 4096) depth_log_stats("running");
+    } else {
+        depth_last_ = 0;
+    }
 
     /* The last round's proposal into the slots, then rank 0's slots back to the host. Only the
      * drafting rows: at depth 1 the last pass is the history pass, whose later rows only carried
@@ -377,6 +608,19 @@ int Engine::finish_serial_drafter(const StepOut& so) {
             }
         }
     }
+    /* --draft-depth adaptive: what the verify of d drafts accepted, by d (the tuning line). */
+    if (depth_cfg_.on) {
+        for (size_t i = 0; i < plan.e.size(); ++i) {
+            const StepEntry& e = plan.e[i];
+            if (so.first_row[i] < 0 || e.n_spec <= 0 || e.n_spec > (int)RAD_MTP_COUPLE_MAX_ROUNDS ||
+                e.card < 0 || (size_t)e.card >= couple_by_card_.size())
+                continue;
+            const RadMtpCoupleDraw& d = couple_by_card_[(size_t)e.card];
+            if (d.seq != e.seq || d.mode != 1) continue;
+            depth_stats_.acc[e.n_spec] += (uint64_t)std::max(0, so.accepted[i]);
+            ++depth_stats_.acc_n[e.n_spec];
+        }
+    }
     sched_.serial_end(serial_done_);
     if (serial_done_ <= 0 || serial_rows_ <= 0) return RAD_OK;
 
@@ -393,9 +637,12 @@ int Engine::finish_serial_drafter(const StepOut& so) {
          * cannot snapshot its state); the sampler would refuse the next step otherwise. */
         if (!r0.sampler.allows_speculation(serial_row_[(size_t)i].seq)) continue;
         const uint64_t seq = serial_row_[(size_t)i].seq;
-        const int rc = sched_.set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], done);
+        /* Under --draft-depth adaptive the row's own chain: the drafts the step issued ahead was
+         * planned with (issue_ahead's expect_draft), a prefix of the rounds that ran. */
+        const int row_nodes = depth_cfg_.on ? depth_row_nodes(i) : done;
+        const int rc = sched_.set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], row_nodes);
         if (mtp_couple_)
-            RAD_TRY(bind_couple(seq, i, done, rc == RAD_OK, serial_row_[(size_t)i].card));
+            RAD_TRY(bind_couple(seq, i, row_nodes, rc == RAD_OK, serial_row_[(size_t)i].card));
     }
     return RAD_OK;
 }

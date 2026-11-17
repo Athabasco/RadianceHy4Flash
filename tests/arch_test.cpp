@@ -11120,6 +11120,66 @@ TEST(flashnext_draft_passes_refill_the_rope_table_where_the_carry_is_live) {
 /* The vocab-parallel draft head gathers each rank's top-R as (id, value) pairs: a row is 2R
  * floats, whole 16-byte words, and the gather moves every draft row's. A row of one pair (8 bytes)
  * is what the two-rank gather cannot take. */
+/* --draft-depth adaptive (core/sched/draft_depth.h): a deployment declared for the deepest chain D
+ * verifies, step by step, the 1 .. D drafts the chain of that step really made. The plugin learns the
+ * depth from the batch's rows alone; a verify of d drafts under the deep declaration issues exactly
+ * the ops, in the order, of a chain deployment declared at depth d, and so does the history pass
+ * behind it (whose rows mirror the verify's). Sequences of one step may differ in depth. */
+TEST(flashnext_a_shorter_verify_under_a_deeper_coupled_chain_issues_that_chains_ops) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    const int D = 5;
+    auto seq = [](const RadBuilder& b, const RadCtx& c) {
+        std::vector<std::string> v;
+        for (const auto& i : c.issues) if (const RecOp* o = b.op_of(i.op)) v.push_back(o->op);
+        return v;
+    };
+    /* One plugin instance keeps its handles per slot: each deployment is declared right before its
+     * steps run. */
+    auto run = [&](int declared, const std::vector<int>& rows, std::vector<std::string>* ver,
+                   std::vector<std::string>* his) {
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() } };
+        RadBuildCtx c = q4_ctx(0, 1, 4);
+        c.max_spec = declared;
+        c.draft_coupling = 1;
+        REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+        CHECK_EQ(b.drafter.depth, declared);
+        const auto k = kit(b, rows, {});
+        const auto h = history_pass(b, *k);
+        const auto v = run_passes(b, qwen4exp_fp8::step, { k.get(), h.get() });
+        CHECK_PASSES(b, v);
+        *ver = seq(b, *v[0]);
+        *his = seq(b, *v[1]);
+    };
+    for (int d = 1; d <= D; ++d) {
+        const std::vector<int> rows((size_t)4, d + 1);
+        std::vector<std::string> fv, fh, av, ah;
+        run(d, rows, &fv, &fh);
+        /* A head of one round ends in its history pass; with more rounds that pass also hands its
+         * output to round 2 (one cast), whatever the verify behind it carried. The history pass of a
+         * one-draft verify is therefore compared under a two-round declaration. */
+        if (d == 1) {
+            std::vector<std::string> v2;
+            run(2, rows, &v2, &fh);
+            CHECK(v2 == fv);
+        }
+        run(D, rows, &av, &ah);
+        CHECK(!fv.empty() && !fh.empty());
+        CHECK(av == fv);
+        CHECK(ah == fh);
+        if (av != fv || ah != fh) std::fprintf(stderr, "    depth %d under %d: issue pattern differs\n", d, D);
+    }
+    /* depths that differ between the sequences of one step: the ops of the full-depth step. The
+     * rows add up past kPrefetchRows, as the full-depth step's do: below it the model issues a
+     * step by its row count (the decode-height issue order), and that is not this property. */
+    std::vector<std::string> mv, mh, dv, dh;
+    run(D, { 2, D + 1, D + 1, D + 1 }, &mv, &mh);
+    run(D, { D + 1, D + 1, D + 1, D + 1 }, &dv, &dh);
+    CHECK(mv == dv);
+    CHECK(mh == dh);
+}
+
 TEST(flashnext_draft_head_gathers_whole_candidate_rows_at_two_ranks) {
     MetaKV mk = q4_small();
     const RadModelMeta& meta = *mk.meta();
