@@ -21,7 +21,8 @@
  *     an invalidation. A slot is rewritten one lap after it was last read, so a system-scope
  *     acquire is placed at least once per half lap; without it every kernel after the first lap
  *     reads its predecessor's arguments. Slots are 1 KiB so no argument fetch shares a cache line
- *     with the next slot;
+ *     with the next slot. No fence makes a write through the BAR arrive: the card's host data
+ *     path is flushed in front of every doorbell (host_writes_out);
  *   - host-written memory: the first dispatch after the host waits on any queue takes a
  *     system-scope acquire, since host writes for the next step follow such a wait;
  *   - copies touching host or peer memory carry the scope themselves, as do the barrier packets
@@ -225,6 +226,9 @@ struct Dev {
     bool        has_vram = false;
     uint32_t    kfd_id = 0;             /* the driver's gpu_id: its sysfs and ioctls name it so */
     bool        host_kargs = false;     /* no large BAR: the argument ring lives in host memory */
+    /* The card's host data path flush register (HSA_AMD_AGENT_INFO_HDP_FLUSH), where the host
+     * writes arguments into VRAM; see host_writes_out. */
+    volatile uint32_t* hdp_flush = nullptr;
 };
 
 struct Global {
@@ -441,6 +445,18 @@ bool init_devices() {
             RAD_INFO("device: card %d (%s) keeps kernel arguments in pinned host memory, as a "
                      "test asked", i, bus);
         }
+        if (!g.dev[(size_t)i].host_kargs) {
+            hsa_amd_hdp_flush_t hdp{};
+            if (hsa_agent_get_info(g.dev[(size_t)i].agent,
+                                   (hsa_agent_info_t)HSA_AMD_AGENT_INFO_HDP_FLUSH,
+                                   &hdp) == HSA_STATUS_SUCCESS)
+                g.dev[(size_t)i].hdp_flush = hdp.HDP_MEM_FLUSH_CNTL;
+            if (!g.dev[(size_t)i].hdp_flush)
+                RAD_WARN("device: card %d (%s) gives no host data path flush register, so a kernel "
+                         "may start before the arguments written for it through the BAR have "
+                         "reached VRAM; only the packet processor's acquire, which holds a launch "
+                         "back, leaves them the time", i, bus);
+        }
     }
     /* Without the handler a fault falls back to the runtime's own handling, which the
      * memory-fault report below replaces; warn at startup. */
@@ -600,6 +616,7 @@ struct Stream {
     hsa_queue_t*    q = nullptr;
     uint64_t        mask = 0;
     char*           karg = nullptr;           /* VRAM the CPU writes through the BAR, or host memory */
+    volatile uint32_t* hdp = nullptr;         /* Dev::hdp_flush where `karg` is VRAM */
     std::atomic<bool> busy{false};
     uint64_t        wr = 0;                   /* next packet index */
     uint64_t        rd = 0;                   /* last read index seen */
@@ -1093,10 +1110,37 @@ inline int reserve(Stream* s, uint64_t* out) {
     return RAD_OK;
 }
 
+/* What the host wrote for the card, on its way before the packets that read it are announced.
+ *
+ * An argument slot in VRAM is written through the BAR: the bytes sit in the processor's
+ * write-combining buffers until a store fence, and behind the link in the card's host data path,
+ * which hands them on to memory in its own time unless it is told to flush. Nothing orders that
+ * against the doorbell. A kernel the card starts soon enough after its packet was announced
+ * reads the slot as the launch a lap of the ring before left it: first its chain record, which
+ * it obeys (an old target, so no wait) or does not accept (so it counts nothing and the chained
+ * launch behind it waits for good), then, behind its wait, its arguments.
+ *
+ * On an R9700 "soon enough" is a microsecond or two. What kept launches from it so far is that the
+ * packet processor's acquire holds a launch about 0.9 us and an ordered launch waits for the
+ * kernel in front: the margin is timing, not ordering. Without the packet's acquire (a test that
+ * issues it so) runs of fourteen 256 KiB card-side copies issued one by one: back to back, six runs
+ * in nine of 300 000 ended with a unit moved by another launch's arguments; with the host quiet
+ * for 50 us behind each doorbell the queue stalled in its first lap, four runs in four, on either
+ * card. With the flush below neither happened.
+ *
+ * The register is the driver's (HSA_AMD_AGENT_INFO_HDP_FLUSH, the remapped page it gives a
+ * process for this), and the store travels the link behind the slot's bytes and in front of the
+ * doorbell's: the order the driver's own submissions use. It goes in front of every doorbell, a
+ * chained launch's or not: no launch was ordered against the write. */
+inline void host_writes_out(Stream* s) {
+    _mm_sfence();
+    if (s->hdp) *s->hdp = 1;
+}
+
 inline void publish(Stream* s, uint64_t idx, uint16_t header, uint16_t setup) {
     s->wr = idx + 1;
     hsa_queue_store_write_index_relaxed(s->q, idx + 1);
-    _mm_sfence();                       /* the argument slot, written before the header */
+    host_writes_out(s);                 /* the argument slot, in VRAM before the header */
     __atomic_store_n(reinterpret_cast<uint32_t*>(
                          static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) +
                          (idx & s->mask)),
@@ -1372,6 +1416,9 @@ struct PlayRun {
 
     void ring() {
         if (!unrung) return;
+        /* The chained records' argument slots (put) are VRAM the packets read as soon as they
+         * are announced. */
+        host_writes_out(s);
         hsa_queue_store_write_index_relaxed(s->q, next);
         hsa_signal_store_relaxed(s->q->doorbell_signal, (hsa_signal_value_t)(next - 1));
         unrung = 0;
@@ -1795,6 +1842,7 @@ int a_stream_create(RadStream* out, int high_priority) {
         return RAD_E_DEVICE;
     }
     s->karg = static_cast<char*>(ka);
+    s->hdp = d.host_kargs ? nullptr : d.hdp_flush;
     s->chain_ctr = reinterpret_cast<uint64_t*>(s->karg + (size_t)(s->mask + 1) * kKargSlot);
     *reinterpret_cast<volatile uint64_t*>(s->chain_ctr) = 0;
     _mm_sfence();
@@ -4651,6 +4699,32 @@ bool ride_reusable(void* token) {
     std::lock_guard<std::mutex> lk(pool().mu);
     return reusable(g);
 }
+
+int chain_probe(void* stream, unsigned* x, unsigned* seen, unsigned pairs, unsigned blocks) {
+    if (!ours(stream) || !x || !seen) return RAD_E_INVAL;
+    for (unsigned i = 0; i < pairs; ++i)
+        if (rad_aql_probe_store(x, i + 1u, stream) < 0 ||
+            rad_aql_probe_load(x, seen + (size_t)i * blocks, blocks, stream) < 0)
+            return RAD_E_DEVICE;
+    return RAD_OK;
+}
+
+int chain_asks(void* stream, const void* src, void* dst, uint64_t bytes, unsigned* seen, unsigned n) {
+    Stream* s = ours(stream);
+    if (!s || !src || !dst || !seen || !s->chain_ctr || bytes == 0 || (bytes & 15)) return RAD_E_INVAL;
+    for (unsigned i = 0; i < n; ++i)
+        if (rad_aql_probe_ask(src, dst, bytes, seen, i + 1u,
+                              reinterpret_cast<unsigned long long*>(s->chain_ctr), stream) < 0)
+            return RAD_E_DEVICE;
+    return RAD_OK;
+}
+
+int chain_marks(void* stream, unsigned* seen, unsigned n) {
+    if (!ours(stream) || !seen) return RAD_E_INVAL;
+    for (unsigned i = 0; i < n; ++i)
+        if (rad_aql_probe_mark(seen, i + 1u, stream) < 0) return RAD_E_DEVICE;
+    return RAD_OK;
+}
 }  // namespace aql
 
 size_t aql_code_registered(void) { return a_code_mark(); }
@@ -4961,8 +5035,11 @@ hipError_t hipPeekAtLastError(void) {
 
 namespace rad {
 namespace aql {
-/* A build without the AQL backend hands out no ride. */
+/* A build without the AQL backend hands out no ride and launches no chain. */
 bool ride_reusable(void*) { return false; }
+int chain_probe(void*, unsigned*, unsigned*, unsigned, unsigned) { return RAD_E_UNSUPPORTED; }
+int chain_marks(void*, unsigned*, unsigned) { return RAD_E_UNSUPPORTED; }
+int chain_asks(void*, const void*, void*, uint64_t, unsigned*, unsigned) { return RAD_E_UNSUPPORTED; }
 }  // namespace aql
 }  // namespace rad
 
