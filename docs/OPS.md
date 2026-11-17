@@ -2998,10 +2998,11 @@ resolutions of one op. The one exception is `sample_chain` (below).
 | `sample_logprobs` | `M`(range) `n_vocab` `k` `vocab_off`/opt | `logits`, `params`? → `stats` |
 | `mtp_couple_propose` | `M`(range) `n_vocab` `round` `max_rounds` | `idx`:inout, `val`, `seq_ids`, `draw` → `state`:inout |
 | `mtp_couple_verify` | `M`(range) `n_cand` `n_vocab` | `cand_idx`, `cand_val`, `params`, `state` → `token`:inout |
+| `mtp_trav_verify` | `M`(range) `n_cand` `n_vocab` | `cand_idx`, `cand_val`, `params`, `state` → `token`:inout, `topo` |
 | `dflash_couple_propose` | `M`(range) `steps` `top_k` `rank` `n_vocab` `anchor_stride` `max_rounds` `q_temp`:f64/opt | `cand`, `unary`, `hp`?, `anchor`, `pred`w, `succ`w, `seq_ids`, `draw`, `tokens`:inout → `state`:inout |
 
-`mtp_couple_propose`, `dflash_couple_propose` and `mtp_couple_verify` are the speculative coupling
-(`draft-coupling: on`), and nothing else in the engine knows about coupling. Turning coupling on
+`mtp_couple_propose`, `dflash_couple_propose`, `mtp_couple_verify` and `mtp_trav_verify` are the
+speculative coupling (`draft-coupling: on`), and nothing else in the engine knows about coupling. Turning coupling on
 requires a linear chain of drafts: a serial head's rounds, or a block drafter whose architecture
 declares the coupled walk (DFlash2); no drafter, or a block drafter without the walk, is refused at
 bringup, because neither has a per-round draw to couple. The `spechub` plugin ships every row and
@@ -3020,7 +3021,20 @@ token the target itself drew at that position, and otherwise the token is a draw
 residual `(P - Q)+`. Both use 53-bit uniforms at `params.pos`; a row whose state is not bound to
 that seed and position keeps the ordinary token. `P` is FP64-normalised where `sample_pick` is
 FP32/24-bit, so a coupled row realizes the ideal filtered target law and is **not** seed-identical
-to the ordinary pick.
+to the ordinary pick. A state whose `blk` is at least 1 is the first row of a block, which the same
+op decides together with the rows after it (`draft-verify: block`, Block Verification, arXiv
+2403.10444, abi/rad_mtp_block.h): the workgroup of its round-1 row writes the tokens of rows 0 ..
+tau and the block's other rows return.
+
+`mtp_trav_verify` replaces `mtp_couple_verify` under `draft-verify: traversal` (Traversal
+Verification, arXiv 2505.12398, abi/rad_mtp_traversal.h). Its sixth operand `topo` is `[M, 2]` int32
+per sampled row: the parent's row in the step (-1 for a request's first row, the root of its tree)
+and the row's own draft token; the rows of a request are contiguous, root first, parents before
+children. One workgroup a request, on its root row, decides the whole request: the target's law of
+each row as integer masses of a fixed-point exponential, the walk from the last draft back to the
+first in FP64, and the tokens of the accepted path and the final token written into `token`. Rows
+whose state is not eligible are leaves and keep the ordinary token. Any `n_cand`. The kernel has no
+scratch segment. It emits the same law as the row-wise verify and accepts at least as many drafts.
 
 `dflash_couple_propose` is DFlash2's block walk sampled (abi/rad_spechub.h,
 `rad_dflash_couple_step`). It runs right after `dflash_select` over the same lattice, one workgroup a

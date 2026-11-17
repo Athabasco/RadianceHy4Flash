@@ -587,7 +587,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--num-speculative-tokens", { "2" } }, { "--spec-ngram", { "4" } },
         { "--spec-ngram-min", { "1" } }, { "--spec-ngram-max", { "6" } },
         { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
-        { "--draft-coupling", { "on" } },
+        { "--draft-coupling", { "on" } }, { "--draft-verify", { "block" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--api-key-env", { "RAD_KEY_ENV_INVENTORY" } },
         { "--allow-host", { "box" } },
@@ -1035,6 +1035,36 @@ TEST(the_draft_window_is_fixed_or_adaptive) {
     CHECK_EQ(parse({ "--draft-window" }, &c), RAD_E_INVAL);
     CHECK_EQ(std::string(draft_window_name(DraftWindow::Adaptive)), std::string("adaptive"));
     CHECK_EQ(std::string(draft_window_name(DraftWindow::Fixed)), std::string("fixed"));
+}
+
+/* --draft-verify is token (alias rowwise) unless asked for; block and traversal parse. block
+ * implies the coupled drafting and refuses coupling off; traversal needs the coupling and says so. */
+TEST(the_draft_verify_is_token_block_or_traversal) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(!d.draft_verify_block);
+    CHECK(!d.draft_verify_traversal);
+    Config c;
+    CHECK_EQ(parse({ "--draft-verify", "block" }, &c), RAD_OK);
+    CHECK(c.draft_verify_block);
+    CHECK(!c.draft_verify_traversal);
+    CHECK(c.draft_coupling);
+    Config t;
+    CHECK_EQ(parse({ "--draft-coupling", "on", "--draft-verify", "traversal" }, &t), RAD_OK);
+    CHECK(t.draft_verify_traversal);
+    CHECK(!t.draft_verify_block);
+    CHECK_EQ(parse({ "--draft-verify", "rowwise" }, &t), RAD_OK);
+    CHECK(!t.draft_verify_traversal);
+    CHECK_EQ(parse({ "--draft-verify", "token" }, &t), RAD_OK);
+    CHECK(!t.draft_verify_block);
+    Config b;
+    for (const char* bad : { "Block", "Traversal", "on", "" })
+        CHECK_EQ(parse({ "--draft-verify", bad }, &b), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-verify" }, &b), RAD_E_INVAL);
+    Config off;
+    CHECK_EQ(parse({ "--draft-verify", "block", "--draft-coupling", "off" }, &off), RAD_E_INVAL);
+    Config nocouple;
+    CHECK_EQ(parse({ "--draft-verify", "traversal" }, &nocouple), RAD_E_INVAL);
 }
 
 /* --draft-coupling is off unless asked for, and only off and on parse: a misspelt value must not
@@ -1634,7 +1664,7 @@ TEST(usage_names_every_flag_it_documents) {
      * for, so a flag added without a help line is caught. */
     const std::string text = stderr_of([] { config_usage("radiance"); });
     for (const char* f : { "--model", "--host-pool-mib", "--kv-cache-dtype",
-                           "--num-speculative-tokens", "--draft-window", "--draft-coupling",
+                           "--num-speculative-tokens", "--draft-window", "--draft-coupling", "--draft-verify",
                            "--checkpoint-policy",
                            "--prefix-cache-mib", "--prefix-cache-ttl", "--tp-wire",
                            "--embedding-placement", "--ngram-placement",

@@ -216,6 +216,13 @@ static const Flag g_flags[] = {
     "                                    couples the target's draw to it: more accepted drafts on sampled\n"
     "                                    requests, the same output law, other tokens than off for a fixed\n"
     "                                    seed" },
+    { "--draft-verify",       "MODE",   "token (default, alias rowwise) | block | traversal -- how a coupled draft chain is\n"
+    "                                    verified: token decides each row on its own (maximal coupling);\n"
+    "                                    block decides the whole chain at once (Block Verification, arXiv\n"
+    "                                    2403.10444; switches --draft-coupling on); traversal decides a\n"
+    "                                    root-to-leaf path bottom-up (Traversal Verification, arXiv\n"
+    "                                    2505.12398; needs --draft-coupling on). The same output law in\n"
+    "                                    every mode, more drafts accepted per step in block and traversal" },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
 
     { "--host",               "ADDR",   "listen address" },
@@ -904,6 +911,19 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
         }
+        else if (S("--draft-verify")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "token") || !std::strcmp(v, "rowwise")) {
+                c->draft_verify_block = false;
+                c->draft_verify_traversal = false;
+            }
+            else if (!std::strcmp(v, "block"))     { c->draft_verify_block = true;  c->draft_verify_traversal = false; }
+            else if (!std::strcmp(v, "traversal")) { c->draft_verify_block = false; c->draft_verify_traversal = true; }
+            else {
+                RAD_ERR("--draft-verify takes token (rowwise), block or traversal, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
         else if (S("--draft-model")) {
             /* Refused, not ignored: separate draft models are not supported (spec §10), and the
              * drafter comes from the container (rad-convert --draft-model merges one in; an MTP
@@ -1411,6 +1431,21 @@ int config_parse(int argc, char** argv, Config* c) {
         RAD_ERR("--video-min-pixels is above --video-max-pixels"); return RAD_E_INVAL; }
     if (c->video_min_frames && c->video_max_frames && *c->video_min_frames > *c->video_max_frames) {
         RAD_ERR("--video-min-frames is above --video-max-frames"); return RAD_E_INVAL; }
+    /* --draft-verify block verifies a linear chain with the coupled drafting's states, so it
+     * switches the coupling on; traversal needs it and says so rather than switching it on. */
+    if (c->draft_verify_block) {
+        if (c->given.count("--draft-coupling") && !c->draft_coupling) {
+            RAD_ERR("--draft-verify block needs the coupled drafting (--draft-coupling on); "
+                    "--draft-coupling off contradicts it");
+            return RAD_E_INVAL;
+        }
+        c->draft_coupling = true;
+    }
+    if (c->draft_verify_traversal && !c->draft_coupling) {
+        RAD_ERR("--draft-verify traversal requires --draft-coupling on: the walk needs the draft's "
+                "law Q, which only a coupled draft carries");
+        return RAD_E_INVAL;
+    }
     /* --host-pool-mib is what the model pins for its weights in all; Config::host_pool_mib is a
      * rank's share of it, whichever of the two options came first. */
     if (pool_all) c->host_pool_mib /= std::max(c->tp, 1);
@@ -1536,6 +1571,8 @@ const ShowRow kShow[] = {
           return c.draft_short_from < 0 ? std::string("auto")
                : c.draft_short_from > 0 ? num(c.draft_short_from) : std::string("0 (never)"); } },
     { "--draft-coupling",     [](const Config& c) { return onoff(c.draft_coupling); } },
+    { "--draft-verify",       [](const Config& c) {
+          return std::string(c.draft_verify_block ? "block" : c.draft_verify_traversal ? "traversal" : "token"); } },
     { "--draft-model",        [](const Config&) { return std::string("not implemented (the container's own drafter)"); } },
     { "--host",               [](const Config& c) { return c.host; } },
     { "--port",               [](const Config& c) { return num(c.port); } },

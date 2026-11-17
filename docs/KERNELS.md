@@ -718,9 +718,11 @@ Rows declaring an optional hook (tuning, fusion, weight layout):
 | `ref_dflash_couple_propose` | `dflash_couple_propose` |
 | `ref_mtp_couple_propose` | `mtp_couple_propose` |
 | `ref_mtp_couple_verify` | `mtp_couple_verify` |
+| `ref_mtp_trav_verify` | `mtp_trav_verify` |
 | `spechub_dflash_couple_propose` | `dflash_couple_propose` |
 | `spechub_mtp_couple_propose` | `mtp_couple_propose` |
 | `spechub_mtp_couple_verify` | `mtp_couple_verify` |
+| `spechub_mtp_trav_verify` | `mtp_trav_verify` |
 
 `libref`: 179 row(s) not reached:
 
@@ -1073,6 +1075,7 @@ on a marked row is a hole this model falls into.
 | `moe_scatter_inv` |   | - | device | - | - |
 | `mtp_couple_propose` |   | - | - | device+host | - |
 | `mtp_couple_verify` |   | - | - | device+host | - |
+| `mtp_trav_verify` |   | - | - | device+host | - |
 | `mtp_enter` |   | host | device | - | host |
 | `mul` |   | host | device | - | host |
 | `mul_weight` | yes | host | device | - | host |

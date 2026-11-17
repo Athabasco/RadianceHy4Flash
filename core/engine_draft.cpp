@@ -59,6 +59,11 @@ int Engine::step_state_init() {
      * pinned staging beside them. A program without them is refused rather than served
      * uncoupled. */
     mtp_couple_ = cfg_.draft_coupling;
+    if (cfg_.draft_verify_traversal && !mtp_couple_) {
+        RAD_ERR("--draft-verify traversal requires --draft-coupling on: the walk needs the draft's "
+                "law Q, which only a coupled draft carries");
+        return RAD_E_INVAL;
+    }
     if (mtp_couple_) {
         /* Coupling is defined on a linear chain of drafts: a serial head's rounds, or a block
          * drafter whose walk samples each position in turn (DFlash2, dflash_couple_propose), its

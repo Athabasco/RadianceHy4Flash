@@ -94,11 +94,11 @@ TEST(spechub_wiring_the_device_rows_are_production_and_the_oracle_rows_are_refer
     }
     CHECK_EQ(dev + host, p.count());
 #ifdef RAD_SPECHUB_WITH_DEVICE
-    CHECK_EQ(dev, 3);
-    CHECK_EQ(host, 3);
+    CHECK_EQ(dev, 4);
+    CHECK_EQ(host, 4);
 #else
     CHECK_EQ(dev, 0);
-    CHECK_EQ(host, 3);
+    CHECK_EQ(host, 4);
 #endif
 
     /* Every op must have at least one production row on a device build. This is the property the

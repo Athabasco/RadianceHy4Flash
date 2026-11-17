@@ -1038,6 +1038,15 @@ struct Config {
      * (RadBuildCtx::draft_coupling, abi/rad_spechub.h).
      * Off by default; on changes which tokens a fixed seed yields, not their law. */
     bool        draft_coupling = false;
+    /* --draft-verify token|block|traversal: how a coupled draft chain is verified. token (default):
+     * each row's maximal coupling (above). block: Block Verification (arXiv 2403.10444,
+     * abi/rad_mtp_block.h), the chain's drafts accepted jointly; the same output law, at least as
+     * many accepted tokens. block switches --draft-coupling on (the drafting half is shared).
+     * traversal: Traversal Verification (arXiv 2505.12398, abi/rad_mtp_traversal.h) walks the
+     * chain from its last draft back to its first; the same output law, never fewer accepted
+     * tokens than token-wise, and it needs --draft-coupling on. */
+    bool        draft_verify_block = false;
+    bool        draft_verify_traversal = false;
 
     /* ---------------- KL DIVERGENCE AGAINST A REFERENCE (core/kld.h) ----------------
      *

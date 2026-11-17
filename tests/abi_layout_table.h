@@ -1,4 +1,4 @@
-/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 40 and
+/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 41 and
  * RAD_FORMAT_VER 2, as { type, field, offset, size } rows ("" is the struct itself). A snapshot
  * of the headers on x86-64 Linux, which abi_layout_test.cpp holds the layout to; regenerate it
  * from the test's printout only together with a version bump. */
@@ -936,7 +936,7 @@
 { "RadMtpCoupleDraw", "seq", 16, 8 },
 { "RadMtpCoupleDraw", "card", 24, 4 },
 { "RadMtpCoupleDraw", "mode", 28, 4 },
-{ "RadMtpCoupleState", "", 0, 152 },
+{ "RadMtpCoupleState", "", 0, 168 },
 { "RadMtpCoupleState", "draw", 0, 32 },
 { "RadMtpCoupleState", "pos", 32, 8 },
 { "RadMtpCoupleState", "status", 40, 4 },
@@ -945,3 +945,7 @@
 { "RadMtpCoupleState", "count", 52, 4 },
 { "RadMtpCoupleState", "ids", 56, 32 },
 { "RadMtpCoupleState", "q", 88, 64 },
+{ "RadMtpCoupleState", "nkids", 152, 4 },
+{ "RadMtpCoupleState", "scheme", 156, 4 },
+{ "RadMtpCoupleState", "blk", 160, 4 },
+{ "RadMtpCoupleState", "pad_", 164, 4 },

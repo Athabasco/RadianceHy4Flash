@@ -1,0 +1,1146 @@
+/* tests/mtp_rrs_test.cpp -- the verifications of a coupled draft (--draft-coupling on), checked
+ * against their own law: recursive rejection sampling over a node's siblings (abi/rad_mtp_rrs.h) and
+ * Traversal Verification (--draft-verify traversal, abi/rad_mtp_traversal.h).
+ *
+ * The property: whatever the head's law Q and the draft's shape, the tokens a verify step commits
+ * are a prefix of a sample of the TARGET's autoregressive law. The tests run the real shared code
+ * (the propose row, the verify row, the walk) over a toy model with a known target P(. | prefix) and
+ * a different head Q(. | prefix), many seeds, and compare the empirical law of the emitted tokens
+ * with the exact one (chi-square, deterministic seeds), or enumerate every draft tree of a small
+ * model and compare the walk's law with the target's to 1e-10:
+ *
+ *   one node, 2..4 children   the first emitted token ~ P (single-node recursion, exact)
+ *   chain, chain + siblings   R = 3 rounds, with and without three sibling drafts at the root,
+ *                             walked by traversal (for a chain it is Block Verification's case)
+ *   negative controls         the with-replacement verify, token-level ratios, no (1 - p) term and
+ *                             a q that is never renormalised are NOT exact, and the same statistic
+ *                             sees each of them
+ *   degenerate                Q == P accepts the first child; disjoint supports reject all and emit
+ *                             from P
+ *   fixed point               the walk's integer exponential tracks exp to 2^-22, its law is the
+ *                             softmax to FP32 accuracy, and by enumeration the walk emits exactly
+ *                             the law it reads
+ *
+ * The step is walked the way the core walks it: the verify row writes the sampler's token for each
+ * visited node and ADV_ACCEPT's rule (the first child whose token is that token) follows it; after
+ * the step, the sequence continues from the exact target so the first three tokens of every trial
+ * have a known joint law.
+ */
+#include "rad_test.h"
+
+#include "rad_mtp_rrs.h"
+#include "rad_mtp_traversal.h"
+#include "../plugin/spechub/spechub.h"
+
+#include <algorithm>
+#include <functional>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
+namespace {
+
+constexpr int V = 12;  /* the toy vocabulary: larger than the head's top 8, so the target has mass off Q's support */
+
+uint64_t H(uint64_t a) { return rad_mtp_rrs_mix(a); }
+
+/* The target's candidate plane at a prefix (ids and logits; some prefixes drop a token, as a
+ * top-k / top-p would) and the head's shortlist (all V tokens, logits). The head is a noisy
+ * version of the target, so acceptance is neither 0 nor 1. */
+struct Law {
+    int32_t pid[V];  float pval[V];  int pn = 0;      /* target candidates */
+    double  p[V];                                      /* the exact target law over tokens */
+    int32_t qid[8];  float qval[8];                    /* the head's shortlist */
+};
+
+double g_sharp = 1.0;   /* the laws' inverse temperature: a peaked target (T = 0.7 and a top-p) is the engine's regime */
+
+Law law_at(uint64_t prefix_hash, double head_noise) {
+    Law L;
+    float lt[V], lq[V];
+    for (int i = 0; i < V; ++i) {
+        lt[i] = (float)g_sharp * ((float)((H(prefix_hash * 131 + (uint64_t)i * 977 + 1) >> 40) % 3000) / 1000.0f - 1.5f);
+        const float nz = (float)((H(prefix_hash * 257 + (uint64_t)i * 331 + 7) >> 40) % 3000) / 1000.0f - 1.5f;
+        lq[i] = 0.75f * lt[i] + (float)(head_noise * g_sharp) * nz;
+    }
+    const uint64_t h = H(prefix_hash + 99);
+    const int drop = h % 3 == 0 ? (int)((h >> 8) % V) : -1;   /* a target token the filters removed */
+    double z = 0;
+    for (int i = 0; i < V; ++i) { L.p[i] = 0; if (i != drop) { L.pid[L.pn] = i; L.pval[L.pn++] = lt[i]; } }
+    for (int j = 0; j < L.pn; ++j) z += std::exp((double)L.pval[j]);
+    for (int j = 0; j < L.pn; ++j) L.p[L.pid[j]] = std::exp((double)L.pval[j]) / z;
+    /* the head reports its 8 best (descending, ties to the lower id): the rest of the vocabulary is
+     * off Q's support, where the target keeps its mass */
+    int ord[V];
+    for (int i = 0; i < V; ++i) ord[i] = i;
+    std::stable_sort(ord, ord + V, [&](int a, int b) { return lq[a] > lq[b]; });
+    for (int i = 0; i < 8; ++i) { L.qid[i] = ord[i]; L.qval[i] = lq[ord[i]]; }
+    return L;
+}
+
+uint64_t child_hash(uint64_t ph, int tok) { return H(ph * 1000003ull + (uint64_t)tok + 17); }
+
+/* A draw from the target law at the prefix: the ordinary pick. */
+int sample_law(const Law& L, uint64_t seed, uint64_t pos, uint64_t key) {
+    double u = rad_spechub_uniform(seed, pos, key);
+    int last = 0;
+    for (int i = 0; i < V; ++i) {
+        if (L.p[i] <= 0) continue;
+        last = i;
+        u -= L.p[i];
+        if (u < 0) return i;
+    }
+    return last;
+}
+
+RadMtpCoupleDraw make_draw(uint64_t seed, uint64_t base) {
+    RadMtpCoupleDraw d{};
+    d.seed = seed; d.base = base; d.seq = 1; d.card = 0; d.mode = 1;
+    return d;
+}
+
+/* The verify row of the real plugin code over one candidate plane and one bound state. */
+int verify(const RadMtpCoupleState& st, const Law& L, uint64_t seed, uint64_t pos, int fallback) {
+    uint32_t params[24] = {};
+    RadSampleParams* p = reinterpret_cast<RadSampleParams*>(params);
+    p->seed = seed;
+    p->pos = pos;
+    int32_t tok = fallback;
+    RadMtpCoupleVerifyCall c{};
+    c.idx = L.pid; c.val = L.pval; c.params = params;
+    c.state = reinterpret_cast<const uint32_t*>(&st);
+    c.token = &tok;
+    c.M = 1; c.n_cand = L.pn; c.vocab = 1000;
+    c.ld[0] = L.pn; c.ld[1] = L.pn; c.ld[2] = 24; c.ld[3] = RAD_MTP_COUPLE_STATE_WORDS; c.ld[4] = 1;
+    rad_mtp_couple_verify_row(c, 0);
+    return tok;
+}
+
+/* ------------------------------------------------------------------ a toy drafted tree */
+
+struct Tree {
+    int      n = 0;                 /* nodes 1..n */
+    int      tok[64] = {}, par[64] = {};
+    uint64_t hash[64] = {};         /* the prefix hash of every node, node 0 the root */
+    RadMtpCoupleState st[64] = {};  /* row k's coupled state (status 0: none) */
+};
+
+enum Kind { CHAIN, STAGE1 };
+int g_scheme = 0;   /* sibling scheme of the root's drafts: 0 Gumbel-top-k, m + 1 RheoSampling */
+
+/* The chain's drafting, through the real propose row: round r over the head's law at the chain
+ * prefix. With L > 0 the root also drafts L siblings of its first child, sampled without
+ * replacement from the same law (Gumbel-top-k, or RheoSampling's scheme), as a draft tree's root
+ * does; its state then lists the children in draft order (abi/rad_mtp_rrs.h). */
+void draft_chain(Tree* t, uint64_t seed, uint64_t base, int R, int L, double noise, uint64_t h0 = 1) {
+    uint64_t h = h0;
+    t->hash[0] = h;
+    int n = 0;
+    std::vector<int32_t> leaves;
+    for (int r = 1; r <= R; ++r) {
+        const Law law = law_at(h, noise);
+        int32_t idx[8];
+        float   val[8];
+        for (int i = 0; i < 8; ++i) { idx[i] = law.qid[i]; val[i] = law.qval[i]; }
+        const RadMtpCoupleDraw draw = make_draw(seed, base);
+        const int32_t card = 0;
+        RadMtpCoupleProposeCall c{};
+        c.idx = idx; c.val = val; c.card = &card;
+        c.draw = reinterpret_cast<const uint32_t*>(&draw);
+        RadMtpCoupleState rows[8] = {};
+        c.state = reinterpret_cast<uint32_t*>(rows);
+        c.M = 1; c.vocab = 1000;
+        c.ld_idx = 8; c.ld_val = 8; c.ld_draw = RAD_MTP_COUPLE_DRAW_WORDS;
+        c.st_round = RAD_MTP_COUPLE_STATE_WORDS; c.st_row = 0;
+        c.round = r;
+        rad_mtp_couple_propose_row(c, 0);
+        RadMtpCoupleState s = rows[r - 1];
+        if (r == 1 && L > 0 && s.status == 1) {
+            if (g_scheme > 0) rad_mtp_rrs_draw_rheo(&s, 0, 1 + L, g_scheme - 1);
+            else              rad_mtp_rrs_draw(&s, 0, 1 + L);
+            s.status = 1;
+            for (int i = 0; i < 8; ++i) idx[i] = i < s.nkids ? s.ids[i] : -1;
+        }
+        t->st[r - 1] = s;
+        const int pick = idx[0];
+        if (r == 1)
+            for (int i = 1; i < 8; ++i) {
+                const int32_t id = idx[i];
+                if (id < 0 || id >= 1000 || id == pick || (int)leaves.size() >= L) continue;
+                if (std::find(leaves.begin(), leaves.end(), id) == leaves.end()) leaves.push_back(id);
+            }
+        ++n;
+        t->tok[n] = pick; t->par[n] = n - 1;
+        h = child_hash(h, pick);
+        t->hash[n] = h;
+    }
+    for (int32_t id : leaves) {
+        ++n;
+        t->tok[n] = id; t->par[n] = 0;
+        t->hash[n] = child_hash(t->hash[0], id);
+    }
+    t->n = n;
+}
+
+/* One verify step over the drafted tree, walked as the core does. Returns the emitted tokens
+ * (the accepted nodes' tokens and the final one), extended by direct target draws to `want`. */
+int walk(const Tree& t, uint64_t seed, uint64_t n_out, double noise, int want, int* out,
+         int* accepted) {
+    int len = 0, cur = 0, depth = 0;
+    uint64_t h = t.hash[0];
+    *accepted = 0;
+    for (;;) {
+        const Law law = law_at(h, noise);
+        const uint64_t pos = n_out + (uint64_t)depth;
+        /* the row's children, in node order, without repeats */
+        int32_t kid[64];
+        int nk = 0;
+        for (int j = cur + 1; j <= t.n; ++j) {
+            if (t.par[j] != cur) continue;
+            bool dup = false;
+            for (int q = 0; q < nk; ++q) dup = dup || kid[q] == t.tok[j];
+            if (!dup) kid[nk++] = t.tok[j];
+        }
+        int y = sample_law(law, seed, pos, 0);   /* the ordinary pick; an unbound row keeps it */
+        const RadMtpCoupleState& c = t.st[cur];
+        if (nk > 0 && c.status == 1) {
+            const int kept = rad_mtp_rrs_prefix(c, kid, nk);
+            if (kept > 0 && c.round == depth + 1 && c.x == kid[0]) {
+                RadMtpCoupleState b = c;
+                b.pos = rad_mtp_couple_verify_pos(n_out, depth + 1);
+                if (c.nkids >= 2 || c.scheme) b.nkids = kept;
+                y = verify(b, law, seed, pos, y);
+            }
+        }
+        out[len++] = y;
+        int nxt = -1;
+        for (int j = cur + 1; j <= t.n && nxt < 0; ++j)
+            if (t.par[j] == cur && t.tok[j] == y) nxt = j;
+        if (nxt < 0) break;
+        cur = nxt; ++depth; ++*accepted;
+        h = child_hash(h, y);
+    }
+    /* the steps after this one: exact draws from the target given what was committed */
+    uint64_t ph = t.hash[0];
+    for (int i = 0; i < len; ++i) ph = child_hash(ph, out[i]);
+    while (len < want) {
+        const Law law = law_at(ph, noise);
+        const int y = sample_law(law, seed ^ 0xabcdef1234ull, n_out + (uint64_t)len, 1);
+        out[len++] = y;
+        ph = child_hash(ph, y);
+    }
+    return len;
+}
+
+/* Chi-square of the empirical first-`m`-token law against the target's, cells with too little
+ * expected mass pooled; returns (chi2 - df) / sqrt(2 df). */
+double zscore(const std::vector<double>& counts, const std::vector<double>& expect, double n) {
+    double chi = 0, pool_c = 0, pool_e = 0;
+    int cells = 0;
+    for (size_t i = 0; i < counts.size(); ++i) {
+        const double e = expect[i] * n;
+        if (e < 20) { pool_c += counts[i]; pool_e += e; continue; }
+        chi += (counts[i] - e) * (counts[i] - e) / e;
+        ++cells;
+    }
+    if (pool_e >= 5) { chi += (pool_c - pool_e) * (pool_c - pool_e) / pool_e; ++cells; }
+    const double df = cells - 1;
+    return (chi - df) / std::sqrt(2.0 * df);
+}
+
+struct Result { double z; double mean_acc; double first_z; };
+
+/* Run `trials` steps of one drafted-tree kind and compare the first three emitted tokens' joint
+ * law (and the first token's marginal) with the target's. */
+Result run_kind(Kind kind, int trials, double noise,
+                const std::function<void(Tree*, int)>* hook = nullptr) {
+    std::vector<double> cnt3((size_t)V * V * V, 0), cnt1((size_t)V, 0);
+    double acc = 0;
+    for (int s = 0; s < trials; ++s) {
+        const uint64_t seed = 0x1234567ull + (uint64_t)s * 7919ull;
+        Tree t;
+        if (kind == CHAIN)  draft_chain(&t, seed, 0, 3, 0, noise);
+        else if (kind == STAGE1) draft_chain(&t, seed, 0, 3, 3, noise);
+        if (hook) (*hook)(&t, s);
+        int out[64], accepted = 0;
+        walk(t, seed, 0, noise, 3, out, &accepted);
+        ++cnt1[(size_t)out[0]];
+        ++cnt3[(size_t)((out[0] * V + out[1]) * V + out[2])];
+        acc += accepted;
+    }
+    std::vector<double> e1((size_t)V, 0), e3((size_t)V * V * V, 0);
+    const uint64_t h0 = 1;
+    const Law l0 = law_at(h0, noise);
+    for (int a = 0; a < V; ++a) {
+        e1[(size_t)a] = l0.p[a];
+        const Law l1 = law_at(child_hash(h0, a), noise);
+        for (int b = 0; b < V; ++b) {
+            const Law l2 = law_at(child_hash(child_hash(h0, a), b), noise);
+            for (int c = 0; c < V; ++c) e3[(size_t)((a * V + b) * V + c)] = l0.p[a] * l1.p[b] * l2.p[c];
+        }
+    }
+    return { zscore(cnt3, e3, trials), acc / trials, zscore(cnt1, e1, trials) };
+}
+
+
+/* ------------------------------------------------------------------ traversal verification */
+
+/* The walk's view of a drafted toy tree: the bound states exactly as `walk` binds them. */
+struct TravTree {
+    const Tree& t;
+    double noise;
+    uint64_t seed, n_out;
+    Law laws[64];
+    RadMtpCoupleState bound[64];
+    bool has[64] = {};
+    int depth[64] = {};
+    TravTree(const Tree& tr, uint64_t sd, uint64_t no, double nz) : t(tr), noise(nz), seed(sd), n_out(no) {
+        depth[0] = 0;
+        for (int j = 0; j <= t.n; ++j) {
+            if (j > 0) depth[j] = depth[t.par[j]] + 1;
+            laws[j] = law_at(t.hash[j], noise);
+            const RadMtpCoupleState& c = t.st[j];
+            int32_t kid[64];
+            int nk = 0;
+            for (int q = j + 1; q <= t.n; ++q) {
+                if (t.par[q] != j) continue;
+                bool dup = false;
+                for (int z = 0; z < nk; ++z) dup = dup || kid[z] == t.tok[q];
+                if (!dup) kid[nk++] = t.tok[q];
+            }
+            if (nk > 0 && c.status == 1) {
+                const int kept = rad_mtp_rrs_prefix(c, kid, nk);
+                if (kept > 0 && c.round == depth[j] + 1 && c.x == kid[0]) {
+                    bound[j] = c;
+                    bound[j].pos = rad_mtp_couple_verify_pos(n_out, depth[j] + 1);
+                    if (c.nkids >= 2 || c.scheme) bound[j].nkids = kept;
+                    has[j] = true;
+                }
+            }
+        }
+    }
+    const RadMtpCoupleState* state(int v) const { return has[v] ? &bound[v] : nullptr; }
+    bool cand(int v, const int32_t** ids, const float** val, int64_t* n) const {
+        *ids = laws[v].pid; *val = laws[v].pval; *n = laws[v].pn;
+        return true;
+    }
+    int child(int v, int32_t token) const {
+        for (int j = v + 1; j <= t.n; ++j)
+            if (t.par[j] == v && t.tok[j] == token) return j;
+        return -1;
+    }
+    int64_t vocab() const { return 1000; }
+};
+
+/* One step walked by traversal verification, then continued from the exact target. */
+int walk_trav(const Tree& t, uint64_t seed, uint64_t n_out, double noise, int want, int* out,
+              int* accepted, RadMtpTravOpt opt) {
+    TravTree T(t, seed, n_out, noise);
+    RadMtpTravOut o;
+    int len = 0;
+    *accepted = 0;
+    if (rad_mtp_trav_walk(T, 0, seed, n_out, &o, opt)) {
+        for (int i = 1; i < o.n; ++i) out[len++] = t.tok[o.node[i]];
+        *accepted = o.n - 1;
+        const int last = o.node[o.n - 1];
+        out[len++] = o.has_y ? o.y : sample_law(T.laws[last], seed, n_out + (uint64_t)(o.n - 1), 0);
+    } else {
+        out[len++] = sample_law(T.laws[0], seed, n_out, 0);
+    }
+    uint64_t ph = t.hash[0];
+    for (int i = 0; i < len; ++i) ph = child_hash(ph, out[i]);
+    while (len < want) {
+        const Law law = law_at(ph, noise);
+        const int y = sample_law(law, seed ^ 0xabcdef1234ull, n_out + (uint64_t)len, 1);
+        out[len++] = y;
+        ph = child_hash(ph, y);
+    }
+    return len;
+}
+
+Result run_trav(Kind kind, int trials, double noise, RadMtpTravOpt opt) {
+    std::vector<double> cnt3((size_t)V * V * V, 0), cnt1((size_t)V, 0);
+    double acc = 0;
+    for (int s = 0; s < trials; ++s) {
+        const uint64_t seed = 0x1234567ull + (uint64_t)s * 7919ull;
+        Tree t;
+        if (kind == CHAIN)  draft_chain(&t, seed, 0, 3, 0, noise);
+        else if (kind == STAGE1) draft_chain(&t, seed, 0, 3, 3, noise);
+        int out[64], accepted = 0;
+        walk_trav(t, seed, 0, noise, 3, out, &accepted, opt);
+        ++cnt1[(size_t)out[0]];
+        ++cnt3[(size_t)((out[0] * V + out[1]) * V + out[2])];
+        acc += accepted;
+    }
+    std::vector<double> e1((size_t)V, 0), e3((size_t)V * V * V, 0);
+    const uint64_t h0 = 1;
+    const Law l0 = law_at(h0, noise);
+    for (int a = 0; a < V; ++a) {
+        e1[(size_t)a] = l0.p[a];
+        const Law l1 = law_at(child_hash(h0, a), noise);
+        for (int b = 0; b < V; ++b) {
+            const Law l2 = law_at(child_hash(child_hash(h0, a), b), noise);
+            for (int c = 0; c < V; ++c) e3[(size_t)((a * V + b) * V + c)] = l0.p[a] * l1.p[b] * l2.p[c];
+        }
+    }
+    return { zscore(cnt3, e3, trials), acc / trials, zscore(cnt1, e1, trials) };
+}
+
+/* The first FOUR emitted tokens' joint: the fourth is the final token of a three-deep accepted path,
+ * drawn from the walk's residual law, which the three-token statistic never reads. */
+double run_trav4(Kind kind, int trials, double noise) {
+    std::vector<double> cnt((size_t)V * V * V * V, 0), ex((size_t)V * V * V * V, 0);
+    for (int s = 0; s < trials; ++s) {
+        const uint64_t seed = 0x2468ace1ull + (uint64_t)s * 6151ull;
+        Tree t;
+        if (kind == CHAIN)  draft_chain(&t, seed, 0, 3, 0, noise);
+        else if (kind == STAGE1) draft_chain(&t, seed, 0, 3, 3, noise);
+        int out[64], accepted = 0;
+        walk_trav(t, seed, 0, noise, 4, out, &accepted, RadMtpTravOpt{});
+        ++cnt[(size_t)(((out[0] * V + out[1]) * V + out[2]) * V + out[3])];
+    }
+    const uint64_t h0 = 1;
+    const Law l0 = law_at(h0, noise);
+    for (int a = 0; a < V; ++a) {
+        const uint64_t ha = child_hash(h0, a); const Law l1 = law_at(ha, noise);
+        for (int b = 0; b < V; ++b) {
+            const uint64_t hb = child_hash(ha, b); const Law l2 = law_at(hb, noise);
+            for (int c = 0; c < V; ++c) {
+                const Law l3 = law_at(child_hash(hb, c), noise);
+                for (int d = 0; d < V; ++d)
+                    ex[(size_t)(((a * V + b) * V + c) * V + d)] = l0.p[a] * l1.p[b] * l2.p[c] * l3.p[d];
+            }
+        }
+    }
+    return zscore(cnt, ex, trials);
+}
+
+}  /* namespace */
+
+/* A whole generation: steps drafted at the committed prefix (base = the output length so far, the
+ * engine's), each walked as the core walks it, until `want` tokens are out. The joint law of tokens
+ * [1, 4) -- spanning the step boundaries, with token 0 and everything after marginalised -- and of
+ * tokens [0, 3) must be the target's: this is what a draft or verify stream reused across steps
+ * would break. */
+Result run_steps(Kind kind, int trials, double noise, bool trav = false) {
+    const int want = 6;
+    std::vector<double> cnt_a((size_t)V * V * V, 0), cnt_b((size_t)V * V * V, 0);
+    double steps = 0;
+    for (int s = 0; s < trials; ++s) {
+        const uint64_t seed = 0x7654321ull + (uint64_t)s * 104729ull;
+        int out[64], len = 0;
+        uint64_t h = 1;
+        while (len < want) {
+            Tree t;
+            if (kind == CHAIN)       draft_chain(&t, seed, (uint64_t)len, 3, 0, noise, h);
+            else if (kind == STAGE1) draft_chain(&t, seed, (uint64_t)len, 3, 3, noise, h);
+            int step_out[64], accepted = 0;
+            const int n = trav ? walk_trav(t, seed, (uint64_t)len, noise, 0, step_out, &accepted, RadMtpTravOpt{})
+                               : walk(t, seed, (uint64_t)len, noise, 0, step_out, &accepted);
+            for (int i = 0; i < n; ++i) { out[len++] = step_out[i]; h = child_hash(h, step_out[i]); }
+            ++steps;
+        }
+        ++cnt_a[(size_t)((out[0] * V + out[1]) * V + out[2])];
+        ++cnt_b[(size_t)((out[1] * V + out[2]) * V + out[3])];
+    }
+    /* expected: token 0 marginalised for (1,2,3) */
+    std::vector<double> ea((size_t)V * V * V, 0), eb((size_t)V * V * V, 0);
+    const uint64_t h0 = 1;
+    const Law l0 = law_at(h0, noise);
+    for (int a = 0; a < V; ++a) {
+        const uint64_t ha = child_hash(h0, a);
+        const Law l1 = law_at(ha, noise);
+        for (int b = 0; b < V; ++b) {
+            const uint64_t hb = child_hash(ha, b);
+            const Law l2 = law_at(hb, noise);
+            for (int c = 0; c < V; ++c) {
+                const uint64_t hc = child_hash(hb, c);
+                const Law l3 = law_at(hc, noise);
+                ea[(size_t)((a * V + b) * V + c)] = l0.p[a] * l1.p[b] * l2.p[c];
+                for (int d = 0; d < V; ++d)
+                    eb[(size_t)((b * V + c) * V + d)] += l0.p[a] * l1.p[b] * l2.p[c] * l3.p[d];
+            }
+        }
+    }
+    return { zscore(cnt_a, ea, trials), steps / trials, zscore(cnt_b, eb, trials) };
+}
+
+TEST(a_generation_over_several_steps_keeps_the_target_law) {
+    const int trials = 150000;
+    const Kind kinds[] = { CHAIN, STAGE1 };
+    const char* names[] = { "chain", "stage1" };
+    for (int k = 0; k < 2; ++k) {
+        const Result r = run_steps(kinds[k], trials, 1.0);
+        std::printf("  %-8s steps=%.3f  z[0..3)=%.2f  z[1..4)=%.2f\n", names[k], r.mean_acc, r.z, r.first_z);
+        CHECK(r.z < 4.5);
+        CHECK(r.first_z < 4.5);
+    }
+}
+
+/* The single-node recursion: m = 1..4 children drawn without replacement from Q, verified in draft
+ * order, emit ~ P for every (P, Q) pair, including a P that lacks some of Q's tokens. */
+TEST(one_node_with_several_children_emits_the_target_law) {
+    const int trials = 400000;
+    for (int m = 2; m <= 4; ++m)
+        for (int pair = 0; pair < 6; ++pair) {
+            const Law L = law_at(1000 + (uint64_t)pair, 1.0 + 0.4 * pair);
+            std::vector<double> cnt((size_t)V, 0);
+            for (int s = 0; s < trials; ++s) {
+                RadMtpCoupleState st{};
+                CHECK(rad_mtp_couple_build_q(L.qid, L.qval, 1000, &st));
+                st.draw = make_draw(0x9e3779b97f4a7c15ull * (uint64_t)(s + 1), (uint64_t)s);
+                st.status = 1; st.round = 1; st.pos = 5;
+                rad_mtp_rrs_draw(&st, 0, m);
+                CHECK(rad_mtp_couple_state_valid(st, 1000));
+                CHECK_EQ(st.nkids, std::min(m, st.count));
+                const int y = verify(st, L, st.draw.seed, 5, -1);
+                CHECK(y >= 0 && y < V);
+                ++cnt[(size_t)y];
+            }
+            std::vector<double> e(L.p, L.p + V);
+            const double z = zscore(cnt, e, trials);
+            if (z > 4.5) std::printf("  m=%d pair=%d z=%.2f\n", m, pair, z);
+            CHECK(z < 4.5);
+        }
+}
+
+/* The negative control: SpecInfer's with-replacement verify (q not removed or renormalised) on
+ * drafts drawn without replacement is not exact, and the same statistic sees it. */
+TEST(the_with_replacement_verify_is_not_exact_for_without_replacement_drafts) {
+    const int trials = 400000, m = 3;
+    const Law L = law_at(1002, 1.0);
+    std::vector<double> cnt((size_t)V, 0);
+    for (int s = 0; s < trials; ++s) {
+        RadMtpCoupleState st{};
+        rad_mtp_couple_build_q(L.qid, L.qval, 1000, &st);
+        st.draw = make_draw(0x9e3779b97f4a7c15ull * (uint64_t)(s + 1), (uint64_t)s);
+        rad_mtp_rrs_draw(&st, 0, m);
+        double r[V], q[V];
+        for (int i = 0; i < V; ++i) { r[i] = L.p[i]; q[i] = 0; }
+        for (int k = 0; k < st.count; ++k) q[st.ids[k]] = st.q[k];
+        int out = -1;
+        for (int i = 0; i < m && out < 0; ++i) {
+            const int x = st.ids[i];
+            const double u = rad_mtp_rrs_uaccept(st.draw.seed, 5, i);
+            if (r[x] >= q[x] || u * q[x] < r[x]) { out = x; break; }
+            double z = 0;
+            for (int k = 0; k < V; ++k) { r[k] = std::max(r[k] - q[k], 0.0); z += r[k]; }
+            for (int k = 0; k < V; ++k) r[k] /= z;   /* q never renormalised, the child never removed */
+        }
+        if (out < 0) {
+            double u = rad_spechub_uniform(st.draw.seed, 5, RAD_SAMPLE_KEY_RESID);
+            out = 0;
+            for (int k = 0; k < V; ++k) { if (r[k] <= 0) continue; out = k; u -= r[k]; if (u < 0) break; }
+        }
+        ++cnt[(size_t)out];
+    }
+    std::vector<double> e(L.p, L.p + V);
+    const double z = zscore(cnt, e, trials);
+    CHECK(z > 20.0);
+}
+
+TEST(a_chain_and_a_chain_with_root_siblings_emit_the_target_law) {
+    const int trials = 300000;
+    const Result chain = run_kind(CHAIN, trials, 1.0);
+    const Result s1    = run_kind(STAGE1, trials, 1.0);
+    std::printf("  chain z=%.2f acc=%.3f | root siblings z=%.2f acc=%.3f\n", chain.z, chain.mean_acc, s1.z, s1.mean_acc);
+    CHECK(chain.z < 4.5);  CHECK(chain.first_z < 4.5);
+    CHECK(s1.z < 4.5);     CHECK(s1.first_z < 4.5);
+    /* siblings are drafted to be accepted: they accept at least as many drafts as the chain */
+    CHECK(s1.mean_acc > chain.mean_acc);
+    /* and a head far from the target changes the acceptance, never the law */
+    const Result far = run_kind(STAGE1, 150000, 3.0);
+    CHECK(far.z < 4.5);
+}
+
+/* Q == P: the first child is accepted whatever the seed; disjoint supports: nothing drafted is
+ * accepted and the token is a draw from P. */
+TEST(degenerate_laws) {
+    const Law L = law_at(77, 1.0);
+    /* P exactly the head's law: a plane equal to the shortlist */
+    Law same = L;
+    same.pn = 0;
+    for (int i = 0; i < 8; ++i) { same.pid[same.pn] = L.qid[i]; same.pval[same.pn++] = L.qval[i]; }
+    for (int s = 0; s < 2000; ++s) {
+        RadMtpCoupleState st{};
+        CHECK(rad_mtp_couple_build_q(L.qid, L.qval, 1000, &st));
+        st.draw = make_draw(31ull * (uint64_t)(s + 1), 0);
+        st.status = 1; st.round = 1; st.pos = 0;
+        rad_mtp_rrs_draw(&st, 0, 3);
+        CHECK_EQ(verify(st, same, st.draw.seed, 0, -7), st.ids[0]);
+    }
+    /* disjoint: the target lives on tokens the head never reports */
+    Law dis{};
+    dis.pn = 2; dis.pid[0] = 20; dis.pid[1] = 21; dis.pval[0] = 0.3f; dis.pval[1] = -0.4f;
+    const double p20 = 1.0 / (1.0 + std::exp(-0.7));
+    int n20 = 0;
+    const int trials = 100000;
+    for (int s = 0; s < trials; ++s) {
+        RadMtpCoupleState st{};
+        CHECK(rad_mtp_couple_build_q(L.qid, L.qval, 1000, &st));
+        st.draw = make_draw(77ull * (uint64_t)(s + 1), 0);
+        st.status = 1; st.round = 1; st.pos = 3;
+        rad_mtp_rrs_draw(&st, 0, 4);
+        const int y = verify(st, dis, st.draw.seed, 3, -7);
+        CHECK(y == 20 || y == 21);
+        n20 += y == 20;
+    }
+    CHECK(std::fabs((double)n20 / trials - p20) < 5 * std::sqrt(p20 * (1 - p20) / trials));
+}
+
+TEST(traversal_verification_emits_the_target_law_and_accepts_more) {
+    const int trials = 200000;
+    const RadMtpTravOpt ok{};
+    const Result chain = run_trav(CHAIN, trials, 1.0, ok);
+    const Result s1    = run_trav(STAGE1, trials, 1.0, ok);
+    const Result rchain = run_kind(CHAIN, trials, 1.0);
+    const Result rs1    = run_kind(STAGE1, trials, 1.0);
+    std::printf("  traversal chain z=%.2f acc=%.3f (rowwise %.3f) | root siblings z=%.2f acc=%.3f (rowwise %.3f)\n",
+                chain.z, chain.mean_acc, rchain.mean_acc, s1.z, s1.mean_acc, rs1.mean_acc);
+    CHECK(chain.z < 4.5); CHECK(chain.first_z < 4.5);
+    CHECK(s1.z < 4.5);    CHECK(s1.first_z < 4.5);
+    CHECK(chain.mean_acc > rchain.mean_acc);
+    CHECK(s1.mean_acc > rs1.mean_acc);
+    const Result far = run_trav(STAGE1, 100000, 3.0, ok);
+    CHECK(far.z < 4.5);
+}
+
+/* Each mistake the walk could make is caught by the same statistic: token-level ratios (1), no
+ * (1 - p) term (2), the draft law never renormalised after a rejection (3). */
+TEST(traversal_verification_mistakes_are_not_exact) {
+    for (int ctl = 1; ctl <= 3; ++ctl) {
+        RadMtpTravOpt o; o.ctl = ctl;
+        const Result r = run_trav(STAGE1, 100000, 1.0, o);
+        std::printf("  negative control %d: z=%.2f first_z=%.2f\n", ctl, r.z, r.first_z);
+        CHECK(r.z > 20.0 || r.first_z > 20.0);
+    }
+}
+
+/* The walk's final token (the fourth of a three-deep path) and a generation over several steps (no
+ * uniform reused across steps). */
+TEST(traversal_verification_final_token_and_steps_are_exact) {
+    const Kind kinds[] = { CHAIN, STAGE1 };
+    const char* names[] = { "chain", "root siblings" };
+    for (int k = 0; k < 2; ++k) {
+        const double z4 = run_trav4(kinds[k], 300000, 1.0);
+        const Result r = run_steps(kinds[k], 100000, 1.0, true);
+        std::printf("  trav %-14s z4=%.2f steps=%.3f z[0..3)=%.2f z[1..4)=%.2f\n", names[k], z4, r.mean_acc, r.z, r.first_z);
+        CHECK(z4 < 4.5);
+        CHECK(r.z < 4.5);
+        CHECK(r.first_z < 4.5);
+    }
+}
+
+/* Peaked laws: the target's inverse temperature 3 and 6 (a few tokens carry the mass, the acceptance
+ * ratios sit at or above one on the trunk), where a cap or rounding at p = 1 would show. */
+TEST(traversal_verification_is_exact_on_peaked_laws) {
+    const double old = g_sharp;
+    for (double sh : { 3.0, 6.0 }) {
+        g_sharp = sh;
+        for (Kind k : { CHAIN, STAGE1 }) {
+            const Result r = run_trav(k, 150000, 1.0, RadMtpTravOpt{});
+            const double z4 = run_trav4(k, 200000, 1.0);
+            std::printf("  trav sharp=%.0f kind=%d z=%.2f first=%.2f z4=%.2f acc=%.3f\n", sh, (int)k, r.z, r.first_z, z4, r.mean_acc);
+            CHECK(r.z < 4.5); CHECK(r.first_z < 4.5); CHECK(z4 < 4.5);
+        }
+    }
+    g_sharp = old;
+}
+
+namespace {
+
+constexpr int SV = 8;   /* toy vocab bound: tokens 0 .. V-1 with V <= 6 here */
+
+struct SLaw {
+    int     V = 0;
+    int32_t pid[SV];  float pval[SV];  int pn = 0;   /* the target's candidate plane (its nucleus) */
+    double  p[SV] = {};                              /* its exact law over tokens 0 .. V-1 */
+    int32_t qid[8];   float qval[8];                 /* the head's shortlist, holes = -1 / -inf */
+};
+
+/* A target over `psup` of the V tokens (the others have no candidate, as after top-p) and a head over
+ * `qsup` of them, independently chosen: the supports may differ, nest or be disjoint. */
+SLaw small_law(uint64_t h, int V, int qsup, int psup, double qspread = 1.0) {
+    SLaw L;
+    L.V = V;
+    int perm[SV], perm2[SV];
+    for (int i = 0; i < V; ++i) { perm[i] = i; perm2[i] = i; }
+    for (int i = V - 1; i > 0; --i) {
+        std::swap(perm[i], perm[(int)(H(h * 31 + (uint64_t)i) % (uint64_t)(i + 1))]);
+        std::swap(perm2[i], perm2[(int)(H(h * 37 + 5 + (uint64_t)i) % (uint64_t)(i + 1))]);
+    }
+    double z = 0;
+    for (int j = 0; j < psup; ++j) {
+        const float lg = (float)((H(h * 131 + (uint64_t)j * 977 + 1) >> 40) % 4000) / 1000.0f - 2.0f;
+        L.pid[L.pn] = perm[j]; L.pval[L.pn++] = lg;
+    }
+    for (int j = 0; j < L.pn; ++j) z += std::exp((double)L.pval[j]);
+    for (int j = 0; j < L.pn; ++j) L.p[L.pid[j]] = std::exp((double)L.pval[j]) / z;
+    for (int i = 0; i < 8; ++i) { L.qid[i] = -1; L.qval[i] = -INFINITY; }
+    for (int j = 0; j < qsup; ++j) {
+        L.qid[j] = perm2[j];
+        L.qval[j] = (float)(qspread * (((H(h * 257 + (uint64_t)j * 331 + 7) >> 40) % 4000) / 1000.0 - 2.0));
+    }
+    return L;
+}
+
+/* The step function f(u), u in [0, 1): its pieces (token, length) in order, found by bisection. */
+std::vector<std::pair<int, double>> pieces(const std::function<int(double)>& f) {
+    std::vector<std::pair<int, double>> out;
+    double lo = 0;
+    const double last = 1.0 - 0x1p-53;
+    while (lo < 1) {
+        const int t = f(lo);
+        double b = 1.0;
+        if (f(last) != t) {
+            double a = lo, bb = last;
+            for (int it = 0; it < 80; ++it) {
+                const double mid = 0.5 * (a + bb);
+                if (f(mid) == t) a = mid; else bb = mid;
+            }
+            b = bb;
+        }
+        out.emplace_back(t, b - lo);
+        if (b >= 1.0) break;
+        lo = b;
+    }
+    return out;
+}
+
+}  /* namespace */
+
+/* ====================================================================================================
+ * Traversal verification, checked EXACTLY and on its own arithmetic (abi/rad_mtp_traversal.h).
+ *
+ * The walk reads the target through integer masses (rad_mtp_trav_mass: an FP32 exponential in fixed
+ * point), so the law it realises for a row is P~ = masses / their sum, a fixed function of the row.
+ * The tests below check (1) that P~ is the softmax to FP32 accuracy; (2) by ENUMERATION that the walk
+ * emits P~ exactly: every draft tree of a small model is built with its probability (Plackett-Luce
+ * prefixes for Gumbel siblings, the tail draw's pieces for rheo), the walk's tests are scripted (test
+ * t accepts with its own rate after t - 1 rejections, which the walk reports), and the law of the
+ * first two emitted tokens comes out as P~(x1) P~(x2 | x1) to 1e-11; the with-replacement update, the
+ * missing (1 - p) term and a rheo node walked as a Gumbel one miss by percents; (3) that the final
+ * token's uniform maps onto the residual law (support slots, then the off-support candidates by
+ * integer units) on a 700-slot plane; (4) the rheo walk by chi-square through the real drafters.
+ * ================================================================================================== */
+namespace {
+
+/* The law the walk realises for a candidate plane: its integer masses over the tokens. */
+void trav_int_law(const SLaw& L, double* p) {
+    for (int x = 0; x < SV; ++x) p[x] = 0;
+    if (L.pn <= 0) return;
+    float top = -INFINITY;
+    for (int j = 0; j < L.pn; ++j) top = std::max(top, L.pval[j]);
+    uint64_t m[SV] = {}, sum = 0;
+    for (int j = 0; j < L.pn; ++j) m[L.pid[j]] += rad_mtp_trav_mass(L.pval[j], top, RAD_MTP_TRAV_QBITS);
+    for (int x = 0; x < SV; ++x) sum += m[x];
+    for (int x = 0; x < SV; ++x) p[x] = (double)m[x] / (double)sum;
+}
+
+struct ETree {
+    int n = 1;
+    int par[40] = {};
+    int32_t tok[40] = {};
+    bool has[40] = {};
+    RadMtpCoupleState st[40] = {};
+    const SLaw* law[40] = {};
+    const RadMtpCoupleState* state(int v) const { return has[v] ? &st[v] : nullptr; }
+    bool cand(int v, const int32_t** ids, const float** val, int64_t* nn) const {
+        *ids = law[v]->pid; *val = law[v]->pval; *nn = law[v]->pn;
+        return true;
+    }
+    int child(int v, int32_t token) const {
+        for (int j = v + 1; j < n; ++j)
+            if (par[j] == v && tok[j] == token) return j;
+        return -1;
+    }
+    int64_t vocab() const { return 1000; }
+};
+
+struct EDraft { double w = 0; RadMtpCoupleState st{}; int nk = 0; int32_t kid[4] = {}; };
+
+/* Every way a node with the head's law of `L` drafts `want` children, with its probability: the
+ * ordered prefixes of sampling without replacement (scheme 0), or the pieces of the rheo tail draw
+ * (scheme m + 1). Empty when the head has no law (the node drafts nothing). */
+std::vector<EDraft> edrafts(const SLaw& L, int scheme, int want, int round) {
+    std::vector<EDraft> out;
+    RadMtpCoupleState s0{};
+    if (want <= 0 || !rad_mtp_couple_build_q(L.qid, L.qval, 1000, &s0)) return out;
+    s0.draw = make_draw(77, 3); s0.status = 1; s0.round = round; s0.pos = 5;
+    if (scheme > 0) {
+        const int m = scheme - 1;
+        auto drawn = [&](double ut) { RadMtpCoupleState s = s0; rad_mtp_rrs_draw_rheo_u(&s, ut, want, m); return s; };
+        std::vector<std::pair<int, double>> pc;
+        if (s0.count > m) pc = pieces([&](double ut) { return (int)drawn(ut).ids[m]; });
+        else pc.emplace_back(0, 1.0);
+        double lo = 0;
+        for (const auto& x : pc) {
+            EDraft d;
+            d.w = x.second;
+            d.st = drawn(lo + 0.5 * x.second);
+            lo += x.second;
+            d.nk = d.st.nkids;
+            for (int k = 0; k < d.nk; ++k) d.kid[k] = d.st.ids[k];
+            out.push_back(d);
+        }
+        return out;
+    }
+    const int a = std::min(want, s0.count);
+    int idx[4] = {};
+    std::function<void(int, double, double)> rec = [&](int depth, double w, double used) {
+        if (depth == a) {
+            EDraft d;
+            d.w = w;
+            d.st = s0;
+            if (a >= 2) {
+                bool taken[8] = {};
+                int n = 0;
+                for (int i = 0; i < a; ++i) { d.st.ids[n] = s0.ids[idx[i]]; d.st.q[n++] = s0.q[idx[i]]; taken[idx[i]] = true; }
+                for (int i = 0; i < s0.count; ++i)
+                    if (!taken[i]) { d.st.ids[n] = s0.ids[i]; d.st.q[n++] = s0.q[i]; }
+                d.st.x = d.st.ids[0];
+                d.st.nkids = a;
+            } else {
+                d.st.x = s0.ids[idx[0]];   /* the chain's wire: x anywhere in the shortlist's order */
+                d.st.nkids = 0;
+            }
+            d.nk = a;
+            for (int i = 0; i < a; ++i) d.kid[i] = s0.ids[idx[i]];
+            out.push_back(d);
+            return;
+        }
+        for (int i = 0; i < s0.count; ++i) {
+            bool dup = false;
+            for (int j = 0; j < depth; ++j) dup = dup || idx[j] == i;
+            if (dup) continue;
+            idx[depth] = i;
+            rec(depth + 1, w * s0.q[i] / (1.0 - used), used + s0.q[i]);
+        }
+    };
+    rec(0, 1.0, 0.0);
+    return out;
+}
+
+/* The law of the token a walk emits at a path's last node, from the walked tree: the node's
+ * residual (support slots, then its off-support candidates by their integer masses), or the plain
+ * target when the node carries no law. */
+void etree_final_law(const RadTravTree& kt, int c, const SLaw& L, double* law) {
+    for (int x = 0; x < SV; ++x) law[x] = 0;
+    double tot = 0;
+    if (kt.ok[c]) {
+        const double woff = kt.moff[c];
+        tot = rad_mtp_trav_sum8(kt.m[c]) + woff;
+        if (tot > 0) {
+            for (int k = 0; k < 8; ++k)
+                if (kt.ids[c][k] >= 0) law[kt.ids[c][k]] += kt.m[c][k] / tot;
+            if (woff > 0 && kt.off[c] > 0)
+                for (int j = 0; j < L.pn; ++j) {
+                    bool on = false;
+                    for (int k = 0; k < 8; ++k) on = on || kt.ids[c][k] == L.pid[j];
+                    if (!on)
+                        law[L.pid[j]] += woff / tot *
+                            (double)rad_mtp_trav_mass(L.pval[j], kt.top[c], RAD_MTP_TRAV_QBITS) / (double)kt.off[c];
+                }
+        }
+    }
+    if (!(tot > 0)) trav_int_law(L, law);
+}
+
+/* Adds w * P(the first two emitted tokens = (x1, x2) | this draft tree) to `joint`. */
+void etree_joint(const ETree& T, const SLaw* kid, int V, double w, double joint[SV][SV], int ctl,
+                 double* leak) {
+    double pt[64];
+    int nt = 0;
+    RadMtpTravOpt o;
+    o.ctl = ctl; o.accept_at = 0; o.p_test = pt; o.n_tests = &nt; o.max_tests = 64;
+    RadMtpTravOut out;
+    rad_mtp_trav_walk(T, 0, 1, 1, &out, o);   /* every test rejects: the rates of tests 1 .. nt */
+    double kidlaw[SV][SV];
+    for (int x = 0; x < V; ++x) trav_int_law(kid[x], kidlaw[x]);
+    double surv = 1;
+    for (int t = 1; t <= nt; ++t) {
+        const double pa = surv * pt[t - 1];
+        surv *= 1.0 - pt[t - 1];
+        if (!(pa > 0)) continue;
+        RadTravTree kt;
+        int ids[RAD_MTP_TRAV_MAX_ROWS];
+        RadMtpTravOpt o2;
+        o2.ctl = ctl; o2.accept_at = t; o2.u_final = 0.5;
+        RadMtpTravOut po;
+        CHECK(rad_mtp_trav_walk(T, 0, 1, 1, &po, o2, &kt, ids));
+        const int f = po.node[po.n - 1];
+        int c = 0;
+        while (ids[c] != f) ++c;
+        double fl[SV];
+        etree_final_law(kt, c, *T.law[f], fl);
+        if (po.n == 1) {
+            for (int y = 0; y < V; ++y)
+                for (int b = 0; b < V; ++b) joint[y][b] += w * pa * fl[y] * kidlaw[y][b];
+        } else if (po.n == 2) {
+            const int x1 = T.tok[po.node[1]];
+            for (int b = 0; b < V; ++b) joint[x1][b] += w * pa * fl[b];
+        } else {
+            joint[T.tok[po.node[1]]][T.tok[po.node[2]]] += w * pa;
+        }
+    }
+    *leak += w * surv;   /* the root accepts with rate 1: nothing may be left */
+}
+
+/* The exact joint law of the first two emitted tokens for a root that drafts `a` children, each
+ * drafting `b`; returns the largest deviation from P~(x1) P~(x2 | x1). */
+double trav_enum_case(const SLaw& root, const SLaw* kid, int V, int scheme, int a, int b, int ctl, long* trees) {
+    double joint[SV][SV] = {}, leak = 0, wsum = 0;
+    const std::vector<EDraft> roots = edrafts(root, scheme, a, 1);
+    CHECK(!roots.empty());
+    for (const EDraft& r0 : roots) {
+        std::vector<EDraft> cd[4];
+        for (int i = 0; i < r0.nk; ++i) cd[i] = edrafts(kid[r0.kid[i]], scheme, b, 2);
+        int sel[4] = {};
+        for (;;) {
+            ETree T;
+            T.has[0] = true; T.st[0] = r0.st; T.law[0] = &root; T.par[0] = -1;
+            CHECK(rad_mtp_couple_state_valid(r0.st, 1000));
+            double w = r0.w;
+            for (int i = 0; i < r0.nk; ++i) {
+                const int v = T.n++;
+                T.par[v] = 0; T.tok[v] = r0.kid[i]; T.law[v] = &kid[r0.kid[i]];
+                T.has[v] = !cd[i].empty();
+                if (T.has[v]) { T.st[v] = cd[i][(size_t)sel[i]].st; w *= cd[i][(size_t)sel[i]].w; }
+            }
+            for (int i = 0; i < r0.nk; ++i) {
+                if (cd[i].empty()) continue;
+                const EDraft& d = cd[i][(size_t)sel[i]];
+                for (int g = 0; g < d.nk; ++g) {
+                    const int v = T.n++;
+                    T.par[v] = 1 + i; T.tok[v] = d.kid[g]; T.law[v] = &kid[d.kid[g]];
+                }
+            }
+            etree_joint(T, kid, V, w, joint, ctl, &leak);
+            wsum += w;
+            ++*trees;
+            int i = 0;
+            for (; i < r0.nk; ++i) {
+                if (cd[i].empty()) continue;
+                if (++sel[i] < (int)cd[i].size()) break;
+                sel[i] = 0;
+            }
+            if (i >= r0.nk) break;
+        }
+    }
+    CHECK(std::fabs(wsum - 1.0) < 1e-11);
+    double p0[SV], worst = ctl ? 0.0 : std::fabs(leak);
+    trav_int_law(root, p0);
+    for (int x1 = 0; x1 < V; ++x1) {
+        double p1[SV];
+        trav_int_law(kid[x1], p1);
+        for (int x2 = 0; x2 < V; ++x2) worst = std::max(worst, std::fabs(joint[x1][x2] - p0[x1] * p1[x2]));
+    }
+    return worst;
+}
+
+}  /* namespace */
+
+/* (1) The fixed-point exponential against libm's, the integer conversions, and the law they give. */
+TEST(the_walks_fixed_point_exponential_tracks_exp) {
+    const double unit = (double)(1ull << RAD_MTP_TRAV_QBITS);
+    double worst = 0;
+    CHECK_EQ(rad_mtp_trav_mass(3.25f, 3.25f, RAD_MTP_TRAV_QBITS), 1ull << RAD_MTP_TRAV_QBITS);
+    CHECK_EQ(rad_mtp_trav_mass(-INFINITY, 0.0f, RAD_MTP_TRAV_QBITS), 0ull);
+    CHECK_EQ(rad_mtp_trav_mass(-30.0f, 0.0f, RAD_MTP_TRAV_QBITS), 0ull);
+    const int N = 3000000;
+    for (int i = 0; i <= N; ++i) {
+        /* a dense sweep of the whole range, and the same arguments reached from other tops */
+        const float x = -28.6f * (float)i / (float)N;
+        const float top = i % 3 == 0 ? 0.0f : (float)((int)(H((uint64_t)i) % 6000) - 3000) / 100.0f;
+        const float v = top + x;
+        const float xr = v - top;   /* the argument the mass sees */
+        const uint64_t m = rad_mtp_trav_mass(v, top, RAD_MTP_TRAV_QBITS);
+        const double want = xr > -28.5f ? std::exp((double)xr) * unit : 0.0;
+        const double err = std::fabs((double)m - want);
+        CHECK(err <= want * 0x1p-22 + 1.0);
+        if (want > 0x1p32) worst = std::max(worst, err / want);   /* where the floor's one unit is below 2^-32 */
+        /* a coarser unit is the floor of the finer one */
+        if (i % 16 == 0) CHECK_EQ(rad_mtp_trav_mass(v, top, 31), m >> 9);
+    }
+    std::printf("  fixed-point exp: worst relative error %.3g (2^-22 = %.3g) over %d arguments\n", worst, 0x1p-22, N);
+    CHECK(worst < 0x1p-22);
+    CHECK_EQ(rad_mtp_trav_qbits(20), 40);     CHECK_EQ(rad_mtp_trav_qbits(1024), 40);
+    CHECK_EQ(rad_mtp_trav_qbits(4096), 40);   CHECK_EQ(rad_mtp_trav_qbits(4097), 39);
+    CHECK_EQ(rad_mtp_trav_qbits(8192), 39);   CHECK_EQ(rad_mtp_trav_qbits(1ll << 31), 21);
+    for (int i = 0; i < 200000; ++i) {
+        const uint64_t x = H((uint64_t)i * 77 + 5) >> (11 + (i % 40));
+        CHECK(rad_mtp_trav_u2d(x) == (double)x);
+        CHECK_EQ(rad_mtp_trav_d2u(rad_mtp_trav_u2d(x)), x);
+        if (x < (1ull << 50)) CHECK_EQ(rad_mtp_trav_d2u(rad_mtp_trav_u2d(x) + 0.75), x);
+    }
+    /* the law of a plane: the softmax, to FP32 accuracy */
+    double wl = 0;
+    for (int t = 0; t < 2000; ++t) {
+        const Law L = law_at(31000 + (uint64_t)t, 1.0);
+        float top = -INFINITY;
+        CHECK(rad_mtp_trav_row_top(L.pid, L.pval, L.pn, 1000, &top));
+        int32_t sid[8];
+        for (int k = 0; k < 8; ++k) sid[k] = L.qid[k];
+        RadTravLaw w;
+        rad_mtp_trav_row_law(L.pid, L.pval, L.pn, top, sid, 8, &w);
+        uint64_t on = 0;
+        for (int k = 0; k < 8; ++k) {
+            on += w.pq[k];
+            wl = std::max(wl, std::fabs((double)w.pq[k] / (double)w.sum - L.p[sid[k]]));
+        }
+        CHECK_EQ(on + w.off, w.sum);
+    }
+    std::printf("  integer law against the FP64 softmax: worst |dp| = %.3g\n", wl);
+    CHECK(wl < 5e-7);
+}
+
+/* (2) The walk emits the law it reads, exactly: Gumbel siblings and rheo (m = 1, 2), roots with one
+ * to three children, children with none to two, supports that nest, differ or are disjoint. */
+TEST(traversal_two_deep_joint_law_is_exact_by_enumeration) {
+    double worst = 0;
+    long trees = 0;
+    int cases = 0;
+    const struct { int scheme, a, b; } shapes[] = {
+        { 0, 1, 0 }, { 0, 1, 1 }, { 0, 2, 0 }, { 0, 2, 1 }, { 0, 2, 2 }, { 0, 3, 1 }, { 0, 1, 2 },
+        { 0, 3, 2 }, { 0, 2, 3 },
+        { 2, 1, 1 }, { 2, 2, 1 }, { 2, 2, 2 }, { 3, 2, 1 }, { 3, 3, 1 }, { 3, 3, 3 }, { 1, 1, 1 }, { 4, 4, 2 },
+    };
+    for (int V = 4; V <= 6; ++V)
+        for (int cfg = 0; cfg < 24; ++cfg) {
+            const int qs0 = 1 + (cfg * 2 + 1) % V, ps0 = 1 + (cfg * 3 + 2) % V;
+            const SLaw root = small_law((uint64_t)(61000 + V * 50 + cfg), V, qs0, ps0, cfg % 3 == 2 ? 2.5 : 1.0);
+            SLaw kid[SV];
+            for (int x = 0; x < V; ++x)
+                kid[x] = small_law((uint64_t)(67000 + V * 70 + cfg * 13 + x), V, 1 + (cfg + x) % V,
+                                   1 + (cfg + 2 * x + 1) % V);
+            for (const auto& sh : shapes) {
+                const double w = trav_enum_case(root, kid, V, sh.scheme, sh.a, sh.b, 0, &trees);
+                worst = std::max(worst, w);
+                if (!(w < 1e-11))
+                    std::printf("  ENUM FAIL V=%d cfg=%d qs0=%d ps0=%d scheme=%d a=%d b=%d: %g\n", V, cfg, qs0, ps0,
+                                sh.scheme, sh.a, sh.b, w);
+                CHECK(w < 1e-11);
+                ++cases;
+            }
+        }
+    std::printf("  traversal enumeration: %d cases, %ld draft trees, worst |joint - P P| = %.2e\n", cases, trees, worst);
+    /* the same statistic sees the mistakes */
+    const SLaw root = small_law(61333, 5, 5, 5, 1.0);
+    SLaw kid[SV];
+    for (int x = 0; x < 5; ++x) kid[x] = small_law((uint64_t)(67333 + x), 5, 4, 5);
+    long t2 = 0;
+    const double good = trav_enum_case(root, kid, 5, 0, 2, 2, 0, &t2);
+    const double c1 = trav_enum_case(root, kid, 5, 0, 2, 2, 1, &t2);
+    const double c2 = trav_enum_case(root, kid, 5, 0, 2, 2, 2, &t2);
+    const double c3 = trav_enum_case(root, kid, 5, 0, 2, 2, 3, &t2);
+    const double rgood = trav_enum_case(root, kid, 5, 2, 2, 2, 0, &t2);
+    const double c4 = trav_enum_case(root, kid, 5, 2, 2, 2, 4, &t2);
+    std::printf("  controls: exact %.1e | token-level ratios %.3f | no (1 - p) %.3f | no renormalisation %.3f | "
+                "rheo exact %.1e, rheo walked as gumbel %.3f\n", good, c1, c2, c3, rgood, c4);
+    CHECK(good < 1e-11); CHECK(rgood < 1e-11);
+    CHECK(c1 > 1e-3); CHECK(c2 > 1e-3); CHECK(c3 > 1e-3); CHECK(c4 > 1e-3);
+}
+
+/* (3) The final token's uniform against the residual law, on a 700-slot plane (holes, a state whose
+ * support is partly off the plane): after both children are rejected the root accepts, and the pieces
+ * of u -> token have the lengths the walked tree's residual gives each token. */
+TEST(the_traversals_final_draw_is_the_residual_law_on_a_wide_plane) {
+    constexpr int NC = 700, NV = 5000;
+    int mixed = 0;   /* cases where the support slots and the off-support candidates both carry mass */
+    for (int rep = 0; rep < 3; ++rep) {
+        static int32_t ids[NC];
+        static float val[NC];
+        int live = 0;
+        for (int c = 0; c < NC; ++c) {
+            const uint64_t h = H(900000 + (uint64_t)rep * 7919 + (uint64_t)c);
+            if (h % 11 == 0) { ids[c] = -1; val[c] = -INFINITY; continue; }
+            ids[c] = 1 + c * 7;   /* distinct */
+            /* a peaked head and a long tail that still carries a few percent */
+            val[c] = (h % 13 == 1) ? -INFINITY
+                   : c < 16 ? 6.0f - 0.9f * (float)c - (float)((h >> 20) % 1000) * 0.0005f
+                            : 1.5f - 0.012f * (float)c - (float)((h >> 20) % 1000) * 0.002f;
+            ++live;
+        }
+        int32_t qid[8];
+        float qv[8];
+        for (int k = 0; k < 8; ++k) {
+            qid[k] = k < 5 ? 1 + k * 7 : NV - 10 - k;   /* five on the plane's head, three off it */
+            qv[k] = 2.0f - (rep == 0 ? 0.35f : rep == 1 ? 0.6f : 0.15f) * (float)k;
+        }
+        struct WTree {
+            RadMtpCoupleState st; int32_t c1, c2;
+            const RadMtpCoupleState* state(int v) const { return v == 0 ? &st : nullptr; }
+            bool cand(int, const int32_t** i, const float** v, int64_t* n) const { *i = ids; *v = val; *n = NC; return true; }
+            int child(int v, int32_t t) const { return v == 0 ? (t == c1 ? 1 : t == c2 ? 2 : -1) : -1; }
+            int64_t vocab() const { return NV; }
+        } T;
+        CHECK(rad_mtp_couple_build_q(qid, qv, NV, &T.st));
+        T.st.draw = make_draw(4242 + (uint64_t)rep, 3); T.st.status = 1; T.st.round = 1; T.st.pos = 5;
+        rad_mtp_rrs_draw(&T.st, 0, 2);
+        T.c1 = T.st.ids[0]; T.c2 = T.st.ids[1];
+        RadTravTree kt;
+        int map[RAD_MTP_TRAV_MAX_ROWS];
+        RadMtpTravOpt o;
+        o.accept_at = 3; o.u_final = 0.25;   /* the two leaves reject, the root accepts */
+        RadMtpTravOut out;
+        CHECK(rad_mtp_trav_walk(T, 0, 1, 1, &out, o, &kt, map));
+        CHECK_EQ(out.n, 1);
+        CHECK(out.has_y);
+        const double woff = kt.moff[0], tot = rad_mtp_trav_sum8(kt.m[0]) + woff;
+        std::vector<double> want((size_t)NV, 0.0), got((size_t)NV, 0.0);
+        for (int k = 0; k < 8; ++k) want[(size_t)kt.ids[0][k]] += kt.m[0][k] / tot;
+        for (int c = 0; c < NC; ++c) {
+            if (ids[c] < 0 || val[c] == -INFINITY) continue;
+            bool on = false;
+            for (int k = 0; k < 8; ++k) on = on || kt.ids[0][k] == ids[c];
+            if (!on) want[(size_t)ids[c]] += woff / tot * (double)rad_mtp_trav_mass(val[c], kt.top[0], RAD_MTP_TRAV_QBITS) / (double)kt.off[0];
+        }
+        const auto pc = pieces([&](double u) {
+            RadMtpTravOpt q;
+            q.accept_at = 3; q.u_final = u;
+            RadMtpTravOut po;
+            rad_mtp_trav_walk(T, 0, 1, 1, &po, q);
+            return (int)po.y;
+        });
+        for (const auto& x : pc) { CHECK(x.first >= 0 && x.first < NV); got[(size_t)x.first] += x.second; }
+        double worst = 0, off_mass = 0;
+        int support = 0;
+        for (int y = 0; y < NV; ++y) {
+            worst = std::max(worst, std::fabs(got[(size_t)y] - want[(size_t)y]));
+            support += want[(size_t)y] > 0;
+        }
+        off_mass = woff / tot;
+        std::printf("  wide final draw %d: %d live slots, %d tokens with mass, off-support share %.3f, %zu pieces, worst |dp| = %.2e\n",
+                    rep, live, support, off_mass, pc.size(), worst);
+        CHECK(worst < 1e-10);
+        CHECK(pc.size() > 300);
+        mixed += off_mass > 0.01 && off_mass < 0.99;
+    }
+    CHECK(mixed >= 2);
+}
+
+/* (4) RheoSampling siblings through the walk: the real propose row drafts the root's siblings, the
+ * walk tries the tail child first and the deterministic ones as point masses. Exact; the same trees
+ * walked as Gumbel ones (what a walk that ignores the scheme does) are not. */
+TEST(traversal_verification_of_rheo_siblings_is_exact) {
+    const int trials = 200000;
+    double worst_bad = 0;
+    for (int m = 1; m <= 2; ++m) {
+        g_scheme = m + 1;
+        const Result r = run_trav(STAGE1, trials, 1.0, RadMtpTravOpt{});
+        const double z4 = run_trav4(STAGE1, trials, 1.0);
+        const Result row = run_kind(STAGE1, trials, 1.0);
+        RadMtpTravOpt bad;
+        bad.ctl = 4;
+        const Result b = run_trav(STAGE1, trials, 1.0, bad);
+        g_scheme = 0;
+        std::printf("  trav rheo m=%d z=%.2f first=%.2f z4=%.2f acc=%.3f (rowwise %.3f) | walked as gumbel: z=%.1f first=%.1f\n",
+                    m, r.z, r.first_z, z4, r.mean_acc, row.mean_acc, b.z, b.first_z);
+        CHECK(r.z < 4.5); CHECK(r.first_z < 4.5); CHECK(z4 < 4.5);
+        worst_bad = std::max(worst_bad, std::max(b.z, b.first_z));
+    }
+    CHECK(worst_bad > 20.0);
+}
+
+RAD_TEST_MAIN()

@@ -880,6 +880,8 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
     sc.rank          = rank;
     sc.world_size    = cfg_.tp;
     sc.draft_coupling = cfg_.draft_coupling;
+    sc.draft_verify_block = cfg_.draft_verify_block;
+    sc.draft_verify_traversal = cfg_.draft_verify_traversal;
     RAD_TRY(smp.declare(b, sc));
 
     /* Where the chain writes the sampled ids. The engine declares it because rad-kbench drives the
