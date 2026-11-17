@@ -729,10 +729,16 @@ void r4d_moe_gather_pin_form(int form);
 void r4d_moe_gemm_pin_down_dec(int pin);
 // Test hook: pins the gated residual read's prefill tile. 0 is the launcher's rule, 1 the decode
 // tiles' kernels at 128 rows (hc_down_tiled, then hc_up_tiled into `ubuf` and hc_mix), 2 the wide
-// kernels (refusing shapes they are not built for), 3 the PF2 kernels the rule takes from 512 rows
-// (refused likewise, and below 512 rows, whose scratch is not sized for their weight planes).
-// All bit-identical; r4d_selftest compares their bytes.
+// kernels (refusing shapes they are not built for), 3 the PF2 kernels with the wide kernel as their
+// up product (refused likewise, and below 512 rows, whose scratch is not sized for their weight
+// planes), 4 the PF2 kernels as the rule takes them from 512 rows, the up product
+// hc_up_mix_pf3_kernel. All bit-identical; r4d_selftest compares their bytes.
 void r4d_hc_read_pin_prefill(int form);
+// Test hook: the PF2 up product's reciprocal rule against the division, over every float whose bit
+// pattern lies in [lo, hi] (r4d_hc_bf16.hip). Returns how many take another bf16 (the claim: none
+// from 1.0 to infinity and over the NaNs), -1 when the launch fails; `far` (optional) receives how
+// many reciprocals the rule keeps lie more than one unit in the last place from the quotient.
+long long r4d_hc_rcp_check(unsigned lo, unsigned hi, long long* far);
 // Test hook: pins the gated residual read's decode kernels. 0 is the launcher's rule (kernels A and
 // B as one grid at one to seven rows where the per-stream counters exist, the tiled up-mix's K
 // passes pipelined from eight rows), 1 the two-grid form (A, then the up-mix in a second launch;

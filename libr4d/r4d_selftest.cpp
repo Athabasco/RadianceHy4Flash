@@ -149,6 +149,7 @@ struct Plugin {
     void (*pin_ddec)(int) = nullptr;
     void (*pin_hc)(int) = nullptr;
     void (*pin_hc_dec)(int) = nullptr;
+    long long (*hc_rcp_check)(unsigned, unsigned, long long*) = nullptr;
     void (*pin_qsel)(int) = nullptr;
     void (*pin_mla)(int) = nullptr;
     void (*mla_stats)(unsigned long long*) = nullptr;
@@ -222,6 +223,7 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_moe_gemm_pin_down_dec", &pl->pin_ddec);
     okall &= sym(pl->h, "r4d_hc_read_pin_prefill", &pl->pin_hc);
     okall &= sym(pl->h, "r4d_hc_read_pin_decode", &pl->pin_hc_dec);
+    okall &= sym(pl->h, "r4d_hc_rcp_check", &pl->hc_rcp_check);
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
     okall &= sym(pl->h, "r4d_mla_matrix_pin_form", &pl->pin_mla);
     okall &= sym(pl->h, "r4d_mla_matrix_stats", &pl->mla_stats);
@@ -20343,9 +20345,10 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool 
     const RadStream rst = (RadStream)hs;
 
     struct Out { std::vector<uint8_t> x, inj, q, qs, rq, rs; };
-    const int f_lo = pl.pin_hc ? 1 : 0, f_hi = pl.pin_hc ? (M >= kHcPf2MinRows ? 3 : 2) : 0;
+    const int f_lo = pl.pin_hc ? 1 : 0, f_hi = pl.pin_hc ? (M >= kHcPf2MinRows ? 4 : 2) : 0;
     static const char* const kForm[] = { "the launcher's rule", "the decode tiles' kernels",
-                                         "the wide kernels", "the PF2 kernels" };
+                                         "the wide kernels", "the PF2 kernels, the wide up product",
+                                         "the PF2 kernels" };
     std::vector<Out> outs;
     std::vector<int> ran;   /* the form each of `outs` came from */
     for (int form = f_lo; form <= f_hi; ++form) {
@@ -33674,6 +33677,17 @@ static void device_phase(const Plugin& pl) {
         /* 700 and 1000 put PF2's K chunks across a stream boundary and row tiles past the last
          * row; 4096 is the one-chunk epilogue. */
         for (int64_t m : { 65, 300, 700, 1000, 2048, 4096 }) hc_prefill(pl, m, 0, false);
+        /* The PF2 up product's reciprocal rule (hc_up_mix_pf3_kernel) over every float it can
+         * meet: 1 + e^-v lies in [1, inf], and a NaN stays the division's. */
+        if (pl.hc_rcp_check) {
+            long long far = 0, far2 = 0;
+            const long long bad  = pl.hc_rcp_check(0x3f800000u, 0x7f800000u, &far);
+            const long long bad2 = pl.hc_rcp_check(0x7f800001u, 0x7fffffffu, &far2);
+            ok(fmt("hc_read's rounded reciprocal: the quotient's bf16 for every float in [1, inf] "
+                   "(%lld of 1082130433 differ; %lld kept reciprocals more than one unit in the "
+                   "last place from the quotient) and every positive NaN (%lld differ)", bad, far,
+                   bad2).c_str(), bad == 0 && bad2 == 0 && far == 0);
+        }
         /* 1 to 7 rows each hit a different up-product instantiation below eight. */
         for (int64_t m : { 1, 2, 3, 4, 5, 6, 7, 33, 65, 300, 2048 }) {
             hc_read_i8(pl, m, false, 0);
