@@ -215,6 +215,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
 
     DraftController::Params dp;
     dp.max_depth = cfg.n_spec;
+    dp.head_depth = cfg.n_spec_head > 0 && cfg.n_spec_head < cfg.n_spec ? cfg.n_spec_head : 0;
     /* The adaptive window (draft.h) prices a draft by the measured cost of the step it adds to.
      * A block drafter proposes its block in one pass, but each verified draft is still a verify
      * row, which is not free on a MoE that reads each row's routed experts. So it takes the same
@@ -749,6 +750,7 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
     if (cfg_.prefix_cache && pc_) pc_->release(*s.req);
     /* Prompt lookup's index is this text's alone. */
     s.ngram_ix.reset();
+    s.suffix_ix.reset();
     if (lookup_gate_on_ && s.look.started && s.look.proposed > 0)
         RAD_DEBUG("prompt lookup: request %llu made %lld proposals, held back %lld (%lld drafts, "
                   "%lld of those scored came true); a %d-draft verify costs %.2f plain steps",
@@ -1086,6 +1088,24 @@ int Scheduler::draft_ngram(SchedReq& s, int depth, int* match) const {
     if (s.ngram_ix.owner() != r.id) s.ngram_ix.reset(r.id);
     return s.ngram_ix.propose(seq, cfg_.spec_ngram_min, cfg_.spec_ngram_max, depth, s.draft, match,
                               LookupGate::kLongMatch);
+}
+
+/* --draft-suffix: SuffixDecoding's chain for the sequence's committed history (suffix.h). */
+int Scheduler::suffix_propose(SchedReq& s, int32_t* out, int* match) {
+    if (match) *match = -1;
+    if (!s.req) return 0;
+    const Request& r = *s.req;
+    TokenSeq seq;
+    seq.a = r.prompt.data();
+    seq.na = (int64_t)r.prompt.size();
+    seq.b = r.output.data();
+    seq.nb = (int64_t)r.output.size();
+    const SuffixIndex::Out o =
+        s.suffix_ix.propose(seq, r.id, cfg_.draft_suffix_min_match,
+                            std::min(cfg_.draft_suffix_max, (int)RAD_SCHED_MAX_SPEC),
+                            cfg_.draft_suffix_min_score, out);
+    if (match && o.n > 0) *match = o.match;
+    return o.n;
 }
 
 /* ------------------------------------------------------------------ chunking */
@@ -2031,7 +2051,8 @@ const RadBatch* Scheduler::step() {
     const int64_t Q = std::max<int64_t>(geo_.quantum, 1);
     /* An eighth of this step's budget, which under a span is shared_tok for a shared step. */
     const int64_t share_tok = std::max<int64_t>(Q, budget / 8 / Q * Q);
-    const int64_t dec_row_tok = 1 + std::max<int64_t>(depth, draft_.step_window());
+    const int64_t dec_row_tok = 1 + std::max<int64_t>({ (int64_t)depth, (int64_t)draft_.step_window(),
+                                                         cfg_.draft_suffix ? (int64_t)cfg_.draft_suffix_max : 0 });
     int64_t behind_dec = 0, behind_pf = 0;
     if (share_step) {
         for (int32_t slot : running_) {
@@ -2120,7 +2141,24 @@ const RadBatch* Scheduler::step() {
              * drafts this step and no deeper. */
             const int cap = draft_.adaptive() ? draft_cap(s) : depth;
             bool ngram = false;
-            if (!r.may_speculate) s.n_draft = 0;
+            bool suffix = false;
+            /* --draft-suffix: a sequence whose own history ends in a recurring pattern verifies that
+             * pattern's earlier continuation in place of the head's draft (the head still drafted
+             * behind the step before, so a miss costs nothing but that draft). A function of the
+             * committed text alone, so the choice never reads a draw; the rows it verifies carry no
+             * coupled state (Request::draft_suffix below), so each is the target's plain draw. */
+            if (cfg_.draft_suffix && r.may_speculate) {
+                int32_t buf[RAD_SCHED_MAX_SPEC];
+                const int np = suffix_propose(s, buf);
+                if (np > 0) {
+                    std::copy(buf, buf + np, s.draft);
+                    s.n_draft = np;
+                    s.draft_tree = false;
+                    suffix = true;
+                }
+            }
+            if (suffix) ngram = true;
+            else if (!r.may_speculate) s.n_draft = 0;
             else if (s.n_draft == 0) {
                 /* As the only drafter under the adaptive window, the lookup is the head: its
                  * proposal is cut to the sequence's own window. */
@@ -2148,6 +2186,7 @@ const RadBatch* Scheduler::step() {
             }
             if (!ngram && s.n_draft > cap) s.n_draft = cap;
             s.draft_ngram = ngram;
+            s.draft_suffix = suffix;
             /* No verified position at or past the context end: nothing past ctx_limit_ - 1 has a
              * rotary row or block-table column. commit() finishes a sequence before it reaches
              * the limit, so the one token itself always fits. */
@@ -2227,6 +2266,11 @@ const RadBatch* Scheduler::step() {
         e.n_draft = s.n_draft;
         e.is_prefill = prefill;
         e.ngram = !prefill && s.draft_ngram && s.n_draft > 0;
+        e.suffix = e.ngram && s.draft_suffix;
+        /* A suffix chain has no model node: the coupled sampler binds no state to any row of it
+         * (core/sample/sampler.cpp), whatever stale state the head's own draft for these positions
+         * left. */
+        r.draft_suffix = e.suffix;
         /* A tree drafter's parents, unless prompt lookup replaced its proposal with a chain. */
         e.draft_parent = (!prefill && s.draft_tree && !e.ngram) ? s.draft_par : nullptr;
         r.draft_parent = e.n_spec ? e.draft_parent : nullptr;
@@ -2676,6 +2720,10 @@ const RadBatch* Scheduler::step_next_locked() {
          * that cannot rewind decides at commit whether the next step may speculate; one that can,
          * or no grammar, keeps its answer. */
         if (!e.produces_token || !r.speculation_fixed) return nullptr;
+        /* --draft-suffix: a sequence whose history ended in a recurring pattern at the last commit
+         * is likely to continue it; its next step is built after the commit, where the lookup can
+         * read the committed end (a step issued ahead is made on the card from the head's drafts). */
+        if (cfg_.draft_suffix && s.suffix_hot) { ++m_.suffix_held_ahead; return nullptr; }
         /* A SCORED row (Request::token_scores, a /v1/systemone question) that the step in flight
          * brings to max_tokens gets no step issued ahead: it would run a whole forward pass for a
          * request that finishes at the commit, and max_tokens=1 pays a decode step after its
@@ -2966,6 +3014,11 @@ int Scheduler::commit(StepResult& res) {
                                   draft_.yield(s.adapt, now), est);
                     }
                 }
+                if (e.suffix) {
+                    ++m_.suffix_steps;
+                    m_.suffix_rows += e.n_spec;
+                    m_.suffix_accepted += a;
+                }
                 m_.draft_tokens += e.n_spec;
                 m_.draft_accepted += a;
                 server::sink_drafts(r.sink, e.n_spec, a);
@@ -2973,7 +3026,16 @@ int Scheduler::commit(StepResult& res) {
         }
         s.n_draft = 0;
         r.n_draft = 0;
+        s.draft_suffix = false;
+        r.draft_suffix = false;
         s.entry = -1;
+        /* --draft-suffix: does the history now end in a pattern that recurred? (step_next_locked) */
+        if (cfg_.draft_suffix && e.produces_token && r.state == ReqState::Running) {
+            int32_t buf[RAD_SCHED_MAX_SPEC];
+            s.suffix_hot = r.may_speculate && suffix_propose(s, buf) > 0;
+        } else {
+            s.suffix_hot = false;
+        }
 
         /* A request the next step carries finishes now but keeps its blocks, which that step
          * writes; its commit finds the request not running and returns them. */

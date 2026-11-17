@@ -62,6 +62,10 @@ struct StepEntry {
      * acceptance but not the adaptive window's estimate of the draft head (DraftController,
      * draft.h). */
     bool    ngram = false;
+    /* The drafts are a SuffixDecoding proposal (--draft-suffix, suffix.h): a chain of the
+     * sequence's own history, verified with no coupled row (Request::draft_suffix). Implies
+     * `ngram`. */
+    bool    suffix = false;
     /* Device row: the card overwrites its tokens, positions, rollback count and slots from the
      * StepSlot before the pass runs (advance.h); `ctx_len` is then only an upper bound for the
      * host-side ceilings. dev_tok/dev_out/dev_aux are advance.h's row descriptor: the verify

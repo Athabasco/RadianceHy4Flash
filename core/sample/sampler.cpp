@@ -859,8 +859,10 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
             if (couple_) {
                 couple_stage_[row] = RadMtpCoupleState{};
                 const auto sit = seqs_.find(r->id);
-                if (sit != seqs_.end() && !sp.greedy() && r->draft && k + 1 < n_pos &&
-                    k < sit->second.couple_n) {
+                /* A suffix chain (Request::draft_suffix) was not drawn from the head's law: no row of
+                 * it binds a state, so each is the target's plain draw. */
+                if (sit != seqs_.end() && !sp.greedy() && r->draft && !r->draft_suffix &&
+                    k + 1 < n_pos && k < sit->second.couple_n) {
                     const RadMtpCoupleState& c = sit->second.couple[k];
                     /* Same request and seed, this row's round, position and proposed token
                      * (rad_mtp_couple_binds); anything else is a stale state from another step. */

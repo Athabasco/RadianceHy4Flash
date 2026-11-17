@@ -588,6 +588,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--spec-ngram-min", { "1" } }, { "--spec-ngram-max", { "6" } },
         { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
         { "--draft-coupling", { "on" } }, { "--draft-verify", { "block" } },
+        { "--draft-suffix", { "on" } }, { "--draft-suffix-min-match", { "5" } },
+        { "--draft-suffix-max", { "6" } }, { "--draft-suffix-min-score", { "0.4" } },
         { "--draft-depth", { "adaptive" } }, { "--draft-depth-max", { "5" } },
         { "--draft-depth-min", { "2" } }, { "--draft-depth-stop", { "0.7" } },
         { "--draft-depth-lag", { "0" } }, { "--draft-depth-stat", { "path" } },
@@ -1080,6 +1082,30 @@ TEST(draft_depth_adaptive_parses_and_needs_a_coupled_chain) {
     CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-verify", "block" }), RAD_E_INVAL);
     CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-depth-min", "4", "--draft-depth-max", "3" }),
              RAD_E_INVAL);
+}
+
+
+/* The SuffixDecoding selector: off by default (bit-identical engine), min match 1..12, rows 1..32,
+ * a score in [0, 1]. */
+TEST(the_draft_suffix_flags_default_off_and_parse) {
+    Config c;
+    CHECK(!c.draft_suffix);
+    CHECK_EQ(c.draft_suffix_min_match, 6);
+    CHECK_EQ(c.draft_suffix_max, 7);
+    CHECK_NEAR(c.draft_suffix_min_score, 0.3, 1e-6);
+    CHECK_EQ(c.n_spec_head, 0);
+    CHECK_EQ(parse({ "--draft-suffix", "on", "--draft-suffix-min-match", "5", "--draft-suffix-max", "6",
+                     "--draft-suffix-min-score", "0.45" }, &c), RAD_OK);
+    CHECK(c.draft_suffix);
+    CHECK_EQ(c.draft_suffix_min_match, 5);
+    CHECK_EQ(c.draft_suffix_max, 6);
+    CHECK_NEAR(c.draft_suffix_min_score, 0.45, 1e-6);
+    CHECK_EQ(parse({ "--draft-suffix", "off" }, &c), RAD_OK);
+    CHECK(!c.draft_suffix);
+    for (const char* bad : { "yes", "1", "" }) CHECK_EQ(parse_fresh({ "--draft-suffix", bad }), RAD_E_INVAL);
+    for (const char* bad : { "0", "13", "x", "" }) CHECK_EQ(parse_fresh({ "--draft-suffix-min-match", bad }), RAD_E_INVAL);
+    for (const char* bad : { "0", "33", "x", "" }) CHECK_EQ(parse_fresh({ "--draft-suffix-max", bad }), RAD_E_INVAL);
+    for (const char* bad : { "-0.1", "1.5", "x", "" }) CHECK_EQ(parse_fresh({ "--draft-suffix-min-score", bad }), RAD_E_INVAL);
 }
 
 
@@ -1744,6 +1770,21 @@ TEST(rope_scaling_takes_yarn_with_a_factor_above_one_or_none) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK(d.rope_scaling.empty());
+}
+
+/* The suffix selector and the adaptive chain depth are served together, with traversal verification
+ * (bring-up refuses what the model cannot do; the parse and the shown rows say what was asked). */
+TEST(the_suffix_selector_parses_beside_adaptive_depth_and_traversal) {
+    Config c;
+    CHECK_EQ(parse({ "--draft-suffix", "on", "--draft-depth", "adaptive", "--draft-coupling", "on",
+                     "--draft-verify", "traversal", "--num-speculative-tokens", "5" }, &c), RAD_OK);
+    CHECK(c.draft_suffix);
+    CHECK(c.draft_depth_adaptive);
+    CHECK(c.draft_coupling);
+    CHECK(c.draft_verify_traversal);
+    CHECK(!c.draft_verify_block);
+    CHECK_EQ(c.n_spec, 5);
+    CHECK_EQ(c.draft_suffix_max, 7);
 }
 
 RAD_TEST_MAIN()

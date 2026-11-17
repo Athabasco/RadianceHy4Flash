@@ -1306,6 +1306,44 @@ int Engine::declare() {
             decide("draft trees", "asked", why);
         }
     }
+    /* --draft-suffix: SuffixDecoding's selector (core/sched/suffix.h). A suffix step verifies up to
+     * `draft_suffix_max` rows of the sequence's own history while the head still drafts its own
+     * `n_spec` rounds, so the verify window every consumer of `n_spec` sees (buffers, rings, the
+     * scheduler's window) becomes the larger of the two and the head's rounds are kept apart in
+     * `n_spec_head`. A serial head's chain only: a block drafter's block is fixed. It works with
+     * the fixed chain, with --draft-depth adaptive (whose depth stays within the head's rounds)
+     * and with the traversal verify (a suffix row binds no coupled state, so it is a leaf of the
+     * walk); the block verify decides a head chain as a whole and is refused. */
+    cfg_.n_spec_head = 0;
+    if (cfg_.draft_suffix) {
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
+        const char* bad = nullptr;
+        if (cfg_.n_spec <= 0)                         bad = "speculation is off (this container carries no draft head)";
+        else if (draft_tree_)                         bad = "it needs the head's chain, not a block drafter's tree";
+        else if (pb.draft_depth_fixed)                bad = "this drafter is a block drafter, not a serial head";
+        else if (cfg_.draft_window == DraftWindow::Adaptive)
+                                                      bad = "it needs the fixed window (--draft-window fixed)";
+        else if (cfg_.draft_verify_block)             bad = "it cannot be combined with --draft-verify block "
+                                                            "(a suffix chain is no block; --draft-verify token | traversal)";
+        if (bad) {
+            RAD_ERR("--draft-suffix on: %s", bad);
+            return RAD_E_UNSUPPORTED;
+        }
+        const int window = std::max(cfg_.n_spec, cfg_.draft_suffix_max);
+        if (window > (int)RAD_SCHED_MAX_SPEC) {
+            RAD_ERR("--draft-suffix-max %d is past the largest verify window (%d)", cfg_.draft_suffix_max,
+                    (int)RAD_SCHED_MAX_SPEC);
+            return RAD_E_INVAL;
+        }
+        cfg_.n_spec_head = cfg_.n_spec;
+        cfg_.n_spec      = window;
+        RAD_INFO("draft suffix: on -- a host-built step verifies up to %d row(s) of the sequence's own "
+                 "history when its last %d token(s) recur (path score >= %.2f); the head drafts %d "
+                 "round(s), the verify window is %d", cfg_.draft_suffix_max, cfg_.draft_suffix_min_match,
+                 (double)cfg_.draft_suffix_min_score, cfg_.n_spec_head, window);
+        decide("draft suffix", "on", "--draft-suffix on");
+    }
     /* The audio encoder's pass: the plugin's longest clip, when the model file carries an audio
      * encoder (`radiance.encoder` names one) and the deployment is not text-only. */
     if (cfg_.mm_audio_frames < 0) {

@@ -238,6 +238,18 @@ static const Flag g_flags[] = {
                                         "0 or 1 (default 1: the host decides while the next round runs)" },
     { "--draft-depth-stat",   "S",      "--draft-depth adaptive: top (default, each round's largest\n"
                                         "probability) | path (the probability of the token it drew)" },
+    { "--draft-suffix",       "MODE",   "off (default) | on -- SuffixDecoding as a step selector on a serial head's chain: when the\n"
+                                        "sequence's last --draft-suffix-min-match tokens occurred earlier in\n"
+                                        "its own prompt ++ output, a host-built step verifies the earlier\n"
+                                        "continuation (a chain, up to --draft-suffix-max rows) instead of the\n"
+                                        "head's draft. Lossless; works beside the fixed chain, --draft-verify\n"
+                                        "traversal and --draft-depth adaptive, not --draft-verify block" },
+    { "--draft-suffix-min-match", "L",  "shortest suffix match that selects a suffix step (default 6)" },
+    { "--draft-suffix-max",   "N",      "most rows of a suffix step (default 7; the verify window becomes\n"
+                                        "max(--num-speculative-tokens, N), the head still drafts its own)" },
+    { "--draft-suffix-min-score", "D",  "cut the suffix chain where its path score (the product of the\n"
+                                        "follower frequencies along it, SuffixDecoding's D) falls under D\n"
+                                        "(default 0.3)" },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
 
     { "--host",               "ADDR",   "listen address" },
@@ -970,6 +982,27 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
         }
+        else if (S("--draft-suffix")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "off")) c->draft_suffix = false;
+            else if (!std::strcmp(v, "on"))  c->draft_suffix = true;
+            else {
+                RAD_ERR("--draft-suffix takes off or on, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-suffix-min-match")) { if (!num(1, 12, &c->draft_suffix_min_match)) return RAD_E_INVAL; }
+        else if (S("--draft-suffix-max"))       { if (!num(1, 32, &c->draft_suffix_max)) return RAD_E_INVAL; }
+        else if (S("--draft-suffix-min-score")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            char* end = nullptr;
+            const double d = std::strtod(v, &end);
+            if (end == v || *end || !(d >= 0.0 && d <= 1.0)) {
+                RAD_ERR("--draft-suffix-min-score takes a number in [0, 1], not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->draft_suffix_min_score = (float)d;
+        }
         else if (S("--draft-model")) {
             /* Refused, not ignored: separate draft models are not supported (spec §10), and the
              * drafter comes from the container (rad-convert --draft-model merges one in; an MTP
@@ -1649,6 +1682,10 @@ const ShowRow kShow[] = {
     { "--draft-depth-stop",   [](const Config& c) { return fnum(c.draft_depth_stop); } },
     { "--draft-depth-lag",    [](const Config& c) { return num(c.draft_depth_lag); } },
     { "--draft-depth-stat",   [](const Config& c) { return std::string(c.draft_depth_stat == 1 ? "path" : "top"); } },
+    { "--draft-suffix",       [](const Config& c) { return onoff(c.draft_suffix); } },
+    { "--draft-suffix-min-match", [](const Config& c) { return num(c.draft_suffix_min_match); } },
+    { "--draft-suffix-max",   [](const Config& c) { return num(c.draft_suffix_max); } },
+    { "--draft-suffix-min-score", [](const Config& c) { return fnum(c.draft_suffix_min_score); } },
     { "--draft-model",        [](const Config&) { return std::string("not implemented (the container's own drafter)"); } },
     { "--host",               [](const Config& c) { return c.host; } },
     { "--port",               [](const Config& c) { return num(c.port); } },

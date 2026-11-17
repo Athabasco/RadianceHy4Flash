@@ -138,6 +138,9 @@ int Engine::step_state_init() {
         }
         depth_cfg_.on   = true;
         depth_cfg_.max  = (int)std::min<int64_t>(drafter_.depth, couple_planes_);
+        /* --draft-suffix widens the verify window (and the depth the plugin declares) past the head's
+         * own rounds: the chain never goes deeper than the head's num-speculative-tokens. */
+        if (cfg_.n_spec_head > 0) depth_cfg_.max = std::min(depth_cfg_.max, cfg_.n_spec_head);
         if (cfg_.draft_depth_max > 0) depth_cfg_.max = std::min(depth_cfg_.max, cfg_.draft_depth_max);
         depth_cfg_.max  = std::min(depth_cfg_.max, (int)RAD_MTP_COUPLE_MAX_ROUNDS);
         depth_cfg_.min  = std::min(std::max(cfg_.draft_depth_min, 1), depth_cfg_.max);
@@ -613,7 +616,7 @@ int Engine::finish_serial_drafter(const StepOut& so) {
         for (size_t i = 0; i < plan.e.size(); ++i) {
             const StepEntry& e = plan.e[i];
             if (so.first_row[i] < 0 || e.n_spec <= 0 || e.n_spec > (int)RAD_MTP_COUPLE_MAX_ROUNDS ||
-                e.card < 0 || (size_t)e.card >= couple_by_card_.size())
+                e.suffix || e.card < 0 || (size_t)e.card >= couple_by_card_.size())
                 continue;
             const RadMtpCoupleDraw& d = couple_by_card_[(size_t)e.card];
             if (d.seq != e.seq || d.mode != 1) continue;
