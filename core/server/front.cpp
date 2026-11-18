@@ -789,6 +789,8 @@ void Front::forward_socket(const HttpRequest& q, WsConn& c) {
 }
 
 HttpResponse Front::models(const HttpRequest& q) {
+    /* Discovery holds the server alive without marking it used: polling cards must not
+     * restart the idle TTL or keep a warm-up model resident. */
     /* One model's card: asked of the model it names, under its own id. A model not loaded is
      * described without loading it. */
     if (q.path.rfind("/v1/models/", 0) == 0 && q.path.size() > 11) {
@@ -806,7 +808,7 @@ HttpResponse Front::models(const HttpRequest& q) {
                 return HttpResponse::json_body(200, card.dump());
             }
             e = r;
-            l = lease_entry(r);
+            l = lease_quiet(r);
         }
         HttpRequest one = q;
         const size_t colon = id.find(':');
@@ -820,7 +822,7 @@ HttpResponse Front::models(const HttpRequest& q) {
         for (auto& p : entries_) {
             if (p->removed) continue;
             Row r{p.get(), nullptr, p->name, p->aliases, p->state};
-            if (p->state == State::Open) r.hold = lease_entry(p.get());
+            if (p->state == State::Open) r.hold = lease_quiet(p.get());
             rows.push_back(std::move(r));
         }
     }
