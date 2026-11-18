@@ -10813,6 +10813,88 @@ TEST(qwen35_w8a8_steps_lint_clean_with_its_mtp_head_and_a_dflash2_drafter) {
     CHECK_EQ(p.draft_depth, 7);
 }
 
+namespace {
+
+/* Split target as prepared by vhead.py; each class covers complete tiles on both TP ranks. */
+void q35_split_head(RadBuilder& b, bool draft, int draft_group = 128) {
+    w8a8_encs(&b);
+    const int64_t rows[] = {130560, 31744, 41472, 44544};
+    const uint32_t dt[] = {RAD_U3, RAD_U4, RAD_U5, RAD_U6};
+    for (int i = 0; i < 4; ++i) {
+        RadEncoding e{};
+        rad_enc_copy_str(e.scheme, "trellis");
+        rad_enc_copy_str(e.transform, "fwht128");
+        rad_enc_add_plane(&e, "codes", dt[i], 1, 1);
+        rad_enc_add_plane(&e, "scale", RAD_F32, 1, 0);
+        const int t = rad_enc_add_table(&e, "trellis", RAD_I8, 1 << 16, 1);
+        e.plane[t].block[0] = 256;
+        rad_enc_add_table(&e, "trellis.mad", RAD_U32, 2, 1);
+        const std::string name = "output.k" + std::to_string(i + 3) + ".weight";
+        b.encs.emplace_back(name, e);
+        b.shapes[name] = {rows[i], 5120};
+    }
+    if (draft) {
+        RadEncoding e = rad_enc_affine(RAD_U2, RAD_F16, 1, draft_group);
+        rad_enc_add_plane(&e, "zero", RAD_U8, 1, draft_group);
+        b.encs.emplace_back("mtp.draft_head.weight", e);
+    }
+}
+
+}  /* namespace */
+
+TEST(qwen35_split_target_verifies_independent_u2_mtp_proposals) {
+    MetaKV mk = q35w8a8_meta();
+    for (int world : {1, 2}) for (int rank = 0; rank < world; ++rank) {
+        RadBuilder b;
+        q35_split_head(b, true);
+        RadBuildCtx ctx = spec_ctx(rank, world, 3);
+        REQUIRE_EQ(qwen35_w8a8::declare(&b, mk.meta(), &ctx), RAD_OK);
+        CHECK_EQ(b.drafter_name, std::string("mtp"));
+        CHECK_EQ((int)b.drafter.kind, (int)RAD_DRAFT_SERIAL);
+        CHECK_EQ(b.drafter.proposal, (rad_buf)buf_named(b, "mtp_didx"));
+        CHECK_EQ(b.drafter.proposal_pitch, 1);
+        CHECK(find_w(b, "output.weight") == nullptr);
+        REQUIRE(find_w(b, "mtp.draft_head.weight") != nullptr);
+        CHECK_EQ(count_op(b, "logits_gemm"), 0);  /* no phantom single-weight head */
+        const auto ver = kit(b, {4, 4}, {});
+        const auto hist = history_pass(b, *ver);
+        const auto next = round_pass(b, 2, 2);
+        const auto v = run_passes(b, qwen35_w8a8::step, {ver.get(), hist.get(), next.get()}, rank, world);
+        CHECK_PASSES(b, v);
+        CHECK(issue_of(b, *v[0], "logits_gemm_vocab") != nullptr);
+        for (int p : {1, 2}) {
+            CHECK(issue_of(b, *v[p], "logits_gemm_vocab") == nullptr);
+            CHECK(issue_of(b, *v[p], "row_topk") != nullptr);
+        }
+    }
+}
+
+TEST(qwen35_split_target_loads_only_a_usable_requested_drafter) {
+    MetaKV mk = q35w8a8_meta();
+    for (int spec : {0, 3}) {
+        RadBuilder b;
+        q35_split_head(b, spec == 0);  /* real head with spec off, old container with spec on */
+        RadBuildCtx ctx = spec_ctx(0, 1, spec);
+        REQUIRE_EQ(qwen35_w8a8::declare(&b, mk.meta(), &ctx), RAD_OK);
+        CHECK(b.drafter_name.empty());
+        CHECK(find_w(b, "mtp.fc.weight") == nullptr);
+        CHECK(find_b(b, "mtp_dlog") == nullptr);
+        CHECK_EQ(count_op(b, "logits_gemm_vocab"), 1);
+    }
+    RadBuilder bad;
+    q35_split_head(bad, true, 64);
+    RadBuildCtx ctx = spec_ctx(0, 1, 3);
+    CHECK_EQ(stderr_of_rc([&] { return qwen35_w8a8::declare(&bad, mk.meta(), &ctx); }), RAD_E_DTYPE);
+
+    MetaKV df = with_dflash2(q35w8a8_meta());
+    RadBuilder b;
+    q35_split_head(b, true);
+    ctx.max_spec = 7;
+    REQUIRE_EQ(qwen35_w8a8::declare(&b, df.meta(), &ctx), RAD_OK);
+    CHECK_EQ(b.drafter_name, std::string("dflash2"));
+    CHECK(find_w(b, "mtp.fc.weight") == nullptr);
+}
+
 /* ==================================================================== llama_fp8 and DSpark */
 
 namespace {

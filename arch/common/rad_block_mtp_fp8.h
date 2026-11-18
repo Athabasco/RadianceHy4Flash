@@ -147,9 +147,6 @@ struct MtpBlockFP8 {
         const char* norm               = nullptr;
         const char* pre_norm_hidden    = nullptr;
         const char* pre_norm_embedding = nullptr;
-        /* The checkpoint's lm_head. The trunk maps it as `output.weight`; the draft head is a
-         * second logical weight over the same tensor, quantised to 2 bits (mtp_draft_head_q2). */
-        const char* lm                 = nullptr;
         AttnGatedFP8::Src attn{};
         typename Ffn::Src mlp{};
     };
@@ -186,7 +183,10 @@ inline int MtpBlockFP8<Ffn>::declare(RadBuilder* b, Names& nm, const Geom& geom,
                                      const Src& src) {
     g = geom; w = wire; layer = l; w_tok = tok_embd; w_lm = lm_head;
     rows = g.max_tok;
-    if (rows <= 0 || !w_tok || !w_lm) return RAD_E_INVAL;
+    q2 = w.dq != 0;
+    if (rows <= 0 || !w_tok || (q2 ? (!w.ds || !w.dsum || !w.dlog || !w.didx || !w.dval)
+                                    : (!w_lm || !w.logits)))
+        return RAD_E_INVAL;
 
     /* The normed embedding first, then the normed hidden state (see the header). */
     off_e = 0;
@@ -278,14 +278,17 @@ inline int MtpBlockFP8<Ffn>::declare(RadBuilder* b, Names& nm, const Geom& geom,
                      RAD_WEIGHTS(w_norm)),
                  {w.x}, {w.hout});
 
-    /* The trunk's lm_head over the head's hidden state, banded at the logits buffer's extent: it
-     * runs over one row per drafting sequence. */
-    op_logits = rw(b, RAD_OP(b, "logits_gemm",
-                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
-                                 RAD_INT("n_vocab", g.n_vocab),
-                                 RAD_INT("n_embd", g.n_embd), RAD_STR("dtype", g.dtype)),
-                      RAD_WEIGHTS(w_lm)),
-                  {w.hout}, {w.logits});
+    /* Only the fallback projects through the target's single lm_head. In particular do not
+     * declare an unused logits_gemm with a null weight when the target uses width classes. */
+    if (!q2) {
+        op_logits = rw(b, RAD_OP(b, "logits_gemm",
+                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
+                                      RAD_INT("n_vocab", g.n_vocab),
+                                      RAD_INT("n_embd", g.n_embd), RAD_STR("dtype", g.dtype)),
+                           RAD_WEIGHTS(w_lm)),
+                       {w.hout}, {w.logits});
+        if (!op_logits) return RAD_E_INVAL;
+    }
 
     /* ---- The 2-bit draft head.
      *
@@ -306,13 +309,19 @@ inline int MtpBlockFP8<Ffn>::declare(RadBuilder* b, Names& nm, const Geom& geom,
     enum { MTP_W2_GROUP = 128 };      /* libr4d's R4D_GEMM_W2A8_GROUP, and the layout's g128 tag */
     /* The plugin declares the working set only when mtp_draft_head_q2 found a 2-bit head (and
      * declared its name map). */
-    q2 = src.lm && w.dq && w.ds && w.dsum && w.dlog && w.didx && w.dval;
     if (q2) {
         /* Replicated over the whole vocabulary. Without the sampler's cross-rank merge, a sharded
          * plane would let each rank propose only its own vocabulary slice. Replication costs 341
          * MiB per card at 2 bits and keeps the draft path single-rank. (The stored bytes are also
          * tile-major, 16 output rows per packed block, so a shard would have to be whole tiles.) */
         const char* dhn = nm.f("mtp.draft_head.weight");
+        RadEncoding enc{}, expected = rad_enc_affine(RAD_U2, RAD_F16, 1, MTP_W2_GROUP);
+        rad_enc_add_plane(&expected, "zero", RAD_U8, 1, MTP_W2_GROUP);
+        if (!weight_enc(b, dhn, &enc) || !rad_enc_equal(&enc, &expected)) {
+            std::fprintf(stderr, "radiance: %s requires unrotated U2 codes with an F16 scale and "
+                                 "U8 zero per group of 128\n", dhn);
+            return RAD_E_DTYPE;
+        }
         w_dh  = decl_view(b, dhn, nullptr, "codes", RAD_U2, {g.n_vocab_all, g.n_embd},
                           RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
         w_dhs = decl_view(b, nm.f("mtp.draft_head.scale"), dhn, "scale,zero", RAD_F16,
@@ -340,6 +349,7 @@ inline int MtpBlockFP8<Ffn>::declare(RadBuilder* b, Names& nm, const Geom& geom,
                                     RAD_STR("dtype", g.dtype)),
                          RAD_NOWEIGHTS),
                      {w.dlog}, {w.didx, w.dval});
+        if (!op_dquant || !op_dlogits || !op_dtopk) return RAD_E_INVAL;
     }
 
     /* Keep `hout` live through the head's last op: it is the next round's input, and if only the

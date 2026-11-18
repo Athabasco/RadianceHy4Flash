@@ -1280,8 +1280,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      *
      * Also only when there is no DFlash2 drafter (`n_taps` == 0): a deployment drafts with one,
      * and DFlash2 (one forward per block rather than one per token) is the better one here. */
-    /* (A vocabulary-weighted head has no output.weight for the draft head to read.) */
-    if (nextn > 0 && g.max_spec > 0 && m.n_taps == 0 && !m.n_vcls) {
+    const bool want_mtp = nextn > 0 && g.max_spec > 0 && !m.n_taps;
+    const bool draft_q2 = want_mtp &&
+        mtp_draft_head_q2(b, nm.f("mtp.draft_head.weight"), nm.ckpt("lm_head.weight"));
+    /* A split target has no single output.weight. It can still verify the proposals of an
+     * independent U2 head. Older split-head containers carry neither that head nor the MTP
+     * block, even if the checkpoint metadata advertises NextN. Leave them trunk-only. */
+    if (want_mtp && (m.w_lm_head || draft_q2)) {
         /* Sized at max_tok, not max_logit_rows: a draft round is one row per sequence, but the
          * history pass that fills the head's own K and V is one row per token over a whole prefill
          * chunk (26 MiB at a 512-token chunk, beside 477 MiB of head weights). */
@@ -1293,7 +1298,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         /* The 2-bit draft head's working set, at max_logit_rows, since only a draft round (one row
          * per sequence) uses it. `mtp_dsum` is quant_act_i8's group-major
          * [n_embd/128][ceil(M/16)*16] plane, first dimension the K group, not the token. */
-        if (mtp_draft_head_q2(b, nm.f("mtp.draft_head.weight"), nm.ckpt("lm_head.weight"))) {
+        if (draft_q2) {
             const int64_t dmpad = ((g.max_logit_rows + 15) / 16) * 16;
             m.b_mtp_dq   = decl_b(b, nm.f("mtp_dq"),   RAD_I8,   {g.max_logit_rows, g.n_embd});
             m.b_mtp_ds   = decl_b(b, nm.f("mtp_ds"),   RAD_F32,  {g.max_logit_rows, 1});
@@ -1349,10 +1354,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         ts.mlp.up      = nm.ckpt("mtp.layers.0.mlp.up_proj.weight");
         ts.mlp.down    = nm.ckpt("mtp.layers.0.mlp.down_proj.weight");
 #endif
-        /* The trunk maps this same tensor as `output.weight`; the draft head maps it again under a
-         * name of its own, which the recipe quantises to two bits (mtp_draft_head_q2). */
-        ts.lm          = nm.ckpt("lm_head.weight");
-
         /* Bound as one more layer of the trunk's full-attention group, at absolute index n_main,
          * so a draft round writes its K and V at the slot of the trunk's token for that position.
          * A rejected draft is then overwritten rather than rolled back (rad_block_mtp_fp8.h). */
@@ -1418,7 +1419,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         rad_note(b, "MTP head: the first of %lld NextN layer(s) under `mtp.`, as absolute layer "
                     "%lld of the full-attention KV group",
                  (long long)nextn, (long long)m.n_main);
-    else if (nextn > 0)
+    else if (want_mtp && m.n_vcls)
+        rad_note(b, "no native MTP: this split-head container has no independent U2 draft head");
+    else if (nextn > 0 && !m.have_df)
         rad_note(b, "the %lld MTP/NextN layer(s) under `mtp.` are not loaded: this deployment "
                     "does not speculate", (long long)nextn);
 
