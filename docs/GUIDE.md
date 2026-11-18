@@ -1960,6 +1960,15 @@ tok/s, 47K 6251 to 6414). A message under the floor stays plain: the two forms c
 handshake and not its bytes, is slower coded (a 20 KiB reduction 3.7 us plain and 5.5 coded, 3.8% of
 decode throughput). `R4D_AR_CODED_MIN_KB` (§8) moves the floor.
 
+A large coded message would otherwise take the link's time and then the card memory's time (every
+block pushes its range, then decodes the peer's and writes the streams). From 4 MiB (the write) and
+6 MiB (the gather form) each block cuts its range into parts with their own handshake and folds part
+j - 1 while part j crosses the link (8 parts for the write, 6 for the gather): the same bytes, about
+the longer of the two times instead of their sum. An 8192-row chunk's write takes 1639 instead of
+2015 us and its gather 2015 instead of 2235 us on 2x R9700; decode and verify messages stay far
+below. `R4D_AR_CODED_STAGES` / `R4D_AR_CODED_STAGES_G` (§8) set the parts, `0` keeps the
+single-phase coded kernel.
+
 **Cards without peer access.** The all-reduce kernels normally write into the other card's memory
 directly (P2P). At launch radiance asks the driver whether each pair of cards can, and logs the
 answer; the IOMMU setting, the PCIe topology and any switch between the cards decide. Where a pair
@@ -4729,6 +4738,8 @@ rad-kbench --home $RADIANCE_HOME --max-cases 1   # are the kernels correct?
 | `HF_TOKEN` | for `scripts/hfget.sh` and `model: <owner/name>` on a gated or private repo |
 | `XDG_CACHE_HOME` | where `model: <owner/name>` fetches to without `server.download-dir` (`$XDG_CACHE_HOME/radiance/hf`, else `~/.cache/radiance/hf`) |
 | `R4D_AR_CODED_MIN_KB` | the smallest message, in KiB, the two-rank fused all-reduce writes send coded (§4.7; lossless, the same bytes out): `0` codes every message that fits the form, `off` none. Unset, 512 |
+| `R4D_AR_CODED_STAGES`, `R4D_AR_CODED_STAGES_G` | parts a block of a coded two-rank fused write (`_G`: its gather form) cuts its range into, each with its own handshake, so the push of one part and the fold of the one before overlap (§4.7; the same bytes out). `0` keeps the single-phase coded kernel. Unset, 8 and 6 |
+| `R4D_AR_CODED_STAGES_MIN_KB`, `R4D_AR_CODED_STAGES_G_MIN_KB` | the smallest coded message, in KiB, that takes the staged form (write, gather form). Unset, 4096 and 6144 |
 | `R4D_AR_MAX_BLOCKS` | a ceiling on libr4d's collective block counts, for two tensor-parallel engines on one set of cards; set it in both (below). The MoE models' hyper-connection gathers keep the minimum their LDS table needs. Unset, nothing changes |
 
 **Two engines on one set of cards.** Every block of a libr4d collective spins until its twin on the

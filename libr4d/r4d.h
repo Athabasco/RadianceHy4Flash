@@ -352,6 +352,9 @@ int  r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags,
                             long top_k, long sig, long stream, long nblocks, long nthreads,
                             long drain, long acq, long inv, long gate, long gate_ctr,
                             long stage = 0, long chain = 0, long coded = 0);
+// Test hook: the parts of the staged coded form (r4d_ar_hc_write_coded_staged_kernel) every fused
+// write that takes the coded push uses, 0 for the single-phase kernel; -1 restores the rule.
+void r4d_ar_coded_stages_pin(int stages);
 // r4d_ar_hc_write and r4d_ar_gather_hc_write on the rotated 6-bit wire (r4d_ar_oneshot_2rank_wht6's
 // format, loc_pack and scratch split): byte-identical to all_reduce on that wire then hc_write,
 // with `ye` non-zero preceded by moe_gather. Gather operands as r4d_ar_gather_hc_write; its slot

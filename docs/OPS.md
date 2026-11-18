@@ -2655,7 +2655,10 @@ and a constraint on an absent key does not hold. The two-rank exact row (and `ar
 over P2P carries a message of 512 KiB or more with its push coded at about 12.1 bits a value,
 losslessly: the peer decodes the bf16 words the plain push would have carried, so `y` and `h` are
 the same bytes (docs/GUIDE.md §4.7; `R4D_AR_CODED_MIN_KB` moves the floor). The form needs a message
-of whole 256-value waves and leaves the others, and the host-mailbox twins, plain.
+of whole 256-value waves and leaves the others, and the host-mailbox twins, plain. From 4 MiB (the
+gather form from 6 MiB) the coded push runs staged: each block's range in parts with their own
+handshake, the fold of one part beside the push of the next, the same bytes
+(`R4D_AR_CODED_STAGES`, `R4D_AR_CODED_STAGES_G`).
 
 `ar_gather_hc_write` is `moe_gather` followed by `ar_hc_write`: the gather's output is the message,
 so the gather half writes `y` before it is reduced in place, and the five gather operands and `act`

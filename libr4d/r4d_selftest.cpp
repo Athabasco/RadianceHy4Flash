@@ -157,6 +157,7 @@ struct Plugin {
     void (*mla_stats)(unsigned long long*) = nullptr;
     void (*pin_mla_rows)(int) = nullptr;
     void (*pin_late_push)(int) = nullptr;
+    void (*pin_ar_stages)(int) = nullptr;
     void (*pin_ar_form)(int) = nullptr;
     int (*record)(const void**, int) = nullptr;
     void (*ar8_settings)(const R4DAr8Settings*) = nullptr;
@@ -233,6 +234,7 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_mla_matrix_stats", &pl->mla_stats);
     okall &= sym(pl->h, "r4d_mla_rows_pin_form", &pl->pin_mla_rows);
     okall &= sym(pl->h, "r4d_ar_late_push_pin", &pl->pin_late_push);
+    okall &= sym(pl->h, "r4d_ar_coded_stages_pin", &pl->pin_ar_stages);
     okall &= sym(pl->h, "r4d_ar_form_pin", &pl->pin_ar_form);
     okall &= sym(pl->h, "r4d_record_dispatches", &pl->record);
     okall &= sym(pl->h, "r4d_ar8_test_settings", &pl->ar8_settings);
@@ -31044,6 +31046,11 @@ static void ar_hc_forms_case(const Plugin& pl, const std::vector<int>& devs, con
  * four arms: plain; coded; coded with every push held ~20 us behind its flag
  * (r4d_ar_late_push_pin), the path the push check re-reads coded bytes on; and the two forms mixed
  * (plain, plain, coded, coded, plain, coded), so each form's push lands on a slot the other left.
+ * Arms 1 and 3 take the staged coded form (r4d_ar_hc_write_coded_staged_kernel) where its rule does
+ * (from 4 MiB for the write, 6 MiB for the gather); three more arms pin the form for every coded
+ * message (r4d_ar_coded_stages_pin): the single-phase kernel, 3 parts a block, and 16 (the most;
+ * the rule cuts it to the 512 handshake units a launch has, and small messages get empty parts),
+ * each against the plain kernels too.
  * The patterns send groups down every path of the codec: `rough` exponents over 2^-12..2^12 (most
  * groups raw, some coded), and `paths` an exponent range of exactly 14 (coded) and 15 (raw), a
  * subnormal, an infinity, zeros and exponents near the top beside ordinary groups. A message that
@@ -31078,6 +31085,7 @@ static void ar_hc_coded_case(const Plugin& pl, const std::vector<int>& devs, con
     if (devs.size() < 2) { skip(nm.c_str(), "needs 2 gfx1201 cards"); return; }
     if (!ar_peer_path_ok(devs, 2)) { skip(nm.c_str(), "no peer path between the cards (device.p2p)"); return; }
     if (!pl.pin_late_push) { skip(nm.c_str(), "no r4d_ar_late_push_pin"); return; }
+    if (!pl.pin_ar_stages) { skip(nm.c_str(), "no r4d_ar_coded_stages_pin"); return; }
     struct Shape { int64_t M, n, hc; int pat; bool scratch; const char* act; };
     std::vector<Shape> shapes;
     /* Flash-Next's residual (n 2560, four streams) from a decode row to 4096 rows; then widths
@@ -31110,8 +31118,12 @@ static void ar_hc_coded_case(const Plugin& pl, const std::vector<int>& devs, con
             for (int64_t i = 0; i < T; ++i)
                 if (ex[(size_t)i] >= 0) sorted[(size_t)cnt[(size_t)ex[(size_t)i]]++] = (int32_t)i;
         }
-        /* arm 0: plain; 1: coded; 2: coded, late pushes; 3: the forms mixed. */
-        static const std::vector<int> kSeq[] = { { 0 }, { 1 }, { 1 }, { 0, 0, 1, 1, 0, 1 } };
+        /* arm 0: plain; 1: coded; 2: coded, late pushes; 3: the forms mixed; 4-6: coded with the
+         * staged form pinned to 0 (single-phase), 3 and 16 parts. */
+        static const std::vector<int> kSeq[] = { { 0 }, { 1 }, { 1 }, { 0, 0, 1, 1, 0, 1 },
+                                                 { 1 }, { 1 }, { 1 } };
+        static const int kStages[] = { -1, -1, -1, -1, 0, 3, 16 };
+        constexpr int kArms = 7;
         /* Every arm is handed the same inputs, built once. */
         std::vector<ArHc> proto(2);
         {
@@ -31157,8 +31169,9 @@ static void ar_hc_coded_case(const Plugin& pl, const std::vector<int>& devs, con
         }
         std::vector<std::vector<ArHc>> runs;
         bool up = true, ran = true;
-        for (int arm = 0; arm < 4 && up && ran; ++arm) {
+        for (int arm = 0; arm < kArms && up && ran; ++arm) {
             pl.pin_late_push(arm == 2 ? 1 : 0);
+            pl.pin_ar_stages(kStages[arm]);
             std::vector<ArHc> t = proto;
             std::vector<std::thread> th;
             for (ArHc& x : t) { x.coded_seq = kSeq[arm]; th.emplace_back(ar_hc_worker, &x); }
@@ -31173,18 +31186,22 @@ static void ar_hc_coded_case(const Plugin& pl, const std::vector<int>& devs, con
             runs.push_back(std::move(t));
         }
         pl.pin_late_push(0);
+        pl.pin_ar_stages(-1);
         const bool waves = (M * n) % 256 == 0;
         const std::string at = fmt(" M=%lld n=%lld hc=%lld %s%s%s%s", (long long)M, (long long)n,
                                    (long long)hc, kPat[sh.pat],
                                    want_gather ? (sh.scratch ? ", top_k 8, inverse table" : ", top_k 8") : "",
                                    want_gather && sh.act ? ", shared arm" : "",
                                    waves ? "" : " (not whole waves: plain)");
-        ok((nm + at + ": every arm launches").c_str(), up && ran && runs.size() == 4);
-        if (!up || !ran || runs.size() != 4) continue;
+        ok((nm + at + ": every arm launches").c_str(), up && ran && runs.size() == (size_t)kArms);
+        if (!up || !ran || runs.size() != (size_t)kArms) continue;
         static const char* const kWhat[] = { "", "byte-identical to the plain kernels after six launches",
                                              "with every push ~20 us behind its flag: byte-identical too",
-                                             "mixed with the plain kernels on one instance: byte-identical too" };
-        for (size_t f = 1; f < 4; ++f) {
+                                             "mixed with the plain kernels on one instance: byte-identical too",
+                                             "single-phase coded kernel pinned: byte-identical too",
+                                             "staged form pinned to 3 parts: byte-identical too",
+                                             "staged form pinned to 16 parts: byte-identical too" };
+        for (size_t f = 1; f < (size_t)kArms; ++f) {
             int64_t bad = 0, nz = 0;
             for (int r = 0; r < 2; ++r) {
                 const ArHc& a = runs[0][(size_t)r];
