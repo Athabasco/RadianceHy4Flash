@@ -1286,7 +1286,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* A split target has no single output.weight. It can still verify the proposals of an
      * independent U2 head. Older split-head containers carry neither that head nor the MTP
      * block, even if the checkpoint metadata advertises NextN. Leave them trunk-only. */
-    if (want_mtp && (m.w_lm_head || draft_q2)) {
+    if (want_mtp && (m.w_lm_head || draft_q2 || ctx->draft_coupling)) {
+        const int pitch = MtpHead::proposal_pitch(ctx->draft_coupling != 0);
         /* Sized at max_tok, not max_logit_rows: a draft round is one row per sequence, but the
          * history pass that fills the head's own K and V is one row per token over a whole prefill
          * chunk (26 MiB at a 512-token chunk, beside 477 MiB of head weights). */
@@ -1295,9 +1296,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.b_mtp_c = decl_b(b, nm.f("mtp_c"), g.act_dtype, {g.max_tok, 2 * g.n_embd});
         m.b_mtp_x = decl_b(b, nm.f("mtp_x"), g.act_dtype, {g.max_tok, g.n_embd});
 
-        /* The 2-bit draft head's working set, one row per drafting sequence. Target verification (or KLD)
-         * may need many more logits rows; the serial head never proposes those in one round. `mtp_dsum` is quant_act_i8's group-major
-         * [n_embd/128][ceil(M/16)*16] plane, first dimension the K group, not the token. */
+        /* One row per drafting sequence, even if verification or KLD needs many more target
+         * logits rows. mtp_dsum is quant_act_i8's group-major [n_embd/128][ceil(M/16)*16]. */
         if (draft_q2) {
             const int64_t dmpad = ((g.max_seqs + 15) / 16) * 16;
             m.b_mtp_dq   = decl_b(b, nm.f("mtp_dq"),   RAD_I8,   {g.max_seqs, g.n_embd});
@@ -1306,8 +1306,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             m.b_mtp_dlog = decl_b(b, nm.f("mtp_dlog"), g.act_dtype, {g.max_seqs, g.n_vocab_all});
             /* A draft round's proposal comes out of row_topk here, never through the sampler's
              * token buffer. */
-            m.b_mtp_didx = decl_b(b, nm.f("mtp_didx"), RAD_I32,  {g.max_seqs, 1});
-            m.b_mtp_dval = decl_b(b, nm.f("mtp_dval"), RAD_F32,  {g.max_seqs, 1});
+            m.b_mtp_didx = decl_b(b, nm.f("mtp_didx"), RAD_I32, {g.max_seqs, pitch});
+            m.b_mtp_dval = decl_b(b, nm.f("mtp_dval"), RAD_F32, {g.max_seqs, pitch});
         }
 
         /* The head reuses the trunk's working buffers (`attn_qg`, `attn_k`, the ffn planes, `h`),
@@ -1323,6 +1323,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         tw.dq = m.b_mtp_dq; tw.ds = m.b_mtp_ds;  tw.dsum = m.b_mtp_dsum;
         tw.dlog = m.b_mtp_dlog; tw.didx = m.b_mtp_didx; tw.dval = m.b_mtp_dval;
         tw.attn = tw_attn;  tw.mlp = tw_mlp;
+        tw.coupled = ctx->draft_coupling != 0;
 
         MtpHead::Src ts{};
         ts.fc                 = nm.ckpt("mtp.fc.weight");
@@ -1364,14 +1365,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.have_mtp = true;
 
         /* Serial drafter: `max_spec` dependent passes, each embedding the last one's proposal.
-         * The 2-bit head writes its own argmax into `mtp_didx`; without it `mtp_didx` is 0 and the
-         * bf16 head goes through the ordinary sampler chain. */
+         * A U2 head writes its greedy or coupled proposal to column zero. With the fallback
+         * the proposal handle is null and the engine uses the ordinary sampler. */
         RadDrafterDecl dd{};
         dd.name           = "mtp";
         dd.kind           = RAD_DRAFT_SERIAL;
         dd.depth          = ctx->max_spec;
         dd.proposal       = m.b_mtp_didx;
-        dd.proposal_pitch = 1;
+        dd.proposal_pitch = pitch;
         dd.mask_token     = -1;
         RAD_ARCH_TRY(rad_declare_drafter(b, &dd));
     }

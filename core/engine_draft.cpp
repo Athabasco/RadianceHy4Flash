@@ -115,7 +115,7 @@ int Engine::step_state_init() {
             RAD_INFO("DFlash coupled LIVE: %d position(s), x~Q along the candidate walk, maximal "
                      "coupling at the verify; fixed-seed tokens are NOT preserved", drafter_.depth);
         else
-            RAD_INFO("MTP coupled LIVE: %d linear round(s), x~Q from the final reranked top8, "
+            RAD_INFO("MTP coupled LIVE: %d linear round(s), x~Q from the draft shortlist, "
                      "maximal coupling at the verify; fixed-seed tokens are NOT preserved",
                      drafter_.depth);
     }

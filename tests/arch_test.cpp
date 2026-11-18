@@ -10853,6 +10853,8 @@ TEST(qwen35_split_target_verifies_independent_u2_mtp_proposals) {
         CHECK_EQ((int)b.drafter.kind, (int)RAD_DRAFT_SERIAL);
         CHECK_EQ(b.drafter.proposal, (rad_buf)buf_named(b, "mtp_didx"));
         CHECK_EQ(b.drafter.proposal_pitch, 1);
+        CHECK_EQ(count_op(b, "mtp_couple_propose"), 0);
+        CHECK(find_b(b, "mtp_couple_state") == nullptr);
         const RecBuf* dlog = find_b(b, "mtp_dlog");
         REQUIRE(dlog != nullptr);
         CHECK_EQ(dlog->d.shape[0], ctx.max_seqs);
@@ -10871,6 +10873,61 @@ TEST(qwen35_split_target_verifies_independent_u2_mtp_proposals) {
             CHECK(issue_of(b, *v[p], "row_topk") != nullptr);
         }
     }
+}
+
+TEST(qwen35_u2_mtp_couples_each_round_after_the_global_shortlist) {
+    MetaKV mk = q35w8a8_meta();
+    for (int world : {1, 2}) for (int rank = 0; rank < world; ++rank) {
+        RadBuilder b;
+        q35_split_head(b, true);
+        RadBuildCtx ctx = spec_ctx(rank, world, 3);
+        ctx.draft_coupling = 1;
+        REQUIRE_EQ(qwen35_w8a8::declare(&b, mk.meta(), &ctx), RAD_OK);
+        CHECK_EQ(b.drafter.proposal_pitch, 8);
+        const RecBuf* st = find_b(b, "mtp_couple_state");
+        REQUIRE(st != nullptr);
+        CHECK_EQ(st->d.kind, (int)RAD_BUF_PERSIST);
+        CHECK_EQ(st->d.shape[0], 3);
+        CHECK_EQ(st->d.shape[1], ctx.max_seqs);
+        CHECK_EQ(st->d.shape[2], (int64_t)RAD_MTP_COUPLE_STATE_WORDS);
+        const auto ver = kit(b, {4, 4}, {});
+        const auto hist = history_pass(b, *ver);
+        const auto r2 = round_pass(b, 2, 2), r3 = round_pass(b, 2, 3);
+        const auto v = run_passes(b, qwen35_w8a8::step,
+                                  {ver.get(), hist.get(), r2.get(), r3.get()}, rank, world);
+        CHECK_PASSES(b, v);
+        CHECK(issue_of(b, *v[0], "mtp_couple_propose") == nullptr);
+        for (int rd = 1; rd <= 3; ++rd) {
+            const RecIssue* top = issue_of(b, *v[rd], "row_topk");
+            const RecIssue* prop = issue_of(b, *v[rd], "mtp_couple_propose");
+            REQUIRE(top && prop);
+            CHECK(top < prop);
+            CHECK_EQ(pint(b.op_of(top->op), "R"), 8);
+            CHECK_EQ(pint(b.op_of(prop->op), "round"), rd);
+            CHECK_EQ(pint(b.op_of(prop->op), "n_vocab"), mk.m.n_vocab);
+        }
+        hist->b.n_draft_out = 0;  /* a KV-only history pass samples nothing */
+        const auto empty = run_passes(b, qwen35_w8a8::step, {hist.get()}, rank, world);
+        CHECK(issue_of(b, *empty[0], "mtp_couple_propose") == nullptr);
+        const auto past = round_pass(b, 2, 4);
+        const auto invalid = run_passes(b, qwen35_w8a8::step, {past.get()}, rank, world);
+        CHECK(!invalid[0]->step_fail.empty());
+    }
+}
+
+TEST(qwen35_u2_mtp_rejects_unservable_coupling) {
+    MetaKV mk = q35w8a8_meta();
+    auto check = [&](bool head, bool kernels, int depth) {
+        RadBuilder b;
+        q35_split_head(b, head);
+        if (!kernels) b.undeclared.insert("mtp_couple_propose");
+        RadBuildCtx ctx = spec_ctx(0, 1, depth);
+        ctx.draft_coupling = 1;
+        return stderr_of_rc([&] { return qwen35_w8a8::declare(&b, mk.meta(), &ctx); });
+    };
+    CHECK_EQ(check(false, true, 3), RAD_E_UNSUPPORTED);
+    CHECK_EQ(check(true, false, 3), RAD_E_UNSUPPORTED);
+    CHECK_EQ(check(true, true, RAD_MTP_COUPLE_MAX_ROUNDS + 1), RAD_E_UNSUPPORTED);
 }
 
 TEST(qwen35_split_target_loads_only_a_usable_requested_drafter) {

@@ -92,6 +92,7 @@
 #include "rad_block_attn_gated_fp8.h"
 #include "rad_block_mlp_fp8.h"
 #include "rad_block_vit.h"
+#include "rad_spechub.h"
 
 namespace rad {
 namespace arch {
@@ -116,6 +117,9 @@ inline bool mtp_draft_head_q2(RadBuilder* b, const char* head, const char* lm) {
  * (MoeFP8's Config travels inside its Src for this reason). */
 template <class Ffn>
 struct MtpBlockFP8 {
+    /* spechub consumes a top-eight law; otherwise only the greedy token is needed. */
+    static constexpr int proposal_pitch(bool coupled) { return coupled ? 8 : 1; }
+
     struct Wire {
         /* [max_tok, n_embd] the trunk's final hidden states for the step just run (the plugin's
          * `h`). A pass names the rows it wants through out_ids. */
@@ -134,8 +138,9 @@ struct MtpBlockFP8 {
         rad_buf ds   = 0;   /* [max_seqs, 1]           f32, one scale a row */
         rad_buf dsum = 0;   /* [n_embd/group, mpad]    f32, group-major (quant_act_i8's asum) */
         rad_buf dlog = 0;   /* [max_seqs, n_vocab_all] bf16, the coarse logits */
-        rad_buf didx = 0;   /* [max_seqs, 1]           i32, the proposed token */
-        rad_buf dval = 0;   /* [max_seqs, 1]           f32, its logit */
+        rad_buf didx = 0;   /* [max_seqs, proposal_pitch] i32, proposal in column zero */
+        rad_buf dval = 0;   /* [max_seqs, proposal_pitch] f32, shortlist logits */
+        bool coupled = false;
         /* The layer reuses the trunk's working set, which is dead by the time the head runs (a
          * second set would be 150 MiB). */
         AttnGatedFP8::Wire attn{};
@@ -169,6 +174,8 @@ struct MtpBlockFP8 {
     MediaRows  mrows{};
     rad_op     op_norm = 0, op_dsel = 0, op_dback = 0, op_logits = 0;
     rad_op     op_dquant = 0, op_dlogits = 0, op_dtopk = 0;
+    rad_buf    couple_draws = 0, couple_state = 0;
+    rad_op     op_couple[RAD_MTP_COUPLE_MAX_ROUNDS] = {};
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, rad_kvgroup kv,
                  int64_t rotary_dim, rad_weight tok_embd, rad_weight lm_head, float out_wadd,
@@ -184,6 +191,15 @@ inline int MtpBlockFP8<Ffn>::declare(RadBuilder* b, Names& nm, const Geom& geom,
     g = geom; w = wire; layer = l; w_tok = tok_embd; w_lm = lm_head;
     rows = g.max_tok;
     q2 = w.dq != 0;
+    if (w.coupled && (!q2 || g.max_spec < 1 || g.max_spec > RAD_MTP_COUPLE_MAX_ROUNDS)) {
+        std::fprintf(stderr, "radiance: Qwen35 native MTP coupling requires the U2 draft head and "
+                             "a draft depth in 1..%d\n", RAD_MTP_COUPLE_MAX_ROUNDS);
+        return RAD_E_UNSUPPORTED;
+    }
+    if (w.coupled && !rad_op_declared(b, "mtp_couple_propose")) {
+        std::fprintf(stderr, "radiance: load the spechub kernels for Qwen35 MTP draft coupling\n");
+        return RAD_E_UNSUPPORTED;
+    }
     if (rows <= 0 || !w_tok || (q2 ? (!w.ds || !w.dsum || !w.dlog || !w.didx || !w.dval)
                                     : (!w_lm || !w.logits)))
         return RAD_E_INVAL;
@@ -302,9 +318,9 @@ inline int MtpBlockFP8<Ffn>::declare(RadBuilder* b, Names& nm, const Geom& geom,
      * asymmetric (four levels are too few for a symmetric one), so the activation side uses
      * `quant_act_i8`'s three-output form, whose per-group row sums subtract the stored zero.
      *
-     * The draft head bypasses the sampler, which reads f32 logits: `row_topk` at R=1 takes the
-     * argmax on the GEMM's bf16 output and the engine reads the id from `didx`. The trunk's logits
-     * plane is untouched.
+     * The head bypasses the sampler's f32 logits. row_topk takes the argmax, or the shortlist
+     * when coupling is on; the engine reads the proposal from column zero of didx. The target's
+     * logits plane is untouched.
      */
     enum { MTP_W2_GROUP = 128 };      /* libr4d's R4D_GEMM_W2A8_GROUP, and the layout's g128 tag */
     /* The plugin declares the working set only when mtp_draft_head_q2 found a 2-bit head (and
@@ -345,18 +361,34 @@ inline int MtpBlockFP8<Ffn>::declare(RadBuilder* b, Names& nm, const Geom& geom,
 
         op_dtopk = rw(b, RAD_OP(b, "row_topk",
                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs),
-                                    RAD_INT("N", g.n_vocab_all), RAD_INT("R", 1),
+                                    RAD_INT("N", g.n_vocab_all), RAD_INT("R", proposal_pitch(w.coupled)),
                                     RAD_STR("dtype", g.dtype)),
                          RAD_NOWEIGHTS),
                      {w.dlog}, {w.didx, w.dval});
         if (!op_dquant || !op_dlogits || !op_dtopk) return RAD_E_INVAL;
+        if (w.coupled) {
+            /* The engine binds these persistent planes by name. The U2 projection is
+             * replicated over the full vocabulary, so its shortlist already holds global ids. */
+            couple_draws = decl_b(b, nm.f("mtp_couple_draws"), RAD_U32,
+                                  {g.max_seqs, RAD_MTP_COUPLE_DRAW_WORDS}, RAD_BUF_PERSIST);
+            couple_state = decl_b(b, nm.f("mtp_couple_state"), RAD_U32,
+                                  {g.max_spec, g.max_seqs, RAD_MTP_COUPLE_STATE_WORDS}, RAD_BUF_PERSIST);
+            if (!couple_draws || !couple_state) return RAD_E_INVAL;
+            for (int rd = 1; rd <= g.max_spec; ++rd) {
+                op_couple[rd - 1] = rw(b, RAD_OP(b, "mtp_couple_propose",
+                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("n_vocab", g.n_vocab_all),
+                               RAD_INT("round", rd), RAD_INT("max_rounds", g.max_spec)),
+                    RAD_NOWEIGHTS), {w.didx, w.dval, couple_draws}, {w.didx, couple_state});
+                if (!op_couple[rd - 1]) return RAD_E_INVAL;
+            }
+        }
     }
 
     /* Keep `hout` live through the head's last op: it is the next round's input, and if only the
      * lm_head's first op read it, the planner could give its bytes to later ops (silently lowering
      * acceptance). */
     {
-        const rad_op last = q2 ? op_dtopk : op_logits;
+        const rad_op last = w.coupled ? op_couple[g.max_spec - 1] : q2 ? op_dtopk : op_logits;
         if (rad_op_reads(b, last, &w.hout, 1) < 0) return RAD_E_INVAL;
     }
     return RAD_OK;
@@ -375,6 +407,10 @@ inline void MtpBlockFP8<Ffn>::step(RadCtx* c, const RadBatch* batch) const {
     if (r == 1) {
         rad_step_fail(c, "the MTP head was handed a draft-round-1 pass: that round is carried by "
                          "the history pass (RadBatch::draft_out_ids) and has no pass of its own");
+        return;
+    }
+    if (w.coupled && (r == 0 || r > g.max_spec)) {
+        rad_step_fail(c, "Qwen35 MTP coupled round outside the declared draft depth");
         return;
     }
     if (r < 0 && batch->n_out > 0)
@@ -423,6 +459,12 @@ inline void MtpBlockFP8<Ffn>::step(RadCtx* c, const RadBatch* batch) const {
                     brows(w.dlog, L), RAD_B(w.dsum), RAD_NONE);
         RAD_ISSUE_N(c, op_dtopk, L, brows(w.dlog, L), brows(w.didx, L), brows(w.dval, L),
                     RAD_NONE);   /* the `pairs` slot, absent: operands are positional */
+        if (w.coupled) {
+            const int rd = r < 0 ? 1 : r;   /* history already supplied round one's rows */
+            RAD_ISSUE_N(c, op_couple[rd - 1], L, brows(w.didx, L), brows(w.dval, L),
+                        praw(batch->seq_ids, RAD_I32, batch->n_seq), brows(couple_draws, L),
+                        RAD_B(couple_state));
+        }
     } else {
         RAD_ISSUE_N(c, op_logits, L, brows(w.hout, L), RAD_W(w_lm), brows(w.logits, L));
     }
