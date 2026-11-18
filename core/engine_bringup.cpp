@@ -1014,6 +1014,9 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     /* Under --prefill-span every step but a lone prefill is planned at the shared budget
      * (Scheduler::step), so a wider step is one sequence; 0 without a span. */
     bc.max_mixed_tok = cfg_.prefill_span > 1 ? std::min(max_tok, prefill_shared_tok(cfg_)) : 0;
+    /* --prefill-span-pass step: the routed block's pass is the whole spanned step where the plugin
+     * runs such a step serially. */
+    bc.span_pass_step = cfg_.prefill_span > 1 && cfg_.prefill_span_step ? 1 : 0;
     /* --kv-resident in tokens, raised to kStreamFloorTokens as kvstream_ring_shape raises it: the
      * arch declares kv_resolve's ring depth from this, and the kernel refuses a carve deeper than
      * the declared table. */

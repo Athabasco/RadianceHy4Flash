@@ -283,6 +283,14 @@ typedef struct RadBuildCtx {
      * rank: one engine in a process, or a test driving a plugin alone. Two engines may serve the
      * same plugin at once only when it says so (rad_arch_multi_instance). */
     int      slot_base;
+
+    /* ---- appended in ABI 42 (--prefill-span-pass step) */
+    /* Nonzero: where the plugin runs a step wider than max_mixed_tok serially (it pipelines no
+     * part of it), its routed block may take the whole step in one pass rather than one pass a
+     * checkpoint interval, and size the planes that hold a row per (token, expert slot) for
+     * max_tok rows. 0, the zero-initialised default, keeps the interval-tall passes. A plugin
+     * without such a pass ignores it. */
+    int      span_pass_step;
 } RadBuildCtx;
 
 /* The most instances (engine ranks) one process holds at once; every slot is below it. */
