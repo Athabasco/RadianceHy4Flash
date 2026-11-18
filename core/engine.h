@@ -39,6 +39,7 @@
 #include "lora/adapter.h"
 #include "lora/slots.h"
 #include "fleet/broker.h"
+#include "place/expert_restore.h"
 
 #include <atomic>
 #include <chrono>
@@ -498,10 +499,12 @@ private:
     void                          flex_room_tick(uint64_t now_ns);
     /* Expert flex (§6.7). Each rank's slab borrows from its own reserved range (Rank::xflex), the
      * top `xflex_bytes_` of it backed; the ceiling is the loan that covers every slot carved there.
-     * xflex_tick grows it on the step loop while the engine is busy, a GiB at a time once the
+     * xflex_tick grows it while busy, or restores surrendered backing while idle, a GiB
+     * at a time once the
      * slab has filled what it holds; xflex_give recalls and unbacks it, between steps. */
     std::atomic<int64_t>          xflex_bytes_{0};
     std::atomic<int64_t>          xflex_want_{0};
+    ExpertFlexRestore             xflex_restore_;  /* step-loop state, reset on park */
     int64_t                       xflex_cap_ = 0;
     int64_t                       xflex_claimed_ = 0;       /* the claim's expert bytes a card */
     uint64_t                      xflex_ns_ = 0, xflex_busy_ns_ = 0, xflex_retry_ns_ = 0;

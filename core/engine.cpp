@@ -401,6 +401,7 @@ int Engine::park(int64_t drain_ms, const PageOut& req, PageResult* got, std::str
             spare.push_back({ (const char*)r->ctx.arena_base() + fixed, top - fixed });
     }
     if (!spare.empty()) dev_page_discard(owner_, spare);
+    xflex_restore_.clear();
     (void)xflex_settle();
     if (cfg_.prefix_cache) (void)sched_.reset_prefix_cache();
     const auto t2 = clk::now();
@@ -542,6 +543,7 @@ int64_t Engine::xflex_give(int64_t bytes) {
     }
     (void)rad_dev_set(ranks_[0]->device);
     const int64_t left = xflex_settle();
+    xflex_restore_.recalled(cur, left);
     xflex_retry_ns_ = rad_mono_ns() + 5000000000ull;
     const int64_t got = std::max<int64_t>(cur - left, 0);
     if (got > 0)
@@ -550,8 +552,10 @@ int64_t Engine::xflex_give(int64_t bytes) {
     return got;
 }
 
-/* Every tenth of a second on the step loop. While the engine has been busy in the last five
- * seconds, the slab grows a GiB at a time into memory the fleet says no model holds, and grows
+/* Every tenth of a second on the step loop. While recently busy, or restoring backing a
+ * peer's recall removed, the slab grows a GiB at a time into memory the fleet says no model
+ * holds. Idle restoration stops at its previous watermark and never advertises eviction demand.
+ * The slab grows
  * again only once the units fill what it already has, leaving no more than the turnover slots and
  * half a step empty (an empty slot is VRAM nothing uses). A refusal is remembered, so the fleet
  * can make room for it (expert_flex_wanted), and asked again a second later; a backing that fails
@@ -563,20 +567,27 @@ void Engine::xflex_tick(bool busy) {
     if (now - xflex_ns_ < 100000000ull) return;
     xflex_ns_ = now;
     const int64_t cur = xflex_bytes_.load(std::memory_order_acquire);
-    if (cur >= xflex_cap_ || now - xflex_busy_ns_ > 5000000000ull) {
+    const bool idle_restore = now - xflex_busy_ns_ > 5000000000ull;
+    const int64_t restore_limit = xflex_restore_.limit(cur, xflex_cap_);
+    const int64_t limit = idle_restore ? restore_limit : xflex_cap_;
+    // Clear a previous busy demand even when retry or occupancy stops this attempt.
+    // Background restoration must not ask the fleet to evict an idle peer.
+    if (idle_restore) xflex_want_.store(0, std::memory_order_release);
+    if (cur >= limit) {
         xflex_want_.store(0, std::memory_order_release);
         return;
     }
-    if (now < xflex_retry_ns_) return;
+    if (now < xflex_retry_ns_ || (idle_restore && !xflex_restore_.ready(now))) return;
     const Mover& m0 = ranks_[0]->mover;
     const int64_t g = std::max<int64_t>(VMem::granularity(), 1);
-    const int64_t step = std::min<int64_t>(((int64_t)1 << 30) / g * g, xflex_cap_ - cur);
+    const int64_t step = std::min<int64_t>(((int64_t)1 << 30) / g * g, limit - cur);
     /* Still filling: what the loans offer and no unit holds, past the slots kept free for swaps. */
     const int64_t kept = m0.turnover_bytes();
     if (m0.flex_offered_bytes() - m0.flex_used_bytes() > kept + step / 2) return;
     if (!broker_->flex_grow(rank_devices(), step)) {
-        xflex_want_.store(xflex_cap_ - cur, std::memory_order_release);
-        xflex_retry_ns_ = now + 1000000000ull;
+        xflex_want_.store(xflex_restore_.refused(now, idle_restore, xflex_cap_ - cur),
+                          std::memory_order_release);
+        if (!idle_restore) xflex_retry_ns_ = now + 1000000000ull;
         return;
     }
     struct Landed { VramBroker* b; ~Landed() { b->flex_done(); } } landed{ broker_ };
@@ -606,6 +617,10 @@ void Engine::xflex_tick(bool busy) {
     (void)rad_dev_set(ranks_[0]->device);
     xflex_bytes_.store(to, std::memory_order_release);
     xflex_want_.store(0, std::memory_order_release);
+    (void)xflex_restore_.limit(to, xflex_cap_);
+    if (idle_restore && to >= restore_limit)
+        RAD_INFO("expert flex: restored previous %s of backing a card while idle; "
+                 "cached expert fill continues", humanb(to).c_str());
     if (to >= xflex_cap_ || cur == 0)
         RAD_INFO("expert flex: the slab grows into memory no model holds: %s a card of up to %s",
                  humanb(to).c_str(), humanb(xflex_cap_).c_str());
