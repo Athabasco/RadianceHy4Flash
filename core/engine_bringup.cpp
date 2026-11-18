@@ -1303,6 +1303,12 @@ int Engine::declare() {
         /* A tree is verified only behind a step issued ahead (step_loop). The KL mode, which issues
          * none, drafts nothing either (n_spec is 0 there by now), so this never runs under it. */
         draft_tree_ = cfg_.n_spec > 0 && pb.tree_pays != 0;
+        ckpt_snap_ok_ = pb.ckpt_snap_ok != 0;
+        /* The checkpoint stage (KVManager::ckpt_stage), planned before any KV plan is made. */
+        {
+            const char* e = std::getenv("RADIANCE_CKPT_STAGE");
+            cfg_.ckpt_stage = !(e && e[0] == '0');
+        }
         if (draft_tree_) {
             const char* why = "the model's plugin measured a gain with them";
             RAD_INFO("draft trees: asked -- %s", why);

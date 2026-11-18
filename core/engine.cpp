@@ -1216,7 +1216,8 @@ int Engine::prepare_release(const RadBatch* b) {
      * parked, so no allocation races the read. */
     kvstream_step_runs(ranks_[0]->kv, b, sched_.step_seqs(b), &stage_runs_);
     for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, stage_runs_);
-    return RAD_OK;
+    /* A checkpoint inside the step: every rank's Ctx copies into its stage (Ctx::set_ckpt_snap). */
+    return ckpt_stage_arm(b);
 }
 
 int Engine::issue_ahead(const RadBatch** out) {
@@ -1912,6 +1913,49 @@ int Engine::collect_pooled(const RadBatch* b, StepOut& so) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ the checkpoint stage */
+/* After the KV carve, the snapshot store and Scheduler::init. Every rank carved a stage or none
+ * did (KVManager::plan_groups decides on the same config and plans). */
+int Engine::ckpt_stage_open() {
+    bool staged = !ranks_.empty() && ck_store_.enabled();
+    for (auto& rk : ranks_) staged = staged && rk->kv.ckpt_stage() != nullptr;
+    if (!staged) return RAD_OK;
+    ranks_[0]->kv.ckpt_stage_layout(&ck_stage_off_, &ck_stage_lb_);
+    auto env_off = [](const char* k) {
+        const char* e = std::getenv(k);
+        return e && e[0] == '0';
+    };
+    ckpt_inside_ = ckpt_snap_ok_ && !env_off("RADIANCE_CKPT_INSIDE");
+    sched_.set_ckpt_inside(ckpt_inside_);
+    RAD_INFO("checkpoint stage: %s a rank on the card; %s",
+             humanb(ranks_[0]->kv.ckpt_stage_bytes()).c_str(),
+             ckpt_inside_ ? "a prompt's tail snapshot is taken inside its last chunk"
+                          : "every snapshot at a chunk's end");
+    return RAD_OK;
+}
+
+int Engine::ckpt_stage_arm(const RadBatch* b) {
+    if (ck_stage_off_.empty()) return RAD_OK;
+    const StepEntry* in = nullptr;
+    if (b && b->ckpt_cut > 0)
+        for (const StepEntry& e : sched_.plan().e)
+            if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && e.ckpt_tok + 1 < e.n_tokens) in = &e;
+    if (!in) {
+        for (auto& rk : ranks_) rk->ctx.set_ckpt_snap(nullptr, ckpt_slots_, ck_stage_off_, ck_stage_lb_);
+        return RAD_OK;
+    }
+    if (in->ckpt_tok + 1 != b->ckpt_cut || !state_slots_of(in->seq, &ckpt_slots_)) {
+        RAD_ERR("step %d: sequence %llu's checkpoint inside the step (row %d) is not the batch's "
+                "(%d), or its state slots are gone", b->step, (unsigned long long)in->seq,
+                (int)in->ckpt_tok, (int)b->ckpt_cut);
+        return RAD_E_STATE;
+    }
+    /* The step writes the stage; the last snapshot left it on the same stream (save_checkpoints). */
+    for (auto& rk : ranks_)
+        rk->ctx.set_ckpt_snap(rk->kv.ckpt_stage(), ckpt_slots_, ck_stage_off_, ck_stage_lb_);
+    return RAD_OK;
+}
+
 /* Snapshot after the step that produced the state. Linear state is what the chunk's last token
  * leaves, so the chunker ended the chunk at the checkpoint and copy 0 holds exactly that state; a
  * window snapshot is the window's rows behind the checkpoint, which may lie inside the chunk
@@ -1940,12 +1984,26 @@ int Engine::save_checkpoints() {
                             (unsigned long long)e.seq, (int)(e.ctx_len + e.ckpt_tok + 1));
                     return RAD_E_STATE;
                 }
-                for (auto& rk : ranks_) {
+                /* A checkpoint inside the step is in the stage already (rad_ckpt_snap) and goes
+                 * to the host slot from there in one copy; one at the chunk's end is copied from
+                 * the live slots as before. */
+                const bool inside = e.ckpt_tok + 1 < e.n_tokens && !ck_stage_off_.empty();
+                for (size_t ri = 0; ri < ranks_.size(); ++ri) {
+                    auto& rk = ranks_[ri];
                     if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
-                    const int s = rk->kv.checkpoint_save(ckpt_slots_.data(),
-                                                         (int)ckpt_slots_.size(),
-                                                         e.ckpt_slot, rk->ctx.stream(),
-                                                         &ckpt_win_);
+                    int s = RAD_OK;
+                    if (!inside) {
+                        s = rk->kv.checkpoint_save(ckpt_slots_.data(), (int)ckpt_slots_.size(),
+                                                   e.ckpt_slot, rk->ctx.stream(), &ckpt_win_);
+                    } else {
+                        /* The layers the step did not snapshot (rad_ckpt_snap) are the ones it did
+                         * not change: a drafter head's state, which moves only in the drafter's
+                         * passes behind this copy. */
+                        s = rk->kv.checkpoint_stage_rest(
+                            ckpt_slots_.data(), (int)ckpt_slots_.size(), rk->ctx.stream(),
+                            [&](size_t g, int64_t li) { return rk->ctx.ckpt_snapped(g, li); });
+                        if (s >= 0) s = rk->kv.checkpoint_stage_out(e.ckpt_slot, rk->ctx.stream());
+                    }
                     if (s < 0) {
                         RAD_ERR("rank %d could not snapshot sequence %llu into checkpoint slot "
                                 "%d: %s", rk->index, (unsigned long long)e.seq,
@@ -1955,6 +2013,30 @@ int Engine::save_checkpoints() {
                     }
                 }
                 if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                /* RADIANCE_CKPT_HASH=1: wait for the snapshot and log a digest of each rank's
+                 * shard, to compare two builds' snapshots byte for byte. A debugging aid: it
+                 * drains the streams. */
+                static const bool hash_on = [] {
+                    const char* h = std::getenv("RADIANCE_CKPT_HASH");
+                    return h && h[0] == '1';
+                }();
+                if (hash_on) {
+                    for (size_t ri = 0; ri < ranks_.size(); ++ri) {
+                        auto& rk = ranks_[ri];
+                        if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
+                        (void)rad_stream_sync(rk->ctx.stream());
+                        const unsigned char* p = (const unsigned char*)rk->kv.checkpoint_ptr(e.ckpt_slot);
+                        uint64_t h = 0xcbf29ce484222325ull;
+                        const int64_t nb = rk->kv.checkpoint_bytes();
+                        for (int64_t j = 0; p && j < nb; ++j) { h ^= p[j]; h *= 0x100000001b3ull; }
+                        RAD_INFO("ckpt-hash seq=%llu pos=%lld rank=%zu inside=%d bytes=%lld %016llx",
+                                 (unsigned long long)e.seq,
+                                 (long long)(e.ctx_len + e.ckpt_tok + 1), ri,
+                                 (int)(e.ckpt_tok + 1 < e.n_tokens), (long long)nb,
+                                 (unsigned long long)h);
+                    }
+                    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                }
             }
             return RAD_OK;
         });
@@ -2851,6 +2933,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
          * spanned step (--prefill-span-pass step) the span pays from the second interval on. */
         sched_.set_span_min(cfg_.prefill_span_min >= 0 ? cfg_.prefill_span_min : span_auto);
     }
+    RAD_TRY(ckpt_stage_open());
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
 

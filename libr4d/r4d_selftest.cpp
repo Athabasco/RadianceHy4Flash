@@ -8106,6 +8106,71 @@ static void moe_iqr_pack_case(const Plugin& pl, int64_t Mtok, bool down) {
                       std::to_string(first / N) + " column " + std::to_string(first % N)
                 : "the run map's bytes");
     }
+    /* `split` (a checkpoint inside the step): with each expert's slots ascending, as the router's
+     * stable sort leaves them, the rows of tokens before the split are a run of their own, so they
+     * hold the bytes a pass of those tokens alone gives them -- whatever the rows after them. The
+     * head pass is the same routing cut to those rows. */
+    if (!down) {
+        const int64_t cut = Mtok * 3 / 4 + 1;    /* not on a tile, so the runs' remainders move */
+        std::vector<int32_t> so2 = sorted, oh((size_t)E + 1, 0), soh;
+        for (int64_t e = 0; e < E; ++e) {
+            auto b = so2.begin() + off[(size_t)e], en = so2.begin() + off[(size_t)e + 1];
+            /* live slots ascending, dropped ones (-1) last within the run */
+            std::sort(b, en, [](int32_t x, int32_t y2) {
+                return (x < 0) != (y2 < 0) ? y2 < 0 : x < y2; });
+            oh[(size_t)e] = (int32_t)soh.size();
+            for (auto it = b; it != en; ++it)
+                if (*it >= 0 && *it < cut * top_k) soh.push_back(*it);
+        }
+        oh[(size_t)E] = (int32_t)soh.size();
+        /* the dropped slots inside runs are not part of this check: drop them from the split run */
+        std::vector<int32_t> so3, o3((size_t)E + 1, 0);
+        for (int64_t e = 0; e < E; ++e) {
+            o3[(size_t)e] = (int32_t)so3.size();
+            for (int32_t i = off[(size_t)e]; i < off[(size_t)e + 1]; ++i)
+                if (so2[(size_t)i] >= 0) so3.push_back(so2[(size_t)i]);
+        }
+        o3[(size_t)E] = (int32_t)so3.size();
+        const int64_t live = (int64_t)so3.size();
+        so3.resize((size_t)Tr, -1);
+        soh.resize((size_t)Tr, -1);
+        const int32_t cut32 = (int32_t)cut;
+        void* d_cut = dalloc(4);
+        st_memcpy(d_cut, &cut32, 4, hipMemcpyHostToDevice);
+        auto launch = [&](const std::vector<int32_t>& so, const std::vector<int32_t>& of, bool sp,
+                          std::vector<uint16_t>& out) {
+            st_memcpy(d_so, so.data(), (size_t)Tr * 4, hipMemcpyHostToDevice);
+            st_memcpy(d_of, of.data(), (size_t)(E + 1) * 4, hipMemcpyHostToDevice);
+            st_memcpy(d_y, poison.data(), poison.size() * 2, hipMemcpyHostToDevice);
+            std::vector<RadTensor> t2 = ts;
+            if (sp) t2.push_back(T(d_cut, RAD_I32, { 1 }));
+            RadArgs a2 = a;
+            a2.t = t2.data(); a2.n_t = (int)t2.size();
+            const int rc = r->launch(&a2, (RadStream) nullptr);
+            const bool fine = rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+            if (fine) st_memcpy(out.data(), d_y, out.size() * 2, hipMemcpyDeviceToHost);
+            return fine;
+        };
+        std::vector<uint16_t> ys((size_t)(Tr * N)), yh((size_t)(Tr * N));
+        const std::string what = std::string(nm) + ": split at token " + std::to_string(cut) +
+                                 ", the rows before it are a pass of those tokens alone";
+        if (!launch(so3, o3, true, ys) || !launch(soh, oh, false, yh)) {
+            ok(what.c_str(), false, "launch failed");
+        } else {
+            int64_t diff = 0, rows = 0;
+            for (int64_t e = 0; e < E; ++e)
+                for (int32_t j = 0; j < oh[(size_t)e + 1] - oh[(size_t)e]; ++j) {
+                    const int64_t rs = o3[(size_t)e] + j, rh = oh[(size_t)e] + j;
+                    ++rows;
+                    if (std::memcmp(&ys[(size_t)(rs * N)], &yh[(size_t)(rh * N)], (size_t)N * 2))
+                        ++diff;
+                }
+            ok(what.c_str(), diff == 0 && rows > 0 && live > rows,
+               std::to_string(diff) + " of " + std::to_string(rows) + " rows differ");
+        }
+        st_memcpy(d_so, sorted.data(), (size_t)Tr * 4, hipMemcpyHostToDevice);
+        st_memcpy(d_of, off.data(), (size_t)(E + 1) * 4, hipMemcpyHostToDevice);
+    }
     dfree_all();
 }
 

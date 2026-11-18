@@ -528,6 +528,11 @@ struct MoeFP8 {
                  const Wire& wire, const Src& src, bool fold = false, bool add_out = true,
                  int ar_in = kArNone, bool ar_out_ = false);
     void step(RadCtx* c, const RadBatch* batch) const;
+    /* A checkpoint inside the step (RadBatch::ckpt_cut): its token on the card, for the routed
+     * GEMMs' `split` operand, while step() issues a step that is one pass; null otherwise. Each
+     * expert's rows before the checkpoint are then a run of their own, as a step ending there
+     * gives them (moe_gemm_iqr's packed map), so they take the same paths. */
+    mutable const int32_t* split_tok = nullptr;
     /* The block over the first `T` rows of its buffers, for passes that need fewer rows than the
      * batch (the MTP head's history pass reads its output only at drafting rows). */
     void step_rows(RadCtx* c, int64_t T) const;
@@ -1914,6 +1919,9 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * in turn. Flash-Next's 16- and 32-row verify passes on two R9700: 22.1 -> 21.9 ms and
      * 31.6 -> 30.95 ms. Below, the arm fits inside the routed GEMM's time and stays beside it. */
     const bool sh_first = shared && gu_trellis && rows * k >= kSharedFirstRows;
+    /* The routed GEMMs' `split` (split_tok), on a pass that is the whole step. */
+    const bool split_on = split_tok && r0 == 0 && rows == T;
+    const RadOperand sp = split_on ? praw(split_tok, RAD_I32, 1) : RAD_NONE;
     if (sh_first)
         shared_up(c_, T, r0, rows,
                   (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
@@ -1924,24 +1932,29 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         RAD_ISSUE_N(c_, op_gu, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     RAD_WTAB(w_gu[0], ne), brows(w.sorted, rows * k), brows(w.eoff, ne + 1),
                     brows(w.egu, rows * k));
-    else if (ncls == 4)
-        RAD_ISSUE_N(c_, op_gu, rows,
-                    brow_slice(gin_q, r0, rows, g.n_embd),
-                    brow_slice(gin_s, r0, rows, g.n_embd / gin_g),
-                    RAD_WTAB(w_gu[0], n4[0]), RAD_WTAB(w_gus[0], n4[0]),
-                    brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
-                    RAD_WTAB(w_gu[1], n4[1]), RAD_WTAB(w_gus[1], n4[1]),
-                    RAD_WTAB(w_gu[2], n4[2]), RAD_WTAB(w_gus[2], n4[2]),
-                    RAD_WTAB(w_gu[3], n4[3]), RAD_WTAB(w_gus[3], n4[3]),
-                    brows(w.egu, rows * k));
-    else
-        RAD_ISSUE_N(c_, op_gu, rows,
-                    brow_slice(gin_q, r0, rows, g.n_embd),
-                    brow_slice(gin_s, r0, rows, g.n_embd / gin_g),
-                    RAD_WTAB(w_gu[0], n_reg / 2), RAD_WTAB(w_gus[0], n_reg / 2),
-                    brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
-                    RAD_WTAB(w_gu[1], n_reg / 2), RAD_WTAB(w_gus[1], n_reg / 2),
-                    brows(w.egu, rows * k));
+    else if (ncls == 4) {
+        /* `split` only where set: every other step's list is the one it always was. */
+        const RadOperand o_[] = {
+            brow_slice(gin_q, r0, rows, g.n_embd),
+            brow_slice(gin_s, r0, rows, g.n_embd / gin_g),
+            RAD_WTAB(w_gu[0], n4[0]), RAD_WTAB(w_gus[0], n4[0]),
+            brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+            RAD_WTAB(w_gu[1], n4[1]), RAD_WTAB(w_gus[1], n4[1]),
+            RAD_WTAB(w_gu[2], n4[2]), RAD_WTAB(w_gus[2], n4[2]),
+            RAD_WTAB(w_gu[3], n4[3]), RAD_WTAB(w_gus[3], n4[3]),
+            brows(w.egu, rows * k), sp };
+        rad_issue(c_, op_gu, o_, (int)(sizeof o_ / sizeof *o_) - (split_on ? 0 : 1), rows);
+    } else {
+        /* `split` only where set: every other step's list is the one it always was. */
+        const RadOperand o_[] = {
+            brow_slice(gin_q, r0, rows, g.n_embd),
+            brow_slice(gin_s, r0, rows, g.n_embd / gin_g),
+            RAD_WTAB(w_gu[0], n_reg / 2), RAD_WTAB(w_gus[0], n_reg / 2),
+            brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+            RAD_WTAB(w_gu[1], n_reg / 2), RAD_WTAB(w_gus[1], n_reg / 2),
+            brows(w.egu, rows * k), sp };
+        rad_issue(c_, op_gu, o_, (int)(sizeof o_ / sizeof *o_) - (split_on ? 0 : 1), rows);
+    }
     if (shared && !sh_first)
         shared_up(c_, T, r0, rows,
                   (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
@@ -1963,22 +1976,27 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     if (c.expert_bf16)
         RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), brows(w.edn, rows * k));
-    else if (ncls == 4)
-        RAD_ISSUE_N(c_, op_dn, rows,
-                    brows(gq_exp.a.cq(), rows * k), brows(gq_exp.a.cs(), rows * k),
-                    RAD_WTAB(w_dn[0], n4[0]), RAD_WTAB(w_dns[0], n4[0]),
-                    brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
-                    RAD_WTAB(w_dn[1], n4[1]), RAD_WTAB(w_dns[1], n4[1]),
-                    RAD_WTAB(w_dn[2], n4[2]), RAD_WTAB(w_dns[2], n4[2]),
-                    RAD_WTAB(w_dn[3], n4[3]), RAD_WTAB(w_dns[3], n4[3]),
-                    brows(w.edn, rows * k));
-    else
-        RAD_ISSUE_N(c_, op_dn, rows,
-                    brows(gq_exp.a.cq(), rows * k), brows(gq_exp.a.cs(), rows * k),
-                    RAD_WTAB(w_dn[0], n_reg / 2), RAD_WTAB(w_dns[0], n_reg / 2),
-                    brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
-                    RAD_WTAB(w_dn[1], n_reg / 2), RAD_WTAB(w_dns[1], n_reg / 2),
-                    brows(w.edn, rows * k));
+    else if (ncls == 4) {
+        /* `split` only where set: every other step's list is the one it always was. */
+        const RadOperand o_[] = {
+            brows(gq_exp.a.cq(), rows * k), brows(gq_exp.a.cs(), rows * k),
+            RAD_WTAB(w_dn[0], n4[0]), RAD_WTAB(w_dns[0], n4[0]),
+            brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+            RAD_WTAB(w_dn[1], n4[1]), RAD_WTAB(w_dns[1], n4[1]),
+            RAD_WTAB(w_dn[2], n4[2]), RAD_WTAB(w_dns[2], n4[2]),
+            RAD_WTAB(w_dn[3], n4[3]), RAD_WTAB(w_dns[3], n4[3]),
+            brows(w.edn, rows * k), sp };
+        rad_issue(c_, op_dn, o_, (int)(sizeof o_ / sizeof *o_) - (split_on ? 0 : 1), rows);
+    } else {
+        /* `split` only where set: every other step's list is the one it always was. */
+        const RadOperand o_[] = {
+            brows(gq_exp.a.cq(), rows * k), brows(gq_exp.a.cs(), rows * k),
+            RAD_WTAB(w_dn[0], n_reg / 2), RAD_WTAB(w_dns[0], n_reg / 2),
+            brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+            RAD_WTAB(w_dn[1], n_reg / 2), RAD_WTAB(w_dns[1], n_reg / 2),
+            brows(w.edn, rows * k), sp };
+        rad_issue(c_, op_dn, o_, (int)(sizeof o_ / sizeof *o_) - (split_on ? 0 : 1), rows);
+    }
     /* This layer's streamed experts are consumed; the next layer's copies may start. */
     (void)rad_expert_prefetch_mark(c_);
     /* The protected experts, over the trailing offsets: the quantised down GEMM zeroed their
@@ -2115,7 +2133,25 @@ inline void MoeFP8::calib_experts_pass(RadCtx* c_, int64_t slots) const {
 }
 
 inline void MoeFP8::step(RadCtx* c_, const RadBatch* batch) const {
-    step_rows(c_, batch->n_tok);
+    const int64_t T = batch->n_tok, ck = batch->ckpt_cut;
+    const bool cut = ck > 0 && ck < T && batch->ckpt_cu;
+    if (cut && T > c.rows) {
+        /* A checkpoint inside a step wider than a pass: the passes start again at the checkpoint
+         * (as HyperConn::read_pieces does), so the rows before it are passed as a chunk ending
+         * there passes them, and the rows after it as the next chunk would. */
+        for (int64_t a = 0; a < T; a = ck > a ? ck : T) {
+            const int64_t b = ck > a ? ck : T;
+            for (int64_t r0 = a; r0 < b; r0 += c.rows)
+                pass(c_, T, r0, b - r0 < c.rows ? b - r0 : c.rows);
+        }
+        route_report(c_);
+        return;
+    }
+    /* One pass over the whole step: `split` gives the rows before the checkpoint runs of their
+     * own (split_tok). */
+    split_tok = cut ? batch->ckpt_cu + 1 : nullptr;
+    step_rows(c_, T);
+    split_tok = nullptr;
 }
 
 inline void MoeFP8::step_rows(RadCtx* c_, int64_t T) const {

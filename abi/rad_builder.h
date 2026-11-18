@@ -1735,6 +1735,14 @@ typedef struct RadArchProbe {
      * `gen_rows` (its largest pass: a step's two branches, or a query pass's points). It keeps no
      * KV. */
     int32_t gen_shape;
+
+    /* ---- appended in ABI 43 (a checkpoint inside the step), in the tail padding behind gen_shape */
+    /* Nonzero when the plugin serves RadBatch::ckpt_cut: a step of one prefill sequence whose
+     * checkpoint lies inside it runs its recurrence in two pieces and snapshots between them
+     * (rad_ckpt_snap). The scheduler then takes a prompt's tail snapshot inside its last chunk
+     * rather than ending the chunk there and running the rows past it as a step of their own.
+     * Zero keeps that step. */
+    int32_t ckpt_snap_ok;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);

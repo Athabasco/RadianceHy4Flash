@@ -1777,7 +1777,8 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
 
     /* The delta net runs a piece at a time over the bounds (ArPieces::cu) in a step of one
      * prefill sequence in two pieces. */
-    const int32_t* gcu = pcu && K == 2 && batch->n_seq == 1 && batch->phase == RAD_PHASE_PREFILL
+    const int32_t* gcu = pcu && K == 2 && batch->n_seq == 1 && batch->phase == RAD_PHASE_PREFILL &&
+                         batch->ckpt_cut <= 0
                        ? pcu : nullptr;
 
     const int64_t n = (int64_t)m.layers.size();
@@ -1884,7 +1885,8 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
         const Layer& l = m.layers[(size_t)li];
         /* Before the attention connection reads the stream, which is where the reference puts it. */
         if (li == m.ple_layer) m.ple.step(c, batch);
-        l.hc_mix.read_pieces(c, T);
+        /* A checkpoint inside the step (RadBatch::ckpt_cut) cuts the reads' pieces there. */
+        l.hc_mix.read_pieces(c, T, batch->ckpt_cut);
         /* The calibration taps read the codes the mixer's GEMMs read: its input before it runs,
          * its output projection's input before the feed-forward's connection reuses the pair. */
         if (l.cs_in >= 0) m.calib.tap(c, (size_t)l.cs_in, T);
@@ -1919,7 +1921,7 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
                             l.mlp.w_router, T);
         l.hc_mix.write(c, T, 0, T);
         dbg_resid(c, (int)li, "mix", g.n_embd, m.b_h, m.a_x.x);
-        l.hc_ffn.read_pieces(c, T);
+        l.hc_ffn.read_pieces(c, T, batch->ckpt_cut);
         l.mlp.step(c, batch);
         l.hc_ffn.write(c, T, 0, T);
         /* The request's control vector, on the stream the write just finished. */
@@ -2069,6 +2071,11 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
      * have chained forms: on two R9700 a full pass under the draft head went from 13.9 to 12.5 ms
      * and the step without the head from 9.98 to 9.17 ms at one sequence. */
     out->chain_pays = RAD_CHAIN_ALWAYS;
+    /* A step of one prefill sequence with its checkpoint inside it (RadBatch::ckpt_cut): the delta
+     * net runs its recurrence in two pieces and snapshots between them (rad_block_gdn_fp8.h), and
+     * the connection reads cut their pieces at the checkpoint (HyperConn::read_pieces), so the
+     * rows before it read what a chunk ending there reads. */
+    out->ckpt_snap_ok = 1;
     return RAD_OK;
 }
 

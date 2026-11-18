@@ -58,8 +58,8 @@ std::vector<Row> cpp_rows() {
     };
 }
 
-/* The layout at RAD_ABI_VERSION 42 / RAD_FORMAT_VER 2 (see the file header). */
-constexpr uint32_t kTableAbi = 42, kTableFormat = 2;
+/* The layout at RAD_ABI_VERSION 43 / RAD_FORMAT_VER 2 (see the file header). */
+constexpr uint32_t kTableAbi = 43, kTableFormat = 2;
 const AbiRow kTable[] = {
 #include "abi_layout_table.h"
 };
@@ -223,6 +223,16 @@ TEST(rad_yarn_is_the_same_function_in_c_and_cpp) {
 TEST(the_span_pass_field_is_appended_past_the_build_contexts_end) {
     CHECK_EQ(offsetof(RadBuildCtx, span_pass_step), (size_t)200);
     CHECK_EQ(sizeof(RadBuildCtx), (size_t)208);
+}
+
+/* ABI 43: a checkpoint inside the step. The probe's flag takes the tail padding behind gen_shape
+ * (the probe keeps its 128 bytes); the batch's cut and bounds sit past its old end. */
+TEST(the_checkpoint_cut_fields_are_appended_past_the_old_ends) {
+    CHECK_EQ(offsetof(RadArchProbe, ckpt_snap_ok), (size_t)124);
+    CHECK_EQ(sizeof(RadArchProbe), (size_t)128);
+    CHECK_EQ(offsetof(RadBatch, ckpt_cut), (size_t)480);
+    CHECK_EQ(offsetof(RadBatch, ckpt_cu), (size_t)488);
+    CHECK_EQ(sizeof(RadBatch), (size_t)496);
 }
 
 RAD_TEST_MAIN()

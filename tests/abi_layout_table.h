@@ -1,4 +1,4 @@
-/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 42 and
+/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 43 and
  * RAD_FORMAT_VER 2, as { type, field, offset, size } rows ("" is the struct itself). A snapshot
  * of the headers on x86-64 Linux, which abi_layout_test.cpp holds the layout to; regenerate it
  * from the test's printout only together with a version bump. */
@@ -23,6 +23,7 @@
 { "RadArchProbe", "gen_max_pixels", 104, 8 },
 { "RadArchProbe", "gen_max_refs", 112, 8 },
 { "RadArchProbe", "gen_shape", 120, 4 },
+{ "RadArchProbe", "ckpt_snap_ok", 124, 4 },
 { "RadArgs", "", 0, 72 },
 { "RadArgs", "t", 0, 8 },
 { "RadArgs", "n_t", 8, 4 },
@@ -35,7 +36,7 @@
 { "RadArgs", "world_size", 60, 4 },
 { "RadArgs", "kv_used_max_h", 64, 4 },
 { "RadArgs", "wgp_count", 68, 4 },
-{ "RadBatch", "", 0, 480 },
+{ "RadBatch", "", 0, 496 },
 { "RadBatch", "phase", 0, 4 },
 { "RadBatch", "step", 4, 4 },
 { "RadBatch", "n_tok", 8, 8 },
@@ -101,6 +102,8 @@
 { "RadBatch", "bidi_seq", 456, 8 },
 { "RadBatch", "bidi_used", 464, 8 },
 { "RadBatch", "anchor_rows", 472, 8 },
+{ "RadBatch", "ckpt_cut", 480, 4 },
+{ "RadBatch", "ckpt_cu", 488, 8 },
 { "RadBufDecl", "", 0, 80 },
 { "RadBufDecl", "dtype", 0, 4 },
 { "RadBufDecl", "rank", 4, 4 },

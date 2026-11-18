@@ -787,6 +787,20 @@ private:
      * the checkpoint save waits for its context pass (save_checkpoints). */
     bool drafter_snap_ = false;
     int  save_checkpoints();
+    /* Checkpoints through the stage (KVManager::ckpt_stage).
+     *
+     * ckpt_snap_ok_: the plugin snapshots inside a step (RadArchProbe::ckpt_snap_ok); with a
+     * stage on every rank the scheduler then takes a prompt's tail snapshot inside its last chunk
+     * (Scheduler::set_ckpt_inside; RADIANCE_CKPT_INSIDE=0 keeps the chunk's own step). Such a
+     * snapshot is the stage's one contiguous copy to the host slot rather than a pitched copy a
+     * group. */
+    bool ckpt_snap_ok_ = false;
+    bool ckpt_inside_ = false;
+    std::vector<int64_t>   ck_stage_off_, ck_stage_lb_;
+    int  ckpt_stage_open();
+    /* Before a step: a step with a checkpoint inside it arms every rank's Ctx
+     * (Ctx::set_ckpt_snap); every other step disarms them. */
+    int  ckpt_stage_arm(const RadBatch* b);
     /* A tree drafter (rad_drafter_tree), driven on the card only: ADV_BTAKE takes its parents,
      * ADV_COMPACT moves the accepted path's K and V after the acceptance, and ADV_CTXTREE stages
      * the context pass by that path. */
