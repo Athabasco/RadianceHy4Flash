@@ -287,10 +287,7 @@ private:
         Model* m = nullptr;
         int grant(const VramAsk& ask, int64_t* g, std::string* why) override { return f->grant(*m, ask, g, why); }
         bool host_room(int64_t bytes) override {
-            if (!f->load_host_room(*m, bytes)) return false;
-            m->pools_held.fetch_add(bytes);
-            f->host_reserve_.fetch_add(bytes);
-            return true;
+            return f->load_host_room(*m, bytes, 0, /*reserve=*/true);
         }
         bool host_pools_room() override {
             const int64_t own = m->pools_held.load();
@@ -445,7 +442,7 @@ private:
                           bool take_busy = false, int64_t own = 0, bool evict = true);
     /* Parked models give back their snapshot stores, in `parked` order, until `need` is free. */
     bool   release_spares(const std::vector<Model*>& parked, int64_t need);
-    bool   load_host_room(Model& m, int64_t need, int64_t own = 0);
+    bool   load_host_room(Model& m, int64_t need, int64_t own = 0, bool reserve = false);
     bool   loading_beside(const Model& m);
     bool   alone_on_host(const Model& m);
     int64_t host_held();
@@ -1426,11 +1423,21 @@ bool Fleet::alone_on_host(const Model& m) {
 
 /* Room to pin `need` during a load. As in the load's first wait, beside another load in flight
  * parked and idle models go only after ten seconds, once a load counted twice has passed. */
-bool Fleet::load_host_room(Model& m, int64_t need, int64_t own) {
+bool Fleet::load_host_room(Model& m, int64_t need, int64_t own, bool reserve) {
+    // A new pool must reserve the room in the same critical section that found it. A check
+    // of already reserved pools (own) does not count them a second time.
+    auto commit_reservation = [&] {
+        if (!reserve) return;
+        m.pools_held.fetch_add(need);
+        host_reserve_.fetch_add(need);
+    };
     {
         /* There already: a warm-up needs no budget for a pin that leaves the host its floor. */
         std::lock_guard<std::recursive_mutex> room(room_mu_);
-        if (host_available() - host_reserve_.load() + own - kHostFloor >= need) return true;
+        if (host_available() - host_reserve_.load() + own - kHostFloor >= need) {
+            commit_reservation();
+            return true;
+        }
     }
     /* Before its grant a load holds a guess of VRAM, which what pins this memory may be waiting
      * for (a parked model coming back): they would wait for each other. The guess goes while it
@@ -1452,8 +1459,12 @@ bool Fleet::load_host_room(Model& m, int64_t need, int64_t own) {
         /* As in load_op: without a load in flight beside this one the figure is exact, and parked
          * and idle models give their host memory at once. */
         const bool exact = !warm && !loading_beside(m);
-        ok = make_host_room(need, &m, !warm, !warm && (exact || i >= 50),
-                            !warm && (i >= 150 || (exact && i >= 10)), own);
+        {
+            std::lock_guard<std::recursive_mutex> room(room_mu_);
+            ok = make_host_room(need, &m, !warm, !warm && (exact || i >= 50),
+                                !warm && (i >= 150 || (exact && i >= 10)), own);
+            if (ok) commit_reservation();
+        }
         if (ok || i + 1 >= tries) break;
         if (i == 0)
             RAD_INFO("model %s: waiting for %s of host memory to pin (%s available, %s of it kept "
@@ -1690,6 +1701,9 @@ void Fleet::park_op(Model& m, const std::string& why) {
  * copies of copies: make_host_room lets them go first. */
 void Fleet::fill_op(Model& m) {
     if (!m.engine || !m.parked) return;
+    // Size and reserve the fill together with parks and load reservations. The transfer itself
+    // runs without room_mu_: a slow drive must not hold up another model's room decision.
+    std::unique_lock<std::recursive_mutex> room_lock(room_mu_);
     /* A GiB at a time: a restore asked for meanwhile waits for one batch at most. */
     constexpr int64_t kBatch = (int64_t)1 << 30;
     if (host_room() - kFillSlack - Engine::kRefillHost < kBatch) {
@@ -1707,8 +1721,20 @@ void Fleet::fill_op(Model& m) {
         fill_wait_ns_.store(rad_mono_ns() + 5000000000ull);
         return;
     }
+    const int64_t budget = std::min(room, kBatch);
+    const int64_t reserved = budget + Engine::kRefillHost;
+    host_reserve_.fetch_add(reserved);
+    room_lock.unlock();
     const auto t0 = std::chrono::steady_clock::now();
-    const int64_t n = m.engine->fill_host(std::min(room, kBatch));
+    int64_t n;
+    {
+        struct FillReservation {
+            std::atomic<int64_t>& total;
+            int64_t bytes;
+            ~FillReservation() { total.fetch_sub(bytes); }
+        } hold{ host_reserve_, reserved };
+        n = m.engine->fill_host(budget);
+    }
     if (n < 0) {
         RAD_WARN("model %s: reading its parked copy into host memory failed: %s", m.entry.name.c_str(),
                  rad_dev_last_error());
