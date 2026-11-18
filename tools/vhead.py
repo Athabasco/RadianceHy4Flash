@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """vhead.py -- a vocabulary-weighted lm_head checkpoint, as the IQR-V4 recipes convert it.
 
-    vhead.py SRC DST CLASSES
+    vhead.py [--keep-lm-head] SRC DST CLASSES
 
 SRC is a Hugging Face checkpoint directory (Qwen/Qwen3.8-27B), CLASSES a width-class file from
 data/vhead/ (q38-27b-vhead-4.0.cls, -4.5, -5.0: the head's mean code width). DST becomes SRC with
 lm_head.weight replaced by its width classes; every other file of SRC is linked, not copied. Pass DST
-to rad-convert in place of SRC.
+to rad-convert in place of SRC. With --keep-lm-head, also index the original lm_head.weight so a
+native MTP drafter can quantise its own copy. No extra bytes are copied into the checkpoint.
 
 A vocabulary-weighted head stores each vocabulary row on one of four trellis widths, the tokens that
 carry the most probability on the widest. The classes were chosen per 256-row run to minimise each
@@ -27,10 +28,10 @@ CLASSES: one ASCII line `radiance-vhead-1 n_vocab=V widths=a,b,c,d`, then V/4 by
 
 bf16 is moved as raw u16 (no arithmetic happens here), so numpy alone suffices.
 """
+import argparse
 import json
 import os
 import struct
-import sys
 
 import numpy as np
 
@@ -81,9 +82,14 @@ def read_classes(path):
 
 
 def main():
-    if len(sys.argv) != 4:
-        raise SystemExit(__doc__.split("\n\n")[1])
-    src, dst, cpath = sys.argv[1:4]
+    parser = argparse.ArgumentParser(description="Prepare a vocabulary-weighted checkpoint.")
+    parser.add_argument("src")
+    parser.add_argument("dst")
+    parser.add_argument("classes")
+    parser.add_argument("--keep-lm-head", action="store_true",
+                        help="keep the original lm_head.weight indexed for a separate draft head")
+    args = parser.parse_args()
+    src, dst, cpath = args.src, args.dst, args.classes
     cls, widths = read_classes(cpath)
     idx = json.load(open(os.path.join(src, "model.safetensors.index.json")))
     W, dt = st_tensor(os.path.join(src, idx["weight_map"]["lm_head.weight"]), "lm_head.weight")
@@ -103,12 +109,13 @@ def main():
     os.makedirs(dst, exist_ok=True)
     st_write(os.path.join(dst, "vhead.safetensors"), out_ids + [("lm_head.vrow", vrow, "I32")] + out_w)
     wm = dict(idx["weight_map"])
-    del wm["lm_head.weight"]
+    if not args.keep_lm_head:
+        del wm["lm_head.weight"]
     for name, _, _ in out_ids + out_w + [("lm_head.vrow", None, None)]:
         wm[name] = "vhead.safetensors"
     with open(os.path.join(dst, "model.safetensors.index.json"), "w") as f:
         json.dump({"metadata": idx.get("metadata", {}), "weight_map": wm}, f)
-    # every other file of SRC, and every shard (lm_head's own shard still holds other tensors)
+    # Link every original shard, including a shard holding only lm_head.weight.
     keep = set(idx["weight_map"].values())
     for f in os.listdir(src):
         if f == "model.safetensors.index.json" or (f.endswith(".safetensors") and f not in keep):

@@ -881,6 +881,8 @@ add_test(NAME artifact_sums
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/artifact_sums.sh ${CMAKE_SOURCE_DIR})
 set_tests_properties(artifact_sums PROPERTIES LABELS "fast;unit" TIMEOUT ${RAD_TEST_TIMEOUT})
 if(RAD_PYTHON3)
+  add_test(NAME vhead_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/vhead_test.py)
+  set_tests_properties(vhead_test PROPERTIES LABELS "unit;fast" SKIP_RETURN_CODE 77 TIMEOUT ${RAD_TEST_TIMEOUT})
   add_test(NAME rad_export_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/rad_export_test.py)
   set_tests_properties(rad_export_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
   add_test(NAME spark25_validation_test
