@@ -10853,6 +10853,10 @@ TEST(qwen35_split_target_verifies_independent_u2_mtp_proposals) {
         CHECK_EQ((int)b.drafter.kind, (int)RAD_DRAFT_SERIAL);
         CHECK_EQ(b.drafter.proposal, (rad_buf)buf_named(b, "mtp_didx"));
         CHECK_EQ(b.drafter.proposal_pitch, 1);
+        const RecBuf* dlog = find_b(b, "mtp_dlog");
+        REQUIRE(dlog != nullptr);
+        CHECK_EQ(dlog->d.shape[0], ctx.max_seqs);
+        CHECK_EQ(dlog->d.shape[1], mk.m.n_vocab);
         CHECK(find_w(b, "output.weight") == nullptr);
         REQUIRE(find_w(b, "mtp.draft_head.weight") != nullptr);
         CHECK_EQ(count_op(b, "logits_gemm"), 0);  /* no phantom single-weight head */

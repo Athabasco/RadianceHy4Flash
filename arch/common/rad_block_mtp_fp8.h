@@ -128,14 +128,14 @@ struct MtpBlockFP8 {
         rad_buf c      = 0;   /* [max_tok, 2 * n_embd]  the two normed halves, fc's input */
         rad_buf x      = 0;   /* [max_tok, n_embd]      the head's own residual stream */
         rad_buf logits = 0;   /* [max_logit_rows, n_vocab]  the trunk's, shared */
-        /* The 2-bit draft head's working set (see op_dlogits), sized at max_logit_rows: only
-         * drafting rows reach it. */
-        rad_buf dq   = 0;   /* [max_logit_rows, n_embd]   int8 codes */
-        rad_buf ds   = 0;   /* [max_logit_rows, 1]        f32, one scale a row */
-        rad_buf dsum = 0;   /* [n_embd/group, mpad]       f32, group-major (quant_act_i8's asum) */
-        rad_buf dlog = 0;   /* [max_logit_rows, n_vocab]  bf16, the coarse logits */
-        rad_buf didx = 0;   /* [max_logit_rows, 1]        i32, the proposed token */
-        rad_buf dval = 0;   /* [max_logit_rows, 1]        f32, its logit */
+        /* The 2-bit projection's scratch: at most one proposal per sequence, including the
+         * selected final history rows. The unselected history rows need only K/V. */
+        rad_buf dq   = 0;   /* [max_seqs, n_embd]      int8 codes */
+        rad_buf ds   = 0;   /* [max_seqs, 1]           f32, one scale a row */
+        rad_buf dsum = 0;   /* [n_embd/group, mpad]    f32, group-major (quant_act_i8's asum) */
+        rad_buf dlog = 0;   /* [max_seqs, n_vocab_all] bf16, the coarse logits */
+        rad_buf didx = 0;   /* [max_seqs, 1]           i32, the proposed token */
+        rad_buf dval = 0;   /* [max_seqs, 1]           f32, its logit */
         /* The layer reuses the trunk's working set, which is dead by the time the head runs (a
          * second set would be 150 MiB). */
         AttnGatedFP8::Wire attn{};
@@ -330,21 +330,21 @@ inline int MtpBlockFP8<Ffn>::declare(RadBuilder* b, Names& nm, const Geom& geom,
         if (!w_dh || !w_dhs) return RAD_E_INVAL;
 
         op_dquant = rw(b, RAD_OP(b, "quant_act_i8",
-                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
+                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs),
                                      RAD_INT("n", g.n_embd), RAD_INT("group", MTP_W2_GROUP),
                                      RAD_STR("dtype", g.dtype)),
                           RAD_NOWEIGHTS),
                       {w.hout}, {w.dq, w.ds, w.dsum});
 
         op_dlogits = rw(b, RAD_OP(b, "gemm_nt_q",
-                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
+                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs),
                                       RAD_INT("N", g.n_vocab_all), RAD_INT("K", g.n_embd),
                                       RAD_INT("group", MTP_W2_GROUP), RAD_STR("dtype", "w2a8")),
                            RAD_WEIGHTS(w_dh, w_dhs)),
                        {w.dq, w.ds, w.dsum}, {w.dlog});
 
         op_dtopk = rw(b, RAD_OP(b, "row_topk",
-                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
+                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs),
                                     RAD_INT("N", g.n_vocab_all), RAD_INT("R", 1),
                                     RAD_STR("dtype", g.dtype)),
                          RAD_NOWEIGHTS),

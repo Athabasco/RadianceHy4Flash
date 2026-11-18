@@ -1295,19 +1295,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.b_mtp_c = decl_b(b, nm.f("mtp_c"), g.act_dtype, {g.max_tok, 2 * g.n_embd});
         m.b_mtp_x = decl_b(b, nm.f("mtp_x"), g.act_dtype, {g.max_tok, g.n_embd});
 
-        /* The 2-bit draft head's working set, at max_logit_rows, since only a draft round (one row
-         * per sequence) uses it. `mtp_dsum` is quant_act_i8's group-major
+        /* The 2-bit draft head's working set, one row per drafting sequence. Target verification (or KLD)
+         * may need many more logits rows; the serial head never proposes those in one round. `mtp_dsum` is quant_act_i8's group-major
          * [n_embd/128][ceil(M/16)*16] plane, first dimension the K group, not the token. */
         if (draft_q2) {
-            const int64_t dmpad = ((g.max_logit_rows + 15) / 16) * 16;
-            m.b_mtp_dq   = decl_b(b, nm.f("mtp_dq"),   RAD_I8,   {g.max_logit_rows, g.n_embd});
-            m.b_mtp_ds   = decl_b(b, nm.f("mtp_ds"),   RAD_F32,  {g.max_logit_rows, 1});
+            const int64_t dmpad = ((g.max_seqs + 15) / 16) * 16;
+            m.b_mtp_dq   = decl_b(b, nm.f("mtp_dq"),   RAD_I8,   {g.max_seqs, g.n_embd});
+            m.b_mtp_ds   = decl_b(b, nm.f("mtp_ds"),   RAD_F32,  {g.max_seqs, 1});
             m.b_mtp_dsum = decl_b(b, nm.f("mtp_dsum"), RAD_F32,  {g.n_embd / 128, dmpad});
-            m.b_mtp_dlog = decl_b(b, nm.f("mtp_dlog"), g.act_dtype, {g.max_logit_rows, g.n_vocab_all});
+            m.b_mtp_dlog = decl_b(b, nm.f("mtp_dlog"), g.act_dtype, {g.max_seqs, g.n_vocab_all});
             /* A draft round's proposal comes out of row_topk here, never through the sampler's
              * token buffer. */
-            m.b_mtp_didx = decl_b(b, nm.f("mtp_didx"), RAD_I32,  {g.max_logit_rows, 1});
-            m.b_mtp_dval = decl_b(b, nm.f("mtp_dval"), RAD_F32,  {g.max_logit_rows, 1});
+            m.b_mtp_didx = decl_b(b, nm.f("mtp_didx"), RAD_I32,  {g.max_seqs, 1});
+            m.b_mtp_dval = decl_b(b, nm.f("mtp_dval"), RAD_F32,  {g.max_seqs, 1});
         }
 
         /* The head reuses the trunk's working buffers (`attn_qg`, `attn_k`, the ffn planes, `h`),
