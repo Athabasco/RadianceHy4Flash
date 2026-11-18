@@ -3703,6 +3703,31 @@ int Engine::run_server() {
             return RAD_E_INVAL;
         }
         if (vc.family == mm::Family::Gemma4) {
+            /* A two-sided paged window is exact for image spans no longer than the window.
+             * Limit what the processor admits if a rank cannot run the long-span variant. */
+            if (encd.bidirectional) {
+                for (const auto& rank : ranks_) {
+                    long long window = 0;
+                    bool ahead = false;
+                    for (const OpInfo& op : rank->program.ops) {
+                        if (op.op == "attn_paged_ahead" || op.op == "attn_paged_qrow_ahead")
+                            for (const Band& b : op.bands)
+                                ahead = ahead || b.dom[RAD_DOMAIN_HOST] || b.dom[RAD_DOMAIN_DEVICE];
+                        if (op.op == "attn_paged" || op.op == "attn_paged_qrow") {
+                            long long causal = 1, w = 0;
+                            if (op.base.get_i("causal", &causal) && causal == 0 &&
+                                op.base.get_i("window", &w) && w > 0)
+                                window = window > 0 ? std::min(window, w) : w;
+                        }
+                    }
+                    if (!ahead && window > 0 && window < vc.max_patches / encd.merge)
+                        vc.max_patches = window * encd.merge;
+                }
+                if (vc.max_patches < encd.max_patches)
+                    RAD_INFO("media: image spans are limited to %lld soft tokens because the "
+                             "loaded kernels cannot attend beyond the sliding window",
+                             (long long)(vc.max_patches / encd.merge));
+            }
             if (cfg_.image_min_pixels || cfg_.image_max_pixels || cfg_.video_min_pixels ||
                 cfg_.video_max_pixels || cfg_.video_min_frames) {
                 RAD_ERR("media: this model's processor sizes images and video frames by a token "
@@ -3782,10 +3807,11 @@ int Engine::run_server() {
         }
         if (vc.family == mm::Family::Gemma4 &&
             (int64_t)std::max(vc.image_soft_tokens, vc.video_soft_tokens) * vc.merge * vc.merge >
-                encd.max_patches) {
-            RAD_ERR("media: an image of %d soft tokens or a video frame of %d is more patches than "
-                    "one encoder pass holds (--mm-max-patches %lld)", vc.image_soft_tokens,
-                    vc.video_soft_tokens, (long long)encd.max_patches);
+                vc.max_patches) {
+            RAD_ERR("media: an image of %d soft tokens or a video frame of %d exceeds this "
+                    "deployment's limit of %lld soft tokens per segment; lower --image-tokens "
+                    "or --video-max-frame-tokens", vc.image_soft_tokens, vc.video_soft_tokens,
+                    (long long)(vc.max_patches / encd.merge));
             return RAD_E_INVAL;
         }
         mm_proc = std::make_unique<mm::Processor>();

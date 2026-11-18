@@ -3361,6 +3361,39 @@ TEST(op_attn_paged) {
     CHECK_NEAR(out2.at(5), 1.0f, 1e-6);
 }
 
+/* An image span split by a step cannot give its first rows keys not staged yet.
+ * Compare the exact same Q/K/V with full-span versus chunk-bounded key counts. This
+ * records the scheduler fallback's numerical limit; it is not a full-model parity test. */
+TEST(op_attn_paged_split_image_span_is_not_full_span_bidirectional_attention) {
+    T q_all(RAD_F32, {2, 1, 2}); q_all.f({0, 0, 0, 0});
+    T q_one(RAD_F32, {1, 1, 2}); q_one.f({0, 0});
+    T kv(RAD_F32, {1, 1, 2, 4});
+    kv.f({0, 0, 1, 0,  0, 0, 3, 0});
+    T bt(RAD_I32, {1, 1}); bt.n({0});
+    T full_keys(RAD_I32, {1}); full_keys.n({2});
+    T first_keys(RAD_I32, {1}); first_keys.n({1});
+    T full(RAD_F32, {2, 1, 2}), first(RAD_F32, {1, 1, 2}), last(RAD_F32, {1, 1, 2});
+    auto attend = [&](const T& q, const T& used, const T& out, int n) {
+        A a; a.t(q).t(kv).t(bt).t(used).tnull().tnull().tnull().t(out)
+              .i("q_len", n).i("head_dim", 2).i("gqa", 1).i("block_size", 2)
+              .i("causal", 0).i("window", 2).s("q_dtype", "f32").s("kv_dtype", "f32");
+        return run("attn_paged", a);
+    };
+    REQUIRE_EQ(attend(q_all, full_keys, full, 2), RAD_OK);
+    REQUIRE_EQ(attend(q_one, first_keys, first, 1), RAD_OK);
+    REQUIRE_EQ(attend(q_one, full_keys, last, 1), RAD_OK);
+    CHECK_NEAR(full.at(0), 2.0f, 1e-6);
+    CHECK_NEAR(full.at(2), 2.0f, 1e-6);
+    CHECK_NEAR(first.at(0), 1.0f, 1e-6);
+    CHECK_NEAR(last.at(0), 2.0f, 1e-6);
+    const double diff = first.at(0) - full.at(0);
+    const double rel_l2 = std::sqrt(diff * diff / 8.0);
+    CHECK_NEAR(rel_l2, 0.3535533905932738, 1e-6);
+    std::fprintf(stderr, "split-span reference: full=[2,0,2,0] split=[1,0,2,0], "
+                         "relative L2=%.9f, max absolute=1; first-row unseen key changes attention\n",
+                 rel_l2);
+}
+
 TEST(op_attn_paged_sink) {
     /* op_attn_paged's cache and queries, non-causal, with a sink logit a head: token 0 now sees both
      * keys too, and each sink adds exp(sink) to the denominator only. Head 0, token 0, q = [1,0]:

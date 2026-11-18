@@ -7009,7 +7009,292 @@ int buf_named(const RadBuilder& b, const char* name) {
     return 0;
 }
 
+struct G4MoeVision {
+    std::vector<const char*> keys = g4df_keys(), vals = g4df_vals();
+
+    G4MoeVision() {
+        const char* vk[] = { "vision_config.model_type", "vision_config.hidden_size",
+                             "vision_config.num_attention_heads", "vision_config.head_dim",
+                             "vision_config.intermediate_size", "vision_config.pooling_kernel_size",
+                             "vision_config.position_embedding_size", "vision_config.num_hidden_layers",
+                             "vision_config.patch_size", "vision_config.rope_parameters.rope_theta",
+                             "vision_config.rope_parameters.rope_type", "vision_config.hidden_activation",
+                             "vision_config.standardize", "text_config.use_bidirectional_attention" };
+        const char* vv[] = { "gemma4_vision", "1152", "16", "72", "4304", "3", "10240", "27", "16",
+                             "100", "default", "gelu_pytorch_tanh", "1", "vision" };
+        keys.insert(keys.end(), std::begin(vk), std::end(vk));
+        vals.insert(vals.end(), std::begin(vv), std::end(vv));
+    }
+
+    RadModelMeta meta() const {
+        RadModelMeta m = gemma4_moe_meta();
+        m.n_kv = (int)keys.size();
+        m.kv_key = keys.data();
+        m.kv_val = vals.data();
+        return m;
+    }
+};
+
 }  /* namespace */
+
+TEST(gemma4_moe_declares_and_runs_the_26b_vision_tower_only_when_enabled) {
+    const G4MoeVision f;
+    const RadModelMeta meta = f.meta();
+    RadArchProbe p{};
+    CHECK_OK(gemma4::probe(&meta, &p));
+    CHECK_EQ(p.enc_merge, 9);
+    CHECK_EQ(p.draft_depth, 15);
+    CHECK_EQ(p.chain_pays, RAD_CHAIN_SPEC); // retain current upstream policy pending device evidence
+
+    std::vector<std::string> text_ops;
+    for (int patches : { 0, 18 }) {
+        RadBuilder b;
+        RadBuildCtx ctx = build_ctx();
+        ctx.max_enc_patches = patches;
+        REQUIRE_EQ(gemma4::declare(&b, &meta, &ctx), RAD_OK);
+        CHECK_EQ(b.encoder.bidirectional, patches ? 1 : 0);
+        CHECK_EQ(count_op(b, "scatter_rows"), patches ? 1 : 0);
+
+        RadBatch text = prefill_batch();
+        RadCtx tc{ .b = &b, .batch = &text };
+        gemma4::step(&tc, &text);
+        CHECK(tc.step_fail.empty());
+        CHECK_LINT(b, &tc);
+        if (!patches) text_ops = issued_ops(b, tc);
+        else CHECK(issued_ops(b, tc) == text_ops);
+
+        static uint16_t pixels[18 * 768];
+        static int32_t coords[2 * 18];
+        static const int32_t cu[] = { 0, 18 };
+        RadBatch enc{};
+        enc.enc = RAD_MM_IMAGE | RAD_MM_VIDEO; /* BatchBuilder uses the encoder mask. */
+        enc.enc_pixels = pixels;
+        enc.enc_coord = coords;
+        enc.enc_cu = cu;
+        enc.enc_n_patch = enc.enc_max_seg = 18;
+        enc.enc_n_seg = 1;
+        RadCtx ec{ .b = &b, .batch = &enc };
+        gemma4::step(&ec, &enc);
+        if (!patches) {
+            CHECK(find_w(b, "v.embed.weight") == nullptr);
+            CHECK(ec.step_fail.find("no vision tower was declared") != std::string::npos);
+            CHECK(ec.issues.empty());
+            continue;
+        }
+
+        CHECK_EQ(b.encoder.n_embd, 2816);
+        CHECK_EQ(b.encoder.patch_dim, 768);
+        CHECK_EQ(b.encoder.merge, 9);
+        CHECK_EQ(b.encoder.modalities, (uint32_t)(RAD_MM_IMAGE | RAD_MM_VIDEO));
+        const RecWeight* first = find_w(b, "v.blk.0.qkv");
+        REQUIRE(first != nullptr);
+        CHECK_EQ(first->d.group.layer, meta.n_layers + 5);
+        CHECK(find_w(b, "dflash.fc.weight") == nullptr);
+        const RecWeight* proj = find_w(b, "v.embed.weight");
+        REQUIRE(proj != nullptr);
+        CHECK_EQ(proj->d.shape[0], 2816);
+        CHECK_EQ(proj->d.shape[1], 1152);
+        CHECK_EQ(proj->d.shard, RAD_SHARD_NONE);
+        const RecMap* map = find_map(b, proj->name);
+        REQUIRE(map && map->src.size() == 1);
+        CHECK_EQ(map->src.front(), std::string("model.embed_vision.embedding_projection.weight"));
+        for (const RecWeight& w : b.weights)
+            if (w.name.starts_with("v.")) CHECK(find_map(b, w.name) != nullptr);
+
+        CHECK(ec.step_fail.empty());
+        CHECK_LINT(b, &ec);
+        REQUIRE(!ec.issues.empty());
+        const auto ops = issued_ops(b, ec);
+        CHECK_EQ(count_issued(ops, "attn_dense"), 27);
+        CHECK_EQ(count_issued(ops, "kv_store"), 0);
+        CHECK_EQ(ec.issues.back().n, 2);
+        CHECK_EQ(ec.issues.back().opd.back().handle, b.encoder.out);
+        for (int modality : {int(RAD_MM_IMAGE), int(RAD_MM_VIDEO), int(RAD_MM_AUDIO),
+                             int(RAD_MM_IMAGE | RAD_MM_AUDIO)}) {
+            enc.enc = modality;
+            RadCtx mc{ .b = &b, .batch = &enc };
+            gemma4::step(&mc, &enc);
+            if (modality & ~(RAD_MM_IMAGE | RAD_MM_VIDEO)) {
+                CHECK(mc.step_fail.find("unsupported encoder modality") != std::string::npos);
+                CHECK(mc.issues.empty());
+            } else {
+                CHECK(mc.step_fail.empty());
+                CHECK_LINT(b, &mc);
+                CHECK_EQ(count_issued(issued_ops(b, mc), "attn_dense"), 27);
+            }
+        }
+    }
+}
+
+TEST(gemma4_moe_text_only_container_with_vision_metadata_needs_no_tower_weights) {
+    const G4MoeVision f;
+    const RadModelMeta meta = f.meta();
+    const RadEncoding bf16 = rad_enc_plain(RAD_BF16);
+    for (int patches : { 0, 18 }) {
+        RadBuilder b;
+        b.encs = { { "token_embd.weight", bf16 } };
+        RadBuildCtx ctx = build_ctx();
+        ctx.max_enc_patches = patches;
+        ctx.max_spec = 15;
+        CHECK_EQ(gemma4::declare(&b, &meta, &ctx), patches ? RAD_E_NOTFOUND : RAD_OK);
+        if (!patches) {
+            CHECK_EQ(b.encoder.modalities, 0u);
+            CHECK(find_w(b, "v.patch.weight") == nullptr);
+            CHECK(find_w(b, "dflash.fc.weight") != nullptr);
+        }
+    }
+}
+
+TEST(gemma4_moe_vision_without_bidirectional_metadata_uses_causal_attention) {
+    G4MoeVision f;
+    f.keys.pop_back();  /* text_config.use_bidirectional_attention */
+    f.vals.pop_back();
+    const RadModelMeta meta = f.meta();
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    ctx.max_enc_patches = 18;
+    REQUIRE_EQ(gemma4::declare(&b, &meta, &ctx), RAD_OK);
+    CHECK_EQ(b.encoder.bidirectional, 0);
+    CHECK_EQ(count_op(b, "scatter_rows"), 1);
+    CHECK(find_w(b, "v.patch.weight") != nullptr);
+    for (const RecOp& op : b.ops)
+        if (op.op.starts_with("attn_paged")) CHECK_EQ(pint(&op, "causal"), 1);
+}
+
+TEST(gemma4_moe_defensively_refuses_an_overlong_span_without_ahead_attention) {
+    G4MoeVision f;
+    for (size_t i = 0; i < f.keys.size(); ++i)
+        if (!std::strcmp(f.keys[i], "sliding_window")) f.vals[i] = "8";
+    const RadModelMeta meta = f.meta();
+    RadBuilder b;
+    b.undeclared = { "attn_paged_qrow", "attn_paged_ahead", "attn_paged_qrow_ahead" };
+    RadBuildCtx ctx = build_ctx();
+    ctx.max_enc_patches = 126;
+    REQUIRE_EQ(gemma4::declare(&b, &meta, &ctx), RAD_OK);
+    CHECK(b.asked_undeclared.empty());
+
+    static const int32_t row = 4, seq = 0;
+    for (int32_t n : { 8, 9 }) {
+        const int32_t used = row + n;
+        RadBatch batch = prefill_batch();
+        batch.n_bidi = 1;
+        batch.bidi_row = &row;
+        batch.bidi_n = &n;
+        batch.bidi_seq = &seq;
+        batch.bidi_used = &used;
+        RadCtx c{ .b = &b, .batch = &batch };
+        gemma4::step(&c, &batch);
+        if (n == 8) {
+            CHECK(c.step_fail.empty());
+            CHECK_LINT(b, &c);
+        } else {
+            CHECK(c.step_fail.find("unrestricted lookahead") != std::string::npos);
+        }
+    }
+}
+
+TEST(gemma4_moe_tp2_image_spans_and_int8_dflash_share_the_trunk) {
+    G4MoeVision f;
+    for (size_t i = 0; i < f.keys.size(); ++i)
+        if (!std::strcmp(f.keys[i], "sliding_window")) f.vals[i] = "8";
+    const RadModelMeta meta = f.meta();
+    static const int32_t rows[] = { 12, 40 }, lengths[] = { 3, 10 };
+    static const int32_t seqs[] = { 0, 1 }, used[] = { 15, 18 };
+    static const int32_t mm_rows[] = { 12, 13, 14, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49 };
+    static uint16_t mm_embd[13 * 2816];
+    static int32_t tables[2 * 4];
+
+    /* Exercise both dense-Q and fused-row queries, and a span longer than the window. */
+    for (bool i8 : { false, true })
+    for (bool qrow : { false, true })
+    for (int rank : { 0, 1 }) {
+        RadBuilder b;
+        if (!qrow) b.undeclared.insert("attn_paged_qrow");
+        const RadEncoding draft_i8 = rad_enc_affine(RAD_I8, RAD_F16, 1, 128);
+        RadEncoding expert = i8 ? rad_enc_affine(RAD_I8, RAD_BF16, 1, 128) : rad_enc_plain(RAD_BF16);
+        if (i8) std::strcpy(expert.transform, "fwht128");
+        b.encs = { { "ffn_gate_up_exps.", expert }, { "dflash.fc.", draft_i8 }, { "dflash.blk.", draft_i8 },
+                   { "dflash.draft_head.", draft_i8 } };
+        RadBuildCtx ctx = build_ctx(rank, 2);
+        ctx.max_enc_patches = 126;
+        ctx.max_spec = 15;
+        ctx.kv_dtype = RAD_I8;
+        REQUIRE_EQ(gemma4::declare(&b, &meta, &ctx), RAD_OK);
+        CHECK(b.asked_undeclared.empty());
+        CHECK(find_w(b, "dflash.draft_head.weight") != nullptr);
+        const RecWeight* vis = find_w(b, "v.blk.0.qkv");
+        REQUIRE(vis != nullptr);
+        CHECK_EQ(vis->d.group.layer, meta.n_layers + 5);
+
+        RadKVGroupBatch sliding{};
+        sliding.group = b.binds.front().second;
+        sliding.block_table = tables;
+        sliding.block_table_pitch = 4;
+        RadBatch batch = prefill_batch();
+        batch.kv = &sliding;
+        batch.n_kv_groups = 1;
+        batch.n_mm_rows = 13;
+        batch.mm_rows = mm_rows;
+        batch.mm_embd = mm_embd;
+        batch.n_bidi = 2;
+        batch.bidi_row = rows;
+        batch.bidi_n = lengths;
+        batch.bidi_seq = seqs;
+        batch.bidi_used = used;
+        RadCtx c{ .b = &b, .batch = &batch, .rank = rank, .world = 2 };
+        gemma4::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(b, &c);
+        const auto ops = issued_ops(b, c);
+        REQUIRE(ops.size() >= 3);
+        CHECK_EQ(ops[0], std::string("embed_lookup"));
+        CHECK_EQ(ops[1], std::string("scatter_rows"));
+        CHECK_EQ(ops[2], std::string("all_reduce"));
+        CHECK_EQ(c.issues[1].opd[0].raw, mm_embd);
+        CHECK_EQ(count_issued(ops, "moe_gemm_q"), i8 ? 6 : 0);
+        CHECK_EQ(count_issued(ops, "moe_gemm"), i8 ? 6 : 12);
+
+        int causal = 0, corrections = 0;
+        for (const RecIssue& issue : c.issues) {
+            const RecOp* op = b.op_of(issue.op);
+            if (!op || !op->op.starts_with("attn_paged")) continue;
+            if (pint(op, "causal")) {
+                ++causal;
+                continue;
+            }
+            const int span = corrections++ % 2;
+            CHECK_EQ(causal, (corrections + 1) / 2);
+            CHECK_EQ(pint(op, "head_dim"), 256);
+            CHECK_EQ(pint(op, "window"), 8);
+            CHECK_EQ(pstr(op, "kv_dtype"), std::string("i8"));
+            CHECK_EQ(op->op, std::string(qrow ? "attn_paged_qrow" : "attn_paged") +
+                                  (span ? "_ahead" : ""));
+            CHECK_EQ(issue.n, lengths[span]);
+            REQUIRE(issue.opd.size() == 8);
+            CHECK_EQ(issue.opd[0].offset, rows[span] * (qrow ? 4096 : 2048));
+            CHECK_EQ(issue.opd[2].raw, tables + 4 * seqs[span]);
+            CHECK_EQ(issue.opd[3].raw, used + span);
+            CHECK_EQ(issue.opd[7].offset, rows[span] * 2048);
+            CHECK_EQ(issue.opd[7].rows, lengths[span]);
+        }
+        CHECK_EQ(causal, 6);
+        CHECK_EQ(corrections, 10);
+
+        for (int pass : { -1, 1 }) {
+            RadBatch draft = decode_batch();
+            draft.draft_pass = pass;
+            RadCtx dc{ .b = &b, .batch = &draft, .rank = rank, .world = 2 };
+            gemma4::step(&dc, &draft);
+            CHECK(dc.step_fail.empty());
+            const auto draft_ops = issued_ops(b, dc);
+            CHECK_EQ(count_issued(draft_ops, "kv_store"), 5);
+            CHECK_EQ(count_issued(draft_ops, "scatter_rows"), 0);
+            CHECK_EQ(count_issued(draft_ops, "attn_dense"), 0);
+            CHECK_EQ(count_issued(draft_ops, "moe_gemm_q"), 0);
+            CHECK(count_issued(draft_ops, "gemm_nt_q") > 0);
+        }
+    }
+}
 
 /* DFlash proposes a block in one pass, so the probe's depth is the trained block size minus the
  * anchor, and fixed. Without a drafter, or with DFlash2 (not served by this plugin), it is 0. */
@@ -7388,6 +7673,48 @@ bool noted(const RadBuilder& b, const char* text) {
 }
 
 }  /* namespace */
+
+TEST(gemma4_moe_overlap_attends_an_image_span_across_the_slice_boundary) {
+    const G4MoeVision f;
+    const RadModelMeta meta = f.meta();
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx(0, 2);
+    ctx.max_tok = 4096;
+    ctx.max_enc_patches = 36;
+    REQUIRE_EQ(gemma4::declare(&b, &meta, &ctx), RAD_OK);
+    REQUIRE(noted(b, "prefill overlap: a chunk of two routed passes"));
+
+    static const int32_t rows[] = { 2046, 2047, 2048, 2049 };
+    static const int32_t n = 4, seq = 0, used = 2050, out = 4095;
+    static uint16_t image[4 * 2816];
+    RadBatch batch = one_prompt(4096, &out);
+    batch.n_mm_rows = 4;
+    batch.mm_rows = rows;
+    batch.mm_embd = image;
+    batch.n_bidi = 1;
+    batch.bidi_row = rows;
+    batch.bidi_n = &n;
+    batch.bidi_seq = &seq;
+    batch.bidi_used = &used;
+    RadCtx c{ .b = &b, .batch = &batch, .world = 2 };
+    gemma4::step(&c, &batch);
+    CHECK(c.step_fail.empty());
+    CHECK_LINT(b, &c);
+    CHECK_EQ(races(b, c), 0);
+    int corrections = 0, overlap_reductions = 0;
+    for (const RecIssue& issue : c.issues) {
+        const RecOp* op = b.op_of(issue.op);
+        REQUIRE(op != nullptr);
+        if (issue.lane == 1 && op->op == "all_reduce") ++overlap_reductions;
+        if (op->op != "attn_paged_qrow" || pint(op, "causal") != 0) continue;
+        ++corrections;
+        CHECK_EQ(issue.n, n);
+        CHECK_EQ(issue.opd.back().offset, 2046 * 2048);
+        CHECK_EQ(issue.opd.back().rows, n);
+    }
+    CHECK_EQ(corrections, 5);
+    CHECK_EQ(overlap_reductions, 24);
+}
 
 /* A prefill chunk in two slices (arch/gemma4, trunk_overlap). Checked: every reduction runs on
  * lane 1 after its producer and before its consumer, and nothing else does; the cut is a whole
