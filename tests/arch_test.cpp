@@ -10875,6 +10875,59 @@ TEST(qwen35_split_target_verifies_independent_u2_mtp_proposals) {
     }
 }
 
+TEST(qwen35_mtp_draft_head_calibration_taps_full_history) {
+    MetaKV mk = q35w8a8_meta();
+    const char* out_dir = "/tmp/rad-qwen35-mtp-calib-test";
+    for (int rank = 0; rank < 2; ++rank) {
+        RadBuilder b;
+        q35_split_head(b, true);
+        RadBuildCtx ctx = spec_ctx(rank, 2, 3);
+        ctx.max_spec = 0;  /* calibration needs the MTP context pass, not speculative proposals */
+        ctx.calib_dir = out_dir;
+        ctx.calib_layer_lo = 8;  /* n_main: the virtual MTP layer */
+        ctx.calib_layer_hi = 9;
+        ctx.calib_tokens = 100;  /* keep the fake stream below the write threshold */
+        REQUIRE_EQ(qwen35_w8a8::declare(&b, mk.meta(), &ctx), RAD_OK);
+        auto& model = qwen35_w8a8::g_model[rank];
+        CHECK(model.mtp.draft_head_calib_on);  /* all ranks run the same replicated-head path */
+        if (rank == 0) {
+            CHECK(model.mtp.draft_head_calib.op != 0);
+            CHECK(model.mtp.draft_head_calib.h != 0);
+        } else {
+            CHECK_EQ(model.mtp.draft_head_calib.op, 0u);
+        }
+
+        auto k = kit(b, {}, { 8 }, 10);
+        k->b.phase = RAD_PHASE_DECODE;
+        k->out = { 0, 1, 2, 3, 4, 5, 6, 7 };
+        k->b.out_ids = k->out.data();
+        k->b.n_out = 8;
+        k->b.n_draft_out = 0;  /* a calib-corpus prompt has no proposal rows */
+        k->b.draft_pass = 0;
+        RadCtx trunk{ .b = &b, .batch = &k->b, .rank = rank, .world = 2 };
+        qwen35_w8a8::step(&trunk, &k->b);
+        RadBatch history_batch = k->b;
+        history_batch.draft_pass = -1;
+        RadCtx history{ .b = &b, .batch = &history_batch, .rank = rank, .world = 2 };
+        qwen35_w8a8::step(&history, &history_batch);
+        CHECK(trunk.step_fail.empty());
+        CHECK(history.step_fail.empty());
+        const auto issued = [&](rad_op op) {
+            for (const auto& i : history.issues) if (i.op == op) return true;
+            return false;
+        };
+        CHECK(!issued(model.mtp.op_dsel));
+        CHECK(!issued(model.mtp.op_dquant));
+        CHECK(issue_of(b, history, "row_topk") == nullptr);
+        if (rank == 0) CHECK(issue_of(b, history, "gram_accum") != nullptr);
+        else           CHECK(issue_of(b, history, "gram_accum") == nullptr);
+        const auto lint = lint_step(b, { &trunk, &history });
+        for (const std::string& problem : lint)
+            std::fprintf(stderr, "MTP draft-head tap lint: %s\n", problem.c_str());
+        CHECK(lint.empty());
+    }
+}
+
 TEST(qwen35_u2_mtp_couples_each_round_after_the_global_shortlist) {
     MetaKV mk = q35w8a8_meta();
     for (int world : {1, 2}) for (int rank = 0; rank < world; ++rank) {

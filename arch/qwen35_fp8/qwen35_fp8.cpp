@@ -581,6 +581,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * `model.language_model.layers.N` and its MTP block separately under `mtp.`; subtracting it
      * would drop full-attention layer 63 and silently run a trunk one layer short. */
     m.n_main = g.n_layer;
+    const bool calib_requested = ctx->calib_dir && *ctx->calib_dir;
+    const bool calib_mtp_layer = calib_requested && nextn > 0 &&
+        (!ctx->calib_layer_hi ||
+         (ctx->calib_layer_lo <= m.n_main && m.n_main < ctx->calib_layer_hi));
+#if !QWEN35_MOE
+    const bool calib_trunk_layers = calib_requested &&
+        (!ctx->calib_layer_hi || ctx->calib_layer_lo < m.n_main);
+#endif
+    if (calib_requested && ctx->calib_layer_hi && ctx->calib_layer_lo >= m.n_main &&
+        !calib_mtp_layer) {
+        fprintf(stderr, "radiance: qwen35: --calib-layers selects no trunk or MTP layer\n");
+        return RAD_E_INVAL;
+    }
 
     /* Qwen3.5's norms are GemmaRMSNorm, `x_hat * (1 + w)` (vLLM imports GemmaRMSNorm as
      * Qwen3_5RMSNorm). This covers input_layernorm, post_attention_layernorm, the final norm and
@@ -1110,12 +1123,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.layers.resize((size_t)m.n_main);
 #if !QWEN35_MOE
     /* GPTQ calibration over the trunk's own int8 codes (rad_calib_full.h, site_i8): one rank, the
-     * serial step. The scratch is the widest input's square, the feed-forward's. */
-    if (ctx->calib_dir && *ctx->calib_dir && g.world > 1) {
-        fprintf(stderr, "radiance: qwen35: --calib-dir records an int8 trunk at --tp 1 only\n");
+     * serial step. MTP-only calibration selects virtual layer n_main and does not touch this tap. */
+    if (calib_trunk_layers && g.world > 1) {
+        fprintf(stderr, "radiance: qwen35: --calib-dir records an int8 trunk at --tp 1 only; "
+                        "select only the MTP layer for replicated-head calibration\n");
         return RAD_E_INVAL;
     }
-    RAD_ARCH_TRY(m.calib.begin(b, nm, g, ctx, m.n_main, 0, std::max<int64_t>(g.n_ff, g.n_embd)));
+    if (calib_trunk_layers)
+        RAD_ARCH_TRY(m.calib.begin(b, nm, g, ctx, m.n_main, 0,
+                                   std::max<int64_t>(g.n_ff, g.n_embd)));
 #endif
     for (int64_t l = 0; l < m.n_main; ++l) {
         Layer& lay = m.layers[(size_t)l];
@@ -1280,9 +1296,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      *
      * Also only when there is no DFlash2 drafter (`n_taps` == 0): a deployment drafts with one,
      * and DFlash2 (one forward per block rather than one per token) is the better one here. */
-    const bool want_mtp = nextn > 0 && g.max_spec > 0 && !m.n_taps;
+    if (calib_mtp_layer && m.n_taps > 0) {
+        fprintf(stderr, "radiance: qwen35: MTP draft-head calibration cannot use a DFlash2 drafter\n");
+        return RAD_E_UNSUPPORTED;
+    }
+    const bool want_mtp = nextn > 0 && (g.max_spec > 0 || calib_mtp_layer) && !m.n_taps;
     const bool draft_q2 = want_mtp &&
         mtp_draft_head_q2(b, nm.f("mtp.draft_head.weight"), nm.ckpt("lm_head.weight"));
+    if (calib_mtp_layer && !draft_q2) {
+        fprintf(stderr, "radiance: qwen35: MTP draft-head calibration requires a U2 "
+                        "mtp.draft_head.weight\n");
+        return RAD_E_UNSUPPORTED;
+    }
     /* A split target has no single output.weight. It can still verify the proposals of an
      * independent U2 head. Older split-head containers carry neither that head nor the MTP
      * block, even if the checkpoint metadata advertises NextN. Leave them trunk-only. */
@@ -1324,6 +1349,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         tw.dlog = m.b_mtp_dlog; tw.didx = m.b_mtp_didx; tw.dval = m.b_mtp_dval;
         tw.attn = tw_attn;  tw.mlp = tw_mlp;
         tw.coupled = ctx->draft_coupling != 0;
+        if (calib_mtp_layer) {
+            tw.calib_dir = ctx->calib_dir;
+            tw.calib_tokens = ctx->calib_tokens;
+        }
 
         MtpHead::Src ts{};
         ts.fc                 = nm.ckpt("mtp.fc.weight");
@@ -1370,7 +1399,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RadDrafterDecl dd{};
         dd.name           = "mtp";
         dd.kind           = RAD_DRAFT_SERIAL;
-        dd.depth          = ctx->max_spec;
+        dd.depth          = ctx->max_spec > 0 ? ctx->max_spec : 1; /* one context pass for calibration */
         dd.proposal       = m.b_mtp_didx;
         dd.proposal_pitch = pitch;
         dd.mask_token     = -1;

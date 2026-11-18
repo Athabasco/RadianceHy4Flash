@@ -184,10 +184,9 @@ inline long long calib_target() {
  * from an exercised one: libquant reads a per-expert file only when it holds several times K
  * rows. `domain` is what the tap summed; a reader quantising in another domain converts the file
  * itself (libquant's calib_sum). */
-inline bool calib_write_host(const float* h, int64_t k, long long rows, const char* what,
-                             uint32_t domain, int rank) {
-    const char* dir = calib_dir();
-    if (!dir || !h || k <= 0) return false;
+inline bool calib_write_host_to(const char* dir, const float* h, int64_t k, long long rows,
+                                 const char* what, uint32_t domain, int rank) {
+    if (!dir || !*dir || !h || k <= 0) return false;
     char path[512];
     std::snprintf(path, sizeof path, "%s/gram.r%d.%s.bin", dir, rank, what);
     FILE* f = std::fopen(path, "wb");
@@ -211,6 +210,11 @@ inline bool calib_write_host(const float* h, int64_t k, long long rows, const ch
     return okw;
 }
 
+inline bool calib_write_host(const float* h, int64_t k, long long rows, const char* what,
+                             uint32_t domain, int rank) {
+    return calib_write_host_to(calib_dir(), h, k, rows, what, domain, rank);
+}
+
 /* The same file from a device accumulator: copied back on the block's stream, then written. */
 inline bool calib_write(RadCtx* c, rad_buf b, int64_t k, long long rows, const char* what,
                         uint32_t domain) {
@@ -221,6 +225,19 @@ inline bool calib_write(RadCtx* c, rad_buf b, int64_t k, long long rows, const c
     if (rad_memcpy_async(h.data(), p, (int64_t)h.size() * 4, rad_stream(c)) < 0) return false;
     rad_stream_sync(rad_stream(c));
     return calib_write_host(h.data(), k, rows, what, domain, rad_rank(c));
+}
+
+/* A selected architecture tap may use the build context's directory directly, rather than the
+ * legacy process environment helper above. */
+inline bool calib_write_to(RadCtx* c, rad_buf b, int64_t k, long long rows, const char* what,
+                           uint32_t domain, const char* dir) {
+    if (!dir || !*dir || !b || k <= 0) return false;
+    void* p = rad_buf_ptr(c, b);
+    if (!p) return false;
+    std::vector<float> h((size_t)(k * k));
+    if (rad_memcpy_async(h.data(), p, (int64_t)h.size() * 4, rad_stream(c)) < 0) return false;
+    rad_stream_sync(rad_stream(c));
+    return calib_write_host_to(dir, h.data(), k, rows, what, domain, rad_rank(c));
 }
 
 /* A pinned host buffer of at least `bytes`, one per instance (slot), held for the process

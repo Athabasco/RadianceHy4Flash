@@ -141,6 +141,10 @@ struct MtpBlockFP8 {
         rad_buf didx = 0;   /* [max_seqs, proposal_pitch] i32, proposal in column zero */
         rad_buf dval = 0;   /* [max_seqs, proposal_pitch] f32, shortlist logits */
         bool coupled = false;
+        /* A targeted calib-corpus run may select the virtual MTP layer (n_main) and record the
+         * draft head's actual input. The trunk's CalibFull is intentionally not involved. */
+        const char* calib_dir = nullptr;
+        int64_t calib_tokens = 0;
         /* The layer reuses the trunk's working set, which is dead by the time the head runs (a
          * second set would be 150 MiB). */
         AttnGatedFP8::Wire attn{};
@@ -176,6 +180,11 @@ struct MtpBlockFP8 {
     rad_op     op_dquant = 0, op_dlogits = 0, op_dtopk = 0;
     rad_buf    couple_draws = 0, couple_state = 0;
     rad_op     op_couple[RAD_MTP_COUPLE_MAX_ROUNDS] = {};
+    CalibTap   draft_head_calib{};
+    bool       draft_head_calib_on = false;
+    mutable int64_t draft_head_calib_rows = 0;
+    mutable bool draft_head_calib_done = false;
+    int64_t    draft_head_calib_target = 0;
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, rad_kvgroup kv,
                  int64_t rotary_dim, rad_weight tok_embd, rad_weight lm_head, float out_wadd,
@@ -191,6 +200,12 @@ inline int MtpBlockFP8<Ffn>::declare(RadBuilder* b, Names& nm, const Geom& geom,
     g = geom; w = wire; layer = l; w_tok = tok_embd; w_lm = lm_head;
     rows = g.max_tok;
     q2 = w.dq != 0;
+    draft_head_calib_on = q2 && w.calib_dir && *w.calib_dir && w.calib_tokens > 0;
+    draft_head_calib_target = w.calib_tokens;
+    if (w.calib_dir && *w.calib_dir && w.calib_tokens <= 0) {
+        std::fprintf(stderr, "radiance: MTP draft-head calibration requires a non-empty corpus\n");
+        return RAD_E_INVAL;
+    }
     if (w.coupled && (!q2 || g.max_spec < 1 || g.max_spec > RAD_MTP_COUPLE_MAX_ROUNDS)) {
         std::fprintf(stderr, "radiance: Qwen35 native MTP coupling requires the U2 draft head and "
                              "a draft depth in 1..%d\n", RAD_MTP_COUPLE_MAX_ROUNDS);
@@ -293,6 +308,9 @@ inline int MtpBlockFP8<Ffn>::declare(RadBuilder* b, Names& nm, const Geom& geom,
                                 RAD_STR("dtype", g.dtype)),
                      RAD_WEIGHTS(w_norm)),
                  {w.x}, {w.hout});
+    if (draft_head_calib_on && g.rank == 0)
+        RAD_ARCH_TRY(draft_head_calib.declare(b, nm, rows, nm.f("mtp.draft_head"), w.hout,
+                                             g.n_embd));
 
     /* Only the fallback projects through the target's single lm_head. In particular do not
      * declare an unused logits_gemm with a null weight when the target uses width classes. */
@@ -427,18 +445,25 @@ inline void MtpBlockFP8<Ffn>::step(RadCtx* c, const RadBatch* batch) const {
 
     RAD_ISSUE(c, op_fc, brows(w.c, T), RAD_W(w_fc), brows(w.x, T));
 
-    /* A history pass with no drafting rows (every prefill chunk but a prompt's last) only needs
-     * K and V. `n_draft_out` is the same on every rank, so skipped collectives match. */
-    if (r < 0 && batch->n_draft_out <= 0) {
+    /* The ordinary history fast path only stores K/V. A selected MTP calibration layer instead
+     * runs every prompt row through the block so the U2 draft head gets a real, full-rank Gram. */
+    const bool tap_history = draft_head_calib_on && !draft_head_calib_done && r < 0 &&
+                             batch->n_draft_out <= 0;
+    if (tap_history && batch->n_out != T) {
+        rad_step_fail(c, "MTP draft-head calibration needs every history row in out_ids");
+        return;
+    }
+    if (r < 0 && batch->n_draft_out <= 0 && !tap_history) {
         attn.store_kv(c, batch);
         return;
     }
     attn.step(c, batch);
 
     /* A history pass with drafting rows continues on those rows alone (round 1): they are moved
-     * to the front of `x` and the rest of the head runs over them. */
+     * to the front of `x` and the rest of the head runs over them. Calibration uses all prompt
+     * rows and returns before the proposal path. */
     int64_t L = T;                      /* the rows the stream goes on with */
-    if (r < 0) {
+    if (r < 0 && !tap_history) {
         L = batch->n_draft_out;
         RAD_ISSUE_N(c, op_dsel, L, RAD_B(w.x), praw(batch->draft_out_ids, RAD_I32, L),
                     brows(w.hout, L));
@@ -448,6 +473,20 @@ inline void MtpBlockFP8<Ffn>::step(RadCtx* c, const RadBatch* batch) const {
     mlp.step_rows(c, L);
 
     RAD_ISSUE(c, op_norm, brows(w.x, L), RAD_W(w_norm), brows(w.hout, L));
+    if (tap_history) {
+        draft_head_calib.step(c, w.hout, L, true);  /* only rank 0 declares this local tap */
+        draft_head_calib_rows += L;                 /* same replicated input on every rank */
+        if (draft_head_calib_rows >= draft_head_calib_target) {
+            if (g.rank == 0 && !calib_write_to(c, draft_head_calib.h, draft_head_calib.K,
+                                               draft_head_calib_rows, "mtp.draft_head", 0,
+                                               w.calib_dir)) {
+                rad_step_fail(c, "failed to write the MTP draft-head RADGRAM2 calibration");
+                return;
+            }
+            draft_head_calib_done = true;
+        }
+        return;  /* calib-corpus needs the head input, not a speculative proposal */
+    }
     if (q2) {
         /* `dsum` is group-major [n_embd/group][ceil(L/16)*16], so it has no row slice; pass it
          * whole. */

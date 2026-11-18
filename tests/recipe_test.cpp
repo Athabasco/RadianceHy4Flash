@@ -151,6 +151,45 @@ TEST(the_q38_native_mtp_overlay_only_changes_draft_weights) {
         CHECK(r.match(n) == nullptr);
 }
 
+/* The calibrated native-MTP overlay keeps the int8 block at RTN and fits only the U2 draft head. */
+TEST(the_q38_native_mtp_gptq_overlay_uses_the_draft_head_gram) {
+    const std::string src = __FILE__;
+    std::ifstream in(src.substr(0, src.find_last_of('/')) +
+                     "/../data/recipes/q38-27b-native-mtp-u2-gptq.recipe");
+    REQUIRE(in.good());
+    Recipe r;
+    std::string why;
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const char* old_calib = std::getenv("MTP_CALIB");
+    const std::string saved_calib = old_calib ? old_calib : "";
+    setenv("MTP_CALIB", "/tmp/qwen35-mtp-calib", 1);
+    const int parse_rc = r.add_text(text, "mtp-gptq.recipe", &why);
+    if (old_calib) setenv("MTP_CALIB", saved_calib.c_str(), 1);
+    else unsetenv("MTP_CALIB");
+    REQUIRE_EQ(parse_rc, RAD_OK);
+    CHECK_EQ(r.rules().size(), (size_t)7);
+    for (const char* linear : {"attn_qg", "attn_k", "attn_v", "attn_output", "ffn_gate_up", "ffn_down"}) {
+        const auto* rule = r.match(std::string("blk.64.") + linear + ".weight");
+        REQUIRE(rule != nullptr);
+        CHECK_EQ(rule->quantizer, std::string("rtn"));
+        CHECK(has_opt(rule, "codes", "i8"));
+        CHECK(has_opt(rule, "group", "128"));
+        CHECK(has_opt(rule, "scale", "bf16"));
+        CHECK(has_opt(rule, "transform", "fwht128"));
+    }
+    const auto* head = r.match("mtp.draft_head.weight");
+    REQUIRE(head != nullptr);
+    CHECK_EQ(head->quantizer, std::string("gptq"));
+    CHECK(has_opt(head, "codes", "u2"));
+    CHECK(has_opt(head, "zero", "u8"));
+    CHECK(has_opt(head, "group", "128"));
+    CHECK(has_opt(head, "scale", "f16"));
+    CHECK(has_opt(head, "calib", "/tmp/qwen35-mtp-calib"));
+    CHECK(has_opt(head, "damp", "0.01"));
+    CHECK(r.match("mtp.fc.weight") == nullptr);
+    CHECK(r.match("output.k4.weight") == nullptr);
+}
+
 /* The Sage-A1.5 recipe as it ships: every trunk linear -- attention, the delta net's in- and
  * out-projections, the routed and shared experts of all 40 blocks and the MTP layer at its own
  * index 40 -- goes to block fp8, the head likewise, and the routers, the shared-expert gates,

@@ -273,6 +273,15 @@ for the target recipe. To retain an existing calibrated target, pass `--reuse or
 the **same source, target recipe and calibration** and write a new file. Check the converter's
 reuse count and that the plan includes `mtp.fc.weight`, `blk.64.*` and `mtp.draft_head.weight`.
 
+To fit the U2 draft head to its actual inputs, run with `--calib-corpus FILE`, `--calib-dir DIR`,
+`--calib-layers 64:65` and `--num-speculative-tokens 0`. Layer 64 is the MTP block beside a
+64-layer trunk; this records `gram.r0.mtp.draft_head.bin` without generating proposals. Selecting
+only that virtual layer skips the trunk's separate int8 Hessian capture, so the MTP-only run can use
+tensor parallelism. Then use `q38-27b-native-mtp-u2-gptq.recipe` in place of the RTN overlay, set
+`MTP_CALIB=DIR` and keep `CALIB` pointed at the target recipe's original Hessians. The base
+IQ4R-S-V4 recipe stays unchanged. The serving plugin is `qwen35_w8a8` (rotated int8 activations),
+not the deprecated block-FP8 plugin.
+
 No external drafter is needed. At serve time `num-speculative-tokens: auto` and
 `draft-window: adaptive` use the native chain; startup should report `'mtp' drafts`, not prompt
 lookup alone. `num-speculative-tokens: 0` leaves the extra block unloaded. An older split-head
