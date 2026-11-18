@@ -14449,6 +14449,46 @@ MetaKV krea2_meta() {
 
 }  /* namespace */
 
+TEST(krea2_reduces_the_denoiser_and_output_buffers_for_a_pixel_limit) {
+    MetaKV mk = krea2_meta();
+    RadArchProbe probe{};
+    probe.gen_max_pixels = 512 * 512;
+    REQUIRE_EQ(krea2::probe(mk.meta(), &probe), RAD_OK);
+    CHECK_EQ(probe.gen_rows, 2 * (1024 + 512));
+
+    RadBuilder b;
+    RadBuildCtx ctx = qimg_ctx(0, 1);
+    ctx.gen_max_pixels = probe.gen_max_pixels;
+    ctx.max_tok = probe.gen_rows;
+    REQUIRE_EQ(krea2::declare(&b, mk.meta(), &ctx), RAD_OK);
+    CHECK_EQ(b.generator.max_tokens, 1024);
+    CHECK_EQ(b.generator.default_width, 512);
+    CHECK_EQ(b.generator.default_height, 512);
+    CHECK_EQ(b.generator.max_refs, 0);
+    REQUIRE(b.generator.image_out > 0);
+    CHECK_EQ(b.bufs[b.generator.image_out - 1].d.shape[0], 512 * 512 * 3);
+}
+
+TEST(krea2_target_buffers_cover_multiple_bounded_images) {
+    MetaKV mk = krea2_meta();
+    RadArchProbe probe{};
+    probe.gen_max_pixels = 256 * 256;
+    REQUIRE_EQ(krea2::probe(mk.meta(), &probe), RAD_OK);
+    for (const int entries : {1, 2, 4}) {
+        RadBuilder b;
+        RadBuildCtx ctx = qimg_ctx(0, 1);
+        ctx.max_seqs = entries;
+        ctx.max_tok = probe.gen_rows;
+        ctx.gen_max_pixels = probe.gen_max_pixels;
+        REQUIRE_EQ(krea2::declare(&b, mk.meta(), &ctx), RAD_OK);
+        const auto* latent = find_b(b, "dit.lat");
+        const auto* velocity = find_b(b, "dit.v");
+        REQUIRE(latent && velocity);
+        CHECK_EQ(latent->d.shape[0], entries * 256);
+        CHECK_EQ(velocity->d.shape[0], entries * 256);
+    }
+}
+
 /* An IQ8R container (every quantised linear at one scale a 256 of K): where the rotating twins are
  * served a DiT block's two modulated norms write the int8 codes in their own pass
  * (rms_mod_had_quant_i8g at the weights' group) and every attention's output gate writes the out
@@ -14607,4 +14647,27 @@ TEST(the_plain_bf16_plugins_ask_for_chained_launches) {
         CHECK_OK(unlimitedocr_bf16::probe(&meta, &p));
         CHECK_EQ(p.chain_pays, (int)RAD_CHAIN_ALWAYS);
     }
+}
+
+TEST(krea_pixel_limits_preserve_the_default_canvas_and_reject_unusable_declarations) {
+    MetaKV meta = krea2_meta();
+    RadArchProbe probe{};
+    REQUIRE_EQ(krea2::probe(meta.meta(), &probe), RAD_OK);
+    RadBuildCtx ctx = qimg_ctx(0, 1);
+    ctx.max_tok = probe.gen_rows;
+    ctx.max_seqs = 16;
+    RadBuilder builder;
+    REQUIRE_EQ(krea2::declare(&builder, meta.meta(), &ctx), RAD_OK);
+    CHECK_EQ(builder.generator.default_width, 1024);
+    CHECK_EQ(builder.generator.default_height, 1024);
+    const auto* latent = find_b(builder, "dit.lat");
+    REQUIRE(latent);
+    CHECK_EQ(latent->d.shape[0], ctx.max_tok);
+    ctx.gen_max_pixels = 255;
+    RadBuilder too_small;
+    CHECK_EQ(krea2::declare(&too_small, meta.meta(), &ctx), RAD_E_INVAL);
+    ctx.gen_max_pixels = 256 * 256;
+    ctx.max_seqs = 0;
+    RadBuilder no_entries;
+    CHECK_EQ(krea2::declare(&no_entries, meta.meta(), &ctx), RAD_E_INVAL);
 }
