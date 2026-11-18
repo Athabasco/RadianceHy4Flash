@@ -6,7 +6,7 @@
 SRC is a Hugging Face checkpoint directory (Qwen/Qwen3.8-27B), CLASSES a width-class file from
 data/vhead/ (q38-27b-vhead-4.0.cls, -4.5, -5.0: the head's mean code width). DST becomes SRC with
 lm_head.weight replaced by its width classes; every other file of SRC is linked, not copied. Pass DST
-to rad-convert in place of SRC. With --keep-lm-head, also index the original lm_head.weight so a
+to rad-convert in place of SRC. Use a fresh DST on the same filesystem as the shards. With --keep-lm-head, also index the original lm_head.weight so a
 native MTP drafter can quantise its own copy. No extra bytes are copied into the checkpoint.
 
 A vocabulary-weighted head stores each vocabulary row on one of four trellis widths, the tokens that
@@ -29,6 +29,7 @@ CLASSES: one ASCII line `radiance-vhead-1 n_vocab=V widths=a,b,c,d`, then V/4 by
 bf16 is moved as raw u16 (no arithmetic happens here), so numpy alone suffices.
 """
 import argparse
+import errno
 import json
 import os
 import struct
@@ -115,13 +116,27 @@ def main():
         wm[name] = "vhead.safetensors"
     with open(os.path.join(dst, "model.safetensors.index.json"), "w") as f:
         json.dump({"metadata": idx.get("metadata", {}), "weight_map": wm}, f)
-    # Link every original shard, including a shard holding only lm_head.weight.
+    # Indexed shards must resolve inside DST: the converter rejects external shard symlinks.
+    # Hard-link their bytes (including a lone lm_head shard); never copy a whole model silently.
     keep = set(idx["weight_map"].values())
     for f in os.listdir(src):
         if f == "model.safetensors.index.json" or (f.endswith(".safetensors") and f not in keep):
             continue
-        if not os.path.lexists(os.path.join(dst, f)):
-            os.symlink(os.path.abspath(os.path.join(src, f)), os.path.join(dst, f))
+        source, target = os.path.join(src, f), os.path.join(dst, f)
+        if f in keep:
+            if os.path.lexists(target):
+                if os.path.islink(target) or not os.path.samefile(source, target):
+                    raise SystemExit(f"vhead.py: {target} already exists; use a fresh DST")
+                continue
+            try:
+                os.link(os.path.realpath(source), target)
+            except OSError as exc:
+                if exc.errno == errno.EXDEV:
+                    raise SystemExit("vhead.py: SRC shards and DST must share a filesystem "
+                                     "for hard links") from exc
+                raise
+        elif not os.path.lexists(target):
+            os.symlink(os.path.abspath(source), target)
     print(f"vhead.py: {dst}: " + " ".join(f"k{k}:{int((cls == i).sum())}" for i, k in enumerate(widths))
           + f", mean {sum(widths[i] * int((cls == i).sum()) for i in range(len(widths))) / V:.3f} b")
 

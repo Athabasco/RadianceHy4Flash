@@ -36,6 +36,7 @@ class VHeadTest(unittest.TestCase):
             self.assertEqual(draft.pop("lm_head.weight"), shard)
             self.assertEqual(draft, base)
             self.assertTrue((mtp / shard).samefile(src / shard))
+            self.assertFalse((mtp / shard).is_symlink())
             self.assertEqual((mtp / "vhead.safetensors").read_bytes(),
                              (plain / "vhead.safetensors").read_bytes())
 
