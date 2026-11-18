@@ -1673,6 +1673,8 @@ int Engine::step_loop() {
          * immediately for a kind that is not its own. */
         st = block_drafting() ? finish_block_drafter(so) : finish_serial_drafter(so);
         if (st < 0) return fail_loop(st);
+        /* --draft-depth-load: the step's time and tokens, for the rule's rate and prices. */
+        if (depth_load_on_) depth_step_note(b, so);
         /* The step ends here, after its draft rounds, so step timing includes them
          * (Scheduler::step_finished). */
         sched_.step_finished();

@@ -20,6 +20,8 @@
 #include <string>
 #include <vector>
 
+#include <sys/stat.h>
+
 namespace rad {
 
 /* ------------------------------------------------------------------ the card's step state */
@@ -148,6 +150,41 @@ int Engine::step_state_init() {
         depth_cfg_.stat = cfg_.draft_depth_stat;
         depth_cfg_.stop = cfg_.draft_depth_stop;
         depth_cfg_.lawless = std::min(3, depth_cfg_.max);
+        /* --draft-depth-load: the rule's tables (built in, or the configured lists) and the online
+         * calibration that keeps them. */
+        if (cfg_.draft_depth_load) {
+            draft_depth_load_defaults(&depth_cfg_);
+            depth_cfg_.load      = true;
+            depth_load_on_       = true;
+            depth_cfg_.load_from = std::max(2, cfg_.draft_depth_load_from);
+            depth_cfg_.load_min  = std::min(std::max(cfg_.draft_depth_load_min, 1), depth_cfg_.max);
+            depth_cfg_.late      = cfg_.draft_depth_load_late;
+            depth_cfg_.late_lag  = 1;
+            const int kN = DraftDepthCfg::kLoadSeqs, kJ = DraftDepthCfg::kJumps;
+            /* a list by drafting rows 1 .. 8; a short one repeats its last number */
+            auto by_rows = [&](const std::string& l, double* dst) {
+                double v[DraftDepthCfg::kLoadSeqs];
+                const int k = l.empty() ? 0 : draft_depth_parse_list(l.c_str(), v, kN, 0.0, 1000.0);
+                for (int i = 0; i < kN && k > 0; ++i) dst[1 + i] = v[std::min(i, k - 1)];
+                dst[0] = dst[1];
+            };
+            by_rows(cfg_.draft_depth_load_tok_ms, depth_cfg_.load_lam);
+            by_rows(cfg_.draft_depth_load_row_ms, depth_cfg_.load_row_ms);
+            by_rows(cfg_.draft_depth_load_round_ms, depth_cfg_.load_round_ms);
+            if (!cfg_.draft_depth_load_jump_ms.empty()) {
+                double v[DraftDepthCfg::kJumps] = {};
+                const int k = draft_depth_parse_list(cfg_.draft_depth_load_jump_ms.c_str(), v, kJ, 0.0, 1000.0);
+                for (int nn = 0; nn <= kN && k > 0; ++nn)
+                    for (int j = 0; j < kJ; ++j) depth_cfg_.load_jump_ms[nn][j] = j < k ? v[j] : 0.0;
+            }
+            depth_online_on_ = cfg_.draft_depth_load_online;
+            draft_depth_online_begin(depth_cfg_, &depth_online_);
+            depth_pend_.assign((size_t)n_slot, DepthPend{});
+            if (const char* e = std::getenv("RADIANCE_CONC_LOG"); e && *e) {
+                depth_log_ = std::fopen(e, "w");
+                if (depth_log_) std::setvbuf(depth_log_, nullptr, _IOFBF, 1 << 20);
+            }
+        }
         depth_rb_ = static_cast<RadMtpCoupleState*>(rad_dev_alloc(
             (int64_t)RAD_MTP_COUPLE_MAX_ROUNDS * couple_rows_ * (int64_t)sizeof(RadMtpCoupleState),
             RAD_MEM_HOST_PINNED));
@@ -162,6 +199,19 @@ int Engine::step_state_init() {
                  "always run); a row with no law drafts %d",
                  depth_cfg_.max, depth_cfg_.stat == DRAFT_DEPTH_PATH ? "drawn-token" : "top",
                  depth_cfg_.stop, depth_cfg_.lag, depth_cfg_.min, depth_cfg_.lawless);
+        if (depth_cfg_.load)
+            RAD_INFO("draft depth load-aware: a step drafting for %d sequence(s) or more runs a round "
+                     "for the rows whose expected accepted drafts pay their verify rows, the tile "
+                     "they open and the round (%d round(s) always run; late choice of the verify's "
+                     "rows %s); tables %s (at 8 sequences: %.3f tok/ms, a row %.3f ms, a round "
+                     "%.3f ms, past %d/%d/%d/%d rows +%.2f/%.2f/%.2f/%.2f ms)",
+                     depth_cfg_.load_from, depth_cfg_.load_min, depth_cfg_.late ? "on" : "off",
+                     depth_online_on_ ? "calibrated online from these" : "static",
+                     depth_cfg_.load_lam[8], depth_cfg_.load_row_ms[8], depth_cfg_.load_round_ms[8],
+                     depth_cfg_.load_jump_at[0], depth_cfg_.load_jump_at[1], depth_cfg_.load_jump_at[2],
+                     depth_cfg_.load_jump_at[3], depth_cfg_.load_jump_ms[8][0],
+                     depth_cfg_.load_jump_ms[8][1], depth_cfg_.load_jump_ms[8][2],
+                     depth_cfg_.load_jump_ms[8][3]);
     }
 
     RAD_TRY(rad_event_create_as(&step_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
@@ -186,6 +236,8 @@ void Engine::step_state_fini() {
     if (depth_rb_) rad_dev_free(depth_rb_, RAD_MEM_HOST_PINNED);
     depth_rb_ = nullptr;
     for (RadEvent& e : depth_ev_) { if (e) rad_event_destroy(e); e = nullptr; }
+    if (depth_log_) std::fclose(depth_log_);
+    depth_log_ = nullptr;
     if (step_end_) rad_event_destroy(step_end_);
     step_end_ = nullptr;
     if (tok_end_) rad_event_destroy(tok_end_);
@@ -430,6 +482,143 @@ void Engine::depth_log_stats(const char* when) {
                  (unsigned long long)ds.acc_n[d2]);
     RAD_INFO("draft depth adaptive (%s): by drafts made, the card's cycle and the drafts the "
              "verify accepted -- %s", when, by.c_str());
+    if (depth_load_on_) depth_load_log(when);
+}
+
+/* RADIANCE_DEPTH_CTL=<file>, diagnostics: `load=0|1` the load-aware rule (and with it the late
+ * choice), `late=0|1` the late choice alone. The file is looked at every 16 steps and
+ * read again when its mtime has moved; a word switches only what --draft-depth-load on set up.
+ * Between steps, like every table the rule reads. */
+void Engine::depth_ctl_poll(int step) {
+    static const char* path = std::getenv("RADIANCE_DEPTH_CTL");
+    if (!path || !*path || (step & 15) != 0) return;
+    struct stat sb;
+    if (::stat(path, &sb) != 0) return;
+    const int64_t mt = (int64_t)sb.st_mtim.tv_sec * 1000000000ll + (int64_t)sb.st_mtim.tv_nsec;
+    if (mt == depth_ctl_mtime_) return;
+    depth_ctl_mtime_ = mt;
+    std::FILE* f = std::fopen(path, "r");
+    if (!f) return;
+    char buf[256];
+    const size_t got = std::fread(buf, 1, sizeof buf - 1, f);
+    std::fclose(f);
+    buf[got] = 0;
+    for (char* t = std::strtok(buf, " \t\r\n"); t; t = std::strtok(nullptr, " \t\r\n")) {
+        char* eq = std::strchr(t, '=');
+        if (!eq) continue;
+        const bool v = std::atoi(eq + 1) != 0;
+        *eq = 0;
+        if      (!std::strcmp(t, "load")) depth_cfg_.load = v && depth_load_on_;
+        else if (!std::strcmp(t, "late")) depth_cfg_.late = v && depth_load_on_ && cfg_.draft_depth_load_late;
+    }
+    RAD_INFO("draft depth control (step %d): load-aware rule %s, late choice %s", step,
+             depth_cfg_.load ? "on" : "off", depth_cfg_.load && depth_cfg_.late ? "on" : "off");
+    if (depth_log_)
+        std::fprintf(depth_log_, "C %d %d %d\n", step, (int)depth_cfg_.load,
+                     (int)(depth_cfg_.load && depth_cfg_.late));
+}
+
+/* --draft-depth-load, once a step, after its draft passes ended and its verify was committed:
+ * the step's milliseconds (since the step before it ended, when both were pure decode steps of the
+ * same drafting rows), its verify rows, rounds and tokens for the rule's rate and prices; every 64
+ * steps the tables again from what was measured. Between steps: the next step's chain is decided
+ * after this returns, from tables that nothing of that step went into (sched/draft_depth.h). */
+void Engine::depth_step_note(const RadBatch* b, const StepOut& so) {
+    const auto now = std::chrono::steady_clock::now();
+    const StepPlan& plan = sched_.plan();
+    bool pure = b->phase == RAD_PHASE_DECODE;
+    int tokens = 0;
+    for (size_t i = 0; i < plan.e.size(); ++i) {
+        if (plan.e[i].is_prefill) pure = false;
+        if (i < so.first_row.size() && so.first_row[i] >= 0)
+            tokens += 1 + std::max(0, i < so.accepted.size() ? so.accepted[i] : 0);
+    }
+    const int n = serial_rows_;
+    if (depth_online_on_ && pure && n >= 1 && serial_done_ >= 1 && tokens > 0 &&
+        depth_note_step_ == b->step - 1 && depth_note_rows_ == n) {
+        const double ms = std::chrono::duration<double, std::milli>(now - depth_note_t_).count();
+        draft_depth_online_step(depth_cfg_, &depth_online_, n, (int)b->n_tok, serial_done_, ms, tokens);
+    }
+    depth_note_t_ = now;
+    depth_note_step_ = pure ? b->step : -2;
+    depth_note_rows_ = n;
+    if (depth_log_) depth_log_step(b, so);
+    if (depth_online_on_ && (++depth_note_n_ & 63u) == 0) {
+        draft_depth_online_refresh(&depth_cfg_, &depth_online_);
+        if ((depth_note_n_ & 32767u) == 0) depth_load_log("running");
+        if (depth_log_) {
+            /* K: the tables after a refresh, at the step's drafting rows */
+            const int nn = draft_depth_seqs(std::max(n, 1));
+            std::string k = fmt("K %d %d %.4f %.4f %.4f", b->step, nn, depth_cfg_.load_lam[nn],
+                                depth_cfg_.load_row_ms[nn], depth_cfg_.load_round_ms[nn]);
+            for (int j = 0; j < DraftDepthCfg::kJumps; ++j) k += fmt(" %.3f", depth_cfg_.load_jump_ms[nn][j]);
+            for (int t = 0; t < 3; ++t)
+                for (int j = 2; j <= depth_cfg_.max && j <= DraftDepthCfg::kCalRounds; ++j) {
+                    k += fmt(" | %d,%d", t, j);
+                    for (int x = 0; x < draft_depth_knots(depth_cfg_); ++x)
+                        k += fmt(" %.3f", depth_cfg_.cal_p[t][j][x]);
+                }
+            std::fprintf(depth_log_, "%s\n", k.c_str());
+        }
+    }
+}
+
+/* What the load-aware rule's tables hold now, by drafting rows that were measured. */
+void Engine::depth_load_log(const char* when) const {
+    const DraftDepthOnline& o = depth_online_;
+    std::string t;
+    for (int n = 1; n <= DraftDepthCfg::kLoadSeqs; ++n) {
+        if (o.reg[n].n < 64 && o.lam[n].n < 32) continue;
+        t += fmt("%s%d seq: %.3f tok/ms, row %.3f ms, round %.3f ms, tiles +%.2f/%.2f/%.2f/%.2f ms "
+                 "(%lld steps)", t.empty() ? "" : "; ", n, depth_cfg_.load_lam[n],
+                 depth_cfg_.load_row_ms[n], depth_cfg_.load_round_ms[n], depth_cfg_.load_jump_ms[n][0],
+                 depth_cfg_.load_jump_ms[n][1], depth_cfg_.load_jump_ms[n][2],
+                 depth_cfg_.load_jump_ms[n][3], (long long)o.reg[n].n);
+    }
+    std::string c;
+    for (int j = 2; j <= depth_cfg_.max && j <= DraftDepthCfg::kCalRounds; ++j) {
+        c += fmt("%sdraft %d:", j > 2 ? "; " : "", j);
+        for (int x = 0; x < draft_depth_knots(depth_cfg_); ++x) c += fmt(" %.2f", depth_cfg_.cal_p[2][j][x]);
+    }
+    RAD_INFO("draft depth load-aware (%s): %s calibration, %lld chain(s) and %lld step(s) counted "
+             "(%lld stalled step(s) left out), %lld refresh(es); %s; acceptance by the confidence "
+             "that includes the draft's own law, at %.2f .. %.2f -- %s", when,
+             depth_online_on_ ? "online" : "static", (long long)o.chains, (long long)o.steps,
+             (long long)o.outliers, (long long)o.refreshes, t.empty() ? "no step count measured yet" : t.c_str(),
+             depth_cfg_.cal_x[0], depth_cfg_.cal_x[draft_depth_knots(depth_cfg_) - 1], c.c_str());
+}
+
+/* RADIANCE_CONC_LOG: the step just finished, one line.
+ *   S step ns phase n_seq n_tok rounds drafting_rows load_step | entry;... | chain;...
+ * An entry is a sequence of the step's verify: seq,is_prefill,n_tokens,drafts verified,drafts
+ * accepted (-1: no token row),ctx_len. A chain is what a drafting row made behind the step, for
+ * the next verify: seq,depth,the rule's round,rounds that ran for it,lawless, then each of those
+ * rounds' top mass. Called after finish_serial_drafter, while plan() still describes the step. */
+void Engine::depth_log_step(const RadBatch* b, const StepOut& so) {
+    const StepPlan& plan = sched_.plan();
+    std::string e, d;
+    for (size_t i = 0; i < plan.e.size(); ++i) {
+        const StepEntry& x = plan.e[i];
+        e += fmt("%s%llu,%d,%d,%d,%d,%d", i ? ";" : "", (unsigned long long)x.seq, (int)x.is_prefill,
+                 (int)x.n_tokens, (int)x.n_spec,
+                 i < so.accepted.size() && so.first_row[i] >= 0 ? (int)so.accepted[i] : -1,
+                 (int)x.ctx_len);
+    }
+    for (int i = 0; i < serial_rows_ && serial_done_ > 0; ++i) {
+        const DraftDepthRow& row = depth_row_[(size_t)i];
+        const int ran = serial_done_;
+        d += fmt("%s%llu,%d,%d,%d,%d", i ? ";" : "", (unsigned long long)serial_row_[(size_t)i].seq,
+                 depth_row_nodes(i), depth_load_step_ ? row.rule : 0, ran, (int)row.lawless);
+        if (mtp_couple_ && couple_readback_)
+            for (int r = 1; r <= ran && r <= (int)couple_planes_; ++r)
+                d += fmt(",%.4f", draft_depth_stat(couple_readback_[(int64_t)(r - 1) * couple_rows_ + i],
+                                                    r, DRAFT_DEPTH_TOP));
+    }
+    const uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::fprintf(depth_log_, "S %d %llu %d %lld %lld %d %d %d | %s | %s\n", b->step,
+                 (unsigned long long)ns, (int)b->phase, (long long)b->n_seq, (long long)b->n_tok,
+                 serial_done_, serial_rows_, (int)depth_load_step_, e.c_str(), d.c_str());
 }
 
 /* Issue the step's draft passes behind it, without waiting. After the trunk's ranks join: the
@@ -441,6 +630,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     serial_rounds_ = 0;
     serial_rows_   = 0;
     serial_done_   = 0;
+    if (depth_cfg_.on) depth_ctl_poll(step);
     /* A step issued ahead continues from the card's acceptance, so run it even without drafts. */
     if (!serial_drafting()) {
         if (pipelining_) RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
@@ -472,6 +662,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
 
     /* --draft-depth adaptive: every row starts a chain; a greedy row (no draw) has no law. */
     const bool adepth = depth_cfg_.on && n > 0;
+    depth_load_step_ = false;
     if (adepth) {
         depth_seen_ = 0;
         for (bool& b : depth_issued_) b = false;
@@ -479,6 +670,12 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
             draft_depth_begin(depth_cfg_, &depth_row_[(size_t)i], couple_draw_stage_[(size_t)i].mode != 1);
             depth_of_[(size_t)i] = 0;
         }
+        /* --draft-depth-load: the next verify's rows beside the drafting sequences' (the plan's
+         * other token rows), and whether this step has the sequences for the load-aware rule. */
+        depth_other_rows_ = 0;
+        for (const StepEntry& pe : sched_.plan().e) depth_other_rows_ += pe.produces_token;
+        depth_other_rows_ = std::max(0, depth_other_rows_ - n);
+        depth_load_step_ = depth_cfg_.load && n >= depth_cfg_.load_from;
     }
 
     /* Pass 0, then rounds 2..rounds: round 1 has no pass of its own. */
@@ -490,8 +687,11 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
             const int need = draft_depth_need(depth_cfg_, rd);
             if (need >= 1) RAD_TRY(depth_observe_upto(need, n, so));
             bool any = false;
-            for (int i = 0; i < n; ++i)
-                any = draft_depth_go(depth_cfg_, &depth_row_[(size_t)i], rd) || any;
+            if (depth_load_step_)
+                any = draft_depth_go_load(depth_cfg_, depth_row_.data(), n, rd, depth_other_rows_);
+            else
+                for (int i = 0; i < n; ++i)
+                    any = draft_depth_go(depth_cfg_, &depth_row_[(size_t)i], rd) || any;
             if (!any) break;
         }
         const auto tA = std::chrono::steady_clock::now();
@@ -547,11 +747,21 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
         if (rd > 0) serial_done_ = rd;
         else if (drafted > 0) serial_done_ = 1;
         /* This round's states to the host, when a later round's decision reads them. */
+        /* The late choice reads every round but the last. */
         if (adepth && serial_done_ == (rd > 0 ? rd : 1) &&
-            serial_done_ <= draft_depth_need(depth_cfg_, rounds))
+            (serial_done_ <= draft_depth_need(depth_cfg_, rounds) ||
+             (depth_load_step_ && depth_cfg_.late)))
             RAD_TRY(depth_readback_issue(serial_done_, n));
     }
     if (serial_done_ <= 0 || n <= 0) return RAD_OK;
+    /* The late choice (--draft-depth-load-late): every row's verified prefix again, from the
+     * rounds read by now and the wait for all but the last (it is still running, so the card is
+     * not held up as long as the wait and the next step's issue fit in it). */
+    if (adepth && depth_load_step_ && depth_cfg_.late && serial_done_ >= 2) {
+        const int upto = std::max(depth_seen_, serial_done_ - std::max(0, depth_cfg_.late_lag));
+        if (upto > depth_seen_) RAD_TRY(depth_observe_upto(upto, n, so));
+        draft_depth_select(depth_cfg_, depth_row_.data(), n, serial_done_, depth_other_rows_);
+    }
     if (adepth) {
         DepthStats& ds = depth_stats_;
         ++ds.steps;
@@ -620,11 +830,20 @@ int Engine::finish_serial_drafter(const StepOut& so) {
                 continue;
             const RadMtpCoupleDraw& d = couple_by_card_[(size_t)e.card];
             if (d.seq != e.seq || d.mode != 1) continue;
+            /* --draft-depth-load: the chain this verify settled, with the confidences its
+             * decisions read, for the online calibration. */
+            if (depth_online_on_ && (size_t)e.card < depth_pend_.size()) {
+                const DepthPend& pd = depth_pend_[(size_t)e.card];
+                if (pd.depth > 0 && pd.seq == e.seq && pd.depth == e.n_spec)
+                    draft_depth_online_chain(depth_cfg_, &depth_online_, pd.depth, pd.rule,
+                                             std::max(0, so.accepted[i]), pd.s, pd.n_s);
+            }
             depth_stats_.acc[e.n_spec] += (uint64_t)std::max(0, so.accepted[i]);
             ++depth_stats_.acc_n[e.n_spec];
         }
     }
     sched_.serial_end(serial_done_);
+    for (DepthPend& pd : depth_pend_) pd.depth = 0;     /* settled above, or never verified */
     if (serial_done_ <= 0 || serial_rows_ <= 0) return RAD_OK;
 
     Rank& r0 = *ranks_[0];
@@ -644,6 +863,29 @@ int Engine::finish_serial_drafter(const StepOut& so) {
          * planned with (issue_ahead's expect_draft), a prefix of the rounds that ran. */
         const int row_nodes = depth_cfg_.on ? depth_row_nodes(i) : done;
         const int rc = sched_.set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], row_nodes);
+        /* --draft-depth-load: the chain as the next verify will settle it -- its depth, the round
+         * the rule sent it to, and the statistics of the rounds that ran for it. */
+        if (depth_online_on_ && rc == RAD_OK && mtp_couple_ && couple_readback_ && row_nodes >= 1 &&
+            !depth_row_[(size_t)i].lawless) {
+            const int32_t card = serial_row_[(size_t)i].card;
+            if (card >= 0 && (size_t)card < depth_pend_.size()) {
+                DepthPend& pd = depth_pend_[(size_t)card];
+                pd.seq = seq;
+                pd.depth = row_nodes;
+                pd.rule = depth_load_step_ ? depth_row_[(size_t)i].rule : 0;
+                pd.n_s = 0;
+                const int ran = std::min(done, (int)std::min<int64_t>(RAD_MTP_COUPLE_MAX_ROUNDS, couple_planes_));
+                for (int r = 1; r <= ran; ++r) {
+                    const RadMtpCoupleState& cs = couple_readback_[(int64_t)(r - 1) * couple_rows_ + i];
+                    if (std::memcmp(&cs.draw, &couple_draw_stage_[(size_t)i], sizeof cs.draw)) break;
+                    const double st = draft_depth_stat(cs, r, DRAFT_DEPTH_TOP);
+                    if (st < 0.0) break;
+                    pd.s[r - 1] = (float)st;
+                    pd.n_s = r;
+                }
+                if (pd.n_s < row_nodes) pd.depth = 0;   /* a round with no law: not counted */
+            }
+        }
         if (mtp_couple_)
             RAD_TRY(bind_couple(seq, i, row_nodes, rc == RAD_OK, serial_row_[(size_t)i].card));
     }

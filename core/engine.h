@@ -42,6 +42,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -708,6 +709,39 @@ private:
     std::chrono::steady_clock::time_point depth_e1_{};   /* the last step's first statistic */
     uint64_t      depth_logged_ = 0;                     /* depth_stats_.rows at the last line */
     int           depth_last_ = 0;                       /* and the deepest chain that step made */
+    /* --draft-depth-load (sched/draft_depth.h): the load-aware rule and the late choice of the
+     * verify's rows, for a step that drafts for depth_cfg_.load_from sequences or more, and the
+     * online calibration of the tables they read. */
+    DraftDepthOnline depth_online_;
+    bool          depth_online_on_ = false;              /* --draft-depth-load-calib online */
+    int           depth_other_rows_ = 0;                 /* the next verify's token rows that draft nothing */
+    bool          depth_load_step_ = false;              /* this step's chains were decided by the load-aware rule */
+    bool          depth_load_on_ = false;                /* --draft-depth-load on: the tables exist */
+    /* Diagnostics. RADIANCE_DEPTH_CTL=<file>: the words `load=0|1 late=0|1`, read again when the
+     * file changes (looked at every 16 steps), so one server compares the rules on interleaved
+     * load; it switches only what the configuration set up. */
+    int64_t       depth_ctl_mtime_ = -1;
+    void          depth_ctl_poll(int step);
+    /* A chain between the step that drafted it and the verify that settles it, by card slot: what
+     * the online calibration counts once the accepted count is known. */
+    struct DepthPend {
+        uint64_t seq = 0;
+        int32_t  depth = 0, rule = 0, n_s = 0;           /* depth 0: nothing pending */
+        float    s[RAD_MTP_COUPLE_MAX_ROUNDS] = {};
+    };
+    std::vector<DepthPend> depth_pend_;
+    /* The step before this one, for the rule's rate and prices: when its passes ended, and whether
+     * it was a pure decode step of how many drafting rows. */
+    std::chrono::steady_clock::time_point depth_note_t_{};
+    int           depth_note_step_ = -2, depth_note_rows_ = 0;
+    uint64_t      depth_note_n_ = 0;
+    void          depth_step_note(const RadBatch* b, const StepOut& so);
+    void          depth_load_log(const char* when) const;
+    /* RADIANCE_CONC_LOG=<file>, diagnostics of the load-aware rule: one line a decode step (rows,
+     * rounds, each chain's depth and statistics, what the verify accepted) and one a refresh of
+     * the tables. */
+    std::FILE*    depth_log_ = nullptr;
+    void          depth_log_step(const RadBatch* b, const StepOut& so);
     /* Drafting row i's depth after issue_serial_drafter: its own under the adaptive rule, else the
      * rounds every row ran. */
     int  depth_row_nodes(int i) const;

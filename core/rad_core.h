@@ -1066,6 +1066,26 @@ struct Config {
     int         draft_depth_lag = 1;
     int         draft_depth_stat = 0;
     double      draft_depth_stop = 0.85;
+    /* --draft-depth-load on|off (core/sched/draft_depth.h): the load-aware depth rule. A step that
+     * drafts for draft_depth_load_from sequences or more runs round j only for the rows whose
+     * expected accepted drafts pay their verify rows, the kernel tile those rows open and the
+     * round, at the throughput the engine has; and, with draft_depth_load_late, chooses each
+     * row's verified prefix again when the next verify is issued, from the laws read by then.
+     * draft_depth_load_min rounds always run. The tables (acceptance by confidence, tokens a
+     * millisecond, a row's, a round's and a tile's milliseconds) start from built-in ones -- or
+     * the comma lists below, by drafting rows 1 .. 8 (jumps: past 16, 32, 48, 64 verify rows) --
+     * and with draft_depth_load_online follow the running server. Needs --draft-depth adaptive
+     * with --draft-depth-stat top. A step with fewer sequences is the stop rule's, bit for bit.
+     * Lossless: the rule reads draft-side laws of the step and tables fixed before it. */
+    bool        draft_depth_load = false;
+    int         draft_depth_load_from = 5;
+    int         draft_depth_load_min = 2;
+    bool        draft_depth_load_late = true;
+    bool        draft_depth_load_online = true;
+    std::string draft_depth_load_tok_ms;
+    std::string draft_depth_load_row_ms;
+    std::string draft_depth_load_round_ms;
+    std::string draft_depth_load_jump_ms;
     /* --draft-suffix on (core/sched/suffix.h): SuffixDecoding as a step SELECTOR on a serial head's
      * chain. On a host-built step, when the sequence's own history (prompt ++ output) ends in a
      * pattern of at least `draft_suffix_min_match` tokens that occurred before, the step verifies
