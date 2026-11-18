@@ -10902,11 +10902,12 @@ TEST(qwen35_mtp_draft_head_calibration_taps_full_history) {
         k->out = { 0, 1, 2, 3, 4, 5, 6, 7 };
         k->b.out_ids = k->out.data();
         k->b.n_out = 8;
-        k->b.n_draft_out = 0;  /* a calib-corpus prompt has no proposal rows */
+        k->b.n_draft_out = 0;  /* the trunk step has no proposal rows */
         k->b.draft_pass = 0;
         RadCtx trunk{ .b = &b, .batch = &k->b, .rank = rank, .world = 2 };
         qwen35_w8a8::step(&trunk, &k->b);
         RadBatch history_batch = k->b;
+        history_batch.n_draft_out = 1;  /* serial history still names one proposal row */
         history_batch.draft_pass = -1;
         RadCtx history{ .b = &b, .batch = &history_batch, .rank = rank, .world = 2 };
         qwen35_w8a8::step(&history, &history_batch);

@@ -583,8 +583,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.n_main = g.n_layer;
     const bool calib_requested = ctx->calib_dir && *ctx->calib_dir;
     const bool calib_mtp_layer = calib_requested && nextn > 0 &&
-        (!ctx->calib_layer_hi ||
-         (ctx->calib_layer_lo <= m.n_main && m.n_main < ctx->calib_layer_hi));
+        ctx->calib_layer_lo == m.n_main && ctx->calib_layer_hi == m.n_main + 1;
 #if !QWEN35_MOE
     const bool calib_trunk_layers = calib_requested &&
         (!ctx->calib_layer_hi || ctx->calib_layer_lo < m.n_main);

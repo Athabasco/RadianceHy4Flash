@@ -1064,18 +1064,23 @@ int Engine::declare() {
         decide("--no-prefix-cache", "prefix caching off", prefix_off_why_);
     }
     /* --calib-corpus: every token of the corpus through prefill exactly once, so no prefix hit
-     * skips any and no drafter adds rows; the corpus is loaded here, before the plugins declare,
-     * because they are told its size. */
+     * skips any and no drafter adds scored rows; the corpus is loaded here, before the plugins
+     * declare, because they are told its size. A serial MTP drafter's history pass is enabled only
+     * when its virtual layer is selected; that plugin's calibration tap returns before proposing. */
     if (cfg_.calib()) {
-        if (cfg_.n_spec > 0) {
-            RAD_ERR("--num-speculative-tokens %d: a calibration run drafts nothing; leave it at "
-                    "auto or 0", cfg_.n_spec);
+        const bool calib_mtp_history = arch_probe_.draft_depth > 0 && !arch_probe_.draft_depth_fixed &&
+            cfg_.calib_layer_lo == meta_.n_layers && cfg_.calib_layer_hi == meta_.n_layers + 1;
+        if (cfg_.n_spec > 0 && (!calib_mtp_history || cfg_.n_spec != 1)) {
+            RAD_ERR("--num-speculative-tokens %d: a calibration run drafts nothing; MTP-only "
+                    "calibration permits only its single history pass", cfg_.n_spec);
             return RAD_E_INVAL;
         }
-        cfg_.n_spec = 0;
+        cfg_.n_spec = calib_mtp_history ? 1 : 0;
         cfg_.prefix_cache = false;
         if (cfg_.mm_max_patches < 0) cfg_.mm_max_patches = 0;
-        decide("--num-speculative-tokens", "0", "a calibration run records the trunk's rows only");
+        decide("--num-speculative-tokens", calib_mtp_history ? "1" : "0",
+               calib_mtp_history ? "one selected MTP history pass; the calibration tap suppresses proposals"
+                                 : "a calibration run records the trunk's rows only");
         prefix_off_why_ = "a calibration run: a prefix hit would skip tokens the statistics must count";
         decide("--no-prefix-cache", "prefix caching off", prefix_off_why_);
         calib_ = std::make_unique<Kld>();

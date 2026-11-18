@@ -447,8 +447,7 @@ inline void MtpBlockFP8<Ffn>::step(RadCtx* c, const RadBatch* batch) const {
 
     /* The ordinary history fast path only stores K/V. A selected MTP calibration layer instead
      * runs every prompt row through the block so the U2 draft head gets a real, full-rank Gram. */
-    const bool tap_history = draft_head_calib_on && !draft_head_calib_done && r < 0 &&
-                             batch->n_draft_out <= 0;
+    const bool tap_history = draft_head_calib_on && !draft_head_calib_done && r < 0;
     if (tap_history && batch->n_out != T) {
         rad_step_fail(c, "MTP draft-head calibration needs every history row in out_ids");
         return;
