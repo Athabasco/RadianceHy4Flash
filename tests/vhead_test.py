@@ -24,7 +24,8 @@ class VHeadTest(unittest.TestCase):
             shard, index = "head.safetensors", "model.safetensors.index.json"
             head = np.arange(32, dtype=np.uint16).reshape(8, 4)
             vhead.st_write(src / shard, [("lm_head.weight", head, "BF16")])
-            (src / index).write_text(json.dumps({"weight_map": {"lm_head.weight": shard}}))
+            original = json.dumps({"weight_map": {"lm_head.weight": shard}})
+            (src / index).write_text(original)
             classes = src / "widths.cls"
             classes.write_bytes(b"radiance-vhead-1 n_vocab=8 widths=3,4,5,6\n\xe4\xe4")
             plain, mtp = Path(tmp) / "plain", Path(tmp) / "mtp"
@@ -39,6 +40,15 @@ class VHeadTest(unittest.TestCase):
             self.assertFalse((mtp / shard).is_symlink())
             self.assertEqual((mtp / "vhead.safetensors").read_bytes(),
                              (plain / "vhead.safetensors").read_bytes())
+
+            alias = Path(tmp) / "alias"
+            alias.symlink_to(src, target_is_directory=True)
+            attempt = subprocess.run([sys.executable, TOOLS / "vhead.py", src, alias, classes],
+                                     capture_output=True)
+            self.assertNotEqual(attempt.returncode, 0)
+            self.assertIn(b"DST must be separate from SRC", attempt.stderr)
+            self.assertEqual((src / index).read_text(), original)
+            self.assertFalse((src / "vhead.safetensors").exists())
 
 
 if __name__ == "__main__":

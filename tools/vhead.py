@@ -6,8 +6,9 @@
 SRC is a Hugging Face checkpoint directory (Qwen/Qwen3.8-27B), CLASSES a width-class file from
 data/vhead/ (q38-27b-vhead-4.0.cls, -4.5, -5.0: the head's mean code width). DST becomes SRC with
 lm_head.weight replaced by its width classes; every other file of SRC is linked, not copied. Pass DST
-to rad-convert in place of SRC. Use a fresh DST on the same filesystem as the shards. With --keep-lm-head, also index the original lm_head.weight so a
-native MTP drafter can quantise its own copy. No extra bytes are copied into the checkpoint.
+to rad-convert in place of SRC. Use a fresh DST on the same filesystem as the shards.
+With --keep-lm-head, also index the original lm_head.weight so a native MTP drafter can
+quantise its own copy without duplicating the source shard.
 
 A vocabulary-weighted head stores each vocabulary row on one of four trellis widths, the tokens that
 carry the most probability on the widest. The classes were chosen per 256-row run to minimise each
@@ -91,6 +92,8 @@ def main():
                         help="keep the original lm_head.weight indexed for a separate draft head")
     args = parser.parse_args()
     src, dst, cpath = args.src, args.dst, args.classes
+    if os.path.realpath(src) == os.path.realpath(dst):
+        parser.error("DST must be separate from SRC")
     cls, widths = read_classes(cpath)
     idx = json.load(open(os.path.join(src, "model.safetensors.index.json")))
     W, dt = st_tensor(os.path.join(src, idx["weight_map"]["lm_head.weight"]), "lm_head.weight")
