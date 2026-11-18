@@ -127,6 +127,30 @@ bool has_opt(const RecipeRule* r, const char* k, const char* v) {
 }
 }  /* namespace */
 
+TEST(the_q38_native_mtp_overlay_only_changes_draft_weights) {
+    const std::string src = __FILE__;
+    std::ifstream in(src.substr(0, src.find_last_of('/')) + "/../data/recipes/q38-27b-native-mtp-u2.recipe");
+    REQUIRE(in.good());
+    Recipe r;
+    std::string why;
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    REQUIRE_EQ(r.add_text(text, "mtp.recipe", &why), RAD_OK);
+    CHECK_EQ(r.rules().size(), (size_t)7);
+    for (const char* linear : {"attn_qg", "attn_k", "attn_v", "attn_output", "ffn_gate_up", "ffn_down"}) {
+        const auto* rule = r.match(std::string("blk.64.") + linear + ".weight");
+        REQUIRE(rule != nullptr);
+        CHECK_EQ(rule->quantizer, std::string("rtn"));
+        CHECK_EQ(rule->options_text(), std::string("codes=i8,group=128,scale=bf16,transform=fwht128"));
+    }
+    const auto* head = r.match("mtp.draft_head.weight");
+    REQUIRE(head != nullptr);
+    CHECK_EQ(head->quantizer, std::string("rtn"));
+    CHECK_EQ(head->options_text(), std::string("codes=u2,group=128,scale=f16,zero=u8"));
+    for (const char* n : {"blk.63.attn_qg.weight", "output.k4.weight", "output.weight",
+                          "token_embd.weight", "blk.64.attn_norm.weight", "mtp.fc.weight"})
+        CHECK(r.match(n) == nullptr);
+}
+
 /* The Sage-A1.5 recipe as it ships: every trunk linear -- attention, the delta net's in- and
  * out-projections, the routed and shared experts of all 40 blocks and the MTP layer at its own
  * index 40 -- goes to block fp8, the head likewise, and the routers, the shared-expert gates,
