@@ -6,7 +6,7 @@
 SRC is a Hugging Face checkpoint directory (Qwen/Qwen3.8-27B), CLASSES a width-class file from
 data/vhead/ (q38-27b-vhead-4.0.cls, -4.5, -5.0: the head's mean code width). DST becomes SRC with
 lm_head.weight replaced by its width classes; every other file of SRC is linked, not copied. Pass DST
-to rad-convert in place of SRC. Use a fresh DST on the same filesystem as the shards.
+to rad-convert in place of SRC. DST must be absent or empty and on the same filesystem as the shards.
 With --keep-lm-head, also index the original lm_head.weight so a native MTP drafter can
 quantise its own copy without duplicating the source shard.
 
@@ -34,6 +34,7 @@ import errno
 import json
 import os
 import struct
+import tempfile
 
 import numpy as np
 
@@ -91,11 +92,15 @@ def main():
     parser.add_argument("--keep-lm-head", action="store_true",
                         help="keep the original lm_head.weight indexed for a separate draft head")
     args = parser.parse_args()
-    src, dst, cpath = args.src, args.dst, args.classes
-    if os.path.realpath(src) == os.path.realpath(dst):
-        parser.error("DST must be separate from SRC")
+    src, dst, cpath = os.path.abspath(args.src), os.path.abspath(args.dst), args.classes
+    src_real, dst_real = os.path.realpath(src), os.path.realpath(dst)
+    if os.path.commonpath([src_real, dst_real]) == src_real:
+        parser.error("DST must be separate from SRC (not inside it or an alias for it)")
+    if os.path.lexists(dst) and (os.path.islink(dst) or not os.path.isdir(dst) or os.listdir(dst)):
+        parser.error("DST must be absent or an empty directory")
     cls, widths = read_classes(cpath)
-    idx = json.load(open(os.path.join(src, "model.safetensors.index.json")))
+    with open(os.path.join(src, "model.safetensors.index.json")) as f:
+        idx = json.load(f)
     W, dt = st_tensor(os.path.join(src, idx["weight_map"]["lm_head.weight"]), "lm_head.weight")
     V = W.shape[0]
     if cls.size != V or V % 2:
@@ -110,36 +115,42 @@ def main():
         out_ids.append((f"lm_head.k{k}.ids", rows.astype(np.int32)[:, None], "I32"))
         out_w.append((f"lm_head.k{k}.weight", W[rows], dt))
     assert (vrow >= 0).all()
-    os.makedirs(dst, exist_ok=True)
-    st_write(os.path.join(dst, "vhead.safetensors"), out_ids + [("lm_head.vrow", vrow, "I32")] + out_w)
     wm = dict(idx["weight_map"])
     if not args.keep_lm_head:
         del wm["lm_head.weight"]
     for name, _, _ in out_ids + out_w + [("lm_head.vrow", None, None)]:
         wm[name] = "vhead.safetensors"
-    with open(os.path.join(dst, "model.safetensors.index.json"), "w") as f:
-        json.dump({"metadata": idx.get("metadata", {}), "weight_map": wm}, f)
-    # Indexed shards must resolve inside DST: the converter rejects external shard symlinks.
-    # Hard-link their bytes (including a lone lm_head shard); never copy a whole model silently.
-    keep = set(idx["weight_map"].values())
-    for f in os.listdir(src):
-        if f == "model.safetensors.index.json" or (f.endswith(".safetensors") and f not in keep):
-            continue
-        source, target = os.path.join(src, f), os.path.join(dst, f)
-        if f in keep:
-            if os.path.lexists(target):
-                if os.path.islink(target) or not os.path.samefile(source, target):
-                    raise SystemExit(f"vhead.py: {target} already exists; use a fresh DST")
+    # Build beside DST and publish only once the head, index, and all links exist. A failed copy,
+    # link or rename must not leave a checkpoint whose index points at missing or stale shards.
+    parent = os.path.dirname(dst)
+    os.makedirs(parent, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".vhead-", dir=parent) as tmp:
+        stage = os.path.join(tmp, "checkpoint")
+        os.mkdir(stage)
+        keep = set(idx["weight_map"].values())
+        for f in os.listdir(src):
+            if f == "model.safetensors.index.json" or (f.endswith(".safetensors") and f not in keep):
                 continue
-            try:
-                os.link(os.path.realpath(source), target)
-            except OSError as exc:
-                if exc.errno == errno.EXDEV:
-                    raise SystemExit("vhead.py: SRC shards and DST must share a filesystem "
-                                     "for hard links") from exc
-                raise
-        elif not os.path.lexists(target):
-            os.symlink(os.path.abspath(source), target)
+            if f == "vhead.safetensors":
+                raise SystemExit("vhead.py: SRC already indexes vhead.safetensors; use the original checkpoint")
+            source, target = os.path.join(src, f), os.path.join(stage, f)
+            if f in keep:
+                # The converter rejects external shard symlinks. Link, don't copy the model.
+                try:
+                    os.link(os.path.realpath(source), target)
+                except OSError as exc:
+                    if exc.errno == errno.EXDEV:
+                        raise SystemExit("vhead.py: SRC shards and DST must share a filesystem "
+                                         "for hard links") from exc
+                    raise
+            else:
+                os.symlink(source, target)
+        st_write(os.path.join(stage, "vhead.safetensors"),
+                 out_ids + [("lm_head.vrow", vrow, "I32")] + out_w)
+        with open(os.path.join(stage, "model.safetensors.index.json"), "w") as f:
+            json.dump({"metadata": idx.get("metadata", {}), "weight_map": wm}, f)
+        # POSIX rename can replace an empty directory but not one that gained files meanwhile.
+        os.rename(stage, dst)
     print(f"vhead.py: {dst}: " + " ".join(f"k{k}:{int((cls == i).sum())}" for i, k in enumerate(widths))
           + f", mean {sum(widths[i] * int((cls == i).sum()) for i in range(len(widths))) / V:.3f} b")
 
