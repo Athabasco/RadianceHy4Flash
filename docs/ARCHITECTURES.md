@@ -1791,6 +1791,11 @@ current BF16 and rotated-int8 expert paths; it does not re-enable retired block-
 A split image run only sees keys staged in its chunk; correct row insertion does not establish
 full-image bidirectional numerical equivalence when a run cannot fit a step.
 
+**Adding a tower to an existing RAD.** `rad-convert VISION.safetensors --add-vision BASE.rad
+--config SOURCE_CONFIG -o NEW.rad` copies the compatible text/MoE/DFlash container's original
+weight planes, scales and vocabularies and adds BF16 Vision weights. `NEW.rad` must not exist;
+`--plan-only` validates without writing. Use a tower/config from the same checkpoint/tokenizer
+family: matching dimensions and token bounds alone do not establish checkpoint identity.
 
 **Not declared.** An fp8 attention or dense arm: under a tenth of the weight bytes, and the dense
 arm's 2112 is not whole 128-blocks either.
