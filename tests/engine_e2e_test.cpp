@@ -3400,4 +3400,36 @@ TEST(nemotron35_rerank_real_weights_match_native_scores_and_rankings) {
     }
 }
 
+
+TEST(undersized_guidance_is_rejected_without_blocking_the_image_server) {
+    if (!rad::mm::decoder_available()) SKIP("this build has no image codec");
+    const QwenImageContainers& model = qwen_image();
+    REQUIRE(!model.bf16.empty());
+    const json guided = {{"prompt", "a red mug"}, {"negative_prompt", "a blue mug"},
+                         {"size", "64x64"}, {"seed", 7}, {"num_inference_steps", 1},
+                         {"true_cfg_scale", 3.0}, {"output_format", "png"}};
+    for (const int entries : {1, 2}) {
+        Server server;
+        REQUIRE(server.start(model.bf16, {"--max-num-seqs", std::to_string(entries)},
+                             device_env(2048)));
+        int status = 0;
+        const json result = post(server.port, "/v1/images/generations", guided, &status);
+        CHECK_EQ(status, entries == 1 ? 400 : 200);
+        if (entries == 1) {
+            CHECK(result.dump().find("--max-num-seqs") != std::string::npos);
+            json plain = guided;
+            plain["true_cfg_scale"] = 1.0;
+            plain.erase("negative_prompt");
+            const json recovered = post(server.port, "/v1/images/generations", plain, &status);
+            REQUIRE_EQ(status, 200);
+            REQUIRE(recovered.contains("data") && recovered["data"].size() == 1);
+            CHECK(!recovered["data"][0].value("b64_json", std::string()).empty());
+        } else {
+            REQUIRE(result.contains("data") && result["data"].size() == 1);
+            CHECK(!result["data"][0].value("b64_json", std::string()).empty());
+        }
+        CHECK_EQ(server.stop(), 0);
+    }
+}
+
 RAD_TEST_MAIN()
