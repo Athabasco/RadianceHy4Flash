@@ -10888,8 +10888,16 @@ TEST(qwen35_mtp_draft_head_calibration_taps_full_history) {
         ctx.calib_layer_hi = 9;
         ctx.calib_tokens = 100;  /* keep the fake stream below the write threshold */
         REQUIRE_EQ(qwen35_w8a8::declare(&b, mk.meta(), &ctx), RAD_OK);
+        CHECK_EQ(b.drafter.kind, RAD_DRAFT_HISTORY);
+        CHECK_EQ(b.drafter.depth, 0);
+        CHECK_EQ(b.drafter.proposal, RAD_NULL_HANDLE);
+        CHECK_EQ(b.drafter.proposal_pitch, 0);
+        CHECK(find_w(b, "mtp.draft_head.weight") == nullptr);
+        CHECK(find_b(b, "mtp_dlog") == nullptr);
         auto& model = qwen35_w8a8::g_model[rank];
-        CHECK(model.mtp.draft_head_calib_on);  /* all ranks run the same replicated-head path */
+        CHECK(model.mtp.draft_head_calib_on);
+        CHECK_EQ(model.mtp.op_dsel, RAD_NULL_HANDLE);
+        CHECK_EQ(model.mtp.op_dquant, RAD_NULL_HANDLE);  /* all ranks run the same replicated-head path */
         if (rank == 0) {
             CHECK(model.mtp.draft_head_calib.op != 0);
             CHECK(model.mtp.draft_head_calib.h != 0);
@@ -10907,19 +10915,20 @@ TEST(qwen35_mtp_draft_head_calibration_taps_full_history) {
         RadCtx trunk{ .b = &b, .batch = &k->b, .rank = rank, .world = 2 };
         qwen35_w8a8::step(&trunk, &k->b);
         RadBatch history_batch = k->b;
-        history_batch.n_draft_out = 1;  /* serial history still names one proposal row */
-        history_batch.draft_pass = -1;
+        history_batch.draft_pass = -1;  /* every row is history; no proposal row */
         RadCtx history{ .b = &b, .batch = &history_batch, .rank = rank, .world = 2 };
         qwen35_w8a8::step(&history, &history_batch);
         CHECK(trunk.step_fail.empty());
         CHECK(history.step_fail.empty());
-        const auto issued = [&](rad_op op) {
-            for (const auto& i : history.issues) if (i.op == op) return true;
-            return false;
-        };
-        CHECK(!issued(model.mtp.op_dsel));
-        CHECK(!issued(model.mtp.op_dquant));
+        CHECK(!history.issues.empty());
         CHECK(issue_of(b, history, "row_topk") == nullptr);
+
+        RadBatch invalid = history_batch;
+        invalid.n_draft_out = 1;
+        RadCtx bad{ .b = &b, .batch = &invalid, .rank = rank, .world = 2 };
+        model.mtp.step(&bad, &invalid);
+        CHECK(!bad.step_fail.empty());
+        CHECK(bad.issues.empty());
         if (rank == 0) CHECK(issue_of(b, history, "gram_accum") != nullptr);
         else           CHECK(issue_of(b, history, "gram_accum") == nullptr);
         const auto lint = lint_step(b, { &trunk, &history });
@@ -10927,6 +10936,18 @@ TEST(qwen35_mtp_draft_head_calibration_taps_full_history) {
             std::fprintf(stderr, "MTP draft-head tap lint: %s\n", problem.c_str());
         CHECK(lint.empty());
     }
+}
+
+TEST(qwen35_refuses_a_calibration_range_that_mixes_trunk_and_mtp) {
+    MetaKV mk = q35w8a8_meta();
+    RadBuilder b;
+    q35_split_head(b, true);
+    RadBuildCtx ctx = spec_ctx(0, 1, 0);
+    ctx.calib_dir = "/tmp/rad-qwen35-mtp-calib-test";
+    ctx.calib_layer_lo = 7;
+    ctx.calib_layer_hi = 9;  /* includes the last trunk layer and the virtual MTP layer */
+    ctx.calib_tokens = 100;
+    CHECK_EQ(stderr_of_rc([&] { return qwen35_w8a8::declare(&b, mk.meta(), &ctx); }), RAD_E_INVAL);
 }
 
 TEST(qwen35_u2_mtp_couples_each_round_after_the_global_shortlist) {

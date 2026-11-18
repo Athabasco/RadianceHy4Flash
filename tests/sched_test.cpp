@@ -6168,6 +6168,36 @@ TEST(a_refused_lookahead_still_runs_the_history_pass) {
     f.sch.serial_end(0);
 }
 
+TEST(calibration_history_keeps_every_row_without_reserving_a_proposal) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.prog.drafter.kind = RAD_DRAFT_HISTORY;
+    f.cfg.n_spec = 0;
+    f.cfg.prefix_cache = false;
+    CHECK_OK(f.start());
+
+    REQUIRE(f.submit(160, /*max_tokens=*/1, /*priority=*/0, /*ignore_eos=*/true));
+    REQUIRE(f.submit(32, /*max_tokens=*/1, /*priority=*/0, /*ignore_eos=*/true));
+    const RadBatch* trunk = f.sch.step();
+    REQUIRE(trunk != nullptr);
+    const int64_t tokens = trunk->n_tok;
+    CHECK_EQ(tokens, 192);
+
+    // Like the engine, plan history after issuance but before either request commits.
+    int rounds = 1;
+    Scheduler::SerialRow rows[4];
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 0);
+    const RadBatch* history = f.sch.serial_batch(0, 1);
+    REQUIRE(history != nullptr);
+    CHECK_EQ(history->draft_pass, -1);
+    CHECK_EQ(history->n_tok, tokens);
+    CHECK_EQ(history->n_out, tokens);
+    CHECK_EQ(history->n_draft_out, 0);
+    CHECK(f.sch.serial_batch(2, 1) == nullptr);
+    f.commit_plain();
+    f.sch.serial_end(0);
+}
+
 /* Draft round 1 rides the history pass. A drafting verifier owes the head's history at all
  * 1 + n_spec verified positions, and the card repeats the last committed one past it, so the
  * run's last row is round 1's input: the pass names that row, and round 1 has no pass of its own. */

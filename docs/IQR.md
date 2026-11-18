@@ -275,9 +275,10 @@ reuse count and that the plan includes `mtp.fc.weight`, `blk.64.*` and `mtp.draf
 
 To fit the U2 draft head to its actual inputs, run with `--calib-corpus FILE`, `--calib-dir DIR`,
 `--calib-layers 64:65` and `--num-speculative-tokens 0`. Layer 64 is the MTP block beside a
-64-layer trunk; this records `gram.r0.mtp.draft_head.bin` without generating proposals. Selecting
-only that virtual layer skips the trunk's separate int8 Hessian capture, so the MTP-only run can use
-tensor parallelism. Then use `q38-27b-native-mtp-u2-gptq.recipe` in place of the RTN overlay, set
+64-layer trunk; this records `gram.r0.mtp.draft_head.bin` without loading the draft projection or
+generating proposals. Use `--calib-corpus`, not `--kld-record`, and select the virtual layer alone:
+this skips the trunk's separate int8 Hessian capture and allows tensor parallelism. Leave draft
+coupling off. Use `q38-27b-native-mtp-u2-gptq.recipe` in place of the RTN overlay, set
 `MTP_CALIB=DIR` and keep `CALIB` pointed at the target recipe's original Hessians. The base
 IQ4R-S-V4 recipe stays unchanged. The serving plugin is `qwen35_w8a8` (rotated int8 activations),
 not the deprecated block-FP8 plugin.

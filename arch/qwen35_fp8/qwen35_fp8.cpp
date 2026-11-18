@@ -582,15 +582,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * would drop full-attention layer 63 and silently run a trunk one layer short. */
     m.n_main = g.n_layer;
     const bool calib_requested = ctx->calib_dir && *ctx->calib_dir;
-    const bool calib_mtp_layer = calib_requested && nextn > 0 &&
+    const bool calib_mtp_layer = QWEN35_W8A8 && !QWEN35_MOE && calib_requested && nextn > 0 &&
         ctx->calib_layer_lo == m.n_main && ctx->calib_layer_hi == m.n_main + 1;
 #if !QWEN35_MOE
     const bool calib_trunk_layers = calib_requested &&
         (!ctx->calib_layer_hi || ctx->calib_layer_lo < m.n_main);
 #endif
-    if (calib_requested && ctx->calib_layer_hi && ctx->calib_layer_lo >= m.n_main &&
-        !calib_mtp_layer) {
-        fprintf(stderr, "radiance: qwen35: --calib-layers selects no trunk or MTP layer\n");
+    if (calib_requested && !calib_mtp_layer && ctx->calib_layer_hi > m.n_main) {
+        if (nextn > 0)
+            fprintf(stderr, "radiance: qwen35: select only the virtual MTP layer for draft-head "
+                            "calibration on dense qwen35_w8a8\n");
+        else
+            fprintf(stderr, "radiance: qwen35: --calib-layers extends past the trunk, with no MTP "
+                            "layer to calibrate\n");
         return RAD_E_INVAL;
     }
 
@@ -1322,7 +1326,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
         /* One row per drafting sequence, even if verification or KLD needs many more target
          * logits rows. mtp_dsum is quant_act_i8's group-major [n_embd/128][ceil(M/16)*16]. */
-        if (draft_q2) {
+        if (draft_q2 && !calib_mtp_layer) {
             const int64_t dmpad = ((g.max_seqs + 15) / 16) * 16;
             m.b_mtp_dq   = decl_b(b, nm.f("mtp_dq"),   RAD_I8,   {g.max_seqs, g.n_embd});
             m.b_mtp_ds   = decl_b(b, nm.f("mtp_ds"),   RAD_F32,  {g.max_seqs, 1});
@@ -1347,7 +1351,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         tw.dq = m.b_mtp_dq; tw.ds = m.b_mtp_ds;  tw.dsum = m.b_mtp_dsum;
         tw.dlog = m.b_mtp_dlog; tw.didx = m.b_mtp_didx; tw.dval = m.b_mtp_dval;
         tw.attn = tw_attn;  tw.mlp = tw_mlp;
-        tw.coupled = ctx->draft_coupling != 0;
+        tw.coupled = !calib_mtp_layer && ctx->draft_coupling != 0;
         if (calib_mtp_layer) {
             tw.calib_dir = ctx->calib_dir;
             tw.calib_tokens = ctx->calib_tokens;
@@ -1392,15 +1396,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                    m.w_lm_head, final_wadd, tw, ts));
         m.have_mtp = true;
 
-        /* Serial drafter: `max_spec` dependent passes, each embedding the last one's proposal.
-         * A U2 head writes its greedy or coupled proposal to column zero. With the fallback
-         * the proposal handle is null and the engine uses the ordinary sampler. */
+        /* A U2 drafter writes a greedy or coupled proposal to column zero. The BF16 fallback
+         * uses the ordinary sampler. Calibration carries no projection, proposal or draft depth. */
         RadDrafterDecl dd{};
         dd.name           = "mtp";
-        dd.kind           = RAD_DRAFT_SERIAL;
-        dd.depth          = ctx->max_spec > 0 ? ctx->max_spec : 1; /* one context pass for calibration */
+        dd.kind           = calib_mtp_layer ? RAD_DRAFT_HISTORY : RAD_DRAFT_SERIAL;
+        dd.depth          = ctx->max_spec;
         dd.proposal       = m.b_mtp_didx;
-        dd.proposal_pitch = pitch;
+        dd.proposal_pitch = calib_mtp_layer ? 0 : pitch;
         dd.mask_token     = -1;
         RAD_ARCH_TRY(rad_declare_drafter(b, &dd));
     }

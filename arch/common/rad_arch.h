@@ -236,7 +236,7 @@ inline bool calib_write_to(RadCtx* c, rad_buf b, int64_t k, long long rows, cons
     if (!p) return false;
     std::vector<float> h((size_t)(k * k));
     if (rad_memcpy_async(h.data(), p, (int64_t)h.size() * 4, rad_stream(c)) < 0) return false;
-    rad_stream_sync(rad_stream(c));
+    if (rad_stream_sync(rad_stream(c)) < 0) return false;
     return calib_write_host_to(dir, h.data(), k, rows, what, domain, rad_rank(c));
 }
 

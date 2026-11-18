@@ -1064,23 +1064,18 @@ int Engine::declare() {
         decide("--no-prefix-cache", "prefix caching off", prefix_off_why_);
     }
     /* --calib-corpus: every token of the corpus through prefill exactly once, so no prefix hit
-     * skips any and no drafter adds scored rows; the corpus is loaded here, before the plugins
-     * declare, because they are told its size. A serial MTP drafter's history pass is enabled only
-     * when its virtual layer is selected; that plugin's calibration tap returns before proposing. */
+     * skips any and no drafter adds rows. Load it before declaration so a plugin knows its size
+     * and can opt into a separate, proposal-free history pass (RAD_DRAFT_HISTORY). */
     if (cfg_.calib()) {
-        const bool calib_mtp_history = arch_probe_.draft_depth > 0 && !arch_probe_.draft_depth_fixed &&
-            cfg_.calib_layer_lo == meta_.n_layers && cfg_.calib_layer_hi == meta_.n_layers + 1;
-        if (cfg_.n_spec > 0 && (!calib_mtp_history || cfg_.n_spec != 1)) {
-            RAD_ERR("--num-speculative-tokens %d: a calibration run drafts nothing; MTP-only "
-                    "calibration permits only its single history pass", cfg_.n_spec);
+        if (cfg_.n_spec > 0) {
+            RAD_ERR("--num-speculative-tokens %d: a calibration run drafts nothing; leave it at "
+                    "auto or 0", cfg_.n_spec);
             return RAD_E_INVAL;
         }
-        cfg_.n_spec = calib_mtp_history ? 1 : 0;
+        cfg_.n_spec = 0;
         cfg_.prefix_cache = false;
         if (cfg_.mm_max_patches < 0) cfg_.mm_max_patches = 0;
-        decide("--num-speculative-tokens", calib_mtp_history ? "1" : "0",
-               calib_mtp_history ? "one selected MTP history pass; the calibration tap suppresses proposals"
-                                 : "a calibration run records the trunk's rows only");
+        decide("--num-speculative-tokens", "0", "a calibration run does not propose draft tokens");
         prefix_off_why_ = "a calibration run: a prefix hit would skip tokens the statistics must count";
         decide("--no-prefix-cache", "prefix caching off", prefix_off_why_);
         calib_ = std::make_unique<Kld>();
@@ -1610,7 +1605,13 @@ int Engine::declare() {
     drafter_       = p0.drafter;
     drafter_name_  = p0.drafter_name;
     drafter_.name  = drafter_name_.c_str();
-    if (cfg_.n_spec <= 0) drafter_ = RadDrafterDecl{};
+    const bool calib_history = drafter_.kind == RAD_DRAFT_HISTORY;
+    if (calib_history && !cfg_.calib()) {
+        RAD_ERR("'%s' history calibration requires --calib-corpus; it cannot run with "
+                "--kld-record", drafter_.name);
+        return RAD_E_UNSUPPORTED;
+    }
+    if (cfg_.n_spec <= 0 && !calib_history) drafter_ = RadDrafterDecl{};
     /* A tree drafter (rad_drafter_tree): its parents plane rides with the proposal. */
     tree_         = drafter_.kind == RAD_DRAFT_BLOCK && drafter_.depth > 0 && p0.drafter_tree;
     tree_parents_ = tree_ ? p0.drafter_parents : 0;
@@ -1651,7 +1652,9 @@ int Engine::declare() {
                 "for the sequences the head declines", drafter_.name);
         return RAD_E_INVAL;
     }
-    if (drafter_.kind != RAD_DRAFT_NONE) {
+    if (calib_history) {
+        RAD_INFO("calib: '%s' history only; no draft proposals", drafter_.name);
+    } else if (drafter_.kind != RAD_DRAFT_NONE) {
         /* A zero proposal handle means the sampler's token buffer: the head's logits go through
          * the ordinary sampler chain. */
         RAD_INFO("speculation: %s",

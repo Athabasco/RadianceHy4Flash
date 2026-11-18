@@ -631,8 +631,9 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     serial_rows_   = 0;
     serial_done_   = 0;
     if (depth_cfg_.on) depth_ctl_poll(step);
+    const bool history_only = drafter_.kind == RAD_DRAFT_HISTORY;
     /* A step issued ahead continues from the card's acceptance, so run it even without drafts. */
-    if (!serial_drafting()) {
+    if (!serial_drafting() && !history_only) {
         if (pipelining_) RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
         return RAD_OK;
     }
@@ -640,7 +641,9 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
     RAD_TRY(collect_issue(so, /*fence=*/true));
 
-    int rounds = drafter_.depth;
+    /* serial_begin needs a pass budget even for history alone. The scheduler's speculative
+     * depth is still zero there, so it stages history rows but never reserves a proposal row. */
+    int rounds = history_only ? 1 : drafter_.depth;
     /* --draft-depth-max below the head's declared depth: no round past it is ever asked for. */
     if (depth_cfg_.on && rounds > depth_cfg_.max) rounds = depth_cfg_.max;
     serial_row_.resize((size_t)cfg_.max_seqs);
@@ -696,12 +699,23 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
         }
         const auto tA = std::chrono::steady_clock::now();
         const RadBatch* db = sched_.serial_batch(rd, step);
-        if (!db) { if (rd == 0) continue; break; }
+        if (!db) {
+            if (history_only) {
+                RAD_ERR("'%s' calibration: missing history batch for step %d", drafter_.name, step);
+                return RAD_E_STATE;
+            }
+            if (rd == 0) continue;
+            break;
+        }
         /* Pass 0 is the history pass, writing the head's own K and V (nothing else does). It is
          * also draft round 1 for drafting rows, whose inputs are the last row of their history run
          * (RadBatch::draft_out_ids), so it ends in the lm_head over those rows. Round r >= 2 embeds
          * round r-1's proposal, which the advance takes from the proposal buffer on the card. */
         const int drafted = rd == 0 ? (int)db->n_draft_out : n;
+        if (history_only && (n != 0 || drafted != 0 || rd != 0)) {
+            RAD_ERR("'%s' history-only calibration cannot reserve draft proposals", drafter_.name);
+            return RAD_E_STATE;
+        }
         RAD_TRY(advance_all(rd == 0 ? ADV_HIST : ADV_ROUND, rd, rd > 0));
         const auto tB = std::chrono::steady_clock::now();
 
@@ -805,7 +819,12 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
  * set_draft, and move the history watermark. The card's acceptance positioned every draft pass,
  * so a disagreement is a defect and the step is refused. */
 int Engine::finish_serial_drafter(const StepOut& so) {
-    if (!serial_drafting() || serial_rounds_ <= 0) return RAD_OK;
+    if (serial_rounds_ <= 0) return RAD_OK;
+    if (drafter_.kind == RAD_DRAFT_HISTORY) {
+        sched_.serial_end(0);  /* advance the history watermark, not the draft chain */
+        return RAD_OK;
+    }
+    if (!serial_drafting()) return RAD_OK;
     const StepPlan& plan = sched_.plan();
     if (serial_done_ > 0 && serial_rows_ > 0) {
         for (size_t i = 0; i < plan.e.size(); ++i) {
