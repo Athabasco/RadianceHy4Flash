@@ -307,6 +307,9 @@ public:
         int64_t  kv_tokens = 0;
         int32_t  n_draft = 0;          /* the proposal standing for the next step */
         int32_t  slot = -1;
+        /* The runtime LoRA slot this row runs with, -1 for the base. The name is the caller's:
+         * rad::Engine::lora_names() indexes by slot. */
+        int32_t  lora_slot = -1;
         double   age_s = 0;
         double   ttft_s = -1;          /* negative until the first token */
         double   prefill_s = -1;       /* first token minus admission; negative until both */

@@ -595,9 +595,10 @@ struct PCBinding final : IPrefixCache {
         toks.insert(toks.end(), r.prompt.begin(), r.prompt.end());
         toks.insert(toks.end(), r.output.begin(), r.output.end());
         if (n_tokens > (int64_t)toks.size()) n_tokens = (int64_t)toks.size();
-        /* r.id is the session, the same id reserve_checkpoint keys its snapshots by. */
+        /* r.id is the session, the same id reserve_checkpoint keys its snapshots by.
+         * The slot rides along so the session row knows which adapter answered last. */
         media_keys(r, &mm_, salt_id);
-        return m->insert(r.id, toks, mm_, blocks, n_tokens, r.session_label);
+        return m->insert(r.id, toks, mm_, blocks, n_tokens, r.session_label, r.lora_slot);
     }
     /* Installed by the engine when the idle tiers are on: lands every pending host copy now and
      * returns whether any landed. Runs on the step thread under the scheduler's lock. */

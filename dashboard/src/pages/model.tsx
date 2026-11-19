@@ -54,9 +54,9 @@ export function ModelPage({ id, tab, model }: { id: string; tab: Tab; model: Fle
           <>
             {!serving && scope.series.t.length > 0 && <div className="text-sm text-muted-foreground">This model is not loaded right now. The charts show its earlier activity.</div>}
             {scope.series.t.length === 0 && !serving ? <Empty>{model.state === "failed" ? "The model failed to start, so there is no data" : model.state === "cold" ? "This model has not been loaded yet. It loads when a request asks for it." : "No data yet. Charts appear once the model has been loaded."}</Empty>
-              : <Performance scope={scope} kind={kind} slots={slots} noun={noun} />}
+              : <Performance scope={scope} kind={kind} slots={slots} noun={noun} model={id} />}
           </>
-        ) : shown === "requests" ? <Requests scope={scope} />
+        )        : shown === "requests" ? <Requests scope={scope} model={id} />
         : shown === "sessions" ? (serving ? <SessionsView model={id} /> : <Empty>Conversations are listed while the model is loaded</Empty>)
         : <Details model={id} stats={s} />}
     </div>

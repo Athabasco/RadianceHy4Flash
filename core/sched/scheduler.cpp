@@ -741,6 +741,17 @@ bool Scheduler::publish_prefix(SchedReq& s) {
 void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool defer_free,
                               bool publish, int status, const char* why) {
     ++step_finished_;
+    /* What a slot did, kept apart from the model's totals: the adapter a finished row ran under
+     * took the model's compute, and a view that attributes work by adapter reads these. */
+    if (st == ReqState::Finished) {
+        const int32_t sl = s.req->lora_slot;
+        if (sl >= 0 && sl < SchedMetrics::MAX_LORA_SLOTS) {
+            SchedMetrics::LoraCount& L = m_.loras[sl];
+            ++L.requests;
+            L.prompt_tokens += (int64_t)s.req->prompt.size();
+            L.output_tokens += (int64_t)s.req->output.size();
+        }
+    }
     /* Publish before freeing: this is the only moment the whole prefix is both computed and still
      * owned. insert() takes its own KV references, so the blocks survive the free below. Cancelled
      * and failed requests are published too; their prompts were computed, and a client that hangs
@@ -1034,6 +1045,7 @@ int Scheduler::requests_locked(ReqStat* out, int max) const {
         }
         o.n_draft         = s.n_draft;
         o.slot            = s.slot;
+        o.lora_slot       = r.lora_slot;
         o.age_s           = (double)(now - s.arrived_us) / 1e6;
         o.ttft_s          = s.first_tok_us ? (double)(s.first_tok_us - s.arrived_us) / 1e6 : -1.0;
         o.prefill_s       = (s.first_tok_us && s.admitted_us)
@@ -3939,6 +3951,11 @@ SchedMetrics Scheduler::metrics_locked() const {
     SchedMetrics m = m_;
     m.step = step_;
     m.running = (int64_t)running_.size();
+    for (int32_t slot : running_)
+        if (slot >= 0 && slot < (int32_t)reqs_.size() && reqs_[(size_t)slot] && reqs_[(size_t)slot]->req) {
+            const int32_t sl = reqs_[(size_t)slot]->req->lora_slot;
+            if (sl >= 0 && sl < SchedMetrics::MAX_LORA_SLOTS) ++m.loras[sl].running;
+        }
     m.queue_depth = (int64_t)waiting_.size();
     m.preempted_waiting = 0;
     for (int32_t slot : waiting_)
