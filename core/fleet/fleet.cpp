@@ -2623,15 +2623,19 @@ json Fleet::status() {
         /* Runtime LoRA: an adapter is a model as far as choosing one goes, and /v1/models lists
          * each as a child under `base:adapter` (server.cpp). The fleet view must say the same,
          * or a view built on it is blind to what this machine answers to. A child owns nothing:
-         * no cards, no bytes, no policy of its own; its state and counters are the parent's,
-         * because the parent is what serves it. */
+         * no cards, no bytes, no policy of its own. Its state is the parent's, because the parent
+         * is what serves it; its in-flight count is its own -- the leases taken under its name
+         * (Front::adapter_leases) -- so a view can tell which adapter is running. A request for
+         * the base names no adapter and lights up no child, and one adapter's traffic never
+         * lights up another's. Its waiting is the parent's queue: while the parent is not open
+         * nothing reaches any child. */
         for (const std::string& a : adapters_of(n)) {
             json ad;
             ad["id"]        = n + ":" + a;
             ad["parent"]    = n;
             ad["adapter"]   = true;
             ad["state"]     = j["state"];
-            ad["in_flight"] = j["in_flight"];
+            ad["in_flight"] = front_.adapter_leases(n, a);
             ad["waiting"]   = j["waiting"];
             models.push_back(std::move(ad));
         }
