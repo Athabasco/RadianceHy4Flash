@@ -41,7 +41,14 @@ __device__ __forceinline__ void rad_chain_wait() {
      * scalar data cache still holds what a launch read from the address before the launch in front
      * of this one wrote it: only the packet processor's acquire empties that cache, and it runs
      * when the kernel is launched, before the launch in front has written. */
+#if defined(__GFX12__)
+    /* The wait: the compiler does not know the asm is an SMEM op, so it inserts no s_wait_kmcnt for it,
+     * and the RDNA4 ISA text does not say a later s_load is served behind the invalidate. (This unit
+     * is also built for generic gfx10/gfx11 targets, which have no s_wait_kmcnt.) */
+    asm volatile("s_dcache_inv\n\ts_wait_kmcnt 0x0" ::: "memory");
+#else
     asm volatile("s_dcache_inv" ::: "memory");
+#endif
 }
 
 __device__ __forceinline__ void rad_chain_done() {
