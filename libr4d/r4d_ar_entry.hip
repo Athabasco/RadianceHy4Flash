@@ -1638,7 +1638,9 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_i8_4rank(const RadArgs* a, RadStream s) 
         tail_nbt = nb_for_shard(words16 / in->world, in->nb_cap > 24 ? 24 : in->nb_cap);
         if (tail_nbt > in->max_blocks) tail_nbt = in->max_blocks;
     }
-    const long tail_ctr = in->my_seq + (2L * in->max_blocks + 8) * 4;
+    /* Eight words past the landed counter, at the allocation's bound (gate_ctr is at 2*maxb words):
+     * in->max_blocks may be capped below it by R4D_AR_MAX_BLOCKS and would land in the parity counters. */
+    const long tail_ctr = in->gate_ctr + 8 * 4;
     /* `sp` (0 unless asked): the all-reduce split around the junction, P2P only. The host mailbox
      * runs the whole form, which leaves every byte the split one does. */
     const long long sp = r4d_geti_or(a, "sp", 0);
