@@ -8086,8 +8086,9 @@ std::unique_ptr<Request> with_run(Fixture& f, int n_prompt, int tok, int n, mm::
     return req;
 }
 
-void media_fixture(Fixture& f, int64_t max_tok, int32_t bidi) {
-    f.build(/*blocks=*/4096, /*states=*/64, max_tok);
+void media_fixture(Fixture& f, int64_t max_tok, int32_t bidi, bool windowed = false) {
+    f.build(/*blocks=*/4096, /*states=*/64, max_tok, /*max_ctx=*/4096, windowed,
+            /*linear=*/!windowed);
     f.prog.encoder.modalities = RAD_MM_IMAGE;
     f.prog.encoder.n_embd = 4;
     f.prog.encoder.patch_dim = 4;
@@ -8159,6 +8160,36 @@ TEST(a_run_longer_than_a_step_is_cut_and_reads_up_to_the_cut) {
     CHECK_EQ(b->bidi_row[0], 8);
     CHECK_EQ(b->bidi_n[0], 56);
     CHECK_EQ(b->bidi_used[0], 256);
+}
+
+/* A run read both ways is attended on sliding layers, over the window group's block table, which
+ * starts at first_block_pos once the window has recycled the blocks below it. bidi_used counts from
+ * there, as that group's seqused does; the absolute end would point the run's rows past the keys
+ * the pass wrote, and a picture after the first chunk was read as nothing. Gemma 4's layout: a
+ * full group and a 64-token window group, no linear group. */
+TEST(a_run_in_a_later_chunk_counts_its_keys_from_the_recycled_window) {
+    Fixture f;
+    media_fixture(f, 256, 1, /*windowed=*/true);
+    CHECK_OK(f.start());
+    f.add(with_run(f, 400, 200, 100, mm::Kind::Image));
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_bidi, (int64_t)0);
+    const int64_t c0 = b->n_tok;                      /* the chunk ends before the run */
+    f.commit_plain();
+    f.kv.first_pos[1] = 128;                          /* trim_window: the window slid past 0..127 */
+    b = f.sch.step();
+    REQUIRE(b != nullptr);
+    REQUIRE_EQ(b->n_bidi, (int64_t)1);
+    CHECK_EQ(b->bidi_row[0], (int32_t)(200 - c0));
+    CHECK_EQ(b->bidi_n[0], 100);
+    CHECK_EQ(b->bidi_used[0], 300 - 128);
+    /* The same count as the window group's own: its seqused less the rows past the run. */
+    const RadKVGroupBatch* win = nullptr;
+    for (int g = 0; g < b->n_kv_groups; ++g)
+        if (b->kv[g].group == 1) win = &b->kv[g];
+    REQUIRE(win != nullptr && win->seqused_h != nullptr);
+    CHECK_EQ(b->bidi_used[0], win->seqused_h[0] - (int32_t)(c0 + b->n_tok - 300));
 }
 
 TEST(runs_are_cut_anywhere_without_the_flag_and_for_audio) {
