@@ -171,6 +171,7 @@ __device__ __forceinline__ void r4d_archk_wait(unsigned int* my_flags, unsigned 
   __shared__ unsigned int s_ckok;
   const unsigned int tid = threadIdx.x, nt = blockDim.x;
   const unsigned long long t0 = tid == 0 ? wall_clock64() : 0ull;
+  bool expired = false;
   for (;;) {
     /* The check word first, so its round trip overlaps the re-hash's loads. Read before the bytes
      * it is compared with, it can only be older than them, and an older word just fails this try. */
@@ -186,7 +187,12 @@ __device__ __forceinline__ void r4d_archk_wait(unsigned int* my_flags, unsigned 
       unsigned int t = 0u;
       for (unsigned int w = 0; w < (nt + 31u) / 32u; ++w) t += s_ckw[w];
       const bool ok = t + seq * R4D_ARCHK_SALT == want;
-      if (!ok && wall_clock64() - t0 > R4D_ARCHK_DEADLINE) __builtin_trap();
+      /* Trap only when a whole further attempt, begun after the deadline had passed, failed too: a
+       * wave preempted for longer than the deadline mid-attempt read stale bytes before the pause. */
+      if (!ok) {
+        if (expired) __builtin_trap();
+        expired = wall_clock64() - t0 > R4D_ARCHK_DEADLINE;
+      }
       s_ckok = ok ? 1u : 0u;
     }
     __syncthreads();
@@ -290,6 +296,7 @@ __device__ __forceinline__ void r4d_ar_word_handshake(unsigned int* peer_flags,
   }
   r4d_lds_barrier();
   const unsigned long long t0 = tid == 0 ? wall_clock64() : 0ull;
+  bool expired = false;
   for (;;) {
     /* The check word first, so its round trip overlaps the re-hash's loads (r4d_archk_wait). */
     const unsigned int want = tid == 0 ? __hip_atomic_load(r4d_archk_word(my_flags, nbw, slot, b),
@@ -304,7 +311,12 @@ __device__ __forceinline__ void r4d_ar_word_handshake(unsigned int* peer_flags,
       unsigned int t = 0u;
       for (unsigned int w = 0; w < nw; ++w) t += s_wchk[w];
       const bool ok = t + seq * R4D_ARCHK_SALT == want;
-      if (!ok && wall_clock64() - t0 > R4D_ARCHK_DEADLINE) __builtin_trap();
+      /* Trap only when a whole further attempt, begun after the deadline had passed, failed too: a
+       * wave preempted for longer than the deadline mid-attempt read stale bytes before the pause. */
+      if (!ok) {
+        if (expired) __builtin_trap();
+        expired = wall_clock64() - t0 > R4D_ARCHK_DEADLINE;
+      }
       s_wok = ok ? 1u : 0u;
     }
     r4d_lds_barrier();
