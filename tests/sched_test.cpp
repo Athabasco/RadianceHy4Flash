@@ -9366,3 +9366,111 @@ TEST(adaptive_depth_rows_are_issued_ahead_in_a_suffix_deployment_unless_a_sequen
         }
     }
 }
+
+/* ================================================================== --draft-suffix over a block drafter */
+
+namespace {
+/* DFlash2's shape: a block drafter of 7 proposals (block 8) whose block is the verify window, with
+ * --draft-suffix on (window 7: the suffix chain cut to the block). */
+void block_suffix_setup(Fixture& f, int min_match = 4) {
+    f.build(4096, 64);
+    f.cfg.n_spec = 7;
+    f.cfg.n_spec_head = 7;
+    f.cfg.draft_suffix = true;
+    f.cfg.draft_suffix_min_match = min_match;
+    f.cfg.draft_suffix_max = 7;
+    f.cfg.draft_suffix_min_score = 0.3f;
+    f.prog.drafter.kind  = RAD_DRAFT_BLOCK;
+    f.prog.drafter.depth = 7;
+    f.prog.drafter.block = 8;
+}
+const int32_t kBlockDraft[7] = { 21, 22, 23, 24, 25, 26, 27 };
+}  // namespace
+
+/* A recurring history gives the step to the suffix chain in place of the block's proposal; the
+ * drafter's context pass behind it mirrors every row the step verified (1 + 7, rejected ones
+ * included: its cache is positional), its query pass starts at the committed end, and the next
+ * step, with the cycle broken, verifies the block's prefix again. */
+TEST(a_block_drafters_proposal_gives_way_to_a_suffix_step_and_its_passes_cover_the_step) {
+    Fixture f;
+    block_suffix_setup(f);
+    CHECK_OK(f.start());
+    const uint64_t a = ngram_cycle_request(f);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(100);
+    CHECK_OK(f.sch.set_draft(a, kBlockDraft, 7));
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_spec, 7);
+    CHECK_EQ(b->n_tok, 8);
+    const StepEntry& e = f.sch.plan().e[0];
+    CHECK(e.suffix);
+    CHECK(e.draft_parent == nullptr);
+    const Request* rq = f.sch.find(a);
+    REQUIRE(rq != nullptr);
+    CHECK(rq->draft_suffix);
+    const int32_t want[7] = { 101, 102, 103, 104, 105, 106, 107 };
+    for (int j = 0; j < 7; ++j) CHECK_EQ(rq->draft[j], want[j]);
+    const int32_t ctx0 = e.ctx_len;
+    commit_one(f, 3, 900);
+    CHECK_EQ(f.sch.metrics().suffix_steps, (int64_t)1);
+    CHECK_EQ(f.sch.metrics().suffix_accepted, (int64_t)3);
+
+    Scheduler::BlockRow rows[4];
+    CHECK_EQ(f.sch.block_begin(8, 7, 0, 99, rows, 4), 1);
+    CHECK(rows[0].seq == a);
+    const RadBatch* cb = f.sch.block_context(2);
+    REQUIRE(cb != nullptr);
+    CHECK_EQ(cb->n_tok, 8);                     /* every row of the suffix step */
+    CHECK_EQ(cb->ctx_lens[0], ctx0);
+    const RadBatch* qb = f.sch.block_query(2);
+    REQUIRE(qb != nullptr);
+    CHECK_EQ(qb->n_tok, 8);                     /* the anchor and seven masks */
+    CHECK_EQ(qb->token_ids[0], 900);            /* anchored at the committed end */
+    CHECK_EQ(qb->token_ids[1], 99);
+    f.sch.block_end();
+    /* 900 broke the cycle: the block's own proposal, as the adaptive prefix cut it (4 of 7) */
+    CHECK_OK(f.sch.set_draft(a, kBlockDraft, 4));
+    const RadBatch* b2 = f.sch.step();
+    REQUIRE(b2 != nullptr);
+    CHECK_EQ(b2->n_spec, 4);
+    CHECK(!f.sch.plan().e[0].suffix);
+    CHECK(!f.sch.find(a)->draft_suffix);
+    for (int j = 0; j < 4; ++j) CHECK_EQ(f.sch.find(a)->draft[j], kBlockDraft[j]);
+}
+
+/* Issued ahead: the block's rows with each row's own prefix (expect_draft of the adaptive rule),
+ * unless a sequence's history is in a pattern, which holds the step back for the suffix selector
+ * after the commit. */
+TEST(a_block_drafters_rows_are_issued_ahead_with_their_own_prefix_unless_a_sequence_is_in_a_pattern) {
+    for (int hot = 0; hot < 2; ++hot) {
+        Fixture f;
+        block_suffix_setup(f);
+        CHECK_OK(f.start());
+        const uint64_t a = hot ? ngram_cycle_request(f) : f.submit(160, 2000);
+        const uint64_t b = f.submit(160, 2000);
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(hot ? 100 : 7);
+        CHECK_OK(f.sch.set_draft(a, kBlockDraft, 7));
+        CHECK_OK(f.sch.set_draft(b, kBlockDraft, 2));
+        REQUIRE(f.sch.step() != nullptr);
+        f.sch.find(a)->speculation_fixed = true;
+        f.sch.find(b)->speculation_fixed = true;
+        f.sch.expect_draft(a, 5);
+        f.sch.expect_draft(b, 1);
+        const RadBatch* nb = f.sch.step_next();
+        if (hot) {
+            CHECK(nb == nullptr);
+            CHECK_EQ(f.sch.metrics().suffix_held_ahead, (int64_t)1);
+        } else {
+            REQUIRE(nb != nullptr);
+            std::vector<int> q;
+            for (int64_t i = 0; i < nb->n_seq; ++i) q.push_back((int)nb->q_lens[i]);
+            std::sort(q.begin(), q.end());
+            REQUIRE_EQ(q.size(), (size_t)2);
+            CHECK_EQ(q[0], 2);
+            CHECK_EQ(q[1], 6);
+        }
+    }
+}
+

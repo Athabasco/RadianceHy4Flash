@@ -2029,4 +2029,423 @@ TEST(suffix_steps_beside_adaptive_depth_chains_emit_the_target_law) {
     CHECK(worst > 8.0);
 }
 
+
+/* ==================================================================== a block drafter (DFlash2)
+ *
+ * The levers of the serial chain over a BLOCK drafter's coupled walk (abi/rad_spechub.h,
+ * rad_dflash_couple_walk, the very function the device kernel is checked against): the drafter's
+ * pass proposes all positions at once from the committed text alone (the candidates and unary
+ * scores of position l), and the walk draws x_l from Q_l, the softmax of the unary scores plus the
+ * pairwise edge from the walk's own x_{l-1}. Here position l's candidates are the head's top eight
+ * at its own greedy guess of the prefix (what a block drafter predicts without knowing its earlier
+ * positions), and the codebooks make the edge term large, so Q_{l+1} depends strongly on x_l.
+ *
+ * Checked, over generations of three tokens through several steps (each step's block depends on
+ * what the steps before committed), with the real verifies (row-wise coupling, the traversal walk,
+ * block verification):
+ *   the fixed block, the adaptive prefix (draft_depth_block_stop: top through Q_j, path through
+ *   x_{j-1}, a min), the load-aware prefix over three sequences side by side (draft_depth_block_load,
+ *   static and online tables), suffix steps in place of the block;
+ *   controls: a prefix that reads Q_{j+1} (the law AFTER x_j, conditioned on it) to verify x_j, and
+ *   one that admits x_j by its own mass -- both biased, and the same statistic sees it. */
+namespace {
+
+constexpr int kBR = 8;   /* the selector's rank: one fmaf a part (RAD_DFLASH_EDGE_PARTS) */
+
+uint16_t blk_bf(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+
+struct BlockBooks {
+    uint16_t pred[V * kBR], succ[V * kBR];
+    BlockBooks() {
+        for (int i = 0; i < V * kBR; ++i) {
+            pred[i] = blk_bf((float)((H(0x9001ull + (uint64_t)i) >> 40) % 2000) / 1000.0f - 1.0f);
+            succ[i] = blk_bf((float)((H(0xa001ull + (uint64_t)i) >> 40) % 2000) / 1000.0f - 1.0f);
+        }
+    }
+};
+
+/* One block of `steps` positions drafted by the real coupled walk after the committed prefix h0
+ * (whose last token is `anchor`). The tree is the chain of the walk's tokens; node l's state is
+ * position l's (round l + 1). */
+void draft_block(Tree* t, uint64_t seed, uint64_t base, int steps, double noise, uint64_t h0,
+                 int32_t anchor, float q_temp = 0.8f) {
+    static const BlockBooks bb;
+    int32_t cand[8 * 8], tok[8];
+    float   un[8 * 8];
+    uint64_t hg = h0;
+    for (int l = 0; l < steps; ++l) {
+        const Law L = law_at(hg, noise);
+        for (int c = 0; c < 8; ++c) { cand[l * 8 + c] = L.qid[c]; un[l * 8 + c] = L.qval[c]; }
+        tok[l] = L.qid[0];                       /* the selector's greedy walk, rewritten below */
+        hg = child_hash(hg, L.qid[0]);
+    }
+    const RadMtpCoupleDraw d = make_draw(seed, base);
+    RadMtpCoupleState st[8] = {};
+    rad_dflash_couple_walk(cand, un, 8, 8, nullptr, 0, anchor, bb.pred, bb.succ, 8, kBR, V, steps,
+                           q_temp, d, true, tok, reinterpret_cast<uint32_t*>(st),
+                           RAD_MTP_COUPLE_STATE_WORDS);
+    t->hash[0] = h0;
+    for (int l = 0; l < steps; ++l) {
+        t->tok[l + 1] = tok[l];
+        t->par[l + 1] = l;
+        t->hash[l + 1] = child_hash(t->hash[l], tok[l]);
+        t->st[l] = st[l];
+    }
+    t->n = steps;
+}
+
+/* The verified prefix of a drafted block: the engine's rule (ctl 0, draft_depth_block_stop over
+ * the statistics read up to the first missing law) or a control: 1 verifies x_j iff the top mass
+ * of Q_{j+1} (the law after x_j) is at least `thr`; 2 iff x_j's own mass is. */
+int block_prefix(Tree* t, const DraftDepthCfg& cfg, int ctl, double thr) {
+    const int steps = t->n;
+    int D = steps;
+    if (ctl == 0) {
+        DraftDepthRow r;
+        draft_depth_begin(cfg, &r, false);
+        for (int l = 1; l <= steps; ++l) {
+            const double st = draft_depth_stat(t->st[l - 1], l, cfg.stat);
+            if (st < 0) break;
+            draft_depth_observe(&r, l, st);
+        }
+        D = draft_depth_block_stop(cfg, r, steps);
+    } else {
+        for (int j = 1; j <= steps; ++j) {
+            double v;
+            if (ctl == 1) v = j < steps ? draft_depth_stat(t->st[j], j + 1, DRAFT_DEPTH_TOP) : 1.0;
+            else          v = draft_depth_stat(t->st[j - 1], j, DRAFT_DEPTH_PATH);
+            if (j > 1 && v < thr) { D = j - 1; break; }
+        }
+    }
+    for (int j = D; j < 64; ++j) t->st[j] = RadMtpCoupleState{};
+    t->n = D;
+    return D;
+}
+
+/* One step of block verification (--draft-verify block, abi/rad_mtp_block.h) over the chain: the
+ * real verify op over the sampler's planes with the block marking, then the core's comparison. */
+int walk_block(const Tree& t, uint64_t seed, uint64_t n_out, double noise, int* out, int* accepted) {
+    const int g = t.n;
+    int32_t  ids[9 * V];
+    float    val[9 * V];
+    uint32_t params[9 * 24] = {};
+    RadMtpCoupleState st[9] = {};
+    int32_t  tk[9];
+    uint64_t h = t.hash[0];
+    for (int i = 0; i <= g; ++i) {
+        const Law L = law_at(h, noise);
+        for (int j = 0; j < V; ++j) { ids[i * V + j] = j < L.pn ? L.pid[j] : -1; val[i * V + j] = j < L.pn ? L.pval[j] : 0.0f; }
+        RadSampleParams* p = reinterpret_cast<RadSampleParams*>(params + i * 24);
+        p->seed = seed;
+        p->pos = n_out + (uint64_t)i;
+        tk[i] = sample_law(L, seed, n_out + (uint64_t)i, 0);
+        if (i < g) {
+            st[i] = t.st[i];
+            st[i].pos = rad_mtp_couple_verify_pos(n_out, i + 1);
+            st[i].blk = g;
+            h = child_hash(h, t.tok[i + 1]);
+        }
+    }
+    RadMtpCoupleVerifyCall c{};
+    c.idx = ids; c.val = val; c.params = params;
+    c.state = reinterpret_cast<const uint32_t*>(st);
+    c.token = tk;
+    c.M = g + 1; c.n_cand = V; c.vocab = 1000;
+    c.ld[0] = V; c.ld[1] = V; c.ld[2] = 24; c.ld[3] = RAD_MTP_COUPLE_STATE_WORDS; c.ld[4] = 1;
+    for (int i = 0; i < g; ++i) rad_mtp_couple_verify_row(c, i);
+    int len = 0;
+    *accepted = 0;
+    for (int i = 0; i <= g; ++i) {
+        out[len++] = tk[i];
+        if (i == g || tk[i] != t.tok[i + 1]) break;
+        ++*accepted;
+    }
+    return len;
+}
+
+enum BlockVerify { BV_ROW, BV_TRAV, BV_BLOCK };
+
+int block_verify(const Tree& t, BlockVerify how, uint64_t seed, uint64_t n_out, double noise, int* out, int* acc) {
+    if (t.n == 0) { out[0] = sample_law(law_at(t.hash[0], noise), seed, n_out, 0); *acc = 0; return 1; }
+    if (how == BV_TRAV) return walk_trav(t, seed, n_out, noise, 0, out, acc, RadMtpTravOpt{});
+    if (how == BV_BLOCK) return walk_block(t, seed, n_out, noise, out, acc);
+    return walk(t, seed, n_out, noise, 0, out, acc);
+}
+
+void block_expect(double noise, std::vector<double>* e1, std::vector<double>* e3) {
+    e1->assign((size_t)V, 0); e3->assign((size_t)V * V * V, 0);
+    const Law l0 = law_at(1, noise);
+    for (int a = 0; a < V; ++a) {
+        (*e1)[(size_t)a] = l0.p[a];
+        const uint64_t ha = child_hash(1, a);
+        const Law l1 = law_at(ha, noise);
+        for (int b = 0; b < V; ++b) {
+            const Law l2 = law_at(child_hash(ha, b), noise);
+            for (int c = 0; c < V; ++c) (*e3)[(size_t)((a * V + b) * V + c)] = l0.p[a] * l1.p[b] * l2.p[c];
+        }
+    }
+}
+
+/* `trials` generations of three tokens; every step a block of `steps` positions, its prefix chosen
+ * by `cfg` (off: the whole block) or a control, or (sfx_pct) a suffix step in its place. */
+DepthRun run_block(const DraftDepthCfg& cfg, BlockVerify how, int trials, double noise, int steps,
+                   int ctl = 0, double thr = 0, int sfx_pct = 0) {
+    std::vector<double> cnt3((size_t)V * V * V, 0), cnt1((size_t)V, 0);
+    DepthRun R{};
+    double nsteps = 0;
+    for (int s = 0; s < trials; ++s) {
+        const uint64_t seed = 0xb10cull + (uint64_t)s * 104729ull;
+        int out[16], len = 0;
+        uint64_t h = 1;
+        int32_t anchor = 0;
+        while (len < 3) {
+            Tree t;
+            draft_block(&t, seed, (uint64_t)len, steps, noise, h, anchor);
+            int D = steps;
+            if (cfg.on || ctl) D = block_prefix(&t, cfg, ctl, thr);
+            if (sfx_pct && (int)(H(h * 31 + 7) % 100) < sfx_pct) {
+                suffix_chain(&t, (int)(h % 100003), (int)(h % 2), 1 + (int)(H(h * 17 + 3) % 7), 1.0);
+                D = t.n;
+                R.share[0] += 1;
+            }
+            R.mean_depth += D; ++R.share[D < 8 ? D : 7]; ++nsteps;
+            int step_out[64], accepted = 0;
+            const int n = block_verify(t, how, seed, (uint64_t)len, noise, step_out, &accepted);
+            R.mean_acc += accepted;
+            for (int i = 0; i < n && len < 16; ++i) { out[len++] = step_out[i]; h = child_hash(h, step_out[i]); anchor = step_out[i]; }
+        }
+        ++cnt1[(size_t)out[0]];
+        ++cnt3[(size_t)((out[0] * V + out[1]) * V + out[2])];
+    }
+    std::vector<double> e1, e3;
+    block_expect(noise, &e1, &e3);
+    R.z3 = zscore(cnt3, e3, trials);
+    R.z1 = zscore(cnt1, e1, trials);
+    R.mean_acc /= nsteps; R.mean_depth /= nsteps;
+    for (int d = 1; d < 8; ++d) R.share[d] /= nsteps;
+    R.share[0] /= nsteps;
+    return R;
+}
+
+/* Three sequences side by side, a step for all that are still short: the load-aware prefix over
+ * the blocks of the step's drafting rows (draft_depth_block_load), with static tables or tables
+ * that follow the run (online 1). With one sequence left the stop rule decides, as in the engine. */
+LoadRun run_block_load(const DraftDepthCfg& cfg0, BlockVerify how, int trials, double noise, int steps,
+                       int other_rows, int online) {
+    const int n_seq = 3;
+    DraftDepthCfg cfg = cfg0;
+    DraftDepthOnline on;
+    if (online) draft_depth_online_begin(cfg, &on);
+    long fed = 0;
+    std::vector<std::vector<double>> cnt3((size_t)n_seq, std::vector<double>((size_t)V * V * V, 0)),
+                                     cnt1((size_t)n_seq, std::vector<double>((size_t)V, 0));
+    LoadRun R{};
+    double rows = 0;
+    for (int s = 0; s < trials; ++s) {
+        uint64_t seed[3], h[3];
+        int32_t anchor[3];
+        int out[3][16], len[3];
+        for (int q = 0; q < n_seq; ++q) {
+            seed[q] = 0x3c0ffull + (uint64_t)s * 104729ull + (uint64_t)q * 0x9e3779b97f4a7c15ull;
+            h[q] = 1; len[q] = 0; anchor[q] = 0;
+        }
+        for (;;) {
+            int act[3], n = 0;
+            for (int q = 0; q < n_seq; ++q) if (len[q] < 3) act[n++] = q;
+            if (n == 0) break;
+            Tree t[3];
+            DraftDepthRow row[3];
+            for (int i = 0; i < n; ++i) {
+                draft_block(&t[i], seed[act[i]], (uint64_t)len[act[i]], steps, noise, h[act[i]], anchor[act[i]]);
+                draft_depth_begin(cfg, &row[i], false);
+                for (int l = 1; l <= steps; ++l) {
+                    const double st = draft_depth_stat(t[i].st[l - 1], l, n > 1 ? DRAFT_DEPTH_TOP : cfg.stat);
+                    if (st < 0) break;
+                    draft_depth_observe(&row[i], l, st);
+                }
+            }
+            int D[3];
+            if (n > 1) {
+                draft_depth_block_load(cfg, row, n, steps, other_rows);
+                for (int i = 0; i < n; ++i) D[i] = row[i].depth;
+            } else {
+                D[0] = draft_depth_block_stop(cfg, row[0], steps);
+            }
+            for (int i = 0; i < n; ++i) {
+                const int q = act[i];
+                Tree& tr = t[i];
+                float sv[8];
+                int ns = 0;
+                for (; ns < steps && ns < 8; ++ns) {
+                    const double x = draft_depth_stat(tr.st[ns], ns + 1, DRAFT_DEPTH_TOP);
+                    if (x < 0) break;
+                    sv[ns] = (float)x;
+                }
+                for (int j = D[i]; j < 64; ++j) tr.st[j] = RadMtpCoupleState{};
+                tr.n = D[i];
+                R.mean_depth += D[i]; ++R.share[D[i] < 8 ? D[i] : 7]; ++rows;
+                int step_out[64], accepted = 0;
+                const int m = block_verify(tr, how, seed[q], (uint64_t)len[q], noise, step_out, &accepted);
+                R.mean_acc += accepted;
+                for (int k = 0; k < m && len[q] < 16; ++k) {
+                    out[q][len[q]++] = step_out[k]; h[q] = child_hash(h[q], step_out[k]); anchor[q] = step_out[k];
+                }
+                if (online) draft_depth_online_chain(cfg, &on, D[i], 0, accepted, sv, ns);
+            }
+            if (online && (++fed & 15) == 0) draft_depth_online_refresh(&cfg, &on);
+        }
+        for (int q = 0; q < n_seq; ++q) {
+            ++cnt1[(size_t)q][(size_t)out[q][0]];
+            ++cnt3[(size_t)q][(size_t)((out[q][0] * V + out[q][1]) * V + out[q][2])];
+        }
+    }
+    std::vector<double> e1, e3;
+    block_expect(noise, &e1, &e3);
+    for (int q = 0; q < n_seq; ++q) {
+        R.z3[q] = zscore(cnt3[(size_t)q], e3, trials);
+        R.z1[q] = zscore(cnt1[(size_t)q], e1, trials);
+    }
+    R.mean_acc /= rows; R.mean_depth /= rows;
+    for (double& x : R.share) x /= rows;
+    return R;
+}
+
+const char* bv_name(BlockVerify b) { return b == BV_ROW ? "rowwise" : b == BV_TRAV ? "traversal" : "block"; }
+
+}  /* namespace */
+
+/* The rule over a block: draft 1 always, draft j while conf_b(j) holds (top through Q_j, path
+ * through x_{j-1}), never past max or the block, min drafts always; a row with no law verifies
+ * `lawless`; a missing law ends what the rule reads. */
+TEST(the_block_prefix_rule_reads_the_laws_up_to_the_draft_it_admits) {
+    DraftDepthCfg c = depth_cfg(7, 1, DRAFT_DEPTH_TOP, 0.5);
+    c.lawless = 7;
+    DraftDepthRow r;
+    draft_depth_begin(c, &r, false);
+    const double s[] = { 0.9, 0.8, 0.7, 0.9, 0.9, 0.9, 0.9 };   /* conf .9 .72 .504 .4536 */
+    for (int l = 1; l <= 7; ++l) draft_depth_observe(&r, l, s[l - 1]);
+    CHECK_EQ(draft_depth_block_stop(c, r, 7), 3);     /* conf_b(4) = .4536 < .5: lag plays no part */
+    CHECK_EQ(draft_depth_block_stop(c, r, 2), 2);     /* the short block */
+    c.stat = DRAFT_DEPTH_PATH;                        /* conf through x_{j-1}: draft 4 reads .504 */
+    CHECK_EQ(draft_depth_block_stop(c, r, 7), 4);
+    c.stat = DRAFT_DEPTH_TOP;
+    c.min = 5;
+    CHECK_EQ(draft_depth_block_stop(c, r, 7), 5);
+    c.min = 1; c.max = 2;
+    CHECK_EQ(draft_depth_block_stop(c, r, 7), 2);
+    c.max = 7; c.stop = 0.95;
+    CHECK_EQ(draft_depth_block_stop(c, r, 7), 1);
+    /* the statistics stop at position 3 (no law there): drafts past it are not verified */
+    DraftDepthRow m;
+    draft_depth_begin(c, &m, false);
+    draft_depth_observe(&m, 1, 0.99); draft_depth_observe(&m, 2, 0.99);
+    c.stop = 0.5;
+    CHECK_EQ(draft_depth_block_stop(c, m, 7), 2);
+    DraftDepthRow g;
+    draft_depth_begin(c, &g, true);
+    CHECK_EQ(draft_depth_block_stop(c, g, 7), 7);
+    CHECK_EQ(draft_depth_block_stop(c, g, 3), 3);
+    /* the load-aware form: a confident row verifies deep, an unsure one short, prices in drafts */
+    DraftDepthCfg L = depth_cfg_load(7, 0, 0.85, 0.3, 0.6);
+    DraftDepthRow q[2];
+    for (int i = 0; i < 2; ++i) draft_depth_begin(L, &q[i], false);
+    for (int l = 1; l <= 7; ++l) { draft_depth_observe(&q[0], l, 0.97); draft_depth_observe(&q[1], l, 0.5); }
+    draft_depth_block_load(L, q, 2, 7, 0);
+    std::printf("  block load prefix: confident %d, unsure %d\n", q[0].depth, q[1].depth);
+    CHECK(q[0].depth >= 5);
+    CHECK(q[1].depth <= 2);
+}
+
+TEST(a_coupled_block_drafter_emits_the_target_law_under_every_verify) {
+    g_sharp = 2.0;
+    const DraftDepthCfg off{};
+    for (BlockVerify how : { BV_ROW, BV_TRAV, BV_BLOCK }) {
+        const DepthRun r = run_block(off, how, 250000, 0.6, 4);
+        std::printf("  block of 4, %-9s: z3=%.2f z1=%.2f acc=%.3f\n", bv_name(how), r.z3, r.z1, r.mean_acc);
+        CHECK(r.z3 < 4.5); CHECK(r.z1 < 4.5);
+    }
+    g_sharp = 1.0;
+}
+
+TEST(an_adaptive_block_prefix_keeps_the_target_law) {
+    g_sharp = 2.0;
+    struct C { int stat; double stop; int min; const char* name; };
+    const C cs[] = { { DRAFT_DEPTH_TOP, 0.30, 1, "top" }, { DRAFT_DEPTH_PATH, 0.20, 1, "path" },
+                     { DRAFT_DEPTH_TOP, 0.18, 2, "top min2" } };
+    for (const C& c : cs) {
+        DraftDepthCfg cfg = depth_cfg(4, 0, c.stat, c.stop, c.min);
+        cfg.lawless = 4;
+        double acc[3] = {};
+        for (BlockVerify how : { BV_ROW, BV_TRAV, BV_BLOCK }) {
+            const DepthRun r = run_block(cfg, how, 200000, 0.6, 4);
+            std::printf("  adaptive block %-8s stop %.2f %-9s: z3=%.2f z1=%.2f acc=%.3f depth %.2f shares %.2f %.2f %.2f %.2f\n",
+                        c.name, c.stop, bv_name(how), r.z3, r.z1, r.mean_acc, r.mean_depth, r.share[1],
+                        r.share[2], r.share[3], r.share[4]);
+            CHECK(r.z3 < 4.5); CHECK(r.z1 < 4.5);
+            int used = 0;
+            for (int d = 1; d <= 4; ++d) used += r.share[d] > 0.05;
+            CHECK(used >= 2);
+            acc[(int)how] = r.mean_acc;
+        }
+        CHECK(acc[BV_TRAV] >= acc[BV_ROW] - 0.01);
+    }
+    g_sharp = 1.0;
+}
+
+TEST(a_load_aware_block_prefix_keeps_the_target_law) {
+    g_sharp = 2.0;
+    for (int online = 0; online < 2; ++online)
+        for (BlockVerify how : { BV_ROW, BV_TRAV }) {
+            DraftDepthCfg cfg = depth_cfg_load(4, 0, 0.40, 0.20, 0.6);
+            cfg.lawless = 4;
+            const LoadRun r = run_block_load(cfg, how, 120000, 0.6, 4, 2, online);
+            std::printf("  load-aware block (%s, %s): z3 %.2f %.2f %.2f z1 %.2f %.2f %.2f acc=%.3f depth %.2f shares %.2f %.2f %.2f %.2f\n",
+                        online ? "online" : "static", bv_name(how), r.z3[0], r.z3[1], r.z3[2], r.z1[0], r.z1[1],
+                        r.z1[2], r.mean_acc, r.mean_depth, r.share[1], r.share[2], r.share[3], r.share[4]);
+            for (int q = 0; q < 3; ++q) { CHECK(r.z3[q] < 4.5); CHECK(r.z1[q] < 4.5); }
+            /* static tables (acceptance = confidence) really choose different prefixes; the online
+             * ones learn this toy's lower acceptance and verify less */
+            int used = 0;
+            for (int d = 1; d <= 4; ++d) used += r.share[d] > 0.05;
+            if (!online) CHECK(used >= 2);
+        }
+    g_sharp = 1.0;
+}
+
+TEST(a_block_prefix_that_reads_past_the_draft_or_its_own_mass_is_not_exact) {
+    g_sharp = 2.0;
+    const DraftDepthCfg cfg = depth_cfg(4, 0, DRAFT_DEPTH_TOP, 0.0);
+    for (BlockVerify how : { BV_ROW, BV_TRAV }) {
+        const DepthRun next = run_block(cfg, how, 100000, 0.6, 4, 1, 0.70);
+        const DepthRun own  = run_block(cfg, how, 100000, 0.6, 4, 2, 0.30);
+        std::printf("  block controls (%s): Q_{j+1} z3=%.1f z1=%.1f depth %.2f | own mass z3=%.1f z1=%.1f depth %.2f\n",
+                    bv_name(how), next.z3, next.z1, next.mean_depth, own.z3, own.z1, own.mean_depth);
+        CHECK(next.z3 > 8.0 || next.z1 > 8.0);
+        CHECK(own.z3 > 8.0 || own.z1 > 8.0);
+    }
+    g_sharp = 1.0;
+}
+
+/* --draft-suffix over a block drafter: a suffix step verifies the history's chain in place of the
+ * block, whose coupled states are then stale and bind no row (draft_extra = 0). */
+TEST(suffix_steps_in_place_of_a_coupled_block_emit_the_target_law) {
+    g_sharp = 2.0;
+    g_suffix_visible = false;
+    DraftDepthCfg cfg = depth_cfg(4, 0, DRAFT_DEPTH_TOP, 0.30);
+    cfg.lawless = 4;
+    for (int adaptive = 0; adaptive < 2; ++adaptive)
+        for (BlockVerify how : { BV_ROW, BV_TRAV }) {
+            const DepthRun r = run_block(adaptive ? cfg : DraftDepthCfg{}, how, 200000, 0.6, 4, 0, 0, 50);
+            std::printf("  suffix beside a %s block (%s): z3=%.2f z1=%.2f acc=%.3f suffix share %.2f\n",
+                        adaptive ? "adaptive" : "fixed", bv_name(how), r.z3, r.z1, r.mean_acc, r.share[0]);
+            CHECK(r.z3 < 4.5); CHECK(r.z1 < 4.5);
+            CHECK(r.share[0] > 0.3);
+        }
+    g_sharp = 1.0;
+}
+
 RAD_TEST_MAIN()

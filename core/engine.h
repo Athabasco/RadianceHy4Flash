@@ -816,6 +816,14 @@ private:
     /* The proposals a row of the query pass took (block_shape), for finish_block_drafter and
      * issue_ahead's expect_draft. */
     int  block_steps_ = 0;
+    /* --draft-depth adaptive over a block drafter's coupled walk: the prefix of the block each
+     * drafting row's next verify carries is chosen from the walk's laws (depth_of_), once the
+     * state copy behind the query pass has landed (depth_ev_[0]). */
+    bool depth_block_ = false;
+    bool block_depth_pending_ = false;
+    bool block_early_ = false;
+    int  block_depth_decide();
+    void couple_settle(const StepOut& so);
     /* Encoder driver (spec §11, core/engine_mm.cpp): encodes every media item the scheduler waits
      * on, in passes of whole segments, and reads it back into the item. Runs between steps, never
      * inside one. */

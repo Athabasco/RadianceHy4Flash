@@ -1321,18 +1321,18 @@ int Engine::declare() {
      * `draft_suffix_max` rows of the sequence's own history while the head still drafts its own
      * `n_spec` rounds, so the verify window every consumer of `n_spec` sees (buffers, rings, the
      * scheduler's window) becomes the larger of the two and the head's rounds are kept apart in
-     * `n_spec_head`. A serial head's chain only: a block drafter's block is fixed. It works with
-     * the fixed chain, with --draft-depth adaptive (whose depth stays within the head's rounds)
-     * and with the traversal verify (a suffix row binds no coupled state, so it is a leaf of the
-     * walk); the block verify decides a head chain as a whole and is refused. */
+     * `n_spec_head`. A drafter's chain (a serial head's, or a block drafter's whose window is its
+     * block): not a tree. It works with the fixed chain, with --draft-depth adaptive (whose depth
+     * stays within the head's rounds or the block) and with the traversal verify (a suffix row
+     * binds no coupled state, so it is a leaf of the walk); the block verify decides a head chain
+     * as a whole and is refused. */
     cfg_.n_spec_head = 0;
     if (cfg_.draft_suffix) {
         RadArchProbe pb{};
         (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
         const char* bad = nullptr;
         if (cfg_.n_spec <= 0)                         bad = "speculation is off (this container carries no draft head)";
-        else if (draft_tree_)                         bad = "it needs the head's chain, not a block drafter's tree";
-        else if (pb.draft_depth_fixed)                bad = "this drafter is a block drafter, not a serial head";
+        else if (draft_tree_)                         bad = "it needs a drafter's chain, not a block drafter's tree";
         else if (cfg_.draft_window == DraftWindow::Adaptive)
                                                       bad = "it needs the fixed window (--draft-window fixed)";
         else if (cfg_.draft_verify_block)             bad = "it cannot be combined with --draft-verify block "
@@ -1340,6 +1340,15 @@ int Engine::declare() {
         if (bad) {
             RAD_ERR("--draft-suffix on: %s", bad);
             return RAD_E_UNSUPPORTED;
+        }
+        /* A block drafter (DFlash2): its pass and its buffers are declared for the block the
+         * verify window names (num-speculative-tokens picks it), so the window stays the block's
+         * and a suffix chain is cut to it. Its context pass mirrors every row the trunk verified,
+         * so a suffix step leaves no hole in its cache. */
+        if (pb.draft_depth_fixed && cfg_.draft_suffix_max > cfg_.n_spec) {
+            RAD_WARN("--draft-suffix-max %d: a block drafter's verify window is its block, %d draft(s); "
+                     "a suffix step verifies at most that many", cfg_.draft_suffix_max, cfg_.n_spec);
+            cfg_.draft_suffix_max = cfg_.n_spec;
         }
         const int window = std::max(cfg_.n_spec, cfg_.draft_suffix_max);
         if (window > (int)RAD_SCHED_MAX_SPEC) {
@@ -1617,6 +1626,20 @@ int Engine::declare() {
     /* A tree drafter (rad_drafter_tree): its parents plane rides with the proposal. */
     tree_         = drafter_.kind == RAD_DRAFT_BLOCK && drafter_.depth > 0 && p0.drafter_tree;
     tree_parents_ = tree_ ? p0.drafter_parents : 0;
+    /* --draft-suffix on a block drafter: its block is the verify window it was declared for, so a
+     * window widened past num-speculative-tokens would have run a different block. */
+    if (cfg_.draft_suffix && drafter_.kind == RAD_DRAFT_BLOCK && cfg_.n_spec_head > 0 &&
+        cfg_.n_spec != cfg_.n_spec_head) {
+        RAD_ERR("--draft-suffix on: '%s' is a block drafter, whose block is the verify window; "
+                "--draft-suffix-max %d is past its %d draft(s) (set it to at most "
+                "num-speculative-tokens)", drafter_.name, cfg_.draft_suffix_max, cfg_.n_spec_head);
+        return RAD_E_UNSUPPORTED;
+    }
+    if (cfg_.draft_suffix && drafter_.kind == RAD_DRAFT_BLOCK && tree_) {
+        RAD_ERR("--draft-suffix on: '%s' proposes a tree; the suffix selector replaces a chain "
+                "(--draft-tree off)", drafter_.name);
+        return RAD_E_UNSUPPORTED;
+    }
     /* --draft-short-from auto: a chain keeps its own block, a tree runs its short block from two
      * decoding sequences on. Its nodes are verify rows every drafting sequence pays for, which a
      * wide tree's extra nodes repay at one sequence and not at many. */

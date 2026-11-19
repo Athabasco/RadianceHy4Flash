@@ -590,6 +590,66 @@ inline void draft_depth_online_refresh(DraftDepthCfg* c, DraftDepthOnline* o) {
     }
 }
 
+/* ------------------------------------------------------------------ a block drafter's depth
+ *
+ * A block drafter (DFlash2) proposes its whole block in one pass, and its coupled walk
+ * (abi/rad_spechub.h, rad_dflash_couple_walk) draws position j from Q_j, the softmax of the
+ * lattice's scores at j given the walk's own x_{j-1}. There are no rounds to stop: the drafter's
+ * pass costs the same whatever the verify carries, so the depth is the PREFIX of the block the
+ * next verify carries, and every law of the block is known by the time that verify is issued.
+ * Hence no lag, and the stop rule reads as far as exactness allows:
+ *
+ *     draft j is verified  iff  draft j - 1 is  and  ( j <= min  or  conf_b(j) >= stop ),
+ *     conf_b(j) = prod_{i <= j} max Q_i   (`top`: Q_j is the law AT x_j's parent)
+ *     conf_b(j) = prod_{i <  j} Q_i(x_i)  (`path`: x_j's own mass is never read)
+ *
+ * Exact for the reason the serial rule is (above): whether the node x_1 .. x_{j-1} gets a child
+ * reads Q_1 .. Q_j -- functions of the committed text and of x_1 .. x_{j-1}, the node's own path
+ * -- and for `path` the masses of x_1 .. x_{j-1}. Never x_j's value, never Q_{j+1} (which is
+ * conditioned on x_j), never the target. `top` may read Q_j because the walk draws x_j from it:
+ * its largest mass does not depend on which token was drawn. The serial chain's late choice reads
+ * the same (table 2 of DraftDepthCfg::cal_p).
+ *
+ * `r` holds the block's statistics (draft_depth_observe for rounds 1 .. steps, the configured
+ * statistic); a row with no law (a greedy request) verifies `lawless` drafts, the block's own
+ * length by default. Returns the verified prefix D in [1, min(max, steps)]. */
+inline int draft_depth_block_stop(const DraftDepthCfg& c, const DraftDepthRow& r, int steps) {
+    int hi = c.max < steps ? c.max : steps;
+    if (hi < 1) return 1;
+    if (r.lawless) {
+        const int l = c.lawless > 0 ? c.lawless : 1;
+        return l < hi ? l : hi;
+    }
+    int d = 1;
+    for (int j = 2; j <= hi; ++j) {
+        if (j > c.min) {
+            const int m = c.stat == DRAFT_DEPTH_PATH ? j - 1 : j;
+            if (m > r.seen || draft_depth_conf(r, m) < c.stop) break;
+        }
+        d = j;
+    }
+    return d;
+}
+
+/* The load-aware rule over a block: the same choice the serial chain's late choice makes once its
+ * rounds have run (draft_depth_select), with every law of the block read -- draft j by
+ * conf(j) = prod_{i <= j} max Q_i (table 2), which never reads past j. The `top` statistic only
+ * (the caller observes it whatever --draft-depth-stat says: a drawn token's own mass at j is
+ * x_j's). Leaves each row's verified prefix in depth. */
+inline void draft_depth_block_load(const DraftDepthCfg& c, DraftDepthRow* r, int n, int steps, int other_rows = 0) {
+    for (int i = 0; i < n; ++i) {
+        if (r[i].lawless) {
+            const int l = c.lawless > 0 ? c.lawless : 1;
+            r[i].depth = l < steps ? l : steps;
+        }
+    }
+    draft_depth_select(c, r, n, steps < c.max ? steps : c.max, other_rows);
+    for (int i = 0; i < n; ++i) {
+        if (r[i].depth < 1) r[i].depth = 1;
+        r[i].rule = 0;
+    }
+}
+
 /* The whole rule at once, for a chain whose statistics are all known (tests, offline): s[i] is
  * round i + 1's, n of them (n >= max - 1 - lag is enough). Returns the depth D in [1, max]. */
 inline int draft_depth_of(const DraftDepthCfg& c, const double* s, int n) {

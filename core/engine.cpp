@@ -1245,8 +1245,11 @@ int Engine::issue_ahead(const RadBatch** out) {
         /* --draft-depth adaptive: the row's own chain (Engine::depth_row_nodes); else the rounds
          * every row ran. */
         sched_.expect_draft(serial_row_[(size_t)i].seq, depth_row_nodes(i));
+    /* --draft-depth adaptive over a block: each row's prefix of it, from the walk's laws. */
+    RAD_TRY(block_depth_decide());
     for (int i = 0; i < block_rows_; ++i)
-        sched_.expect_draft(block_row_[(size_t)i].seq, block_steps_);
+        sched_.expect_draft(block_row_[(size_t)i].seq,
+                            depth_block_ ? depth_of_[(size_t)i] : block_steps_);
     const RadBatch* nb = sched_.step_next();
     if (!nb) return RAD_OK;
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
@@ -1694,7 +1697,7 @@ int Engine::step_loop() {
         st = block_drafting() ? finish_block_drafter(so) : finish_serial_drafter(so);
         if (st < 0) return fail_loop(st);
         /* --draft-depth-load: the step's time and tokens, for the rule's rate and prices. */
-        if (depth_load_on_) depth_step_note(b, so);
+        if (depth_load_on_ || depth_log_) depth_step_note(b, so);
         /* The step ends here, after its draft rounds, so step timing includes them
          * (Scheduler::step_finished). */
         sched_.step_finished();
