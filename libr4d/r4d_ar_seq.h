@@ -224,6 +224,17 @@ __device__ __forceinline__ void r4d_archk_wait(unsigned int* my_flags, unsigned 
 // drain 4 is the plain kernels' test mode (r4d_ar_late_push_pin): the flag ahead of the push and
 // the push ~20 us behind it.
 #define R4D_ARW_SPIN_MAX 4000000000ULL
+/* A dead peer shows as a flag that never arrives. The iteration cap above is minutes to hours, so
+ * the spins also give up on the wall clock: 30 s at wall_clock64's 100 MHz. The clock is read once
+ * every 65536 polls (a poll is a system-scope load, microseconds), and first then, so the hot path
+ * never reads it. */
+#define R4D_AR_FLAG_DEADLINE 3000000000ull
+__device__ __forceinline__ bool r4d_ar_spin_late(unsigned long long z, unsigned long long& t0) {
+  if ((z & 0xffffull) != 0ull) return false;
+  const unsigned long long now = wall_clock64();
+  if (t0 == 0ull) { t0 = now; return false; }
+  return now - t0 > R4D_AR_FLAG_DEADLINE;
+}
 
 // A barrier that orders LDS only.
 __device__ __forceinline__ void r4d_lds_barrier() {
@@ -289,10 +300,11 @@ __device__ __forceinline__ void r4d_ar_word_handshake(unsigned int* peer_flags,
       __hip_atomic_store(&peer_flags[b], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     }
     unsigned long long z = 0;
+    unsigned long long spin_t0 = 0ull;   // first read at the 65536th poll, so a flag already there costs nothing
     /* A handshake that cannot complete is a lockstep violation; trap rather than sum stale bytes. */
     while (r4d_ar_seq_behind(__hip_atomic_load(&my_flags[b], __ATOMIC_RELAXED,
                                                __HIP_MEMORY_SCOPE_SYSTEM), seq))
-      if (++z > R4D_ARW_SPIN_MAX) __builtin_trap();
+      if (++z > R4D_ARW_SPIN_MAX || r4d_ar_spin_late(z, spin_t0)) __builtin_trap();
   }
   r4d_lds_barrier();
   const unsigned long long t0 = tid == 0 ? wall_clock64() : 0ull;

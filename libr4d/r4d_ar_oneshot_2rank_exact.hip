@@ -119,9 +119,10 @@ __global__ void r4d_ar_oneshot_2rank_exact_kernel(
     if (drain == 2) __threadfence_system();
     if (drain != 4) store_sys_rel(&peer_flags[b], s);
     unsigned long long z = 0;
+    unsigned long long spin_t0 = 0ull;   // first read at the 65536th poll, so a flag already there costs nothing
     // A handshake that cannot complete is a lockstep violation; trap rather than sum stale bytes.
     while (r4d_ar_seq_behind(load_sys_acq(&my_flags[b]), s)) {
-      if (++z > R4D_AR_SPIN_MAX) __builtin_trap();
+      if (++z > R4D_AR_SPIN_MAX || r4d_ar_spin_late(z, spin_t0)) __builtin_trap();
     }
   }
   __syncthreads();
@@ -195,8 +196,9 @@ __global__ void r4d_ar_hc_write_kernel(
     if (drain == 2) __threadfence_system();
     store_sys_rel(&peer_flags[b], s);
     unsigned long long z = 0;
+    unsigned long long spin_t0 = 0ull;   // first read at the 65536th poll, so a flag already there costs nothing
     while (r4d_ar_seq_behind(load_sys_acq(&my_flags[b]), s)) {
-      if (++z > R4D_AR_SPIN_MAX) __builtin_trap();
+      if (++z > R4D_AR_SPIN_MAX || r4d_ar_spin_late(z, spin_t0)) __builtin_trap();
     }
   }
   __syncthreads();
@@ -316,8 +318,9 @@ __global__ void r4d_ar_gather_hc_write_kernel(
     if (drain == 2) __threadfence_system();
     store_sys_rel(&peer_flags[b], s);
     unsigned long long z = 0;
+    unsigned long long spin_t0 = 0ull;   // first read at the 65536th poll, so a flag already there costs nothing
     while (r4d_ar_seq_behind(load_sys_acq(&my_flags[b]), s)) {
-      if (++z > R4D_AR_SPIN_MAX) __builtin_trap();
+      if (++z > R4D_AR_SPIN_MAX || r4d_ar_spin_late(z, spin_t0)) __builtin_trap();
     }
   }
   __syncthreads();
@@ -675,8 +678,9 @@ __global__ void r4d_ar_hc_write_coded_kernel(
     if (drain == 2) __threadfence_system();
     if (drain != 4) store_sys_rel(&peer_flags[b], s);
     unsigned long long z = 0;
+    unsigned long long spin_t0 = 0ull;   // first read at the 65536th poll, so a flag already there costs nothing
     while (r4d_ar_seq_behind(load_sys_acq(&my_flags[b]), s)) {
-      if (++z > R4D_AR_SPIN_MAX) __builtin_trap();
+      if (++z > R4D_AR_SPIN_MAX || r4d_ar_spin_late(z, spin_t0)) __builtin_trap();
     }
   }
   __syncthreads();
@@ -810,9 +814,10 @@ __global__ void r4d_ar_hc_write_coded_staged_kernel(
      * agree. */
     if (tid == 0) {
       unsigned long long z = 0;
+    unsigned long long spin_t0 = 0ull;   // first read at the 65536th poll, so a flag already there costs nothing
       while (r4d_ar_seq_behind(__hip_atomic_load(&my_flags[v], __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_SYSTEM), sq)) {
-        if (++z > R4D_AR_SPIN_MAX) __builtin_trap();
+        if (++z > R4D_AR_SPIN_MAX || r4d_ar_spin_late(z, spin_t0)) __builtin_trap();
         __builtin_amdgcn_s_sleep(1);
       }
     }
