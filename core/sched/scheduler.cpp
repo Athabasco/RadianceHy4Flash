@@ -1526,6 +1526,7 @@ bool Scheduler::preempt_back() {
  * blocks to run would be preempted on its first step, a full recompute for nothing. */
 int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve,
                          int64_t mixed_target_shares) {
+    idle_refuse_ = false;
     Request& r = *s.req;
 
     /* A REQUEST THAT WAS PREEMPTED WAITS FOR ROOM FOR THE WHOLE RECOMPUTE, plus one block of
@@ -1735,6 +1736,36 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve,
         s.hit_attn = h.n_attn_tokens;
     }
 
+    /* A fresh prefill is admitted only when its WHOLE prompt plus one decode position fits
+     * beside the whole prompt of every runner and their next-token headroom. The generic
+     * admission below only reserves this chunk; without this gate a long prompt can reach 100%
+     * and then be preempted at the first decode step, wasting the entire prefill. */
+    if (cfg_.prefill_room_gate && r.state != ReqState::Preempted && (int64_t)r.n_computed < (int64_t)r.prompt.size()) {
+        int rounds = 0;
+        while (!fresh_prefill_can_fit(s) && rounds < kEvictRounds &&
+               cfg_.prefix_cache && pc_ && pc_->evict(kEvictBlocks) > 0)
+            ++rounds;
+        if (!fresh_prefill_can_fit(s)) {
+            /* A prompt the empty pool cannot hold must not starve the queue: it fails below
+             * (spec §17) like the preempted path, rather than waiting forever. */
+            if (!kv_->can_ever_fit(s.seq_len() + 1))
+                ;   /* fall through: ensure_from() reports the shortfall */
+            else if (running_.empty() && took_.empty()) {
+                /* Nothing is running, so the next step will not free a block or a slot. A hit
+                 * kept from the previous bounce (n_computed > 0) can be what can_grow refuses;
+                 * drop it once. Still short: refuse, and the step loop fails this request
+                 * instead of parking every waiter behind kAdmitWait. */
+                if (r.n_computed > 0) undo_hit(s);
+                (void)kv_->release_idle_states();
+                if (!fresh_prefill_can_fit(s)) {
+                    idle_refuse_ = true;
+                    return RAD_E_NOMEM;
+                }
+            } else
+                return kAdmitWait;
+        }
+    }
+
     int64_t target = s.seq_len();
     int64_t ckpt = -1;
     int64_t want;
@@ -1897,6 +1928,47 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
     /* Stateful groups: the recompute needs its state slots back, and every running sequence must
      * keep the slot it already holds. A sequence the manager does not know is not a refusal:
      * admit_one adds it, and can_grow on a missing id is false forever. */
+    if (kv_->has_sequence(r.id) && !kv_->can_grow(r.id, target)) return false;
+    for (int32_t slot : running_) {
+        const SchedReq& rs = *reqs_[(size_t)slot];
+        if (rs.req && !kv_->can_grow(rs.req->id, rs.req->n_computed + 1)) return false;
+    }
+    return true;
+}
+
+/* Whether a FRESH prefill may start: the whole prompt plus one decode position has to fit in
+ * every FULL paged group, with one block past that for every running sequence. WINDOW/RING
+ * recycle; counting the whole prompt against them livelocks a long chat in Waiting.
+ * The old admission only checked the first chunk; the pool could then refuse at 100% and
+ * preempt_back() would hand back the entire prefill's KV, forcing the request to start again
+ * at zero. */
+bool Scheduler::fresh_prefill_can_fit(const SchedReq& s) const {
+    const Request& r = *s.req;
+    const int64_t target = s.seq_len() + 1;             /* prompt + one decode token */
+
+    for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
+        const KVGeom::G& gg = kvgeom_.g[g];
+        if (gg.kind != RAD_KV_FULL || !gg.paged || kv_->total_blocks((int32_t)g) <= 0) continue;
+        int64_t need = (target + gg.block_size - 1) / gg.block_size -
+                       (int64_t)kv_->block_table(r.id, (int32_t)g).size();
+        if (need < 0) need = 0;
+        for (int32_t slot : running_) {
+            const SchedReq& rs = *reqs_[(size_t)slot];
+            if (!rs.req) continue;
+            const Request& rr = *rs.req;
+            int64_t goal = rr.n_computed + 1;
+            if (rr.n_computed < (int64_t)rr.prompt.size())
+                goal = std::max(goal, (int64_t)rr.prompt.size());
+            const int64_t rows = (goal + gg.block_size - 1) / gg.block_size;
+            const int64_t held = (int64_t)kv_->block_table(rr.id, (int32_t)g).size();
+            if (rows > held) need += rows - held;
+            need += 1;                       /* one block past that for the running sequence */
+        }
+        if (need > kv_->available_blocks((int32_t)g)) return false;
+    }
+
+    /* Stateful groups: the fresh prefill needs slots for its whole prompt plus the decode
+     * position, and every running sequence must keep the slot it already holds. */
     if (kv_->has_sequence(r.id) && !kv_->can_grow(r.id, target)) return false;
     for (int32_t slot : running_) {
         const SchedReq& rs = *reqs_[(size_t)slot];
@@ -2402,6 +2474,20 @@ const RadBatch* Scheduler::step() {
                 : 0;
             const int as = admit_one(s, budget, areserve,
                                      std::max<int64_t>(0, mixed_target_shares));
+            /* An idle engine that cannot start this request will not be able to on the next
+             * step either: nothing is running to free a block or a slot. Fail it and ask the
+             * next, instead of returning an empty plan forever (every waiter stays Waiting,
+             * the GPU idles). A refusal that is only a wait for a deferred restore
+             * (admit_next_step_) still waits. */
+            if (idle_refuse_ && as < 0 && running_.empty() && took_.empty() && plan_.e.empty() &&
+                !admit_next_step_ && s.req) {
+                idle_refuse_ = false;
+                RAD_WARN("request %llu failed: could not be admitted with nothing running (%s)",
+                         (unsigned long long)s.req->id, rad_strerror(as));
+                close_request(s, ReqState::Failed, "idle_admission", false, true, as,
+                              "could not be admitted with nothing running");
+                continue;
+            }
             /* A preempted request waiting for its whole-recompute gate lets the next one be asked;
              * an overdue one does not. The room the overdue path made this step is for it, and a
              * request queued behind it would take that room back: a victim just forced off for it,

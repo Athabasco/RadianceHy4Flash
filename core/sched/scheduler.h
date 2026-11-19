@@ -583,6 +583,7 @@ private:
     /* Set by admit_one when it held the admitted chunk back: what it would have taken. */
     int64_t       admit_full_ = 0;
     bool          admit_next_step_ = false;   /* admit_one's refusal is a wait for the next step */
+    bool          idle_refuse_ = false;       /* idle engine: this refusal will not clear by waiting */
     /* Whether this step's prefill may span (ChunkGeometry::span): set by step() for the step it
      * plans, true only for a prefill alone in its step, and read by plan_chunk. True outside a
      * step, so plan_chunk called directly answers for a span. */
@@ -928,6 +929,9 @@ private:
      * preempted request: after --preempt-wait-ms the scheduler reclaims cache blocks and preempts
      * a decoding runner until one of them can prefill. A runner still prefilling is not a victim. */
     bool preempted_can_prefill(const SchedReq& s) const;
+    /* A fresh prefill: the whole prompt plus one decode position fits in every FULL paged group,
+     * with one block past that for every running sequence. WINDOW/RING recycle. */
+    bool fresh_prefill_can_fit(const SchedReq& s) const;
     bool preempt_wait_overdue(const SchedReq& s) const;
     /* Give blocks back from the prefix cache until the pool has headroom again. */
     void trim_prefix_cache();

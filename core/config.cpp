@@ -80,6 +80,9 @@ static const Flag g_flags[] = {
     { "--mixed-step-target-ms", "N",    "soft duration target in milliseconds for a mixed prefill/decode\n"
                                         "step. The scheduler learns an aggregate prefill cap from\n"
                                         "completed mixed steps; 0 (default) is off" },
+    { "--prefill-room-gate",  "MODE",   "a fresh prefill starts only when its whole prompt plus one\n"
+                                        "decode position fits beside every runner (on, the default);\n"
+                                        "off admits the first chunk alone, as before the gate" },
     { "--preempt-wait-ms",    "N",      "how long a preempted prefill may wait for the whole-\n"
                                         "recompute gate before reclaiming cache blocks and\n"
                                         "preempting the lowest-priority running request; 0\n"
@@ -728,6 +731,12 @@ int config_parse(int argc, char** argv, Config* c) {
             else if (!parse_int(a.c_str(), v, 0, 64, &c->prefill_interleave)) return RAD_E_INVAL;
         }
         else if (S("--mixed-step-target-ms"))  { if (!num(0, 60000, &c->mixed_step_target_ms)) return RAD_E_INVAL; }
+        else if (S("--prefill-room-gate")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "on"))   c->prefill_room_gate = true;
+            else if (!std::strcmp(v, "off"))  c->prefill_room_gate = false;
+            else { RAD_ERR("--prefill-room-gate takes on or off -- got '%s'", v); return RAD_E_INVAL; }
+        }
         else if (S("--preempt-wait-ms"))       { if (!num(0, INT64_MAX, &c->preempt_wait_ms)) return RAD_E_INVAL; }
         else if (S("--max-num-seqs"))          { if (!num(1, INT64_MAX, &c->max_seqs)) return RAD_E_INVAL; }
         else if (S("--max-model-len"))         { if (!num(0, INT64_MAX, &c->max_ctx)) return RAD_E_INVAL; }
@@ -1749,6 +1758,8 @@ const ShowRow kShow[] = {
                                           : std::string("off"); } },
     { "--mixed-step-target-ms", [](const Config& c) {
           return c.mixed_step_target_ms > 0 ? num(c.mixed_step_target_ms) : std::string("off"); } },
+    { "--prefill-room-gate", [](const Config& c) {
+          return c.prefill_room_gate ? std::string("on") : std::string("off"); } },
     { "--preempt-wait-ms",    [](const Config& c) { return num(c.preempt_wait_ms); } },
     { "--max-num-seqs",       [](const Config& c) { return num(c.max_seqs); } },
     { "--max-model-len",      [](const Config& c) {

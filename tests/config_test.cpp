@@ -612,6 +612,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--p2p", { "off" } }, { "--max-num-batched-tokens", { "512" } },
         { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
         { "--mixed-step-target-ms", { "150" } },
+        { "--prefill-room-gate", { "on" } },
         { "--preempt-wait-ms", { "5000" } },
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },

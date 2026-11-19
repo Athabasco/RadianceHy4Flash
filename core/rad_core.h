@@ -859,6 +859,10 @@ struct Config {
     /* --mixed-step-target-ms: soft duration target for a mixed prefill/decode step. The scheduler
      * learns an aggregate prefill-row cap from completed mixed steps; 0 keeps the fixed policy. */
     int64_t mixed_step_target_ms = 0;
+    /* --prefill-room-gate: a fresh prefill starts only when its whole prompt plus one decode
+     * position fits beside every runner. Off admits the first chunk alone, which can fill the
+     * pool and be preempted back to zero at the first decode step. */
+    bool prefill_room_gate = true;
     /* --preempt-wait-ms: how long a preempted prefill may wait for the whole-recompute gate
      * before the scheduler evicts cache blocks and preempts a lower-priority running request to
      * make room for it. 0 = fall back on the next step; default 5000 ms. */

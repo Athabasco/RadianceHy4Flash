@@ -169,6 +169,7 @@ struct Fixture {
         cfg.max_ctx = max_ctx;
         cfg.checkpoint_interval = 256;
         cfg.prefix_cache = true;
+        cfg.prefill_room_gate = false;
         /* The fixture runs --prefix-resume nearest (a tail snapshot at the last quantum
          * boundary, a hit at any snapshot or block); the exact-resume tests set prefix_exact
          * (--prefix-resume exact, the engine's default) themselves. */
@@ -2224,6 +2225,24 @@ TEST(an_idle_overdue_prefill_is_admitted_when_its_kv_sequence_is_gone) {
     CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
     CHECK(f.kv.has_sequence(b));
     f.commit_plain();
+}
+
+/* A waiter the idle engine cannot start must not park the queue. The room gate used to return
+ * kAdmitWait when the pool could ever hold the prompt but can_grow could not, and with nothing
+ * running the next step never freed a block. step() then returned null forever. */
+TEST(an_idle_engine_fails_a_waiter_it_cannot_start) {
+    Fixture f;
+    f.build(/*blocks=*/64, /*states=*/4);
+    f.cfg.prefill_room_gate = true;
+    f.cfg.prefix_cache = false;
+    CHECK_OK(f.start());
+    for (auto& fl : f.kv.freelist) fl.clear();
+
+    const uint64_t id = f.submit(64, 8);
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(id)->state, (int)ReqState::Failed);
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ(f.sch.metrics().queue_depth, 0);
 }
 
 /* Two prefills that cannot both stay up. Resetting the higher-priority one so the lower one can
