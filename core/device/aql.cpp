@@ -1907,6 +1907,10 @@ int a_stream_create(RadStream* out, int high_priority) {
             r->agent_only = false;
             r->chain_issued = 0;
             r->chain_seen = 0;
+            /* The counter reset above went through the BAR; the card's L2 may still hold the old
+             * value. Make the first dispatch take the system acquire (the half-lap rule does even
+             * on an agent_only stream, which the epoch rule does not), as at creation. */
+            r->last_sys_acq = -(int64_t)kQueuePackets;
             std::fill(r->slot_need.begin(), r->slot_need.end(), 0);
             r->chain_frontier = 0;
             r->frontier_open = false;
