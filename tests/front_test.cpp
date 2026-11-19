@@ -73,7 +73,7 @@ TEST(the_dashboards_reads_do_not_count_as_wanting_a_model) {
 /* The set that must not wake a model for a caller its handler will refuse: exactly the routes
  * Server::register_routes guards with local_operator keyless, and nothing beside them. */
 TEST(guarded_routes_are_the_local_operator_ones) {
-    /* guarded_route now reads the front's own copied routes, so the decision is made by an
+    /* guarded_route reads the front's own copied routes, so the decision is made by an
      * instance's matcher -- a Front with no models installed still carries the full route table
      * (its prototype does), which is exactly the set whose handlers guard. */
     Front f(TransportOptions{}, 0);

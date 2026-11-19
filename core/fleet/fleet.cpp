@@ -460,9 +460,14 @@ private:
 
     void   fail(Model& m, const std::string& why);
     bool   choose_cards(Model& m, const Config& cfg, std::vector<int>* out, std::string* why);
+    /* The cards `m` may be placed on: its own list (models.NAME.cards), else the fleet's. */
+    const std::vector<int>& cards_of(const Model& m) const {
+        return m.entry.cards.empty() ? cards_ : m.entry.cards;
+    }
     std::vector<CardRoom> rooms();
     /* The bytes a model may still claim on `card`: free past the headroom and what is pending. */
     int64_t room_on(int card);
+    int64_t headroom_on(int card) const;
     int64_t pending_on(int card);
     /* rooms() covers `need` on every card in it, without anything leaving. */
     bool   fits_free(const std::map<int, int64_t>& need);
@@ -586,8 +591,15 @@ int64_t Fleet::pending_on(int card) {
     return n;
 }
 
+/* What a card keeps free: its own reserve where memory.card-headroom-mib names it, else the
+ * headroom every card keeps. */
+int64_t Fleet::headroom_on(int card) const {
+    const auto it = fc_.card_headroom_mib.find(card);
+    return it == fc_.card_headroom_mib.end() ? headroom_ : it->second * kMiB;
+}
+
 int64_t Fleet::room_on(int card) {
-    return std::max<int64_t>(free_on(card) - headroom_ - pending_on(card), 0);
+    return std::max<int64_t>(free_on(card) - headroom_on(card) - pending_on(card), 0);
 }
 
 std::vector<CardRoom> Fleet::rooms() {
@@ -711,27 +723,33 @@ std::vector<size_t> Fleet::exclusive_victims(const Model& m) {
 
 bool Fleet::choose_cards(Model& m, const Config& cfg, std::vector<int>* out, std::string* why) {
     const int tp = std::max(cfg.tp, 1);
-    if (tp > (int)cards_.size()) {
+    const std::vector<int>& may = cards_of(m);
+    if (tp > (int)may.size()) {
         *why = "tp " + std::to_string(tp) + " needs " + std::to_string(tp) + " cards; " +
-               std::to_string(cards_.size()) + " are available";
+               std::to_string(may.size()) + " are available";
         return false;
     }
     if (!use_broker()) {
-        out->assign(cards_.begin(), cards_.begin() + tp);
+        out->assign(may.begin(), may.begin() + tp);
         return true;
     }
+    /* The room plan and the fallback below see only the cards this model may use, so a model
+     * with its own list is never planned onto another card, whatever room that card has. */
+    std::vector<CardRoom> open;
+    for (const CardRoom& c : rooms())
+        if (std::find(may.begin(), may.end(), c.card) != may.end()) open.push_back(c);
     const int64_t guess = first_guess(m.claim, cfg);
     std::vector<Resident> res = residents(&m);
     keep_partners(m, &res);
     RoomPlan plan;
     std::string w;
-    if (plan_room(rooms(), res, tp, guess, m.entry.priority, exclusive_victims(m), m.last_cards,
+    if (plan_room(open, res, tp, guess, m.entry.priority, exclusive_victims(m), m.last_cards,
                   nullptr, &plan, &w)) {
         *out = plan.cards;
         return true;
     }
     std::vector<std::pair<int64_t, int>> by;
-    for (const CardRoom& c : rooms()) {
+    for (const CardRoom& c : open) {
         int64_t room = c.free;
         for (const Resident& r : res)
             if (!r.pin && !r.keep && r.priority <= m.entry.priority) room += r.gives(c.card);
@@ -754,9 +772,9 @@ int64_t Fleet::flex_room(const std::vector<int>& cards) {
         for (auto& m : models_)
             if (m->waiting.load(std::memory_order_acquire)) return 0;
     }
-    const int64_t margin = headroom_ + 512 * kMiB;
     int64_t room = INT64_MAX;
-    for (int c : cards) room = std::min(room, free_on(c) - margin - pending_on(c));
+    for (int c : cards)
+        room = std::min(room, free_on(c) - (headroom_on(c) + 512 * kMiB) - pending_on(c));
     return room == INT64_MAX ? 0 : std::max<int64_t>(room, 0);
 }
 
@@ -1777,7 +1795,7 @@ void Fleet::restore_op(Model& m) {
     std::string why;
     /* A parked model comes back on its own cards. A fresh load could pick others, but needs as
      * much room; it is worth it only where other cards exist, and only after a while. */
-    const bool elsewhere = (int)cards_.size() > (int)m.cards.size();
+    const bool elsewhere = (int)cards_of(m).size() > (int)m.cards.size();
     std::unique_lock<std::recursive_mutex> room(room_mu_, std::defer_lock);
     int rrc = RAD_OK;
     bool yielded = false;
@@ -2306,6 +2324,15 @@ std::string Fleet::reload() {
     if (a.host != b.host || a.port != b.port || a.api_key != b.api_key ||
         a.http_threads != b.http_threads || a.cors != b.cors || nf.cards != fc_.cards)
         return "server: and cards: changes need a restart";
+    for (const ModelEntry& e : nf.models)
+        for (int c : e.cards)
+            if (std::find(cards_.begin(), cards_.end(), c) == cards_.end())
+                return "models." + e.name + ": cards lists " + std::to_string(c) +
+                       ", which is not a usable card here";
+    for (const auto& [c, mib] : nf.card_headroom_mib)
+        if (std::find(cards_.begin(), cards_.end(), c) == cards_.end())
+            return "memory.card-headroom-mib names card " + std::to_string(c) +
+                   ", which is not a card this fleet uses";
     if (nf.log_set) log_set_level(nf.log);
     /* Work in flight finishes first. */
     for (auto& m : models_) {
@@ -2338,7 +2365,7 @@ std::string Fleet::reload() {
             RAD_INFO("model %s: added", e.name.c_str());
             continue;
         }
-        if (m->entry.args != e.args) {
+        if (m->entry.args != e.args || m->entry.cards != e.cards) {
             unload(*m, fc_.drain_timeout_ms, "its configuration changed");
             RAD_INFO("model %s: reconfigured", e.name.c_str());
             std::lock_guard<std::mutex> lk(mu_);
@@ -2524,6 +2551,9 @@ void Fleet::history_loop() {
     using clock = std::chrono::steady_clock;
     auto next_row = clock::now();
     std::set<std::string> open;   /* the models that had a row since they last opened */
+    /* The adapter children sampled under each model's name, so that their series close with the
+     * model and a child no longer served is dropped. */
+    std::map<std::string, std::set<std::string>> kids;
     while (!g_stop.load() && !front_.stopping()) {
         const double t = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
         const bool watched = history_.watched(3.0);
@@ -2536,7 +2566,10 @@ void Fleet::history_loop() {
         for (const std::string& n : front_.names()) {
             const bool is_open = front_.activity(n).state == server::Front::State::Open;
             if (!is_open) {
-                if (open.erase(n) || row) history_.model_closed(n);
+                if (open.erase(n) || row) {
+                    history_.model_closed(n);
+                    for (const std::string& c : kids[n]) history_.model_closed(c);
+                }
                 continue;
             }
             const bool first = !open.count(n);
@@ -2549,8 +2582,12 @@ void Fleet::history_loop() {
              * the parent's stats are exactly what a request to the child runs on -- the same
              * tokens, the same queue, the same seconds. Sample the child under its own name with
              * the parent's body so the child's charts draw what its name actually drives. */
-            for (const std::string& a : adapters_of(n))
-                history_.model_sample(n + ":" + a, s, t, body);
+            std::set<std::string> now;
+            for (const std::string& a : adapters_of(n)) now.insert(n + ":" + a);
+            for (const std::string& c : kids[n])
+                if (!now.count(c)) history_.forget(c);
+            for (const std::string& c : now) history_.model_sample(c, s, t, body);
+            kids[n] = std::move(now);
             history_.model_sample(n, s, t, std::move(body));
             open.insert(n);
         }
@@ -2672,15 +2709,15 @@ void Fleet::add_routes() {
      * its finished requests and, as `live`, its latest /stats object; without it the fleet's, with
      * /admin/fleet's object as `live`. `since` (unix seconds) asks for what came after. Every byte
      * comes from the sampler's last read, so a page that polls this reads nothing of the engine:
-     * it neither brings a model back nor costs a running one anything. Both shapes are dashboard
-     * telemetry -- per-model figures name their model and its activity -- so the guard runs
-     * before EITHER answer, exactly like the routes below. */
+     * it neither brings a model back nor costs a running one anything. A model's history is as
+     * open as its /stats, whose figures it repeats, and the fleet's as guarded as /admin/fleet:
+     * a browser the fleet view is refused to still draws the server's own model from it. */
     front_.route("GET", "/history", [this, guard, ok](const server::HttpRequest& q) {
-        if (auto g = guard(q)) return *g;
         double since = 0;
         if (auto it = q.query.find("since"); it != q.query.end()) since = std::strtod(it->second.c_str(), nullptr);
         if (auto it = q.query.find("model"); it != q.query.end() && !it->second.empty())
             return server::HttpResponse::json_body(200, history_.model_body(it->second, since));
+        if (auto g = guard(q)) return *g;
         return server::HttpResponse::json_body(200, history_.fleet_body(since));
     });
     /* A command run by the scheduler thread, its answer awaited. */
@@ -2846,12 +2883,28 @@ int Fleet::run() {
             cards_.push_back(c);
         }
     }
-    for (const ModelEntry& e : fc_.models)
-        if (std::max(e.cfg.tp, 1) > (int)cards_.size()) {
-            RAD_ERR("models.%s: tp %d needs %d cards; %zu are available", e.name.c_str(), e.cfg.tp,
-                    e.cfg.tp, cards_.size());
+    for (const auto& [c, mib] : fc_.card_headroom_mib) {
+        if (std::find(cards_.begin(), cards_.end(), c) == cards_.end()) {
+            RAD_ERR("%s: memory.card-headroom-mib names card %d, which is not a card this fleet "
+                    "uses", fc_.path.c_str(), c);
             return 2;
         }
+        RAD_INFO("fleet: card %d keeps %lld MiB free (memory.card-headroom-mib)", c, (long long)mib);
+    }
+    for (const ModelEntry& e : fc_.models) {
+        for (int c : e.cards)
+            if (std::find(cards_.begin(), cards_.end(), c) == cards_.end()) {
+                RAD_ERR("models.%s: cards lists %d, which is not a usable card here",
+                        e.name.c_str(), c);
+                return 2;
+            }
+        const size_t have = e.cards.empty() ? cards_.size() : e.cards.size();
+        if (std::max(e.cfg.tp, 1) > (int)have) {
+            RAD_ERR("models.%s: tp %d needs %d cards; %zu are available", e.name.c_str(), e.cfg.tp,
+                    e.cfg.tp, have);
+            return 2;
+        }
+    }
 
     /* Park files a process that died left in the disk tier: radiance-park-PID-N.bin (pageable
      * chunks) and radiance-vmem-PID-N.bin (elastic ranges) of a PID that no longer runs. */

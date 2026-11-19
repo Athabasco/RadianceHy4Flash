@@ -142,6 +142,9 @@ def main():
                     if exc.errno == errno.EXDEV:
                         raise SystemExit("vhead.py: SRC shards and DST must share a filesystem "
                                          "for hard links") from exc
+                    if exc.errno in (errno.EPERM, errno.EACCES):
+                        raise SystemExit(f"vhead.py: cannot hard-link {source}: the shard must be "
+                                         "yours or writable by you (fs.protected_hardlinks)") from exc
                     raise
             else:
                 os.symlink(source, target)

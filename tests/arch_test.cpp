@@ -2946,8 +2946,9 @@ TEST(the_encodings_the_model_holds_choose_the_flash_next_kernels) {
 }
 
 /* The input to gate_up and the gated input to down are distinct activations: a trellis
- * gate may read rotated int8 while a W5NL down reads a rotated E4M3 gated product. */
-TEST(flashnext_trellis_gate_and_w5nl_down_use_separate_activation_formats) {
+ * gate may read rotated int8 while a codebook (W5NL, W6NL) down reads a rotated E4M3 gated
+ * product. */
+TEST(flashnext_trellis_gate_and_codebook_down_use_separate_activation_formats) {
     RadEncoding tq{};
     rad_enc_clear(&tq);
     rad_enc_copy_str(tq.scheme, "trellis");
@@ -2974,82 +2975,83 @@ TEST(flashnext_trellis_gate_and_w5nl_down_use_separate_activation_formats) {
     REQUIRE(rad_enc_valid(&r8));
 
     for (int gate_bits : { 4, 5 }) for (int down_bits : { 5, 6 }) {
-    RadEncoding gateq = tq, downq = w5;
-    gateq.plane[0].dtype = gate_bits == 4 ? RAD_U4 : RAD_U5;
-    downq.plane[0].dtype = down_bits == 5 ? RAD_U5 : RAD_U6;
-    downq.plane[3].extent[1] = 1 << down_bits;
-    REQUIRE(rad_enc_valid(&gateq));
-    REQUIRE(rad_enc_valid(&downq));
-    for (int rank = 0; rank < 2; ++rank) {
-        RadModelMeta meta = qwen4exp_meta();
-        RadBuildCtx c = build_ctx(rank, 2);
-        c.max_tok = 64; c.max_seqs = 2; c.max_spec = 0; c.max_ctx = 4096;
-        RadBuilder b;
-        const RadEncoding plain = rad_enc_plain(RAD_BF16);
-        b.encs = { { "blk.1.ffn_gate_up_exps.3.weight", plain },
-                   { "blk.1.ffn_down_exps.3.weight", plain },
-                   { "blk.1.ffn_gate_up_exps.10.weight", plain },
-                   { "blk.1.ffn_down_exps.10.weight", plain },
-                   { "ffn_gate_up_exps", gateq }, { "ffn_down_exps", downq },
-                   { "ssm_inz.weight", tq }, { "attn_qg.weight", tq } };
-        for (const char* name : { "qsa_qk.weight", "attn_k.weight", "attn_v.weight",
-                                  "attn_output.weight", "ssm_out.weight",
-                                  "ffn_gate_up_shexp", "ffn_down_shexp" })
-            b.encs.push_back({ name, r8 });
-        REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
-        const auto& m = qwen4exp_fp8::g_model[rank];
-        const auto& moe = m.layers[0].mlp;
-        CHECK_EQ(moe.fmt[0], 11);
-        CHECK_EQ(moe.fmt[1], down_bits == 5 ? 7 : 12);
-        CHECK_EQ(m.layers[1].mlp.prot.size(), (size_t)2);
-        CHECK_EQ(m.layers[1].mlp.fmt[0], 11);
-        CHECK_EQ(m.layers[1].mlp.fmt[1], down_bits == 5 ? 7 : 12);
-        CHECK(m.a_eff.q && m.a_eff.s && m.a_eff.q8 && m.a_eff.s8);
-        CHECK_EQ(moe.gq_exp.a.cq(), m.a_eff.q);
-        CHECK_EQ(moe.gq_exp.a.cs(), m.a_eff.s);
-        const RecOp* gate = b.op_of(moe.op_gu);
-        const RecOp* down = b.op_of(moe.op_dn);
-        const RecOp* quant = b.op_of(moe.gq_exp.op);
-        REQUIRE(gate && down && quant);
-        CHECK_EQ(quant->op, std::string("gated_had_quant_fp8"));
-        REQUIRE(!down->reads.empty());
-        CHECK_EQ(down->reads[0], m.a_eff.q);
-        bool gate_i8 = false, down_w5 = false;
-        for (const auto& p : gate->p) gate_i8 |= p.key == "dtype" && p.sval == "i8a8h";
-        for (const auto& p : down->p)
-            down_w5 |= p.key == "dtype" && p.sval == (down_bits == 5 ? "w5nl64a8h" : "w6nl64a8h");
-        CHECK(gate_i8);
-        CHECK(down_w5);
+        RadEncoding gateq = tq, downq = w5;
+        gateq.plane[0].dtype = gate_bits == 4 ? RAD_U4 : RAD_U5;
+        downq.plane[0].dtype = down_bits == 5 ? RAD_U5 : RAD_U6;
+        downq.plane[3].extent[1] = 1 << down_bits;
+        REQUIRE(rad_enc_valid(&gateq));
+        REQUIRE(rad_enc_valid(&downq));
+        for (int rank = 0; rank < 2; ++rank) {
+            RadModelMeta meta = qwen4exp_meta();
+            RadBuildCtx c = build_ctx(rank, 2);
+            c.max_tok = 64; c.max_seqs = 2; c.max_spec = 0; c.max_ctx = 4096;
+            RadBuilder b;
+            const RadEncoding plain = rad_enc_plain(RAD_BF16);
+            b.encs = { { "blk.1.ffn_gate_up_exps.3.weight", plain },
+                       { "blk.1.ffn_down_exps.3.weight", plain },
+                       { "blk.1.ffn_gate_up_exps.10.weight", plain },
+                       { "blk.1.ffn_down_exps.10.weight", plain },
+                       { "ffn_gate_up_exps", gateq }, { "ffn_down_exps", downq },
+                       { "ssm_inz.weight", tq }, { "attn_qg.weight", tq } };
+            for (const char* name : { "qsa_qk.weight", "attn_k.weight", "attn_v.weight",
+                                      "attn_output.weight", "ssm_out.weight",
+                                      "ffn_gate_up_shexp", "ffn_down_shexp" })
+                b.encs.push_back({ name, r8 });
+            REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+            const auto& m = qwen4exp_fp8::g_model[rank];
+            const auto& moe = m.layers[0].mlp;
+            CHECK_EQ(moe.fmt[0], 11);
+            CHECK_EQ(moe.fmt[1], down_bits == 5 ? 7 : 12);
+            CHECK_EQ(m.layers[1].mlp.prot.size(), (size_t)2);
+            CHECK_EQ(m.layers[1].mlp.fmt[0], 11);
+            CHECK_EQ(m.layers[1].mlp.fmt[1], down_bits == 5 ? 7 : 12);
+            CHECK(m.a_eff.q && m.a_eff.s && m.a_eff.q8 && m.a_eff.s8);
+            CHECK_EQ(moe.gq_exp.a.cq(), m.a_eff.q);
+            CHECK_EQ(moe.gq_exp.a.cs(), m.a_eff.s);
+            const RecOp* gate = b.op_of(moe.op_gu);
+            const RecOp* down = b.op_of(moe.op_dn);
+            const RecOp* quant = b.op_of(moe.gq_exp.op);
+            REQUIRE(gate && down && quant);
+            CHECK_EQ(quant->op, std::string("gated_had_quant_fp8"));
+            REQUIRE(!down->reads.empty());
+            CHECK_EQ(down->reads[0], m.a_eff.q);
+            bool gate_i8 = false, down_w5 = false;
+            for (const auto& p : gate->p) gate_i8 |= p.key == "dtype" && p.sval == "i8a8h";
+            for (const auto& p : down->p)
+                down_w5 |= p.key == "dtype" &&
+                           p.sval == (down_bits == 5 ? "w5nl64a8h" : "w6nl64a8h");
+            CHECK(gate_i8);
+            CHECK(down_w5);
 
-        /* Declaration alone cannot verify the step's actual wiring. Inspect the issued
-         * gate -> rotated E4M3 producer -> down chain on each TP rank as well. */
-        std::unique_ptr<Kit> k = kit(b, { 1 }, {});
-        RadCtx ctx;
-        ctx.b = &b;
-        ctx.batch = &k->b;
-        qwen4exp_fp8::step(&ctx, &k->b);
-        const RecIssue *gu_issue = nullptr, *quant_issue = nullptr, *dn_issue = nullptr;
-        size_t igu = 0, iq = 0, idn = 0;
-        for (size_t i = 0; i < ctx.issues.size(); ++i) {
-            const RecIssue& issue = ctx.issues[i];
-            if (issue.op == moe.op_gu) { gu_issue = &issue; igu = i; }
-            if (issue.op == moe.gq_exp.op) { quant_issue = &issue; iq = i; }
-            if (issue.op == moe.op_dn) { dn_issue = &issue; idn = i; }
+            /* Declaration alone cannot verify the step's actual wiring. Inspect the issued
+             * gate -> rotated E4M3 producer -> down chain on each TP rank as well. */
+            std::unique_ptr<Kit> k = kit(b, { 1 }, {});
+            RadCtx ctx;
+            ctx.b = &b;
+            ctx.batch = &k->b;
+            qwen4exp_fp8::step(&ctx, &k->b);
+            const RecIssue *gu_issue = nullptr, *quant_issue = nullptr, *dn_issue = nullptr;
+            size_t igu = 0, iq = 0, idn = 0;
+            for (size_t i = 0; i < ctx.issues.size(); ++i) {
+                const RecIssue& issue = ctx.issues[i];
+                if (issue.op == moe.op_gu) { gu_issue = &issue; igu = i; }
+                if (issue.op == moe.gq_exp.op) { quant_issue = &issue; iq = i; }
+                if (issue.op == moe.op_dn) { dn_issue = &issue; idn = i; }
+            }
+            REQUIRE(gu_issue && quant_issue && dn_issue);
+            CHECK(igu < iq && iq < idn);
+            REQUIRE(gu_issue->opd.size() >= 9);
+            REQUIRE(quant_issue->opd.size() >= 3);
+            REQUIRE(dn_issue->opd.size() >= 2);
+            CHECK_EQ(gu_issue->opd.back().handle, quant_issue->opd[0].handle);
+            CHECK_EQ(quant_issue->opd[1].handle, m.a_eff.q);
+            CHECK_EQ(quant_issue->opd[2].handle, m.a_eff.s);
+            CHECK_EQ(dn_issue->opd[0].handle, quant_issue->opd[1].handle);
+            CHECK_EQ(dn_issue->opd[1].handle, quant_issue->opd[2].handle);
+            CHECK_EQ(dn_issue->opd[0].offset, quant_issue->opd[1].offset);
+            CHECK_EQ(dn_issue->opd[1].offset, quant_issue->opd[2].offset);
+            CHECK(gu_issue->opd[0].handle != quant_issue->opd[1].handle);
         }
-        REQUIRE(gu_issue && quant_issue && dn_issue);
-        CHECK(igu < iq && iq < idn);
-        REQUIRE(gu_issue->opd.size() >= 9);
-        REQUIRE(quant_issue->opd.size() >= 3);
-        REQUIRE(dn_issue->opd.size() >= 2);
-        CHECK_EQ(gu_issue->opd.back().handle, quant_issue->opd[0].handle);
-        CHECK_EQ(quant_issue->opd[1].handle, m.a_eff.q);
-        CHECK_EQ(quant_issue->opd[2].handle, m.a_eff.s);
-        CHECK_EQ(dn_issue->opd[0].handle, quant_issue->opd[1].handle);
-        CHECK_EQ(dn_issue->opd[1].handle, quant_issue->opd[2].handle);
-        CHECK_EQ(dn_issue->opd[0].offset, quant_issue->opd[1].offset);
-        CHECK_EQ(dn_issue->opd[1].offset, quant_issue->opd[2].offset);
-        CHECK(gu_issue->opd[0].handle != quant_issue->opd[1].handle);
-    }
     }
 }
 
@@ -6886,8 +6888,8 @@ TEST(a_gemma4_moe_trunk_declares_both_arms_and_the_joins) {
         CHECK(find_map(b, w.name) != nullptr);
 }
 
-/* The sliding group is RAD_KV_FULL with the window on the attention op, since a window group is
- * not prefix-cached (arch/gemma4/gemma4.cpp, the KV groups). */
+/* The sliding group is a window group at the width the attention op reads, the full layers'
+ * group is RAD_KV_FULL (arch/gemma4/gemma4.cpp, the KV groups). */
 TEST(gemma4_moe_kv_groups_are_window_and_full_and_the_window_rides_the_op) {
     RadBuilder b;
     RadModelMeta meta = gemma4_moe_meta();
@@ -14143,19 +14145,16 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
         uint64_t graph, steps;
     };
     const Case cases[] = {
-        /* Flash-Next's step hashes moved once, with the graphs unchanged: the fingerprint's
-         * decode step, verify, history pass and round are below the indexer's exactness bound,
-         * where the indexer now issues no query, score or select and a one-row sequence attends
-         * over its block table (docs/QSA.md, "Below the bound"). Its prefill and mixed steps,
-         * past the bound, are issued as before.
-         *
-         * Both moved again with the decode step's issue order (qwen4exp_fp8.cpp, kVerifyRows;
-         * a_flash_next_decode_step_orders_its_small_launches pins what moved): the graphs by the
-         * indexer's within-step buffers leaving the planner's sharing and, past one rank, by the
-         * router's weight read and each read's verify-height twin; the steps by k and v in front
-         * of q|gate, the indexer's keys behind the attention's launches and, at the verify, the
-         * shared down projection in front of the routed one. Prefill and mixed steps are issued
-         * as before. */
+        /* Flash-Next's hashes. The fingerprint's decode step, verify, history pass and round are
+         * below the indexer's exactness bound, where the indexer issues no query, score or select
+         * and a one-row sequence attends over its block table (docs/QSA.md, "Below the bound").
+         * The decode step's issue order is in them too (qwen4exp_fp8.cpp, kVerifyRows;
+         * a_flash_next_decode_step_orders_its_small_launches pins it): in the graphs, the
+         * indexer's within-step buffers kept out of the planner's sharing and, past one rank,
+         * the router's weight read and each read's verify-height twin; in the steps, k and v in
+         * front of q|gate, the indexer's keys behind the attention's launches and, at the verify,
+         * the shared down projection in front of the routed one. Prefill and mixed steps, past
+         * the bound, issue everything a layer in declared order. */
         { "qwen4exp_fp8", 1, 0, 0xe733184739f30fd2ull, 0x816cd78a65a92598ull },
         { "qwen4exp_fp8", 2, 0, 0x92921730d6df8e8full, 0x3b5931abdde2195dull },
         { "qwen4exp_fp8", 2, 1, 0x9c9352c2e075cb44ull, 0x7cb5889253d852cdull },
@@ -14402,7 +14401,7 @@ TEST(flashnext_a_spanned_prefill_runs_a_pass_at_a_time_with_its_all_reduces_besi
  * one and two ranks, the routed block takes the whole step in one pass -- one router launch a
  * routed block instead of one a piece, over planes a step tall -- while the connection reads and
  * the indexer's windows stay a piece. At four ranks the step is pipelined and keeps its pieces, so
- * the flag changes neither the graph nor the launches there. Off, the flag is the span as it was:
+ * the flag changes neither the graph nor the launches there. Off, the span is a pass a piece:
  * the graph and the step's launches are those of a context that never heard of it. */
 TEST(flashnext_span_pass_step_takes_a_spanned_step_in_one_routed_pass) {
     MetaKV mk = q4_small();

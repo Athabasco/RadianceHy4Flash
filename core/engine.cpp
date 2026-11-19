@@ -1936,11 +1936,7 @@ int Engine::ckpt_stage_open() {
     for (auto& rk : ranks_) staged = staged && rk->kv.ckpt_stage() != nullptr;
     if (!staged) return RAD_OK;
     ranks_[0]->kv.ckpt_stage_layout(&ck_stage_off_, &ck_stage_lb_);
-    auto env_off = [](const char* k) {
-        const char* e = std::getenv(k);
-        return e && e[0] == '0';
-    };
-    ckpt_inside_ = ckpt_snap_ok_ && !env_off("RADIANCE_CKPT_INSIDE");
+    ckpt_inside_ = ckpt_snap_ok_;
     sched_.set_ckpt_inside(ckpt_inside_);
     RAD_INFO("checkpoint stage: %s a rank on the card; %s",
              humanb(ranks_[0]->kv.ckpt_stage_bytes()).c_str(),
@@ -2001,7 +1997,7 @@ int Engine::save_checkpoints() {
                 }
                 /* A checkpoint inside the step is in the stage already (rad_ckpt_snap) and goes
                  * to the host slot from there in one copy; one at the chunk's end is copied from
-                 * the live slots as before. */
+                 * the live slots. */
                 const bool inside = e.ckpt_tok + 1 < e.n_tokens && !ck_stage_off_.empty();
                 for (size_t ri = 0; ri < ranks_.size(); ++ri) {
                     auto& rk = ranks_[ri];
@@ -2028,11 +2024,11 @@ int Engine::save_checkpoints() {
                     }
                 }
                 if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
-                /* RADIANCE_CKPT_HASH=1: wait for the snapshot and log a digest of each rank's
-                 * shard, to compare two builds' snapshots byte for byte. A debugging aid: it
-                 * drains the streams. */
+                /* RADIANCE_DEBUG_CKPT_HASH=1: wait for the snapshot and log a digest of each
+                 * rank's shard, to compare two builds' snapshots byte for byte. A debugging aid:
+                 * it drains the streams. */
                 static const bool hash_on = [] {
-                    const char* h = std::getenv("RADIANCE_CKPT_HASH");
+                    const char* h = std::getenv("RADIANCE_DEBUG_CKPT_HASH");
                     return h && h[0] == '1';
                 }();
                 if (hash_on) {
@@ -2100,15 +2096,13 @@ int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so,
         score_ids_.erase(std::unique(score_ids_.begin(), score_ids_.end()), score_ids_.end());
     }
     bool host_failed = false;
-    /* Step-wide sibling of the scheduler's kMaxScoredCandidates: that cap bounds one request's
-     * candidate list; nothing bounded the step's UNION, which grows toward the whole vocabulary.
-     * The pinned readback's size used to be discovered by ATTEMPTING it -- the cancel path below
-     * fired only when a gigabyte-scale page-locked allocation failed, so on a box that survives
-     * the attempt the bytes stay pinned forever (the buffer is grow-only). The cap is sixteen
-     * maximally-loaded requests -- d1's questions name a few dozen ids each, so every real
-     * scored step lands far under it. A step past it is refused the way an allocation failure
-     * refuses: the scored requests cancel, the engine does not, and the box is never asked to
-     * pin anything to find out. */
+    /* The step-wide sibling of the scheduler's kMaxScoredCandidates. That cap bounds one
+     * request's candidate list; this one bounds the step's union of them, which otherwise grows
+     * toward the whole vocabulary. The readback below is pinned host memory sized by the union and
+     * never shrinks, so a step is refused by its count before the allocation is tried: a
+     * gigabyte-scale pin that succeeds would stay pinned. The cap is sixteen requests at the
+     * per-request maximum; a scored request names a few dozen ids. A step past it is refused the
+     * way an allocation failure is: the scored requests cancel and the engine goes on. */
     static const size_t kMaxScoredStepIds = 1u << 16;
     if (score_only_ && score_ids_.size() > kMaxScoredStepIds) {
         RAD_ERR("scored rows: the step names %zu candidate rows, over the step budget of %zu; "
@@ -2320,11 +2314,11 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
              * drive the KV rollback, the conv cursor and the emitted text) say how far the step
              * really got. */
             acc = accept_cut_at_eog(out, acc,
-                                    [&](int32_t t) { return is_eog(t); });
+                                    [&](int32_t t) { return vocab_ && vocab_->is_eog(t); });
 
             so.accepted[i] = acc;
             so.token[i]    = out[acc];
-            so.eos[i]      = is_eog(so.token[i]) ? 1 : 0;
+            so.eos[i]      = vocab_ && vocab_->is_eog(so.token[i]) ? 1 : 0;
             if (tree) {
                 if (so.path.empty()) so.path.assign(plan.e.size() * RAD_SCHED_MAX_SPEC, 0);
                 for (int32_t t = 0; t < acc; ++t) so.path[i * RAD_SCHED_MAX_SPEC + t] = path[t];
@@ -2361,7 +2355,7 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
             continue;
         }
         so.token[i] = so.rows[(size_t)so.first_row[i]];
-        so.eos[i]   = is_eog(so.token[i]) ? 1 : 0;
+        so.eos[i]   = vocab_ && vocab_->is_eog(so.token[i]) ? 1 : 0;
         if (e.req && e.req->sp.n_probs >= 0)
             RAD_TRY(row_logprobs(so, so.first_row[i], so.token[i]));
         /* Advance the grammar on every rank: each builds the mask for its own vocabulary shard from
@@ -3261,6 +3255,26 @@ SamplingParams Engine::sampling_defaults() const {
     return resolve_sampling_defaults(meta_, file_ != nullptr, cfg_);
 }
 
+/* A token the model's chat format writes as one of its call delimiters is a call boundary, not a
+ * turn's: a reply that closes a call with it must be able to write the next call and text after
+ * it. A checkpoint that also lists the token in generation_config.json's eos ids would end every
+ * tool-calling turn there, so the id leaves the vocabulary's end-of-generation set. This runs
+ * once the vocabulary and the plugins are both loaded (the reply format can be the architecture
+ * plugin's) and before anything reads the set: the scheduler and the cards' step state, which cut
+ * accepted drafts at it, the grammar index and the reply parser's terminators. */
+int Engine::demote_call_delimiters() {
+    if (!vocab_own_ || vocab_own_->chat_template().empty()) return RAD_OK;
+    const std::vector<int32_t> dropped = vocab_own_->drop_named_eog(
+        server::ChatTemplateBridge::eog_call_markers(*vocab_own_,
+                                                     rad_tools_chat_format(plugins_, meta_)));
+    if (dropped.empty()) return RAD_OK;
+    for (int32_t id : dropped)
+        RAD_WARN("vocab: token %d \"%s\" is listed as end-of-generation by the checkpoint's "
+                 "generation_config.json and is one of this model's tool-call delimiters; a turn "
+                 "does not end on it", id, vocab_->text(id).c_str());
+    return build_vocab_view();
+}
+
 /* The HTTP server over the engine. `/v1/completions`, `/v1/chat/completions`, `/v1/models`,
  * `/metrics` and `/health` are live. `/v1/embeddings` answers 501 unless the program is an
  * embedding program, and so do image, video and audio content parts unless the program declared an
@@ -3503,15 +3517,6 @@ int Engine::run_server() {
     const bool have_tpl = !gen_ && vocab_ && !vocab_->chat_template().empty() &&
                           chat_bridge.init(*vocab_, declared_format, plugins_.arch_plugin) >= 0 &&
                           chat_bridge.ready();
-    /* A token this format writes as one of its own call delimiters is a call boundary, not a
-     * turn's: a reply that closes a call with it must be able to write the next one, and text
-     * after it. A container that also declares it end-of-generation would cut every tool-calling
-     * turn there, so the id leaves the decoder's stop set. */
-    eog_demoted_ = chat_bridge.eog_call_markers();
-    for (int32_t id : eog_demoted_)
-        RAD_WARN("vocab: token %d \"%s\" is end-of-generation and one of this model's "
-                 "tool-call delimiters; a turn no longer ends on it", id,
-                 vocab_->text(id).c_str());
     if (embedding_) {
         /* No chat endpoint: the model's template, when it has one, renders a `messages` input. */
         if (have_tpl) embed_info.tpl = &chat_bridge;

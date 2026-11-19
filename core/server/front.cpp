@@ -493,7 +493,7 @@ Front::Got Front::lease(const std::string& model, const std::string& path, int64
     }
     if (e->state == State::Failed) {
         /* The failure prose quotes fetch errors and filesystem paths: operator-facing. A
-         * stranger learns the model failed -- that is public anyway -- never WHY (A-05). */
+         * stranger learns the model failed -- that is public anyway -- never why. */
         *refusal = refuse(path, 503, "service_unavailable",
                           "model '" + e->name + "' could not be loaded" +
                               (operator_ok ? ": " + e->why : std::string()));

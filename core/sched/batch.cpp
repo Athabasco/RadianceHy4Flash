@@ -1090,8 +1090,8 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
             const int64_t c0 = e.ctx_len, c1 = c0 + e.n_tokens, T = max_tok_;
             /* RopeLayout::runs is documented ascending and pairwise disjoint, and the slice
              * bound (h_bidi is 4*max_tok_ wide, one slot per token this step can carry) leans
-             * on exactly that: overlapping runs would count one token twice. The layout is now
-             * fed from request-side placement, so the promise is checked here rather than
+             * on exactly that: overlapping runs would count one token twice. The layout comes
+             * from request-side placement, so the promise is checked here rather than
              * trusted -- an overlapping run drops its media rows' bidirectionality, which the
              * acceptance path treats as an ordinary miss, where a slot overrun is a fault. */
             int64_t prev_b = c0;

@@ -756,8 +756,9 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     const int64_t C = m.C, L = g.n_layer;
     const double eps = g.eps;
     const int gx = kGrpDit;
-    // Entries are denoising branches. One entry serves an unguided image; CFG needs two.
-    const int64_t NI = g.max_seqs > T / m.max_image_tokens ? T : g.max_seqs * m.max_image_tokens;   /* image rows a pass */
+    /* Image rows a pass: a denoising branch an entry (one for an unguided image, two under
+     * classifier-free guidance), as many entries as max-num-seqs allows, within the step's rows. */
+    const int64_t NI = g.max_seqs > T / m.max_image_tokens ? T : g.max_seqs * m.max_image_tokens;
 
     /* ---- the timestep: [cos | sin] of 1000 bf16(t) over 256, linear, gelu_tanh, linear (temb);
      * the shared modulation from gelu_tanh(temb), then each block's table added (table_add), and

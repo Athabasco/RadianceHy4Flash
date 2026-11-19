@@ -584,6 +584,7 @@ private:
     int64_t       admit_full_ = 0;
     bool          admit_next_step_ = false;   /* admit_one's refusal is a wait for the next step */
     bool          idle_refuse_ = false;       /* idle engine: this refusal will not clear by waiting */
+    bool          room_wait_ = false;         /* the refusal is the fresh prefill's room gate */
     /* Whether this step's prefill may span (ChunkGeometry::span): set by step() for the step it
      * plans, true only for a prefill alone in its step, and read by plan_chunk. True outside a
      * step, so plan_chunk called directly answers for a span. */

@@ -1527,6 +1527,7 @@ bool Scheduler::preempt_back() {
 int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve,
                          int64_t mixed_target_shares) {
     idle_refuse_ = false;
+    room_wait_ = false;
     Request& r = *s.req;
 
     /* A REQUEST THAT WAS PREEMPTED WAITS FOR ROOM FOR THE WHOLE RECOMPUTE, plus one block of
@@ -1761,8 +1762,10 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve,
                     idle_refuse_ = true;
                     return RAD_E_NOMEM;
                 }
-            } else
+            } else {
+                room_wait_ = true;
                 return kAdmitWait;
+            }
         }
     }
 
@@ -1937,11 +1940,12 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
 }
 
 /* Whether a FRESH prefill may start: the whole prompt plus one decode position has to fit in
- * every FULL paged group, with one block past that for every running sequence. WINDOW/RING
- * recycle; counting the whole prompt against them livelocks a long chat in Waiting.
- * The old admission only checked the first chunk; the pool could then refuse at 100% and
- * preempt_back() would hand back the entire prefill's KV, forcing the request to start again
- * at zero. */
+ * every FULL paged group, beside the whole prompt (or the next position) of every running
+ * sequence and of every request this step's admission has already taken, with one block past
+ * that for each. Admitting on the first chunk alone lets the pool reach 100% mid-prompt, and
+ * preempt_back() then hands back the whole prefill's KV, so the request starts again at zero.
+ * WINDOW/RING groups recycle; counting the whole prompt against them livelocks a long chat in
+ * Waiting. */
 bool Scheduler::fresh_prefill_can_fit(const SchedReq& s) const {
     const Request& r = *s.req;
     const int64_t target = s.seq_len() + 1;             /* prompt + one decode token */
@@ -1952,9 +1956,9 @@ bool Scheduler::fresh_prefill_can_fit(const SchedReq& s) const {
         int64_t need = (target + gg.block_size - 1) / gg.block_size -
                        (int64_t)kv_->block_table(r.id, (int32_t)g).size();
         if (need < 0) need = 0;
-        for (int32_t slot : running_) {
+        auto beside = [&](int32_t slot) {
             const SchedReq& rs = *reqs_[(size_t)slot];
-            if (!rs.req) continue;
+            if (!rs.req || &rs == &s) return;
             const Request& rr = *rs.req;
             int64_t goal = rr.n_computed + 1;
             if (rr.n_computed < (int64_t)rr.prompt.size())
@@ -1962,14 +1966,19 @@ bool Scheduler::fresh_prefill_can_fit(const SchedReq& s) const {
             const int64_t rows = (goal + gg.block_size - 1) / gg.block_size;
             const int64_t held = (int64_t)kv_->block_table(rr.id, (int32_t)g).size();
             if (rows > held) need += rows - held;
-            need += 1;                       /* one block past that for the running sequence */
-        }
+            need += 1;                       /* one block past that for the sequence */
+        };
+        for (int32_t slot : running_) beside(slot);
+        for (size_t i : took_) beside(waiting_[i]);
         if (need > kv_->available_blocks((int32_t)g)) return false;
     }
 
-    /* Stateful groups: the fresh prefill needs slots for its whole prompt plus the decode
-     * position, and every running sequence must keep the slot it already holds. */
-    if (kv_->has_sequence(r.id) && !kv_->can_grow(r.id, target)) return false;
+    /* Stateful groups: the fresh prefill needs a state slot, and every running sequence must keep
+     * the slot it already holds. Asked at the next position, not the prompt's end: the FULL
+     * groups were counted above, and a window or ring group recycles its blocks, so counting the
+     * whole prompt there refuses a prompt longer than its window that the model serves (an idle
+     * engine then fails it). */
+    if (kv_->has_sequence(r.id) && !kv_->can_grow(r.id, (int64_t)r.n_computed + 1)) return false;
     for (int32_t slot : running_) {
         const SchedReq& rs = *reqs_[(size_t)slot];
         if (rs.req && !kv_->can_grow(rs.req->id, rs.req->n_computed + 1)) return false;
@@ -2482,10 +2491,12 @@ const RadBatch* Scheduler::step() {
             if (idle_refuse_ && as < 0 && running_.empty() && took_.empty() && plan_.e.empty() &&
                 !admit_next_step_ && s.req) {
                 idle_refuse_ = false;
-                RAD_WARN("request %llu failed: could not be admitted with nothing running (%s)",
-                         (unsigned long long)s.req->id, rad_strerror(as));
+                RAD_WARN("request %llu failed: its prompt of %zu tokens does not fit the KV "
+                         "cache with nothing running (%s); a larger cache (gpu memory, "
+                         "kv-cache-dtype) or a shorter prompt serves it",
+                         (unsigned long long)s.req->id, s.req->prompt.size(), rad_strerror(as));
                 close_request(s, ReqState::Failed, "idle_admission", false, true, as,
-                              "could not be admitted with nothing running");
+                              "the prompt does not fit the KV cache with nothing running");
                 continue;
             }
             /* A preempted request waiting for its whole-recompute gate lets the next one be asked;
@@ -2496,6 +2507,10 @@ const RadBatch* Scheduler::step() {
              * waited. */
             if (as == kAdmitWait) {
                 if (s.req->state == ReqState::Preempted && preempt_wait_overdue(s)) break;
+                /* A fresh prompt waiting for room holds the queue behind it: shorter requests
+                 * admitted past it would keep taking the room it waits for, and nothing ages a
+                 * waiting fresh request the way an overdue preempted one is aged. */
+                if (room_wait_) break;
                 ++at;
                 continue;
             }

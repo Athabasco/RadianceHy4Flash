@@ -283,7 +283,17 @@ foreach(t ${RAD_TESTS})
   if(n STREQUAL "mem_test")
     set_target_properties(${n} PROPERTIES ENABLE_EXPORTS ON)
   endif()
-  if(n STREQUAL "dspark_device_test")
+  if(n STREQUAL "spechub_device_test")
+    # The device verify rows against their host rows: on a card, so it carries the gpu label and
+    # the card environment (without either it would pass having checked nothing).
+    if(RAD_HIP_FOUND AND TARGET spechub)
+      add_test(NAME ${n} COMMAND ${n})
+      set_tests_properties(${n} PROPERTIES
+        LABELS gpu
+        TIMEOUT ${RAD_TEST_TIMEOUT}
+        ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+    endif()
+  elseif(n STREQUAL "dspark_device_test")
     if(RAD_HIP_FOUND AND TARGET libr4d)
       add_dependencies(${n} libr4d)
       add_test(NAME ${n} COMMAND ${n} ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
@@ -339,6 +349,7 @@ endif()
 # so a one-card build for another family skips those cases instead of failing strict mode.
 if(TARGET libr4d)
   target_compile_definitions(plugin_test PRIVATE RAD_TEST_HAS_LIBR4D=1)
+  target_compile_definitions(shipped_plugins_test PRIVATE RAD_TEST_HAS_LIBR4D=1)
   add_dependencies(plugin_test libr4d)
 endif()
 

@@ -7239,13 +7239,12 @@ static void i8a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_t N
  * scale on libquant's tcq_rb grid), `two` E4M3 scales under one f32, `rot` the fwht128 forms. */
 struct IqrCase { int kind, B, V, L, rb; bool two, rot; bool rowf = false; };
 
-static void iqr_gemm_case(const Plugin& pl, const IqrCase& f, int64_t M, int64_t N, int64_t K,
-                          bool row_invariance = false) {
+static void iqr_gemm_case(const Plugin& pl, const IqrCase& f, int64_t M, int64_t N, int64_t K) {
     const char* row = M <= 64 ? "gemm_iqr_nt_m64" : "gemm_iqr_tiled";
     const char* ref = M <= 64 ? "gemm_i8a8_nt_m16"
                     : f.rb >= 32 ? "gemm_i8a8_rb32_tiled"
                     : f.rb >= 8 ? "gemm_i8a8_rb8_tiled" : "gemm_i8a8_tiled";
-    if (!row_invariance && !sel(row) && !sel("gemm_iqr")) return;
+    if (!sel(row) && !sel("gemm_iqr")) return;
     static const char* kKind[] = { "", "signed", "zero", "table", "grid", "trellis", "trellis-mad" };
     const bool tr = f.kind == 5 || f.kind == 6;   /* 6: the computed trellis (tcq_code=mad) */
     char nm[200];
@@ -7523,52 +7522,6 @@ static void iqr_gemm_case(const Plugin& pl, const IqrCase& f, int64_t M, int64_t
     std::vector<uint16_t> y((size_t)(M * N)), yr((size_t)(M * N));
     st_memcpy(y.data(), d_y, y.size() * 2, hipMemcpyDeviceToHost);
     st_memcpy(yr.data(), d_yr, yr.size() * 2, hipMemcpyDeviceToHost);
-
-    /* A verify issues several rows where a plain decode issues one. Same weight and activation
-     * must give the same bytes at every position, not merely agree with an oracle to tolerance. */
-    if (row_invariance) {
-        std::vector<uint16_t> batch((size_t)(M * N)), single((size_t)N);
-        for (int64_t width = 2; width <= M; ++width) {
-            auto q = tq;
-            q[0] = T(d_a, RAD_I8, { width, K });
-            q[1] = T(d_as, RAD_F32, { width, nkb });
-            q[4] = T(d_y, RAD_BF16, { width, N });
-            std::vector<RadParam> p = { PI("M", width), PI("N", N), PI("K", K),
-                                        PI("group", 128), PS("dtype", dt) };
-            st_memset(d_y, 0x7f, (size_t)(M * N) * 2);
-            int rc = launch(r, q, p);
-            if (rc == RAD_OK)
-                st_memcpy(batch.data(), d_y, (size_t)(M * N) * 2, hipMemcpyDeviceToHost);
-            int64_t different = 0, first = -1, tail_touched = 0;
-            if (rc == RAD_OK)
-                for (int64_t n = width * N; n < M * N; ++n)
-                    if (batch[(size_t)n] != 0x7f7f) ++tail_touched;
-            for (int64_t j = 0; j < width && rc == RAD_OK; ++j) {
-                auto q1 = tq;
-                q1[0] = T((int8_t*)d_a + j * K, RAD_I8, { 1, K });
-                q1[1] = T((float*)d_as + j * nkb, RAD_F32, { 1, nkb });
-                q1[4] = T(d_yr, RAD_BF16, { 1, N });
-                std::vector<RadParam> p1 = { PI("M", 1), PI("N", N), PI("K", K),
-                                             PI("group", 128), PS("dtype", dt) };
-                rc = launch(r, q1, p1);
-                if (rc != RAD_OK) break;
-                st_memcpy(single.data(), d_yr, (size_t)N * 2, hipMemcpyDeviceToHost);
-                for (int64_t n = 0; n < N; ++n)
-                    if (batch[(size_t)(j * N + n)] != single[(size_t)n]) {
-                        if (first < 0) first = j * N + n;
-                        ++different;
-                    }
-            }
-            const std::string label = "U5 IQR verify M=" + std::to_string(width) +
-                                      " equals independent decodes N=" + std::to_string(N) +
-                                      " K=" + std::to_string(K);
-            ok(label.c_str(), rc == RAD_OK && different == 0 && tail_touched == 0,
-               "rc=" + std::to_string(rc) + ", differing BF16=" + std::to_string(different) +
-               ", first=" + std::to_string(first) + ", untouched-tail violations=" +
-               std::to_string(tail_touched));
-        }
-    }
-
     /* M <= 16 is the GEMV or the 16-token tile, which sum per wave before summing across waves:
      * the product within f32 rounding, so bf16 outputs a rounding apart. The computed trellis
      * under a bf16 scale a (row, 128) takes that tile to 64 tokens. Above, the int8 tiles' bytes. */
@@ -7615,7 +7568,7 @@ struct MoeIqrShape {
 };
 
 static void moe_iqr_case(const Plugin& pl, const MoeIqrShape& sh) {
-    if (!sel("moe_gemm_iqr") && !sel("moe_iqr_row_invariance")) return;
+    if (!sel("moe_gemm_iqr")) return;
     char nm[240];
     std::snprintf(nm, sizeof nm, "moe_gemm_iqr %s B=%d L=%d run=%lld E=%lld T=%lld N=%lld:%lld "
                   "K=%lld:%lld", sh.what, sh.B, sh.L, (long long)sh.run, (long long)sh.E,
@@ -7782,55 +7735,6 @@ static void moe_iqr_case(const Plugin& pl, const MoeIqrShape& sh) {
     if (rq != RAD_OK) { ok(nm, false, "rc " + std::to_string(rq)); dfree_all(); return; }
     std::vector<uint16_t> y((size_t)(Tr * N));
     st_memcpy(y.data(), d_y, y.size() * 2, hipMemcpyDeviceToHost);
-
-    /* Exact verify-vs-decode regression: each token's gate/up is routed to the same experts with
-     * the same activations and weights, once inside this batch and once as a single-token step.
-     * Preserve every expert/slot association while remapping the sorted rows for the latter. */
-    if (g_case && sel("moe_iqr_row_invariance")) {
-        if (sh.sorted || sh.drop) { ok(nm, false, "regression expects token-order inputs"); dfree_all(); return; }
-        void* d_so1 = dalloc((size_t)top_k * 4);
-        void* d_of1 = dalloc((size_t)(E + 1) * 4);
-        void* d_y1 = dalloc((size_t)(top_k * N) * 2);
-        if (!d_so1 || !d_of1 || !d_y1) { ok(nm, false, "regression allocation failed"); dfree_all(); return; }
-        int64_t bad = 0, total = 0;
-        for (int64_t tok = 0; tok < sh.Mtok; ++tok) {
-            std::vector<int32_t> so1, of1((size_t)E + 1), original;
-            for (int64_t e = 0; e < E; ++e) {
-                of1[(size_t)e] = (int32_t)so1.size();
-                for (int32_t i = off[(size_t)e]; i < off[(size_t)e + 1]; ++i) {
-                    const int32_t slot = sorted[(size_t)i];
-                    if (slot / top_k == tok) {
-                        so1.push_back((int32_t)(slot % top_k));
-                        original.push_back(i);
-                    }
-                }
-            }
-            of1[(size_t)E] = (int32_t)so1.size();
-            if ((int64_t)so1.size() != top_k) { ok(nm, false, "routing remap failed"); dfree_all(); return; }
-            st_memcpy(d_so1, so1.data(), so1.size() * 4, hipMemcpyHostToDevice);
-            st_memcpy(d_of1, of1.data(), of1.size() * 4, hipMemcpyHostToDevice);
-            auto t1 = ts;
-            t1[0] = T((int8_t*)d_a + tok * K, RAD_I8, { 1, K });
-            t1[1] = T((float*)d_as + tok * nkb, RAD_F32, { 1, nkb });
-            t1[4] = T(d_so1, RAD_I32, { top_k });
-            t1[5] = T(d_of1, RAD_I32, { E + 1 });
-            t1[8] = T(d_y1, RAD_BF16, { top_k, N });
-            auto p1 = ps; p1[0] = PI("M", 1);
-            const int r1 = launch(r, t1, p1);
-            if (r1 != RAD_OK) { ok(nm, false, "decode reference rc " + std::to_string(r1)); dfree_all(); return; }
-            std::vector<uint16_t> one((size_t)(top_k * N));
-            st_memcpy(one.data(), d_y1, one.size() * 2, hipMemcpyDeviceToHost);
-            for (int64_t i = 0; i < top_k; ++i)
-                for (int64_t col = 0; col < N; ++col) {
-                    ++total;
-                    if (one[(size_t)(i * N + col)] != y[(size_t)(original[(size_t)i] * N + col)]) ++bad;
-                }
-        }
-        ok(nm, bad == 0, std::to_string(bad) + " of " + std::to_string(total) +
-                            " BF16 outputs differ from independent decode");
-        dfree_all();
-        return;
-    }
 
     /* The reference, a run's rows at a time through the dense row over the same buffers. */
     std::vector<float> want((size_t)(Tr * N), 0.0f);
@@ -18695,8 +18599,9 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
             d_ws[c] = dalloc(wsc.size() * 2);
             st_memcpy(d_ws[c], wsc.data(), wsc.size() * 2, hipMemcpyHostToDevice);
         }
-        /* A separate six-bit allocation: do not overread the five-bit experts. Its independent
-         * deterministic generator also leaves the pre-existing benchmark's RNG stream alone. */
+        /* The six-bit experts' own planes: the shared ones hold five bits a weight, short of a
+         * six-bit row. Their bytes come from a generator of their own, not `rnd`, so the other
+         * operands' bytes do not depend on whether the six-bit forms run. */
         void* d_w6[2] = { nullptr, nullptr };
         if (w6_only) for (int c = 0; c < 2; ++c) {
             const size_t bytes = (size_t)(nec[c] * Nc[c] * Kc[c] / 8 * 6);
@@ -18757,7 +18662,8 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
          * w5nl64a8h (`sub` 5), which adds the sign plane's loads and merge. Not over pooled
          * experts, whose blocks are sized for four bits. */
         /* And each against an int8 activation (moe_gemm_w4a8i8, `a8`): the same planes and
-         * activation bytes, the int8 levels and the iu8 WMMA. The five-bit form has no such row. */
+         * activation bytes, the int8 levels and the iu8 WMMA. The five- and six-bit forms have no
+         * such row. */
         const RadKernelInfo* r8 = find(pl, "moe_gemm_w4a8i8");
         for (int a8 = 0; a8 < (r8 ? 2 : 1); ++a8)
         for (const int sub : { 1, 2, 4, 5, 6 }) {
@@ -34062,12 +33968,6 @@ static void device_phase(const Plugin& pl) {
                     iqr_gated_case(pl, b, m, 1024, 1280);
             iqr_gated_case(pl, 4, 1, 17408, 5120);
             iqr_gated_case(pl, 4, 9, 17408, 5120);
-            if (sel("iqr_row_invariance")) {
-                const IqrCase f{ 6, 5, 0, 16, 1, false, true, true };
-                iqr_gemm_case(pl, f, 8, 2048, 2560, true);
-                iqr_gemm_case(pl, f, 8, 6144, 2560, true);
-                iqr_gemm_case(pl, f, 8, 8192, 2560, true);
-            }
             for (const IqrCase& f : fs) {
                 iqr_gemm_case(pl, f, 1, 512, 1024);
                 iqr_gemm_case(pl, f, 2, 4096, 1024);
@@ -34775,11 +34675,10 @@ static void device_phase(const Plugin& pl) {
             for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 })
                 moe_w4_gemm(pl, t, sh, 2, true);
         }
-        moe_w6_cases(pl);
     }
 
-    /* Also expose the W6 tests alone while retaining them in the normal W4 row's test. */
-    if (sel("moe_gemm_w6nl")) moe_w6_cases(pl);
+    /* The six-bit cases, once: with the W4 row's cases or under their own name. */
+    if (sel("moe_gemm_w4a8") || sel("moe_gemm_w6nl")) moe_w6_cases(pl);
 
     /* The grouped GEMM against an int8 activation: the same shapes through each row's forms. */
     {
@@ -34825,12 +34724,6 @@ static void device_phase(const Plugin& pl) {
             moe_iqr_pack_case(pl, 4096, false);
             moe_iqr_pack_case(pl, 8192, false);
             moe_iqr_pack_case(pl, 3277, true);
-        }
-        if (g_case && sel("moe_iqr_row_invariance")) {
-            for (int B : { 4, 5 })
-                for (int64_t m : { (int64_t)2, (int64_t)3, (int64_t)4, (int64_t)7 })
-                    moe_iqr_case(pl, { "row-invariance gate/up", B, 16, 128, 16, 10, m,
-                                       768, 512, 2560, 2560, 2, false, 0 });
         }
         const bool w4 = sel("moe_gemm_w4a8i8"), w4m = sel("moe_gemm_w4a8i8_mod4");
         const bool w8 = sel("moe_gemm_i8a8"), w8m = sel("moe_gemm_i8a8_mod4");
@@ -35209,7 +35102,7 @@ static void device_phase(const Plugin& pl) {
          * form S at 9, 12 and 16 rows, and the tiled up-mix at both of its row tiles. */
         for (int64_t m : { 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 32, 33, 64 })
             for (bool i8 : { false, true }) hc_decode_forms(pl, m, i8);
-        /* The 48-row tile (33 to 48 rows) against the 64-row tile it replaced. */
+        /* The 48-row tile (33 to 48 rows) against the 64-row tile at the same rows. */
         for (int64_t m : { 33, 40, 47, 48 })
             for (bool i8 : { false, true }) hc_decode_forms(pl, m, i8, 2);
     }

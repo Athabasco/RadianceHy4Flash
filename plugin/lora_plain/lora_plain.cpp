@@ -15,9 +15,9 @@
  * rounded once to bf16. The launch delegates to libr4d's own exported bf16 GEMM entries, so the
  * arithmetic is byte-for-byte libr4d's; only the operand bytes differ.
  *
- * With the core's site-gate patch (op_is_site accepts plain fp GEMMs over transform-basis weights;
- * https://codeberg.org/StillDeadcode/radiance/issues/475) the core then injects lora_shrink /
- * lora_expand around these GEMMs and runtime PEFT adapters bind to them.
+ * The core's site gate (core/lora/lora.cpp, op_is_site) accepts plain fp GEMMs over
+ * transform-basis weights, so it injects lora_shrink / lora_expand around these GEMMs and runtime
+ * PEFT adapters bind to them.
  *
  * Build: g++-14 -std=c++20 -O2 -fPIC -shared -I <sdk>/include/radiance lora_plain.cpp \
  *            -o <home>/kernels/lora_plain.so -ldl

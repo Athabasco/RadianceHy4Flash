@@ -20,7 +20,6 @@
 #include <string>
 #include <vector>
 
-#include <sys/stat.h>
 
 namespace rad {
 
@@ -180,7 +179,7 @@ int Engine::step_state_init() {
             depth_online_on_ = cfg_.draft_depth_load_online;
             draft_depth_online_begin(depth_cfg_, &depth_online_);
             depth_pend_.assign((size_t)n_slot, DepthPend{});
-            if (const char* e = std::getenv("RADIANCE_CONC_LOG"); e && *e) {
+            if (const char* e = std::getenv("RADIANCE_DEBUG_CONC_LOG"); e && *e) {
                 depth_log_ = std::fopen(e, "w");
                 if (depth_log_) std::setvbuf(depth_log_, nullptr, _IOFBF, 1 << 20);
             }
@@ -193,7 +192,6 @@ int Engine::step_state_init() {
             RAD_TRY(rad_event_create_as(&e, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
         depth_row_.assign((size_t)n_slot, DraftDepthRow{});
         depth_of_.assign((size_t)n_slot, 0);
-        if (const char* e = std::getenv("RADIANCE_DEPTH_SPIN_US")) depth_spin_us_ = std::atoll(e);
         RAD_INFO("draft depth adaptive: 1..%d draft(s) a step, the chain goes on while the product of "
                  "the head's %s probabilities is >= %.3f (decided %d round(s) behind, %d round(s) "
                  "always run); a row with no law drafts %d",
@@ -406,7 +404,7 @@ int Engine::depth_observe_upto(int round, int n, const StepOut& so) {
                     if (q != 0) break;
                     if ((spin & 255u) == 255u &&
                         std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t1)
-                                .count() > (double)depth_spin_us_) {
+                                .count() > (double)kDepthSpinUs) {
                         blocked = true;
                         break;
                     }
@@ -485,39 +483,6 @@ void Engine::depth_log_stats(const char* when) {
     if (depth_load_on_) depth_load_log(when);
 }
 
-/* RADIANCE_DEPTH_CTL=<file>, diagnostics: `load=0|1` the load-aware rule (and with it the late
- * choice), `late=0|1` the late choice alone. The file is looked at every 16 steps and
- * read again when its mtime has moved; a word switches only what --draft-depth-load on set up.
- * Between steps, like every table the rule reads. */
-void Engine::depth_ctl_poll(int step) {
-    static const char* path = std::getenv("RADIANCE_DEPTH_CTL");
-    if (!path || !*path || (step & 15) != 0) return;
-    struct stat sb;
-    if (::stat(path, &sb) != 0) return;
-    const int64_t mt = (int64_t)sb.st_mtim.tv_sec * 1000000000ll + (int64_t)sb.st_mtim.tv_nsec;
-    if (mt == depth_ctl_mtime_) return;
-    depth_ctl_mtime_ = mt;
-    std::FILE* f = std::fopen(path, "r");
-    if (!f) return;
-    char buf[256];
-    const size_t got = std::fread(buf, 1, sizeof buf - 1, f);
-    std::fclose(f);
-    buf[got] = 0;
-    for (char* t = std::strtok(buf, " \t\r\n"); t; t = std::strtok(nullptr, " \t\r\n")) {
-        char* eq = std::strchr(t, '=');
-        if (!eq) continue;
-        const bool v = std::atoi(eq + 1) != 0;
-        *eq = 0;
-        if      (!std::strcmp(t, "load")) depth_cfg_.load = v && depth_load_on_;
-        else if (!std::strcmp(t, "late")) depth_cfg_.late = v && depth_load_on_ && cfg_.draft_depth_load_late;
-    }
-    RAD_INFO("draft depth control (step %d): load-aware rule %s, late choice %s", step,
-             depth_cfg_.load ? "on" : "off", depth_cfg_.load && depth_cfg_.late ? "on" : "off");
-    if (depth_log_)
-        std::fprintf(depth_log_, "C %d %d %d\n", step, (int)depth_cfg_.load,
-                     (int)(depth_cfg_.load && depth_cfg_.late));
-}
-
 /* --draft-depth-load, once a step, after its draft passes ended and its verify was committed:
  * the step's milliseconds (since the step before it ended, when both were pure decode steps of the
  * same drafting rows), its verify rows, rounds and tokens for the rule's rate and prices; every 64
@@ -588,7 +553,7 @@ void Engine::depth_load_log(const char* when) const {
              depth_cfg_.cal_x[0], depth_cfg_.cal_x[draft_depth_knots(depth_cfg_) - 1], c.c_str());
 }
 
-/* RADIANCE_CONC_LOG: the step just finished, one line.
+/* RADIANCE_DEBUG_CONC_LOG: the step just finished, one line.
  *   S step ns phase n_seq n_tok rounds drafting_rows load_step | entry;... | chain;...
  * An entry is a sequence of the step's verify: seq,is_prefill,n_tokens,drafts verified,drafts
  * accepted (-1: no token row),ctx_len. A chain is what a drafting row made behind the step, for
@@ -630,7 +595,6 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     serial_rounds_ = 0;
     serial_rows_   = 0;
     serial_done_   = 0;
-    if (depth_cfg_.on) depth_ctl_poll(step);
     const bool history_only = drafter_.kind == RAD_DRAFT_HISTORY;
     /* A step issued ahead continues from the card's acceptance, so run it even without drafts. */
     if (!serial_drafting() && !history_only) {

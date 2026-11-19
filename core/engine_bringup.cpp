@@ -1304,11 +1304,10 @@ int Engine::declare() {
          * none, drafts nothing either (n_spec is 0 there by now), so this never runs under it. */
         draft_tree_ = cfg_.n_spec > 0 && pb.tree_pays != 0;
         ckpt_snap_ok_ = pb.ckpt_snap_ok != 0;
-        /* The checkpoint stage (KVManager::ckpt_stage), planned before any KV plan is made. */
-        {
-            const char* e = std::getenv("RADIANCE_CKPT_STAGE");
-            cfg_.ckpt_stage = !(e && e[0] == '0');
-        }
+        /* The checkpoint stage (KVManager::ckpt_stage), planned before any KV plan is made, where
+         * a tail snapshot can be taken inside the last chunk: the plugin cuts its step for it and
+         * a hit resumes at the nearest snapshot (the exact grid snapshots where a chunk starts). */
+        cfg_.ckpt_stage = ckpt_snap_ok_ && !cfg_.prefix_exact;
         if (draft_tree_) {
             const char* why = "the model's plugin measured a gain with them";
             RAD_INFO("draft trees: asked -- %s", why);
@@ -4797,6 +4796,7 @@ int Engine::start() {
     if (vocab_ex) std::rethrow_exception(vocab_ex);
     if (vocab_st < 0) return vocab_st;
     if (plugins_st < 0) return plugins_st;
+    RAD_TRY(demote_call_delimiters());
     {
         /* The loaded libraries in selection order: as --kernels named them, or every library in
          * the home. */
@@ -5443,6 +5443,7 @@ int Engine::load_vocab() {
     auto v = std::make_shared<Vocab>();
     RAD_TRY(v->load(std::move(vb)));
     vocab_ = v;
+    vocab_own_ = v;
     if (file_ && file_->aux_vocab()) {
         VocabBuild ab;
         RAD_TRY(vocab_deserialize(file_->base(), (uint64_t)file_->size(), file_->aux_vocab().h, ab));
@@ -5452,12 +5453,17 @@ int Engine::load_vocab() {
         RAD_INFO("vocab: a second vocabulary of %d tokens", aux_vocab_->n_tokens());
     }
 
+    RAD_INFO("vocab: %d tokens, bos=%d eos=%d%s", vocab_->n_tokens(), vocab_->bos(), vocab_->eos(),
+             vocab_->chat_template().empty() ? ", no chat template" : "");
+    return build_vocab_view();
+}
+
+/* The sampler's view of the vocabulary and the grammar engine's index over it. The index sorts
+ * end-of-generation ids apart from text, so both are built again when that set changes. */
+int Engine::build_vocab_view() {
     auto view = std::make_unique<TokenView>();
     RAD_TRY(view->init(vocab_));
     vocab_view_ = std::move(view);
-
-    RAD_INFO("vocab: %d tokens, bos=%d eos=%d%s", vocab_->n_tokens(), vocab_->bos(), vocab_->eos(),
-             vocab_->chat_template().empty() ? ", no chat template" : "");
 
     /* Build the grammar engine's vocabulary index now rather than on the first grammar request
      * (nearly every tool-calling request has one), so admission pays only for its own grammar. */

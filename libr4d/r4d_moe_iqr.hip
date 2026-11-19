@@ -229,7 +229,7 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
     static_assert(!PK || MAP, "packed entries: the run map's grid");
     constexpr uint32_t NW = KW * RTB, NTHR = NW * kWave, kCols = RTB * TPW * 16u;
     /* `mode`: bit 0 `a_sorted`, bits 1-2 the class shift, bit 3 the activation's scale per 256 of
-     * K, bit 4 the short token-order parity grid, bits 8+ `parts` (r4d_moe.hip's). */
+     * K, bits 8+ `parts` (r4d_moe.hip's). */
     const uint32_t a_sorted = mode & 1u, cshift = (mode >> 1) & 3u, ash = (mode >> 3) & 1u;
     const uint32_t parts = mode >> 8;
     /* the waves' transpose tiles, then their partials (8 x 32 floats a wave, in its own tile) */
@@ -265,21 +265,6 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
             re = oe < T ? oe : T;
             if (re > rs + kRows * NT) re = rs + kRows * NT;
         }
-    } else if (mode & 16u) {
-        /* A short verification batch must use the single-token dot and K reduction even when
-         * several tokens route to the same expert. One block owns one sorted slot; locate its
-         * expert from the monotonic offsets. Dropped slots are zeroed just as in the run grid. */
-        rs = blockIdx.x;
-        if (rs >= T) return;
-        if (rs >= (uint32_t)off[n_expert]) { zero_rows(rs, rs + 1u); return; }
-        uint32_t lo = 0, hi = n_expert;
-        while (lo < hi) {
-            const uint32_t mid = (lo + hi) / 2u;
-            if ((uint32_t)off[mid + 1u] <= rs) lo = mid + 1u;
-            else hi = mid;
-        }
-        e = lo;
-        re = rs + 1u;
     } else {
         /* The (tile, run) grid. The block's first wave finds the run and the others take it from
          * LDS after one barrier: each of its lanes holds kMaxExpert / 32 consecutive experts'
@@ -716,19 +701,11 @@ constexpr uint32_t kPackTiles = 8;
  * (16384 rows at 512 experts, a pass of 1639 tokens at top 10). A constant, so recorded and live
  * passes take the same kernels. */
 constexpr long long kPackMinRowsPerExpert = 32;
-/* The map's token tiles, pinnable for tests: 0 the rule (RADIANCE_MOE_IQR_MAP_TILES gives the pin
- * its first value), 4 the run map, 8 the packed map wherever the form has it. r4d_selftest compares
- * them byte for byte. */
-static std::atomic<int> g_moe_iqr_map_tiles{-1};
+/* The map's token tiles, pinnable for tests: 0 the rule, 4 the run map, 8 the packed map wherever
+ * the form has it. r4d_selftest compares them byte for byte. */
+static std::atomic<int> g_moe_iqr_map_tiles{0};
 static uint32_t map_tiles_pin() {
-    int v = g_moe_iqr_map_tiles.load(std::memory_order_relaxed);
-    if (v < 0) {
-        const char* e = std::getenv("RADIANCE_MOE_IQR_MAP_TILES");
-        v = e ? std::atoi(e) : 0;
-        if (v != (int)kMapTiles && v != (int)kPackTiles) v = 0;
-        g_moe_iqr_map_tiles.store(v, std::memory_order_relaxed);
-    }
-    return (uint32_t)v;
+    return (uint32_t)g_moe_iqr_map_tiles.load(std::memory_order_relaxed);
 }
 /* The routed rows between which a narrow-K wave takes two weight tiles. Flash-Next's down
  * projection (2560 x 384:256, 512 experts, top 10), us a launch at one tile -> two: 10 rows 11.1 ->
@@ -787,8 +764,7 @@ int launch_form(const Launch& g, RadStream stream) {
      * a wide K (eight 128-K blocks and up) under kOneWaveMinRows routed rows is shared between
      * four waves a tile, and a narrow one between kTwoTileMinRows and kTwoTileMaxRows rows gives a
      * wave two tiles in turn and a block eight. */
-    const bool wide_k = g.nkb >= 8u &&
-                        ((g.mode & 16u) || g.T < kOneWaveMinRows || (g.N / 16u) % 4u);
+    const bool wide_k = g.nkb >= 8u && (g.T < kOneWaveMinRows || (g.N / 16u) % 4u);
     const bool two = !wide_k && g.nkb < 8u && g.N % (16u * 8u) == 0u &&
                      g.T >= kTwoTileMinRows && g.T <= kTwoTileMaxRows;
     if (g.map && g.packed) {
@@ -904,13 +880,7 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
     if (M < (a_sorted ? T : (T + top_k - 1) / top_k)) return R4D_NO(RAD_E_SHAPE);
 
     g.nkb = (uint32_t)(K / kBlock);
-    /* The common short verification shape uses the same wide-K dot reduction as a one-token
-     * gate/up. Limit this to geometries whose one-token step takes that decode path; larger batches
-     * retain the throughput-oriented run/map kernels. */
-    const bool parity_rows = !a_sorted && top_k < (long long)kOneWaveMinRows &&
-                             T > top_k && T <= 8 * top_k && g.nkb >= 8u &&
-                             r4d_moe_in_decode_band(top_k, n_expert);
-    const bool band = parity_rows || r4d_moe_in_decode_band(T, n_expert);
+    const bool band = r4d_moe_in_decode_band(T, n_expert);
     /* a narrow-K projection and the run map's grid take four weight tiles a block */
     if (((!band || g.nkb < 8u) && (N / 16) % 4) || (N / parts) % 16) return R4D_NO(RAD_E_SHAPE);
     g.x = (const int8_t*)Aq->data;
@@ -932,7 +902,7 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
     g.inv_ft = parts > 1 ? (uint32_t)(((uint64_t)1 << 32) / (uint64_t)(N / parts / 16) + 1u) : 0u;
     const uint32_t cshift = ncls == 4 ? 2u : 1u;
     g.mode = (a_sorted ? 1u : 0u) | cshift << 1 | (a_group == 2 * (long long)kBlock ? 8u : 0u) |
-             (parity_rows ? 16u : 0u) | (uint32_t)parts << 8;
+             (uint32_t)parts << 8;
 
     if (band) {
         g.map = nullptr;

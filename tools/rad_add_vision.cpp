@@ -64,7 +64,11 @@ struct VisionJob {
 int copy_vocab(RadWriter& writer, const RadFile& base, bool aux) {
     const VocabSection section = aux ? base.aux_vocab() : base.vocab();
     if (!section) return RAD_OK;
-    if (section.h->flags & ~uint64_t(RAD_VOCAB_IGNORE_MERGES)) return RAD_E_UNSUPPORTED;
+    if (section.h->flags & ~uint64_t(RAD_VOCAB_IGNORE_MERGES)) {
+        RAD_ERR("--add-vision: the container's %svocabulary carries flags 0x%llx this tool does not "
+                "copy", aux ? "auxiliary " : "", (unsigned long long)section.h->flags);
+        return RAD_E_UNSUPPORTED;
+    }
     VocabBuild vocab;
     RAD_TRY(vocab_deserialize(base.base(), base.size(), section.h, vocab));
     struct Sink : StringSink {
@@ -272,7 +276,10 @@ int rad_add_gemma4_vision(const std::string& base_path, const std::string& input
         new_weight.layer = g.layer; new_weight.expert = g.expert; new_weight.slot = g.slot;
         jobs.push_back({std::move(new_weight), nullptr, cw});
     }
-    if (jobs.size() == (size_t)base.entry_count()) return RAD_E_FORMAT;
+    if (jobs.size() == (size_t)base.entry_count()) {
+        RAD_ERR("--add-vision: the checkpoint has no vision weights the container lacks");
+        return RAD_E_FORMAT;
+    }
     RAD_INFO("--add-vision: %lld base weights to copy, %zu BF16 vision weights to add",
              (long long)base.entry_count(), jobs.size() - (size_t)base.entry_count());
     if (plan_only) return RAD_OK;

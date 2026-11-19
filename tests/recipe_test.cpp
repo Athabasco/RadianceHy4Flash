@@ -125,6 +125,11 @@ bool has_opt(const RecipeRule* r, const char* k, const char* v) {
         if (kk == k && vv == v) return true;
     return false;
 }
+bool has_key(const RecipeRule* r, const char* k) {
+    for (const auto& kv : r->options)
+        if (kv.first == k) return true;
+    return false;
+}
 }  /* namespace */
 
 TEST(the_q38_native_mtp_overlay_only_changes_draft_weights) {
@@ -436,7 +441,7 @@ TEST(the_museglimmer_iq4r_v4_recipe_selects_the_trellis_trunk) {
         if (std::string(n).find("ffn_") != std::string::npos)
             CHECK(has_opt(m, "calib", "/tmp/muse-glimmer-calib"));
         else
-            CHECK(!has_opt(m, "calib", "$CALIB"));
+            CHECK(!has_key(m, "calib"));
         CHECK(has_opt(m, "tcq_order", "1"));
     }
     const RecipeRule* kv = r.match("blk.1.attn_k.weight");
@@ -452,7 +457,7 @@ TEST(the_museglimmer_iq4r_v4_recipe_selects_the_trellis_trunk) {
         CHECK(has_opt(m, "tcq_code", "mad"));
         CHECK(has_opt(m, "tcq_rows", "256"));
         CHECK(has_opt(m, "transform", "fwht128"));
-        CHECK(!has_opt(m, "calib", "$CALIB"));
+        CHECK(!has_key(m, "calib"));
     }
     CHECK(has_opt(r.match("dflash.blk.0.ffn_down.weight"), "codes", "u3"));
     CHECK(has_opt(r.match("dflash.blk.0.attn_q.weight"), "codes", "u4"));
@@ -607,9 +612,19 @@ TEST(the_ling_tiny_iq8r_recipe_decides_the_model_it_was_written_for) {
  * K)), the 512 routed experts of a layer rotated four-bit codes into the w4nl codebook at an E4M3
  * scale a (row, 64 of K). Flash's MLA has no query LoRA, so no q_a norm is cast. The KDA beta, the
  * MLA's q parts, kv projections and head gate, the convolution taps, the embedding and the head
- * match no rule and keep the checkpoint's bf16. The experts name their statistics through $CALIB, so the test
- * sets it. */
+ * match no rule and keep the checkpoint's bf16. The experts name their statistics through $CALIB,
+ * so the test sets it. */
 TEST(the_ling_flash_iq8r_w4nl64_recipe_decides_the_model_it_was_written_for) {
+    const char* old_calib = std::getenv("CALIB");
+    const std::string saved_calib = old_calib ? old_calib : "";
+    struct RestoreCalib {
+        bool had;
+        const std::string& value;
+        ~RestoreCalib() {
+            if (had) ::setenv("CALIB", value.c_str(), 1);
+            else ::unsetenv("CALIB");
+        }
+    } restore_calib{ old_calib != nullptr, saved_calib };
     ::setenv("CALIB", "/data/calib", 1);
     const std::string dir = std::string(__FILE__).substr(
                                 0, std::string(__FILE__).find_last_of('/')) + "/../data/recipes";

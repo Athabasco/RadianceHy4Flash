@@ -361,8 +361,24 @@ private:
     std::string             scope_;
 };
 
-/* Returns the first negative status from a declare step. */
-#define RAD_ARCH_TRY(expr)  do { int _s = (expr); if (_s < 0) return _s; } while (0)
+/* Returns the first negative status from a declare step, and says where the status crossed. A
+ * step can return a status with no message of its own, and a failed declare would then report
+ * the status alone. Every level the status passes prints one line, innermost first, so the lines
+ * read as the path from the step that failed up to the plugin's declare. */
+#ifdef __FILE_NAME__
+#define RAD_ARCH_FILE __FILE_NAME__
+#else
+#define RAD_ARCH_FILE __FILE__
+#endif
+#define RAD_ARCH_TRY(expr)                                                                  \
+    do {                                                                                    \
+        int _s = (expr);                                                                    \
+        if (_s < 0) {                                                                       \
+            fprintf(stderr, "radiance: declare: %s, from %s:%d\n", rad_strerror(_s),        \
+                    RAD_ARCH_FILE, __LINE__);                                               \
+            return _s;                                                                      \
+        }                                                                                   \
+    } while (0)
 
 /* ================================================================== C++-side decl helpers */
 /* C++ forms of rad_group_layer() and friends, which are C compound literals (a GNU extension in
@@ -1500,8 +1516,8 @@ inline void batch_split(const RadBatch* b, int64_t* n_seq_dec, int64_t* n_tok_de
  *   kQsaOnce    the attention reads a selection (the sparse row a query) on a step entirely at or
  *               below the bound: every complete block is taken whatever it scores, so the
  *               selection depends on the positions and the block table alone and is the same
- *               bytes at every layer. The first full-attention layer of the pass issues it as
- *               always; no later layer issues a query, a score or a select. */
+ *               bytes at every layer. The first full-attention layer of the pass issues it;
+ *               no later layer issues a query, a score or a select. */
 enum QsaUse : int { kQsaSelect = 0, kQsaUnread = 1, kQsaOnce = 2 };
 
 /* Ops of a chain that is independent of a block's own, for the block to issue behind its ordered
@@ -1520,8 +1536,9 @@ struct SideOps {
     void at(int stage) const { if (fn) fn(u, stage); }
 };
 
-/* RADIANCE_DEBUG_QSA_EAGER: every step is kQsaSelect, the issue sequence before the forms above
- * existed. An instrument for comparing the two (the text must not move); read once. */
+/* RADIANCE_DEBUG_QSA_EAGER: every step is kQsaSelect, each layer issuing its own selection. An
+ * instrument for comparing that sequence with the forms above (the text must not move); read
+ * once. */
 inline bool qsa_eager() {
     static const bool on = std::getenv("RADIANCE_DEBUG_QSA_EAGER") != nullptr;
     return on;

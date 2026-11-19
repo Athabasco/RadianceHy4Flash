@@ -719,7 +719,7 @@ TEST(a_lone_spanned_prefill_takes_its_tail_snapshot_inside_its_last_chunk) {
     /* No tail snapshot: the last boundary crossed, 768, inside [512, 830). */
     CHECK_EQ(f.sch.plan_chunk(512, 830, 512, &ck), 318);
     CHECK_EQ(ck, 768);
-    /* Mid-prompt chunks and a prompt ending on its tail are as before. */
+    /* Mid-prompt chunks and a prompt ending on its tail plan as without the cut. */
     CHECK_EQ(f.sch.plan_chunk(256, 2000, 512, &ck), 512);
     CHECK_EQ(ck, 768);
     CHECK_EQ(f.sch.plan_chunk(768, 960, 512, &ck), 192);
@@ -780,8 +780,8 @@ TEST(a_tail_snapshot_inside_the_last_chunk_has_no_quarter_interval_floor) {
     /* A last chunk that crosses no boundary, 3136 (64 past 3072), as well. */
     CHECK_EQ(f.sch.plan_chunk(3072, 3150, 2048, &ck), 78);
     CHECK_EQ(ck, 3136);
-    /* A tail on the boundary itself is that boundary's snapshot, as before; one past a quarter
-     * interval as before too. */
+    /* A tail on the boundary itself is that boundary's snapshot; so is one past a quarter
+     * interval. */
     CHECK_EQ(f.sch.plan_chunk(1024, 2090, 2048, &ck), 1066);
     CHECK_EQ(ck, 2048);
     CHECK_EQ(f.sch.plan_chunk(1024, 2400, 2048, &ck), 1376);
@@ -2243,6 +2243,28 @@ TEST(an_idle_engine_fails_a_waiter_it_cannot_start) {
     CHECK_EQ((int)f.sch.find(id)->state, (int)ReqState::Failed);
     CHECK(f.sch.step() == nullptr);
     CHECK_EQ(f.sch.metrics().queue_depth, 0);
+}
+
+/* The room gate counts the prompts this step already admitted, and a prompt it holds back holds
+ * the queue behind it. 40 blocks of 16 tokens: A's 350-token prompt takes 22, so B's needs 22 more
+ * than are left beside A (and the one past A), and C, a short prompt behind B, waits with B
+ * rather than taking the room B waits for. */
+TEST(the_room_gate_counts_this_steps_admissions_and_holds_the_queue_behind_a_long_prompt) {
+    Fixture f;
+    f.build(/*blocks=*/40, /*states=*/64, /*max_tok=*/512);
+    f.cfg.prefill_room_gate = true;
+    f.cfg.prefix_cache = false;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(350, 8);
+    const uint64_t b = f.submit(350, 8);
+    const uint64_t c = f.submit(20, 8);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK(f.sch.find(a)->n_computed > 0);
+    CHECK_EQ(f.sch.find(b)->n_computed, (int64_t)0);
+    CHECK_EQ(f.sch.find(c)->n_computed, (int64_t)0);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Waiting);
+    CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Waiting);
 }
 
 /* Two prefills that cannot both stay up. Resetting the higher-priority one so the lower one can

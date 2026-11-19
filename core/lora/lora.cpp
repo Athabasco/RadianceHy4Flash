@@ -621,8 +621,7 @@ bool op_is_site(const Program& prog, const OpInfo& op, rad_weight* b_out, std::s
      * gemm_nt_bias) is fed what the architecture hands it: plain activations, with the kernel
      * library's layout/relayout hooks presenting the planes in the plain basis at load (a plain
      * kernel with no such hook is refused at declare by its own layout, RAD_E_DTYPE). A resolved
-     * plain GEMM over a transformed encoding is therefore basis-safe for the adapter epilogue.
-     * Upstream: https://codeberg.org/StillDeadcode/radiance/issues/475 */
+     * plain GEMM over a transformed encoding is therefore basis-safe for the adapter epilogue. */
     if ((gq || gqb) && w.enc_known && w.enc.transform[0])
         return no(fmt("weight '%s' is stored in the '%.*s' transform basis, so its GEMM is fed a "
                       "transformed activation", w.name.c_str(), (int)RAD_ENC_STR, w.enc.transform));

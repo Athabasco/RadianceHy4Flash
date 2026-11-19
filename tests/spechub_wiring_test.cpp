@@ -108,7 +108,7 @@ TEST(spechub_wiring_the_device_rows_are_production_and_the_oracle_rows_are_refer
     CHECK_EQ(refonly.size(), (size_t)0);
 #else
     /* No card: every op is oracle-only, and the gate must still see them as such. */
-    CHECK_EQ(refonly.size(), (size_t)3);
+    CHECK_EQ(refonly.size(), (size_t)4);
 #endif
 }
 

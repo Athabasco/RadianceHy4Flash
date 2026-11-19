@@ -1,6 +1,6 @@
 # plugin/lora_plain -- plain bf16 views of rotated int8 weight planes, so the core runtime LoRA
 # machinery can bind adapters to W8A8-rotated trunk modules: the site gate accepts a plain fp GEMM
-# over a transform-basis weight (https://codeberg.org/StillDeadcode/radiance/issues/475) and this
+# over a transform-basis weight (core/lora/lora.cpp, op_is_site) and this
 # library presents the planes in the plain basis at load so the adapter epilogue sees plain
 # activations.
 #

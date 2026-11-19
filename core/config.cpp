@@ -82,7 +82,7 @@ static const Flag g_flags[] = {
                                         "completed mixed steps; 0 (default) is off" },
     { "--prefill-room-gate",  "MODE",   "on: a fresh prefill starts only when its whole prompt plus one\n"
                                         "decode position fits beside every runner; off (the default)\n"
-                                        "admits the first chunk alone, as before the gate" },
+                                        "admits a prompt when its first chunk fits" },
     { "--preempt-wait-ms",    "N",      "how long a preempted prefill may wait for the whole-\n"
                                         "recompute gate before reclaiming cache blocks and\n"
                                         "preempting the lowest-priority running request; 0\n"
@@ -254,8 +254,9 @@ static const Flag g_flags[] = {
     "                                    the step once the product of the head's probabilities along it falls\n"
     "                                    below --draft-depth-stop, and the next verify carries only the drafts\n"
     "                                    made (1 .. --draft-depth-max). Same output law (the rule reads the\n"
-    "                                    draft's own laws only); needs --draft-coupling on and --draft-window\n"
-    "                                    fixed (both choose the depth, so they are not served together)" },
+    "                                    draft's own laws only); switches --draft-coupling on (an explicit\n"
+    "                                    off is refused) and needs --draft-window fixed (both choose the\n"
+    "                                    depth, so they are not served together)" },
     { "--draft-depth-max",    "N",      "--draft-depth adaptive: the deepest chain (default 0 =\n"
                                         "num-speculative-tokens)" },
     { "--draft-depth-min",    "N",      "--draft-depth adaptive: rounds that always run (default 1)" },

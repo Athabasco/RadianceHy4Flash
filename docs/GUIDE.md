@@ -682,7 +682,7 @@ A key sits at one of these levels:
 | level | holds |
 |---|---|
 | `server:` | the listener and the process: `host`, `port`, `api-key`, `api-key-env`, `allow-host`, `trusted-proxy`, `http-threads`, `read-timeout`, `write-timeout`, `keep-alive-timeout`, `max-body-mib`, `retry-after`, `no-cors`, `live`, `radiance-home`, `kernels`, `download-dir`, `log` (`info`, `debug` or `trace`), `proceed-with-incompatible-configuration`, `debug-accept-reference-kernels` |
-| `memory:` | the per-card budgets: `gpu-headroom-mib`, `gpu-memory-mib`, `host-headroom-mib`; and `host-mib`, the pinned host memory the process may hold, and `disk-tier`, a directory for parked models' copies |
+| `memory:` | the per-card budgets: `gpu-headroom-mib`, `gpu-memory-mib`, `host-headroom-mib`; `card-headroom-mib: {CARD: MiB}`, a reserve for one card in place of `gpu-headroom-mib` (the card that drives a desktop); and `host-mib`, the pinned host memory the process may hold, and `disk-tier`, a directory for parked models' copies |
 | `scheduler:` | `load-timeout`, `drain-timeout`, `keepalive` |
 | `cards:` | `all` or a list of card indices the models may use |
 | `groups:` | `together` and `exclusive` lists of model names |
@@ -1068,8 +1068,8 @@ one for one with the key); a larger headroom that lost part of itself is reporte
 What the engine allocates after reading the card is charged before the split, not to the headroom:
 the step staging, the KV tiers' copy staging and the hardware queues. The driver backs each queue
 with VRAM beyond its ring (33 MiB on an R9700), so startup measures one and the receipt's `hardware
-queues` line shows the count and price. It also includes the queue scratch the runtime keeps once a kernel with a private
-segment has run (5 MiB a compute unit, 160 MiB on an R9700).
+queues` line shows the count and price. It also includes the queue scratch the runtime keeps once a
+kernel with a private segment has run (5 MiB a compute unit, 160 MiB on an R9700).
 
 ### 4.4 Long context
 
@@ -1490,22 +1490,23 @@ nothing); a next turn then resumes from the deepest snapshot a chunk end left, t
 span boundary, and re-prefills up to an interval more. For single-shot prompts (benchmarks, one
 question per document) off is the faster schedule; for conversations that come back, on.
 
-Where the model's plugin can snapshot inside a step (Flash-Next, `qwen4exp_fp8`), a prefill alone
-in its spanned step (`prefill-span` above 1) gets both: its last chunk runs to the prompt's end
+Where the model's plugin can snapshot inside a step (Flash-Next, `qwen4exp_fp8`) and a hit resumes
+at the nearest snapshot (`prefix-resume: nearest`), a prefill alone in its spanned step
+(`prefill-span` above 1) gets both: its last chunk runs to the prompt's end
 and the tail snapshot is taken inside it, at the same position. Everything that carries state
 across the snapshot -- the delta net's recurrence and convolution, the indexer's key ring, the PLE
 windows -- runs over the rows before it and the rows after it as two pieces, each what a chunk of
 those rows computes, and copies its slot to a stage on the card between them; the connection reads
 are cut there too, and the routed GEMMs give each expert's rows before it a run of their own. The
-snapshot holds the bytes the cut schedule's step leaves (a next turn resumes and answers exactly as
-before), and the step of the last tokens is gone. Cutting nothing, it also needs no quarter
-interval past the boundary below it: a prompt whose last quantum boundary lies less far past it,
-which the cut schedule leaves at that boundary, takes its tail snapshot at that last quantum
+snapshot holds the bytes a step cut at the snapshot leaves (a next turn resumes and answers as it
+would from that step), and no step of the last tokens is needed. Cutting nothing, it also needs no
+quarter interval past the boundary below it: a prompt whose last quantum boundary lies less far
+past it, which a cut schedule leaves at that boundary, takes its tail snapshot at that last quantum
 boundary all the same, and a next turn re-prefills under a quantum rather than up to a quarter
-interval. The stage is one snapshot a rank on the card
-(57.1 MiB a rank on Flash-Next at TP2), taken from the KV pool only where `prefill-span` is above 1
-and the prefix cache is on; such a snapshot goes to its host slot from there in one copy. `RADIANCE_CKPT_INSIDE=0` keeps the cut, `RADIANCE_CKPT_STAGE=0` the
-stage and the cut. A step shared with other work keeps the cut. Prompts of documentation text (whose
+interval. The stage is one snapshot a rank on the card (57.1 MiB a rank on Flash-Next at TP2),
+taken from the KV pool only where all of that holds and the prefix cache is on; such a snapshot goes
+to its host slot from there in one copy. A step shared with other work is cut at the snapshot
+instead. Prompts of documentation text (whose
 last tokens read most experts) at 4.8-6.6K tokens: 843 -> 785 ms, 896 -> 850, 1110 -> 1007; filler
 text 6-24K: about -1%.
 
@@ -1761,7 +1762,7 @@ adaptive (final)`). On Qwen3.8-Flash-Next (2x R9700, traversal verify) a cap of 
 cap of 7 gained no more, a deep verify row costing more than a shallow one. The stop is not
 sensitive between 0.80 and 0.90. The engine keeps 48 recorded passes instead of 24 (an adaptive
 chain makes more pass shapes than 24 hold: 3352 recordings per benchmark became 1472, +1.7% tokens a
-second for this mode); the other modes touch no more than they did.
+second for this mode); the other modes make no more pass shapes than 24 hold.
 
 **Several sequences in one step: `draft-depth-load: on`.** The stop rule prices a draft as one stream pays
 for it: its verify row and the head round that makes it. With several sequences drafting in one step the
@@ -1780,7 +1781,7 @@ default) chooses each row's verified drafts again from those -- draft j by the l
 the one after it -- so a chain that turned unsure after its round was issued costs the round but no verify
 row, and the rows are cut back to a tile where the tile costs more than the drafts past it yield. A step
 with fewer sequences is decided by the stop rule exactly as without the key, so a single stream is served
-bit for bit as before.
+bit for bit as the stop rule serves it.
 
 ```yaml
     max-num-seqs: 8
@@ -1806,26 +1807,26 @@ verifies and step times that are over -- draws at coordinates the step in hand n
 follow the run, and the two controls that fail it: a choice that reads the law after the draft, and tables
 made from the step's own verify). Requests that share a seed share those coordinates, as under
 `draft-calib: online`. Shutdown logs what was measured (`draft depth load-aware (final)`), and
-`RADIANCE_CONC_LOG=<file>` writes one line a decode step (rows, rounds, each chain's depth and confidences,
+`RADIANCE_DEBUG_CONC_LOG=<file>` writes one line a decode step (rows, rounds, each chain's depth and confidences,
 the accepted counts) for study; nothing reads it back. On Qwen3.8-Flash-Next (2x R9700, traversal
 verify, `max-num-seqs: 8`, BetterBench's concurrency sweep, 48 requests a run) eight streams in one server
 session, the rule switched between runs, made 565 tokens a second against the stop rule's 557 at
 temperature 1.0 (+1.5%, two runs each) and 572 against 556 at 0.7 (+2.9%); one, two and four streams are
-the stop rule's and unchanged. Those runs had `hc_read`'s 48-row tile for 33..48 rows (a separate
+the stop rule's. Those runs had `hc_read`'s 48-row tile for 33..48 rows (a separate
 change), under which a verify past 32 rows costs about a millisecond more; with a dearer tile the rule has
 more to avoid.
 
-**SuffixDecoding as a step selector: `draft-suffix`.** `draft-suffix: on` (default off, which is the
-engine as it was, bit for bit) lets a serial head's chain give a step to the sequence's own history.
+**SuffixDecoding as a step selector: `draft-suffix`.** `draft-suffix: on` (default off: every step
+is the head's) lets a serial head's chain give a step to the sequence's own history.
 After each commit the engine looks, in the sequence's prompt and output, for an earlier occurrence of
 its last `draft-suffix-min-match` tokens (default 6; the longest of that length and three more wins,
 the latest occurrence of it). If there is one, the next step is a pure verify of what followed it (a
 chain of at most `draft-suffix-max` rows, default 7) in place of the head's draft, cut where the path
 score falls under `draft-suffix-min-score` (default 0.3): SuffixDecoding's frequency rule (Oliaro et
 al., arXiv 2411.04975), the product along the chain of how often that token followed that context in
-the history. Otherwise the step is the head's, as before. It pays where the reply copies its context
-(code edits, quoting, agent and tool loops, pasted text, structured output) and does nothing on free
-chat. A cross-request suffix tree adds nothing on such loads and is not built.
+the history. Otherwise the step is the head's. It pays where the reply copies its context (code
+edits, quoting, agent and tool loops, pasted text, structured output) and does nothing on free chat.
+The history searched is the request's own: a tree over other requests is not built.
 
 It works with the normal fixed MTP chain, with `draft-depth: adaptive` (the adaptive chain stays within
 the head's `num-speculative-tokens` rounds; the suffix window only widens the verify) and with
@@ -2001,7 +2002,7 @@ bits a value): coded, a long prompt's prefill gains 2.6 to 2.9% on 2x R9700 (24K
 tok/s, 47K 6251 to 6414). A message under the floor stays plain: the two forms cost the same near
 280 KiB, an eight-stream decode or verify step is 240 KiB, and a one-stream step, bound by its
 handshake and not its bytes, is slower coded (a 20 KiB reduction 3.7 us plain and 5.5 coded, 3.8% of
-decode throughput). `R4D_AR_CODED_MIN_KB` (§8) moves the floor.
+decode throughput).
 
 A large coded message would otherwise take the link's time and then the card memory's time (every
 block pushes its range, then decodes the peer's and writes the streams). From 4 MiB (the write) and
@@ -2009,8 +2010,7 @@ block pushes its range, then decodes the peer's and writes the streams). From 4 
 j - 1 while part j crosses the link (8 parts for the write, 6 for the gather): the same bytes, about
 the longer of the two times instead of their sum. An 8192-row chunk's write takes 1639 instead of
 2015 us and its gather 2015 instead of 2235 us on 2x R9700; decode and verify messages stay far
-below. `R4D_AR_CODED_STAGES` / `R4D_AR_CODED_STAGES_G` (§8) set the parts, `0` keeps the
-single-phase coded kernel.
+below.
 
 **Cards without peer access.** The all-reduce kernels normally write into the other card's memory
 directly (P2P). At launch radiance asks the driver whether each pair of cards can, and logs the
@@ -2614,6 +2614,7 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | key | default | |
 |---|---|---|
 | `max-num-batched-tokens: N` | 2048 | largest token count one step may carry |
+| `prefill-room-gate: MODE` | off | `on`: a fresh prompt is admitted only when the whole prompt and one decode position fit the KV cache beside every running sequence and every prompt admitted ahead of it, and the requests behind it wait with it; a prompt that cannot fit even with nothing running fails (`idle_admission`) instead of waiting; long prompts then run one after another. `off`: a prompt is admitted when its first chunk fits, so a long one may fill the cache mid-prompt and be preempted, recomputing from its start |
 | `prefill-interleave: N` | auto:1 (0 under `deterministic: true`, KL mode, generators) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64; `auto` fits them in a quarter of the chunk step's measured time, `auto:SHARE` in SHARE of it (0 < SHARE <= 4); `0` lets every step carry a chunk |
 | `mixed-step-target-ms: N` | 0 (off) | soft completed-service-time target for mixed prefill/decode steps; learns one aggregate prefill cap while decoders are active and leaves uncontended prefill unchanged (§4.5) |
 | `preempt-wait-ms: N` | 5000 | how long a preempted prefill may wait for its whole-recompute gate before reclaiming cache blocks and preempting lowest-priority running requests until one overdue request can prefill; `0` falls back on the next step. A preempted request publishes what it computed to the prefix cache, as a finished one does, so its recompute adopts its prompt instead of computing it again; under pressure the cache gives those blocks back, the newest last, before another request is preempted |
@@ -2841,7 +2842,7 @@ keys are refused on it, and so are the pixel bands.
 | `POST /v1/responses`, `POST /v1/responses/input_tokens` | OpenAI's Responses API, for Codex and the OpenAI SDKs' `responses` client (§5.9) |
 | `POST /completion`, `/completions`, `POST /infill` | llama-server's native completion and fill-in-the-middle, for llama.vim, llama.vscode and clients of llama-server's own API (§5.9) |
 | `GET /v1/models`, `/v1/models/:id` | what is loaded, with `max_model_len` (the context it serves) and `root` (the `model` path) as vLLM reports them, and `capabilities` (the same object `/server_info` reports); `:id` returns the entry itself, as OpenAI's retrieve does |
-| `GET /health`, `/v1/health`, `/ping`, `POST /ping` | liveness; 503 with `"status": "stuck"` once the device has advanced nothing for a minute. A device stuck for `scheduler.stuck-exit` (60s; `0` never) ends the process (exit status 70, the queues it is stuck on in the log), so a restart policy brings the server back |
+| `GET /health`, `/v1/health`, `/ping`, `POST /ping` | liveness; 503 with `"status": "stuck"` once the device has advanced nothing for a minute. A device stuck for `scheduler.stuck-exit` (60s; `0` never) ends the process (exit status 70, the queues it is stuck on in the log), so a restart policy brings the server back. The exit is armed once the first model has finished loading: a stall during that first load is logged with the queue state and reported by `/health`, and does not end the process |
 | `GET /load` | current load |
 | `GET /version` | server version |
 | `GET /props` | llama-server's props: `n_ctx`, `total_slots`, `modalities`, `model_path`, the chat template and its capabilities, `bos_token`/`eos_token`, and the request defaults under llama-server's names. Keyless, `model_path` and the template source answer the local operator only (§6.6); the capability flags stay open — clients build requests from them |
@@ -4301,6 +4302,8 @@ curl -s http://localhost:8000/generate -H 'Content-Type: application/json' \
     -d "{\"image\": \"$(base64 -w0 penguin.png)\"}" -o penguin.glb
 ```
 
+- **`model`** names the shape model where the process serves several (the front routes by it, as
+  for every route); `?model=NAME` in the query does the same. A one-model process ignores it.
 - **`image`** is the picture as base64 (a data URL is taken too). Give it an alpha channel that cuts
   the object out: the reference removes an opaque picture's background with rembg first, which this
   server does not, so an opaque picture is taken whole, background and all. The picture is prepared
@@ -4704,7 +4707,7 @@ is the part of a log to paste into an issue. Its sections:
   warning is also printed as a `W` line of its own.
 
 ```
-I STARTUP REPORT -- radiance 2.1.0
+I STARTUP REPORT -- radiance 2.2.0
 I CONFIGURATION -- every option, the value in force, and where it came from
 I   --model                            /models/flashnext.rad                       [models.flashnext.model]
 I   --tp                               2                                           [models.flashnext.tp]
@@ -4770,6 +4773,46 @@ rad-kbench --home $RADIANCE_HOME --max-cases 1   # are the kernels correct?
 
 ---
 
+### 7.3 Moving a 1.x deployment to 2.x
+
+A 1.x server was one model configured by flags. A 2.x server reads one YAML file that names every
+model it serves ([`docs/MULTIMODEL.md`](MULTIMODEL.md) §4). Moving over takes three steps.
+
+**1. The settings.** Start the 2.x binary with the 1.x command line, or hand the flags to
+`rad-yaml`: both print the same settings as a file and start nothing.
+
+```sh
+rad-yaml --model /models/m.rad --tp 2 --max-num-seqs 8 --kv-cache-dtype fp8 > radiance.yaml
+radiance --config radiance.yaml --check        # reads and validates the file, serves nothing
+```
+
+The printed file is the command line, key for key; it is not yet a file 2.x accepts if the command
+line used something 2.x no longer serves. `--served-model-name` becomes the entry's name under
+`models:`, and `aliases:` adds more ids. The compose files of 1.x are replaced by
+`deploy/compose/tp1.yaml` and `tp2.yaml`, with the server's file beside each
+(`tp1.radiance.yaml`, `tp2.radiance.yaml`).
+
+**2. The KV cache.** `kv-cache-dtype: fp8_v4` and `k6_v4` are refused, and `fp8` is refused by
+every model but the few whose plugin keeps an E4M3 cache. `i8` is the 8-bit cache (int8 keys and
+values with a scale per token and head) and `bf16` the other. An `i8` token costs more memory than
+a `k6_v4` token did, so the pool holds fewer of them: the `kv:` line of the startup log says which
+share of `max-num-seqs` sequences at `max-model-len` the pool backs. Below 100%, lower one of the
+two or, on a tiered model, raise `host-pool-mib`, which leaves the cache more of the card.
+
+**3. The container.** 2.x serves int8 and bf16 weights. A container whose weights are block FP8,
+MXFP4, M2XFP4 or ParoQuant, or whose experts read E4M3 activations, is refused at startup by the
+name of the first such weight; the file names of those containers mostly end in `-fp8.rad` or
+`-mxfp4.rad`, and the Flash-Next container of 1.x is `...-fp8-iq4r-moe.rad`. The README's model
+table lists the container that serves each model now (`...-iq8r.rad`, `...-iqr-v4.rad`,
+`...-i8.rad`), with its download. A model with no such container is converted again from its bf16
+checkpoint with an IQ8R recipe from `data/recipes` (README, "Convert a checkpoint"). A container
+with an int8 or bf16 trunk and a block-FP8 drafter serves without the drafter under
+`num-speculative-tokens: 0`.
+
+Two more things changed that a deployment can meet. An out-of-tree plugin is rebuilt against the
+release's ABI. And a device that advances nothing for `scheduler.stuck-exit` (60s) ends the
+process, so that a restart policy brings the server back; `0` turns that off.
+
 ## 8. Environment
 
 **Operation**
@@ -4782,9 +4825,6 @@ rad-kbench --home $RADIANCE_HOME --max-cases 1   # are the kernels correct?
 | `ROCM_PATH` | where ROCm lives, if not `/opt/rocm` (build time) |
 | `HF_TOKEN` | for `scripts/hfget.sh` and `model: <owner/name>` on a gated or private repo |
 | `XDG_CACHE_HOME` | where `model: <owner/name>` fetches to without `server.download-dir` (`$XDG_CACHE_HOME/radiance/hf`, else `~/.cache/radiance/hf`) |
-| `R4D_AR_CODED_MIN_KB` | the smallest message, in KiB, the two-rank fused all-reduce writes send coded (§4.7; lossless, the same bytes out): `0` codes every message that fits the form, `off` none. Unset, 512 |
-| `R4D_AR_CODED_STAGES`, `R4D_AR_CODED_STAGES_G` | parts a block of a coded two-rank fused write (`_G`: its gather form) cuts its range into, each with its own handshake, so the push of one part and the fold of the one before overlap (§4.7; the same bytes out). `0` keeps the single-phase coded kernel. Unset, 8 and 6 |
-| `R4D_AR_CODED_STAGES_MIN_KB`, `R4D_AR_CODED_STAGES_G_MIN_KB` | the smallest coded message, in KiB, that takes the staged form (write, gather form). Unset, 4096 and 6144 |
 | `R4D_AR_MAX_BLOCKS` | a ceiling on libr4d's collective block counts, for two tensor-parallel engines on one set of cards; set it in both (below). The MoE models' hyper-connection gathers keep the minimum their LDS table needs. Unset, nothing changes |
 
 **Two engines on one set of cards.** Every block of a libr4d collective spins until its twin on the

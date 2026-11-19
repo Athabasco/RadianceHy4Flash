@@ -3389,9 +3389,6 @@ TEST(op_attn_paged_split_image_span_is_not_full_span_bidirectional_attention) {
     const double diff = first.at(0) - full.at(0);
     const double rel_l2 = std::sqrt(diff * diff / 8.0);
     CHECK_NEAR(rel_l2, 0.3535533905932738, 1e-6);
-    std::fprintf(stderr, "split-span reference: full=[2,0,2,0] split=[1,0,2,0], "
-                         "relative L2=%.9f, max absolute=1; first-row unseen key changes attention\n",
-                 rel_l2);
 }
 
 TEST(op_attn_paged_sink) {
@@ -4935,11 +4932,8 @@ TEST(op_moe_gemm_q_mod4) {
     }
 }
 
-/* The weight scale grid is the one the dtype names, in both grouped GEMMs: 128x128 tiles for block
- * fp8; for four-bit experts one scale per row per K group of 128 (w4a8/w4a8h/w4nla8h), 64
- * (w4nl64a8h/w5nl64a8h) or 32 (w4nl32a8h). The oracle inverts a relaid weight into exactly this
- * description (core/runtime/oracle.cpp). The final case is one last-class expert at K = 128 whose
- * 64-wide halves scale by 2 and 3 under one 0.5 activation scale; any other grid reads differently. */
+/* w6nl64a8h through the grouped GEMM: two experts whose relaid u6 codes index one 64-entry table,
+ * each weight its level times an E4M3 scale per (row, 64 of K) and the f32 level above it. */
 TEST(op_moe_gemm_q_reads_six_bit_codebook_experts) {
     constexpr int64_t N = 2, K = 128;
     T codes0(RAD_U6, {N, K}), codes1(RAD_U6, {N, K});
@@ -4994,6 +4988,11 @@ TEST(op_moe_gemm_q_reads_six_bit_codebook_experts) {
     }
 }
 
+/* The weight scale grid is the one the dtype names, in both grouped GEMMs: 128x128 tiles for block
+ * fp8; for four-bit experts one scale per row per K group of 128 (w4a8/w4a8h/w4nla8h), 64
+ * (w4nl64a8h/w5nl64a8h) or 32 (w4nl32a8h). The oracle inverts a relaid weight into exactly this
+ * description (core/runtime/oracle.cpp). The final case is one last-class expert at K = 128 whose
+ * 64-wide halves scale by 2 and 3 under one 0.5 activation scale; any other grid reads differently. */
 TEST(op_moe_gemm_q_scale_grid_by_dtype) {
     struct Want { const char* dt; int64_t rows, cols; };
     /* N 256, K 512, group 128; the last class at N 128, K 256. */
