@@ -80,9 +80,9 @@ static const Flag g_flags[] = {
     { "--mixed-step-target-ms", "N",    "soft duration target in milliseconds for a mixed prefill/decode\n"
                                         "step. The scheduler learns an aggregate prefill cap from\n"
                                         "completed mixed steps; 0 (default) is off" },
-    { "--prefill-room-gate",  "MODE",   "a fresh prefill starts only when its whole prompt plus one\n"
-                                        "decode position fits beside every runner (on, the default);\n"
-                                        "off admits the first chunk alone, as before the gate" },
+    { "--prefill-room-gate",  "MODE",   "on: a fresh prefill starts only when its whole prompt plus one\n"
+                                        "decode position fits beside every runner; off (the default)\n"
+                                        "admits the first chunk alone, as before the gate" },
     { "--preempt-wait-ms",    "N",      "how long a preempted prefill may wait for the whole-\n"
                                         "recompute gate before reclaiming cache blocks and\n"
                                         "preempting the lowest-priority running request; 0\n"
