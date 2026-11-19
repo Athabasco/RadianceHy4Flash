@@ -751,8 +751,9 @@ private:
      * (order of 15% prefill throughput). Any use must respect these constraints:
      *
      * 1. Every collective rides the same lane. The all-reduce double-buffers its scratch on a
-     *    per-block `seq & 1`, so collectives that race differently on two ranks pick different
-     *    slots for the same message and deadlock or corrupt.
+     *    launch-count parity (r4d_ar_seq.h: every launch of an instance bumps one parity counter
+     *    per block, and a block takes the slot from it), so collectives that race differently on
+     *    two ranks pick different slots for the same message and deadlock or corrupt.
      *
      * 2. A device-wide arrival counter must be per stream. `split_ctr` in r4d_gemm_fp8a8.hip (the
      *    self-resetting split-K finisher counter) is sound only because its launches are ordered

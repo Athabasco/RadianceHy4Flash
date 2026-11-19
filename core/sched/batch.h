@@ -267,7 +267,9 @@ private:
         int     ev = -1;               /* row of ev_ holding one event per rank */
     };
     static constexpr int kFlights = 64;
-    /* Worst-case builds the staging ring holds (see alloc_set). Must stay below kFlights. */
+    /* Worst-case builds the staging ring holds (see alloc_set). Meant to stay below kFlights, so a full
+     * ring retires by span clash and not by flight count; correctness does not depend on it (reserve
+     * retires the oldest flight whenever `live` reaches kFlights or no event row is free). */
     static constexpr int kRingBuilds = 16;
     struct Ring {
         char*   host = nullptr;
