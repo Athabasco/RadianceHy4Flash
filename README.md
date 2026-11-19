@@ -168,8 +168,13 @@ in the clone (it needs `docker buildx` and tests the build as it goes). Then set
 ## Build from source
 
 You need Linux, git, a C++20 compiler, CMake 3.21+ and Ninja. For the device kernels you also need
-ROCm 10.1 or 7.2 (`hipcc`; set `ROCM_PATH` if it is not `/opt/rocm`). Clone the repository and
-build in it:
+ROCm 10.1 or 7.2 (`hipcc`; set `ROCM_PATH` if it is not `/opt/rocm`).
+
+The C++20 compiler is tested with the clang included in the ROCm 10.1 distribution; other
+compilers may produce compile errors in the C++ architecture plugins. Pull requests for
+cross-compiler build issues are not accepted.
+
+Clone the repository and build in it:
 
 ```sh
 git clone https://codeberg.org/StillDeadcode/radiance.git && cd radiance
