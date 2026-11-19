@@ -637,6 +637,12 @@ struct Stream {
      * far, and whether the last packet on the queue was a chained kernel. */
     uint64_t*       chain_ctr = nullptr;
     uint64_t        chain_issued = 0;
+    /* Per ring slot: the value chain_issued had once the chained kernel in it was issued (0 for any
+     * other packet). The slot holds that kernel's arguments for its whole run, so it is rewritten
+     * only once *chain_ctr has reached the value (see reserve()). chain_seen is the largest
+     * counter value read so far, so the BAR read happens only on a miss. */
+    std::vector<uint64_t> slot_need;
+    uint64_t        chain_seen = 0;
     /* The blocks issued before the last packet that depends on what precedes it: what a chained
      * kernel played beside that packet (an overlap) waits for, since it reads nothing issued
      * from that packet on. */
@@ -1083,7 +1089,9 @@ int64_t stuck_ms() {
 /* Reserves packet `idx` once the packet processor has consumed far enough that its slot is free.
  * A launched barrier-bit packet means every packet before it has completed, which a kernel
  * argument slot (read for the kernel's whole run) needs. A played tape clears the bit on at most
- * kTapeOverlapRun consecutive packets (TapeRec::overlap), so the margin is that run plus one. */
+ * kTapeOverlapRun consecutive packets (TapeRec::overlap), so the margin is that run plus one.
+ * That holds for plain kernels; a chained one may run on without the bit, so its slot is also held
+ * until the completion counter shows it done (slot_free). */
 constexpr uint64_t kReserveMargin = (uint64_t)kTapeOverlapRun + 2;
 
 /* The wait for room in a full ring sleeps rather than spins. A full queue holds thousands of
@@ -1097,14 +1105,25 @@ inline void full_nap() {
     nanosleep(&ts, nullptr);
 }
 
+/* Whether the chained kernel that last used packet `idx`'s slot has finished, which the margin
+ * below does not prove: a chained packet may go out without its barrier bit, any number of them in
+ * a row, so a kernel can still be running (and re-read its arguments after its wait, and its
+ * record at its end) when the read index is far past it. Its blocks all having counted does. */
+inline bool slot_free(Stream* s, uint64_t idx) {
+    const uint64_t need = s->slot_need[idx & s->mask];
+    if (need <= s->chain_seen) return true;
+    s->chain_seen = *reinterpret_cast<volatile uint64_t*>(s->chain_ctr);
+    return need <= s->chain_seen;
+}
+
 inline int reserve(Stream* s, uint64_t* out) {
     const uint64_t idx = s->wr;
     const uint64_t size = s->mask + 1;
-    if (idx + kReserveMargin - s->rd > size) {
+    if (idx + kReserveMargin - s->rd > size || !slot_free(s, idx)) {
         Stall st("a full queue");
         for (;;) {
             s->rd = hsa_queue_load_read_index_scacquire(s->q);
-            if (idx + kReserveMargin - s->rd <= size) break;
+            if (idx + kReserveMargin - s->rd <= size && slot_free(s, idx)) break;
             if (s->fault.load(std::memory_order_relaxed)) return RAD_E_DEVICE;
             /* Behind a closed gate the queue drains only once the host opens it, and the host is
              * the one waiting here. */
@@ -1455,6 +1474,7 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     s->chain_frontier = s->chain_issued;
     s->frontier_open = !keep;
     if (chain) s->chain_issued += blocks_of(p);
+    s->slot_need[idx & s->mask] = chain ? s->chain_issued : 0;
     s->prev_chained = chain;
     s->plain_inflight = keep ? !chain : s->plain_inflight || !chain;
     s->peer_inflight = keep ? t_peer : s->peer_inflight || t_peer;
@@ -1532,7 +1552,7 @@ struct PlayRun {
             foreign = moved(s);
         }
         const uint64_t idx = s->wr;
-        if (idx + kReserveMargin - s->rd > s->mask + 1) {
+        if (idx + kReserveMargin - s->rd > s->mask + 1 || !slot_free(s, idx)) {
             ring();
             uint64_t got = 0;
             const int rc = reserve(s, &got);
@@ -1609,6 +1629,7 @@ struct PlayRun {
             s->frontier_open = !ordered;
         }
         if (chain) s->chain_issued += blocks_of(p);
+        s->slot_need[idx & s->mask] = chain ? s->chain_issued : 0;
         s->prev_chained = chain;
         s->plain_inflight = ordered ? !chain : s->plain_inflight || !chain;
         s->peer_inflight = ordered ? r.peer != 0 : s->peer_inflight || r.peer != 0;
@@ -1885,6 +1906,8 @@ int a_stream_create(RadStream* out, int high_priority) {
              * nothing recorded against the previous owner's id reaches this queue. */
             r->agent_only = false;
             r->chain_issued = 0;
+            r->chain_seen = 0;
+            std::fill(r->slot_need.begin(), r->slot_need.end(), 0);
             r->chain_frontier = 0;
             r->frontier_open = false;
             r->prev_chained = false;
@@ -1930,6 +1953,7 @@ int a_stream_create(RadStream* out, int high_priority) {
     s->karg = static_cast<char*>(ka);
     s->hdp = d.host_kargs ? nullptr : d.hdp_flush;
     s->chain_ctr = reinterpret_cast<uint64_t*>(s->karg + (size_t)(s->mask + 1) * kKargSlot);
+    s->slot_need.assign((size_t)(s->mask + 1), 0);
     *reinterpret_cast<volatile uint64_t*>(s->chain_ctr) = 0;
     _mm_sfence();
     void* bb = nullptr;
