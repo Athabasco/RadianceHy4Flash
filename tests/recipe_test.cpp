@@ -472,6 +472,38 @@ TEST(the_museglimmer_iq4r_v4_recipe_selects_the_trellis_trunk) {
         CHECK(r.match(n) == nullptr);
 }
 
+/* S-V4 text rules plus int8 vision. The patch stem is not named, so it stays BF16. */
+TEST(the_museglimmer_iq4r_s_v4_i8vision_recipe_quantises_the_tower_linears) {
+    const std::string dir = std::string(__FILE__).substr(
+                                0, std::string(__FILE__).find_last_of('/')) + "/../data/recipes";
+    std::ifstream in(dir + "/museglimmer-30b-iq4r-s-v4-i8vision.recipe");
+    REQUIRE(in.good());
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    Recipe r;
+    std::string why;
+    const char* old_calib = std::getenv("CALIB");
+    const std::string saved_calib = old_calib ? old_calib : "";
+    setenv("CALIB", "/tmp/muse-glimmer-calib", 1);
+    const int parse_rc = r.add_text(text, "museglimmer-30b-iq4r-s-v4-i8vision.recipe", &why);
+    if (old_calib) setenv("CALIB", saved_calib.c_str(), 1);
+    else unsetenv("CALIB");
+    REQUIRE_EQ(parse_rc, RAD_OK);
+    for (const char* n : { "v.blk.0.qkv.weight", "v.blk.49.fc2.weight", "v.mlp.fc1.weight",
+                           "v.proj.weight" }) {
+        const RecipeRule* m = r.match(n);
+        REQUIRE(m != nullptr);
+        CHECK_EQ(m->quantizer, std::string("rtn"));
+        CHECK(has_opt(m, "codes", "i8"));
+        CHECK(has_opt(m, "group", "128"));
+        CHECK(has_opt(m, "scale", "bf16"));
+    }
+    CHECK(r.match("v.patch.weight") == nullptr);
+    CHECK(r.match("v.blk.0.norm1.weight") == nullptr);
+    CHECK(r.match("v.blk.0.qkv.bias") == nullptr);
+    CHECK(has_opt(r.match("blk.0.ffn_down.weight"), "codes", "u3"));
+    CHECK(has_opt(r.match("blk.0.ffn_down.weight"), "calib", "/tmp/muse-glimmer-calib"));
+}
+
 /* The Flint recipes as they ship, over arch/flint's declared names. flint-iq8r: every trunk linear
  * (attention, the two dense layers, the shared expert's gate/up) IQ8R, the routed experts and the
  * shared expert's down projection rotated int8 at a bf16 scale a (row, 128 of K), the head plain

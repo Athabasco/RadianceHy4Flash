@@ -279,6 +279,7 @@ public:
     int run();
 
 private:
+    friend struct FleetHostFillTestAccess;
     struct Model;
 
     /* The broker one load hands its engine: the fleet's grant, for that model. */
@@ -2185,7 +2186,15 @@ void Fleet::fill_tick() {
             best_used = used;
         }
     }
-    if (best) (void)start_op(*best, kFill);
+    if (best) {
+        /* Optional warming commits host mappings and submits copies. Do not start another batch
+         * while a response holds any engine: "quiet" above excludes pending lifecycle work,
+         * not active serving. A request arriving after this check may overlap the current batch;
+         * the next batch waits for it. Demand-driven restore is unaffected. */
+        for (const auto& model : models_)
+            if (front_.activity(model->entry.name).leases > 0) return;
+        (void)start_op(*best, kFill);
+    }
 }
 
 /* A live restore's rest that found no device memory (an allocation of another model's took it
@@ -2623,15 +2632,19 @@ json Fleet::status() {
         /* Runtime LoRA: an adapter is a model as far as choosing one goes, and /v1/models lists
          * each as a child under `base:adapter` (server.cpp). The fleet view must say the same,
          * or a view built on it is blind to what this machine answers to. A child owns nothing:
-         * no cards, no bytes, no policy of its own; its state and counters are the parent's,
-         * because the parent is what serves it. */
+         * no cards, no bytes, no policy of its own. Its state is the parent's, because the parent
+         * is what serves it; its in-flight count is its own -- the leases taken under its name
+         * (Front::adapter_leases) -- so a view can tell which adapter is running. A request for
+         * the base names no adapter and lights up no child, and one adapter's traffic never
+         * lights up another's. Its waiting is the parent's queue: while the parent is not open
+         * nothing reaches any child. */
         for (const std::string& a : adapters_of(n)) {
             json ad;
             ad["id"]        = n + ":" + a;
             ad["parent"]    = n;
             ad["adapter"]   = true;
             ad["state"]     = j["state"];
-            ad["in_flight"] = j["in_flight"];
+            ad["in_flight"] = front_.adapter_leases(n, a);
             ad["waiting"]   = j["waiting"];
             models.push_back(std::move(ad));
         }

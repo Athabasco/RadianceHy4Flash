@@ -307,6 +307,9 @@ public:
         int64_t  kv_tokens = 0;
         int32_t  n_draft = 0;          /* the proposal standing for the next step */
         int32_t  slot = -1;
+        /* The runtime LoRA slot this row runs with, -1 for the base. The name is the caller's:
+         * rad::Engine::lora_names() indexes by slot. */
+        int32_t  lora_slot = -1;
         double   age_s = 0;
         double   ttft_s = -1;          /* negative until the first token */
         double   prefill_s = -1;       /* first token minus admission; negative until both */
@@ -583,6 +586,9 @@ private:
     /* Set by admit_one when it held the admitted chunk back: what it would have taken. */
     int64_t       admit_full_ = 0;
     bool          admit_next_step_ = false;   /* admit_one's refusal is a wait for the next step */
+    enum class AdmissionFailure { None, Capacity, ExternalCapacity, Allocator };
+    AdmissionFailure admission_failure_ = AdmissionFailure::None;
+    bool          admission_reclaim_pending_ = false; /* eviction hit its per-step work bound */
     bool          idle_refuse_ = false;       /* idle engine: this refusal will not clear by waiting */
     bool          room_wait_ = false;         /* the refusal is the fresh prefill's room gate */
     /* Whether this step's prefill may span (ChunkGeometry::span): set by step() for the step it

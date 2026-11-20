@@ -4,6 +4,7 @@ import { useState } from "react"
 import { Bars, Empty, Panel, PartBar, PartLegend, type Part } from "@/components/bits"
 import { Chart, Legend, type Line } from "@/components/chart"
 import type { Experts, Stats } from "@/lib/api"
+import { splitModel } from "@/lib/api"
 import { DASH, bytesParts, fBytes, fDur, fNum, fPct, fRate, fSig, fin } from "@/lib/format"
 import type { Scope, Series } from "@/lib/store"
 import { useRange } from "@/lib/ui"
@@ -47,10 +48,13 @@ const METRICS: Metric[] = [
 ]
 const TRAFFIC: Line[] = [["lkAr", "between accelerators"], ["lkUp", "host to accelerator"], ["lkDn", "accelerator to host"], ["lkSsd", "drive"], ["lkStream", "streaming"]].map(([key, label], i) => ({ key, label, color: i + 1 }))
 
-export function Performance({ scope, kind, slots, noun }: { scope: Scope<Stats>; kind: Kind; slots?: number; noun: string }) {
+export function Performance({ scope, kind, slots, noun, model }: { scope: Scope<Stats>; kind: Kind; slots?: number; noun: string; model: string }) {
   const range = useRange()
   const [chosen, setChosen] = useState<string | null>(null)
   const s = scope.live, h = scope.series
+  /* A LoRA child page: what this adapter did, beside the tiles that stay model-wide. */
+  const { adapter } = splitModel(model)
+  const lora = adapter ? s?.loras?.find((l) => l.name === adapter) : undefined
   const hasDraft = (s?.draft_positions?.length ?? 0) > 0
   const produced = (m: Metric) => m.always || m.lines.some((l) => !l.dash && (h.col(l.key) ?? []).some((v) => (v ?? 0) > 0))
   const tiles = METRICS.filter((m) => m.kinds === kind && (!m.draft || hasDraft || h.has(m.lines[0].key)) && (s ? produced(m) : !m.draft))
@@ -61,6 +65,15 @@ export function Performance({ scope, kind, slots, noun }: { scope: Scope<Stats>;
 
   return (
     <div className="flex flex-col gap-4">
+      {adapter && (
+        <div className="grid grid-cols-2 gap-3 rounded-xl border bg-card p-4 sm:grid-cols-4">
+          <div><div className="text-xs text-muted-foreground">Requests served</div><div className="num text-lg font-semibold">{fNum(lora?.requests)}</div></div>
+          <div><div className="text-xs text-muted-foreground">Prompt tokens</div><div className="num text-lg font-semibold">{fNum(lora?.prompt_tokens)}</div></div>
+          <div><div className="text-xs text-muted-foreground">Tokens generated</div><div className="num text-lg font-semibold">{fNum(lora?.output_tokens)}</div></div>
+          <div><div className="text-xs text-muted-foreground">Running now</div><div className="num text-lg font-semibold">{fNum(lora?.running)}</div></div>
+          <div className="col-span-full text-xs text-muted-foreground">Attributed to {adapter}. Timings, cache and memory are the model's, shared by its adapters.</div>
+        </div>
+      )}
       <div className="overflow-hidden rounded-xl border bg-card">
         <div role="tablist" className="grid grid-cols-2 border-b sm:grid-cols-4 xl:grid-flow-col xl:auto-cols-fr xl:grid-cols-none">
           {tiles.map((m) => {

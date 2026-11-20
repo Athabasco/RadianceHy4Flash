@@ -52,6 +52,18 @@ struct SchedMetrics {
     int64_t mixed_step_target_misses = 0;
     int64_t mixed_step_target_prefill_cap = 0;
 
+    /* Runtime LoRA, by slot index (the names ride the same index: rad::Engine::lora_names()).
+     * What has completed under each slot, and what runs there now. The scheduler counts rows;
+     * a slot with no adapter is all-zero. */
+    static const int MAX_LORA_SLOTS = 16;
+    struct LoraCount {
+        int64_t requests = 0;       /* closed Finished */
+        int64_t prompt_tokens = 0;  /* summed over those */
+        int64_t output_tokens = 0;
+        int64_t running = 0;        /* instantaneous: rows on the card right now */
+    };
+    LoraCount loras[MAX_LORA_SLOTS] = {};
+
     /* Cumulative nanoseconds spent inside steps, total and for decode steps only. Wall time over
      * a step count is not a step time: it charges idle gaps between requests to steps and mixes
      * prefill with decode. `step_ns_decode / steps_decode` is the decode step time. Measured from

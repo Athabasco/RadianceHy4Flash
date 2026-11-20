@@ -5255,6 +5255,13 @@ static const RadConstraint cGemmNtI8A8Tiled[] = {
     C_DIV("K", R4D_FP8_BLOCK), C_DIV("N", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK),
     C_IN("dtype", "i8a8 i8a8h"),
 };
+/* The container-form tile. `w_rb` 1 is optional and unnamed by the text rows, so a query that
+ * states it reaches this row and one that does not still reaches the fragment tiles (select.cpp:
+ * a constraint on an absent key does not hold). */
+static const RadConstraint cGemmNtI8A8Row[] = {
+    C_GE("M", 1), C_DIV("K", R4D_FP8_BLOCK), C_DIV("N", R4D_FP8_BLOCK),
+    C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "i8a8"), C_EQ("w_rb", 1),
+};
 /* IQ8R: the int8 twins at one scale per 256 of K on both sides (R4D_I8_GROUP_WIDE), rotated
  * codes only. K a multiple of 256, so the narrow tile always stages 256-byte tiles and folds once a
  * tile. */
@@ -8606,6 +8613,20 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   nullptr, nullptr, r4d_rad_gemm_i8a8_tiled, nullptr,
   r4d_rad_layout_i8_block, r4d_rad_relayout_i8_block,
   nullptr, r4d_rad_unrelayout_i8_block },
+
+{ "gemm_i8a8_row", "gemm_nt_q", "gemm",
+  "gemm_i8a8_tiled over the container's own bytes: row-major int8 codes and a bf16 scale per "
+  "(row, 128 of K), the prefill tile's MMA and fold. Named by w_rb 1, which the fragment rows "
+  "do not read, so a text linear is unchanged. A per-request tower (vision-tower-placement ram) "
+  "reads the weight where it lies; a fragment relayout cannot",
+  "any M; K and N multiples of 128; group 128; w_rb 1; dtype i8a8",
+  "i8 A with an f32 scale per (row, 128 K), i8 W row-major with a bf16 scale per row per 128 K, "
+  "bf16 C",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_FP8_M16 + 1,
+  ROW(cGemmNtI8A8Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_i8a8_row, nullptr,
+  r4d_rad_layout_i8_rowmajor, nullptr,
+  nullptr, nullptr },
 
 { "gemm_iq8r_nt_m16", "gemm_nt_q", "gemm",
   "gemm_i8a8_nt_m16 at IQ8R's group: one scale per 256 of K on both sides, so the int32 sums run "

@@ -741,6 +741,17 @@ bool Scheduler::publish_prefix(SchedReq& s) {
 void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool defer_free,
                               bool publish, int status, const char* why) {
     ++step_finished_;
+    /* What a slot did, kept apart from the model's totals: the adapter a finished row ran under
+     * took the model's compute, and a view that attributes work by adapter reads these. */
+    if (st == ReqState::Finished) {
+        const int32_t sl = s.req->lora_slot;
+        if (sl >= 0 && sl < SchedMetrics::MAX_LORA_SLOTS) {
+            SchedMetrics::LoraCount& L = m_.loras[sl];
+            ++L.requests;
+            L.prompt_tokens += (int64_t)s.req->prompt.size();
+            L.output_tokens += (int64_t)s.req->output.size();
+        }
+    }
     /* Publish before freeing: this is the only moment the whole prefix is both computed and still
      * owned. insert() takes its own KV references, so the blocks survive the free below. Cancelled
      * and failed requests are published too; their prompts were computed, and a client that hangs
@@ -1034,6 +1045,7 @@ int Scheduler::requests_locked(ReqStat* out, int max) const {
         }
         o.n_draft         = s.n_draft;
         o.slot            = s.slot;
+        o.lora_slot       = r.lora_slot;
         o.age_s           = (double)(now - s.arrived_us) / 1e6;
         o.ttft_s          = s.first_tok_us ? (double)(s.first_tok_us - s.arrived_us) / 1e6 : -1.0;
         o.prefill_s       = (s.first_tok_us && s.admitted_us)
@@ -1802,11 +1814,23 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve,
         /* The cache gives way to a new request as it does to a running one; with nothing
          * running, no other path would reclaim from it and the request would wait forever. */
         int rounds = 0;
-        while (kv_->ensure_from(r.id, r.n_computed + want, r.n_computed) < 0) {
-            if (++rounds > kEvictRounds || !cfg_.prefix_cache || pc_->evict(kEvictBlocks) <= 0) {
-                rc = RAD_E_NOMEM;
+        bool waiting_for_fleet = false;
+        while ((rc = kv_->ensure_admission(r.id, r.n_computed + want, r.n_computed,
+                                           &waiting_for_fleet)) < 0) {
+            /* A mapping or device error is not a shortage eviction can repair. Preserve its
+             * status instead of disguising it as an indefinitely retryable allocation wait. */
+            if (rc != RAD_E_FULL) {
+                admission_failure_ = AdmissionFailure::Allocator;
                 break;
             }
+            admission_failure_ = waiting_for_fleet ? AdmissionFailure::ExternalCapacity
+                                                    : AdmissionFailure::Capacity;
+            if (rounds >= kEvictRounds) {
+                admission_reclaim_pending_ = true;
+                break;
+            }
+            if (!cfg_.prefix_cache || !pc_ || pc_->evict(kEvictBlocks) <= 0) break;
+            ++rounds;
         }
     }
     if (rc < 0) {
@@ -2444,6 +2468,7 @@ const RadBatch* Scheduler::step() {
          * after the walk rather than cut at its front. */
         took_.clear();
         size_t at = 0;
+        bool reclaimed_idle_states = false;
         while (at < waiting_.size() &&
                (int64_t)plan_.e.size() < cfg_.max_seqs && budget > 0) {
             /* A step planned for one prefill holds that one (span_now_ above). */
@@ -2474,6 +2499,8 @@ const RadBatch* Scheduler::step() {
                     ? share_tok : 0;
             admit_full_ = 0;
             admit_next_step_ = false;
+            admission_failure_ = AdmissionFailure::None;
+            admission_reclaim_pending_ = false;
             const int64_t mixed_target_shares = mixed_target_active_
                 ? std::min<int64_t>(
                     (int64_t)waiting_.size() - (int64_t)at - 1,
@@ -2514,6 +2541,28 @@ const RadBatch* Scheduler::step() {
                 ++at;
                 continue;
             }
+            if (as < 0 && admission_failure_ == AdmissionFailure::Allocator) {
+                close_request(s, ReqState::Failed, "admission_allocator", false, true, as,
+                              "cache allocation failed during admission");
+                continue;
+            }
+            /* Keep FIFO while a runner can free room, or a deferred owner still needs its
+             * fence. Otherwise an idle, fresh head has no actor that can repair a shortage:
+             * reclaim idle state slots once, then fail it through normal ownership cleanup.
+             * Eviction that reached its work bound while progressing gets another pass. */
+            if (as < 0 && admission_failure_ == AdmissionFailure::Capacity &&
+                s.req && s.req->state != ReqState::Preempted && running_.empty() &&
+                took_.empty() && plan_.e.empty() && !admit_next_step_ && n_deferred_ == 0) {
+                if (!reclaimed_idle_states) {
+                    reclaimed_idle_states = true;
+                    if (kv_->release_idle_states() > 0) continue;
+                }
+                if (!admission_reclaim_pending_) {
+                    close_request(s, ReqState::Failed, "admission_capacity", false, true, as,
+                                  "cache capacity unavailable on an idle engine");
+                    continue;
+                }
+            }
             /* An overdue preempted prefill on an idle engine that still cannot be admitted will
              * not become admissible by waiting: nothing is running to finish and free the pool.
              * Fail it (spec §17) and ask the next request, instead of parking the step loop. Not
@@ -2522,7 +2571,8 @@ const RadBatch* Scheduler::step() {
              * next step, and failing them lost two of ten preempted requests under KV pressure
              * once their prompts were published at the preemption (1. 11. 2026). */
             if (as < 0 && running_.empty() && took_.empty() && plan_.e.empty() &&
-                !admit_next_step_ && s.req && s.req->state == ReqState::Preempted &&
+                !admit_next_step_ && admission_failure_ != AdmissionFailure::ExternalCapacity &&
+                s.req && s.req->state == ReqState::Preempted &&
                 preempt_wait_overdue(s)) {
                 RAD_WARN("request %llu failed: overdue preempted prefill could not be admitted "
                          "with nothing running (%s)",
@@ -3939,6 +3989,11 @@ SchedMetrics Scheduler::metrics_locked() const {
     SchedMetrics m = m_;
     m.step = step_;
     m.running = (int64_t)running_.size();
+    for (int32_t slot : running_)
+        if (slot >= 0 && slot < (int32_t)reqs_.size() && reqs_[(size_t)slot] && reqs_[(size_t)slot]->req) {
+            const int32_t sl = reqs_[(size_t)slot]->req->lora_slot;
+            if (sl >= 0 && sl < SchedMetrics::MAX_LORA_SLOTS) ++m.loras[sl].running;
+        }
     m.queue_depth = (int64_t)waiting_.size();
     m.preempted_waiting = 0;
     for (int32_t slot : waiting_)

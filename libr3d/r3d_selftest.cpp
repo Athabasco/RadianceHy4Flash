@@ -1780,8 +1780,8 @@ static int build_moe_gemm_q(Case& c, const RadOpSchema* s) {
     constexpr int NOPD = 9;
     const long long M = 8, N = 128, K = 128, NE = 8, TK = 2;   // T = 16; N % 128
     const long long T = M * TK, NE0 = (NE + 1) / 2, NE1 = NE / 2, NB = (N + 127) / 128;
-    if (s->n_operands != NOPD) { fail("moe_gemm_q: the schema has %d operands, not 9",
-                                      s->n_operands); return 1; }
+    if (s->n_operands != NOPD + 1) { fail("moe_gemm_q: the schema has %d operands, not 10",
+                                          s->n_operands); return 1; }
     c.n_p = 0;
     const RadParam pp[] = { { "M", RAD_P_INT, T, 0, nullptr, 0.0 },
                             { "N", RAD_P_INT, N, 0, nullptr, 0.0 },
@@ -1839,6 +1839,7 @@ static int build_moe_gemm_q(Case& c, const RadOpSchema* s) {
         for (int r = 0; r < qd[o].rank; ++r) { t.shape[r] = qd[o].sh[r]; t.stride[r] = 1; }
         rad_tensor_pack(&t);   /* dense row-major: the ascending form computes stride[0] before stride[1] */
     }
+    c.t[NOPD] = RadTensor{};   // split absent
     return 0;
 }
 
@@ -1900,8 +1901,8 @@ static int build_moe_gemm_mxfp4a8(Case& c, const RadOpSchema* s) {
     constexpr int NOPD = 9;
     const long long M = 8, N = 128, K = 128, NE = 8, TK = 2;   // T = 16; N % 128
     const long long T = M * TK, NE0 = (NE + 1) / 2, NE1 = NE / 2;
-    if (s->n_operands != NOPD) { fail("moe_gemm_mxfp4a8: the schema has %d operands, not 9",
-                                      s->n_operands); return 1; }
+    if (s->n_operands != NOPD + 1) { fail("moe_gemm_mxfp4a8: the schema has %d operands, not 10",
+                                          s->n_operands); return 1; }
     c.n_p = 0;
     const RadParam pp[] = { { "M", RAD_P_INT, T, 0, nullptr, 0.0 },
                             { "N", RAD_P_INT, N, 0, nullptr, 0.0 },
@@ -1960,6 +1961,7 @@ static int build_moe_gemm_mxfp4a8(Case& c, const RadOpSchema* s) {
         for (int r = 0; r < qd[o].rank; ++r) { t.shape[r] = qd[o].sh[r]; t.stride[r] = 1; }
         rad_tensor_pack(&t);   /* dense row-major: the ascending form computes stride[0] before stride[1] */
     }
+    c.t[NOPD] = RadTensor{};   // split absent
     return 0;
 }
 
@@ -1973,8 +1975,8 @@ static int build_moe_gemm_w4a8(Case& c, const RadOpSchema* s) {
     const long long M = 6, N = 96, K = 256, NE = 4, TK = 4;   // T = 24, six rows per expert
     const long long T = M * TK;
     const long long ne0 = (NE + 1) / 2, ne1 = NE / 2;
-    if (s->n_operands != NOPD) { fail("moe_gemm_w4a8: the schema has %d operands, not 9",
-                                       s->n_operands); return 1; }
+    if (s->n_operands != NOPD + 1) { fail("moe_gemm_w4a8: the schema has %d operands, not 10",
+                                           s->n_operands); return 1; }
     c.n_p = 0;
     const RadParam pp[] = { { "M", RAD_P_INT, M, 0, nullptr, 0.0 },
                             { "N", RAD_P_INT, N, 0, nullptr, 0.0 },
@@ -2046,6 +2048,7 @@ static int build_moe_gemm_w4a8(Case& c, const RadOpSchema* s) {
         for (int r = 0; r < qd[o].rank; ++r) { t.shape[r] = qd[o].sh[r]; t.stride[r] = 1; }
         rad_tensor_pack(&t);
     }
+    c.t[NOPD] = RadTensor{};   // split absent
     return 0;
 }
 

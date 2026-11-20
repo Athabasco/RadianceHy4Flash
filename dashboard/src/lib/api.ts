@@ -3,9 +3,15 @@
 // /sessions, /graph and /server_info are asked for once, when their view is opened.
 
 export interface Columns { [name: string]: (number | null)[] }
+/** A model served through a runtime LoRA reads as `base:adapter`; the tabs slice by adapter. */
+export const splitModel = (id: string): { base: string; adapter: string | null } => {
+  const i = id.lastIndexOf(":")
+  return i < 0 ? { base: id, adapter: null } : { base: id.slice(0, i), adapter: id.slice(i + 1) }
+}
+export interface LoRAStat { name: string; requests: number; prompt_tokens: number; output_tokens: number; running: number }
 export interface FinishedRequest {
   id: string; prompt: number; out: number; ctx: number
-  ttft: number | null; pf: number | null; tps: number | null; at: number
+  ttft: number | null; pf: number | null; tps: number | null; at: number; lora?: string
 }
 export interface HistoryBody<Live> {
   keep_s: number
@@ -43,7 +49,7 @@ export interface Fleet {
 // (tools/dashboard_embed.py copies these names into the compiled-in header).
 export interface RunningRequest {
   id: string | number; state: string; prompt: number; computed: number; cached: number; output: number
-  max: number; age_s: number; tps: number
+  max: number; age_s: number; tps: number; lora?: string
 }
 export interface DraftPosition { reached: number; rate: number }
 export interface ExpertTier { name: string; units: number; bytes: number }
@@ -60,8 +66,9 @@ export interface Stats {
   draft_positions?: DraftPosition[]
   requests?: RunningRequest[]
   experts?: Experts
+  loras?: LoRAStat[]
 }
-export interface Session { id: number | string; label?: string; tokens: number; bytes: number; idle_s: number; on_device: number; on_host: number; moving: boolean; snapshots: number; resume_tokens: number }
+export interface Session { id: number | string; label?: string; tokens: number; bytes: number; idle_s: number; on_device: number; on_host: number; moving: boolean; snapshots: number; resume_tokens: number; lora?: string }
 export interface Sessions {
   sessions: Session[]; enabled?: boolean
   pool?: { tokens_used: number; tokens_total: number; bytes_used: number; bytes_total: number }

@@ -250,6 +250,7 @@ void History::track_requests(Model& m, const json& stats, double t) {
         const double pf = num(r, "prefill_s"), ttft = num(r, "ttft_s"), tps = num(r, "tps");
         json h;
         h["id"] = text(r, "id");
+        if (!text(r, "lora").empty()) h["lora"] = text(r, "lora");
         h["prompt"] = num0(r, "prompt");
         h["out"] = num0(r, "output");
         h["ctx"] = num0(r, "ctx");
