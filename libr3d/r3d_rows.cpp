@@ -385,7 +385,7 @@ static const RadParamSpec pMoeGemmQ[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_
 
 /* moe_gemm_q dtype w4a8: the grouped int4 GEMM (r3d_moe_gemm_w4a8.hip) is a row of the moe_gemm_q
  * op above (two's-complement int4 experts, a bf16 scale per (row, 128 of K), bf16 out; the int8 or
- * E4M3 activation arm is picked by `a`'s dtype). It reuses moe_gemm_q's nine-operand parity schema. */
+ * E4M3 activation arm is picked by `a`'s dtype). It reuses moe_gemm_q's ten-operand parity schema. */
 
  /* moe_gemm: the grouped GEMM with unquantised experts, libref's schema; one weight table. */
 static const RadOperandSpec oMoeGemm[] = { { "a", RAD_OPD_IN, 0 },
