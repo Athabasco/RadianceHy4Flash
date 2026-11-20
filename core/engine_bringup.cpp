@@ -5221,7 +5221,7 @@ int Engine::start() {
      * model holds, backs the stripes on every rank, and the followers take the new mark. A
      * refusal is RAD_E_FULL, and the request waits as on a full cache. */
     if (!lending_ && broker_ && ranks_[0]->kv.flex())
-        ranks_[0]->kv.set_reclaim([this](int64_t tokens) -> int {
+        ranks_[0]->kv.set_fleet_reclaim([this](int64_t tokens, bool* waiting_for_fleet) -> int {
             KVManager& k0 = ranks_[0]->kv;
             const int64_t cur = k0.loan_tokens();
             if (tokens >= cur) return RAD_OK;
@@ -5232,15 +5232,21 @@ int Engine::start() {
             const std::vector<int> cards = rank_devices();
             if (!broker_->flex_grow(cards, (cur - to) * tb)) {
                 to = tokens;
-                if (!broker_->flex_grow(cards, (cur - to) * tb)) return RAD_E_FULL;
+                if (!broker_->flex_grow(cards, (cur - to) * tb)) {
+                    if (waiting_for_fleet) *waiting_for_fleet = true;
+                    return RAD_E_FULL;
+                }
             }
             struct Landed { VramBroker* b; ~Landed() { b->flex_done(); } } landed{ broker_ };
             for (auto& r : ranks_) {
-                if (rad_dev_set(r->device) < 0 || r->kv.flex_back(cur, to) < 0) {
+                int status = rad_dev_set(r->device);
+                if (status >= 0) status = r->kv.flex_back(cur, to);
+                if (status < 0) {
                     for (auto& q : ranks_)
-                        if (rad_dev_set(q->device) >= 0) (void)q->kv.flex_unback_above(cur);
+                        if (rad_dev_set(q->device) < 0 || q->kv.flex_unback_above(cur) < 0)
+                            fatal("flex growth rollback failed; retained mappings cannot be reused");
                     (void)rad_dev_set(ranks_[0]->device);
-                    return RAD_E_FULL;
+                    return status;
                 }
             }
             for (size_t i = 1; i < ranks_.size(); ++i) (void)ranks_[i]->kv.set_loan(tokens);
