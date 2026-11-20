@@ -646,6 +646,8 @@ int r4d_rad_logits_gemm_vocab(const RadArgs*, RadStream);
 int64_t r4d_rad_logits_gemm_vocab_scratch(const RadArgs*);
 int r4d_rad_logit_rerank_iqr(const RadArgs*, RadStream);
 int r4d_rad_gemm_i8a8_tiled(const RadArgs*, RadStream);
+/* Container-form int8 GEMM (row-major codes and per-row scales), selected by w_rb 1. */
+int r4d_rad_gemm_i8a8_row(const RadArgs*, RadStream);
 int r4d_rad_gemm_i8a8_rb8_tiled(const RadArgs*, RadStream);
 int r4d_rad_gemm_i8a8_rb32_tiled(const RadArgs*, RadStream);
 /* The IQR weights, decoded from their codes where they are read (r4d_gemm_iqr.hip). */

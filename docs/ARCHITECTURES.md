@@ -2173,7 +2173,13 @@ kernels), its plain op runs instead (`rmsnorm`, `silu_mul`) and the first linear
 quantises it with `had_quant_act_i8g`: q for the four, gate/up, down. The head is plain int8
 (`codes=i8 group=128 scale=bf16`, `logits_gemm_i8`), which the drafter reads as its own head.
 
-The tower's weights are never quantised: a container that quantises them is refused by name.
+A vision linear is BF16, or int8 codes with a bf16 scale per (row, 128 of K)
+(`codes=i8 group=128 scale=bf16`, `museglimmer-30b-iq4r-s-v4-i8vision.recipe`). The int8 form
+quantises the BF16 activation with `quant_act_i8g` and reads it with `gemm_nt_q` at `i8a8` and
+`w_rb` 1 (`gemm_i8a8_row`): the weight stays the container's row-major bytes, so
+`vision-tower-placement ram` can read it in place. Bias, exact-erf GELU and the residual are
+separate BF16 ops. The patch stem (K 1176), position table, norms and biases stay BF16. Block
+FP8 is retired and refused by name, as is any other vision encoding.
 
 **Context extension.** The architecture takes it by mechanical means, and takes it well: 13 of
 the 52 layers are full-attention **NoPE** (`layer_rope_theta` 0 -- no positions at all) and the 39
