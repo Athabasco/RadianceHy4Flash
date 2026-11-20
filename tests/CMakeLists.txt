@@ -391,13 +391,17 @@ set(RAD_E2E_DEPS radiance rad-convert libref libquant nemotron35_embed qwen35_bf
 if(TARGET libavx)
   list(APPEND RAD_E2E_DEPS libavx)
 endif()
-foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test spark25_convert_test)
+foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test spark25_convert_test
+          hyv4flash_convert_test)
   if(TARGET ${t})
     target_compile_definitions(${t} PRIVATE
       RAD_E2E_SERVER="$<TARGET_FILE:radiance>" RAD_E2E_CONVERT="$<TARGET_FILE:rad-convert>"
       RAD_E2E_HOME="${RAD_PLUGIN_OUT}" RAD_E2E_RECIPES="${CMAKE_SOURCE_DIR}/data/recipes")
     if(t STREQUAL "spark25_convert_test")
       add_dependencies(${t} rad-convert libref spark25_bf16)
+    elseif(t STREQUAL "hyv4flash_convert_test")
+      # The plugin a Hy4-flash checkpoint selects, and the quantisers its recipes name.
+      add_dependencies(${t} rad-convert libref libquant hyv4flash)
     elseif(t STREQUAL "clef_decision_test")
       # The tiny clef's golden (tests/mkclefgolden.py) and the one plugin a clef container selects.
       target_compile_definitions(${t} PRIVATE

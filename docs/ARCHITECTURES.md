@@ -14,6 +14,7 @@ plugin claims.
 | `arch/hyv3_bf16` | `hyv3` | *(empty)* | Tencent Hy-Memory-30B-A3B BF16 safetensors; BF16, W4 or W8A8 weights by recipe; TP1/2, BF16 KV |
 | `arch/hyv3_fp8` | `hyv3` | `fp8` | Tencent Hy-Memory-30B-A3B-FP8's descriptor: the same graph, one dense layer then sigmoid-routed MoE; its per-tensor E4M3 linears are a form this build does not serve; TP1/2, bf16 or int8 KV |
 | `arch/hyv3_gguf` | `hyv3` | `gguf_ftype_15` | llama.cpp Hy-Memory Q4_K_M GGUF, dequantized and recipe-converted to native Radiance weights; TP1/2 |
+| `arch/hyv4flash` | `hyv4flash` | *(empty)* | Tencent Hy4-flash from its bf16 checkpoint, **conversion only**: the weight manifest and the checkpoint name map, so `rad-convert` quantises the release by a recipe (`data/recipes/hy4-flash-bf16.recipe`, `hy4-flash-w4nl64-rtn.recipe`); it declares no graph and a container does not serve yet ([what is declared](#hyv4flash-tencent-hy4-flash)) |
 | `arch/flint` | `flint` | *(empty)* | Recursive Flint (39.8B-A2.5B): 2 dense layers then 47 sigmoid-routed MoE layers (256 experts top-6, ungated 1024-wide shared expert), GQA 32/4 at head_dim 128 with QK RMSNorm, a learned per-head sink on every layer, RoPE on the 35 sliding layers (window 513) and NoPE on the 14 full layers; two KV groups (full and window), TP1/2 (expert parallel); BF16 or int8 KV. Weights by recipe: an IQ8R trunk with rotated int8 experts (`data/recipes/flint-iq8r.recipe`), or u4 attention, int4 experts and plain int8 dense/shared/head (`data/recipes/flint-bf16-q4.recipe`); `docs/FLINT.md` |
 | `arch/qwen35_w8a8` | `qwen35` | `w8a8_fwht128` | `qwen35_fp8` with an int8 trunk: i8 weights with a bf16 scale per 128 of K, rotated by a 128-wide Hadamard, against int8 activations under the same rotation: IQ8R and IQR-V4 (`data/recipes/q38-27b-iq8r.recipe`, `q38-27b-iq4r-s-v4.recipe`) |
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
@@ -3266,3 +3267,155 @@ VAE       latent / scale_factor, post_kl 64 -> 1024, 16 self-attention blocks (q
 geometry  a point's [x | sin | cos] at 8 octaves (51 values, f32, point_fourier), query_proj, one
           cross-attention block over the latent rows (its own MLP), ln_post (eps 1e-5), a logit
 ```
+
+# `hyv4flash`: Tencent Hy4-flash
+
+`model_type: hy_v4_flash`, `HYV4FlashForConditionalGeneration` (HF `tencent/Hy4-flash`, 220B
+parameters in 148 bf16 shards, 440 GB). `arch/hyv4flash` declares the release's weights and maps
+them to its checkpoint tensors, and declares **no op**: it is what `rad-convert` needs to write a
+container, and `rad_arch_step` fails by name. The reference is transformers'
+`modeling_hy_v4_flash.py` (pull request 50903 at the time of writing; the 5.23.0 release has `hy_v4`
+only), which does not load the drafter.
+
+```
+42 layers over hc_mult 4 streams of 3072, vocab 120832 (lm_head not tied), rms_norm_eps 1e-5
+  hyper-connection (iHC), two a layer and one before the head: fn [8, 12288], base [8], scale [2]
+    mixes = fn(streams) * rsqrt(mean(streams^2) + rms_norm_eps)      one scalar a token, all in f32
+    read  = sigmoid(mixes[:4] * scale[0] + base[:4]) + hc_eps        x = sum(read_i * stream_i)
+    write = hc_magnitude 2 * sigmoid(mixes[4:] * scale[1] + base[4:]) + hc_eps
+    stream_i += write_i * block(norm(x))       no mixing matrix between the streams
+  attention, gated MLA: q_a 3072 -> 1024, RMS norm, q_b -> heads * 256
+    kv_a 3072 -> 512 + 64: the latent (RMS-normed) and one rotary key every head shares
+    kv_b 512 -> heads * (192 + 256): a head's key without position, then its value
+    rotary on the trailing 64 of the 256, interleaved pairs, 3-D M-RoPE sections 12/10/10
+    one learned sink logit a head, joined to the softmax and dropped after it
+    out = post_proj_norm(o_proj(attn * sigmoid(linear_gate(x))))     the gate is heads * 256 wide
+    12 sparse layers (0, 1, then every fourth from 5): 32 heads, theta 1e7, a compressed indexer
+    30 sliding layers: 64 heads, theta 1e4, the last 512 keys
+  compressed indexer: token keys 3072 -> 128, RMS norm, cached a token; groups of 4 by slot,
+    pooled = key_norm(sum(value(k) * softmax(gate(k) + intra_group_ape)))   f32 throughout
+    16 query heads of 128 from the q_a latent, rotary on the trailing 64 (a group at its first
+    token's position), score = sum_h head_weight_h * relu(q_h . key), 1/sqrt(16 * 128) on the weights
+    a query keeps its 511 best closed groups and its own; dense while the context is <= 2048
+  feed-forward: layer 0 a 13824-wide SwiGLU and a sandwich norm; 41 latent MoE layers
+    router on the normed hidden state in f32: sigmoid, top 16 of 512 by score + correction bias,
+      the kept sigmoids normalised to sum 1, times 3.998
+    routed arm: routed_expert_down_proj 3072 -> 1536, experts 1536 -> 2 * 1536 -> 1536 with the
+      gate clamped above at 10 and the up clamped to +-10, routed_expert_up_proj 1536 -> 3072
+    shared expert on the hidden state, 3072 -> 1536 -> 3072, unclamped
+    out = combine_output_norm(routed + shared)
+  Engram, added to all four streams in front of layers 1, 11, 21 and 31:
+    ids = token_map[the token and its two predecessors]; an id past the map, or before the start
+      of its document, is the pad's
+    bigram and trigram: xor of id * multiplier, modulo 8 primes each -> 16 rows of 96 from one
+      table a layer (165M rows), each an E4M3 round trip, RMS-normed by its head's gain
+    key_c = norm_key_c(key_proj_c(e)), gate_c = sigmoid(sqrt-compressed (key_c . norm_query_c(stream_c)) / sqrt(3072))
+    value = pre_gamma * rmsnorm(value_proj(e)); stream_c += gate_c * value + branch_scale_c * value
+    nothing at image, video and pad positions
+  DFly2: 5 layers of the sparse geometry with a dense 9216 MLP, a fusion, a correction, a confidence head
+  vision: 27 blocks of 1152 (16 heads, ff 4304), patch 16, 16385 learned positions; the projector
+    is a norm, a 2x2 convolution to 4608 and a 1x1 to 3072, with a newline embedding a merged row
+```
+
+## The name map
+
+One declared weight a role, under the names the tree's blocks use for it. A layer `l` is `blk.<l>`,
+the drafter's `dfly.blk.<i>`, the tower `v.`.
+
+| declared | checkpoint | |
+|---|---|---|
+| `token_embd.weight`, `output.weight`, `output_norm.weight` | `model.embed_tokens.weight`, `lm_head.weight`, `model.norm.weight` | |
+| `hc_head.{fn,base,scale}` | `model.hc_head.hc_head_{fn,base,scale}` | f32 |
+| `blk.l.hc_attn.*`, `blk.l.hc_ffn.*` | `hc_attn_layer.hc_pre.hc_*`, `hc_mlp_layer.hc_pre.hc_*` | f32 |
+| `attn_norm`, `ffn_norm` | `input_layernorm`, `post_attention_layernorm` | |
+| `attn_q_a`, `attn_q_a_norm`, `attn_q_b` | `self_attn.q_a_proj`, `q_a_layernorm`, `q_b_proj` | |
+| `attn_kv_a`, `attn_kv_a_norm`, `attn_kv_b` | `kv_a_proj_with_mqa`, `kv_a_layernorm`, `kv_b_proj` | |
+| `attn_gate`, `attn_output`, `attn_post_norm`, `attn_sinks` | `linear_gate`, `o_proj`, `post_proj_norm`, `learnable_sink_param` | |
+| `index_query`, `index_head`, `index_key`, `index_key_norm` | `compressed_indexer.query_projection`, `head_weight_projection`, `token_key_projection`, `token_key_norm` | sparse layers |
+| `index_pool_value`, `index_pool_gate`, `index_pool_norm`, `index_ape` | `key_value_projection`, `key_gate_projection`, `key_norm`, `intra_group_ape` | f32 |
+| `ffn_gate_up`, `ffn_down`, `ffn_post_norm` | `mlp.gate_proj` + `up_proj`, `down_proj`, `post_fc2_norm` | layer 0 |
+| `ffn_gate_inp.weight`, `ffn_gate_inp.correction` | `mlp.gate.weight`, `mlp.gate.e_score_correction_bias` | |
+| `ffn_latent_in`, `ffn_latent_out` | `mlp.routed_expert_down_proj`, `mlp.routed_expert_up_proj` | |
+| `ffn_gate_up_exps.<e>`, `ffn_down_exps.<e>` | slice `e` of `mlp.experts.gate_up_proj` [512, 3072, 1536] and `down_proj` [512, 1536, 1536] | one movement unit an expert |
+| `ffn_gate_up_shexp`, `ffn_down_shexp`, `ffn_post_norm` | `mlp.shared_experts.gate_proj` + `up_proj`, `down_proj`, `mlp.combine_output_norm` | |
+| `engram_table`, `engram_token_map` | `engram_layer.multi_head_embedding.embedding`, `lookup_table` | |
+| `engram_head_norm` [16 * 96] | `lookup_per_head_norms.0..15`, joined | |
+| `engram_key.{weight,bias}` [4 * 3072, 1536] | `key_projs.0..3`, joined | one GEMM for the four streams |
+| `engram_key_norm`, `engram_query_norm`, `engram_branch_scale` [4 * 3072] | `norm_key.0..3`, `norm_query.0..3`, `unified_per_hc_scales.0..3` | |
+| `engram_value.{weight,bias}`, `engram_value_gain` | `value_proj`, `unified_pre_gamma` | |
+| `engram_mult`, `engram_vocab_sizes`, `engram_offsets` | `engram.<l>.hash_multipliers`, `head_vocab_sizes`, `head_offsets` of `rad-convert --add` | optional, i64 |
+
+Traps:
+
+- **The checkpoint's names are not the transformers port's.** The port renames at load:
+  `linear_gate` is its `gate_proj`, `learnable_sink_param` its `sinks`, `hc_attn_layer.hc_pre` its
+  `attn_hc`, `vit` its `vision_tower`, and the layers sit under `model.layers`, not
+  `model.language_model.layers`. The map above is against the files.
+- **`routed_expert_down_proj` is the latent's input.** It narrows 3072 to 1536 in front of the
+  experts (the port's `pre_expert_proj`), and `routed_expert_up_proj` widens their sum back. An
+  expert's own projections are the stacked `experts.gate_up_proj` and `experts.down_proj`.
+- **The config calls the sparse layers `deepseek_sparse_attention`**, the port `indexed_attention`.
+  `swa_pattern` says the same as `layer_types`; the plugin reads `layer_types`.
+- **`engram_layer_ids` are one above the layer.** Id 2 is the memory in front of layer 1
+  (`model.layers.1.engram_layer`), and `engram_layer_head_vocab_sizes` is keyed by the id. Each
+  layer's table is the sum of its 16 moduli: 164994380, 164999008, 165004086 and 165008942 rows.
+- **The Engram hash is not in the checkpoint.** The multipliers are drawn at load from NumPy's
+  generator, seeded `engram_seed + 10007 * id` and bounded by the compressed vocabulary the token
+  map spans (92620 ids for 120818 tokens; the embedding has 120832 rows, and an id past the map
+  reads as the pad's). `data/hy4flash_engram_tables.py` writes them for `--add`.
+- **Every Engram row is read through E4M3.** `engram_fp8_embedding` quantises each looked-up row of
+  96 under its own absmax scale and back, so the bf16 table is not what the model sees.
+  `hy4-flash-bf16.recipe` stores E4M3 rows, which is that round trip to within one code step: the
+  port divides in bf16 before the cast and `rtn` divides exactly, and on 200,000 rows of layer 1's
+  table 2.9% of the codes differ (1.5% of the rows' norm; the round trip itself is 2.6% from the
+  bf16 rows). The container with no recipe is the exact reference.
+- **The indexer's pooling and the hyper-connections are f32** in the files and stay so in the
+  reference whatever the model's dtype; a recipe that quantises them changes which groups a query
+  recalls. The recipes of record leave them alone.
+- **`engram_fp8_embedding` aside, the release is plain bf16** with no `quantization_config`; Tencent's
+  `Hy4-flash-FP8` is another repository, which this plugin has not been run on.
+
+## Converting
+
+```sh
+python3 data/hy4flash_engram_tables.py <Hy4-flash checkpoint> engram-tables.safetensors
+rad-convert <Hy4-flash checkpoint> --add engram-tables.safetensors \
+    --recipe data/recipes/hy4-flash-w4nl64-rtn.recipe -o hy4-flash-w4nl64.rad
+rad-info -v hy4-flash-w4nl64.rad
+```
+
+| recipe | routed experts | Engram tables | the rest | container |
+|---|---|---|---|---|
+| none | bf16, 277 GiB | bf16, 118 GiB | bf16 | 410.3 GiB |
+| `hy4-flash-bf16.recipe` | bf16 | E4M3 rows at a bf16 scale each, 60.2 GiB | bf16 | 352.5 GiB |
+| `hy4-flash-w4nl64-rtn.recipe` | the `w4nl` codebook at an E4M3 scale a 64 of K, rotated, round to nearest: 71.3 GiB | as above | bf16 | 147.1 GiB |
+
+The sizes are `rad-convert --plan-only`'s over the release's 1964 tensors (43699 declared weights,
+41984 of them expert projections), which is how the name map was checked against the release: its
+safetensors headers and config, without the 440 GB of data. No Hy4-flash weight has been through a
+quantiser yet, so neither recipe has an error report or a quality number.
+
+`--max-spec 0` leaves the drafter out; the tower is declared whenever the config has one. The
+checkpoint is larger than most disks hold twice, and `--defer` / `--in-place` convert it a piece at
+a time (TOOLS.md).
+
+What a recipe may write is bounded by what will read it. With no op declared, no kernel's layout
+hook checks a planned encoding: the quantiser and the core's decoder accept any grid libquant
+writes, and a container can hold a form nothing in this tree serves. The forms the tree's blocks
+read for the same roles are the safe choices: for routed experts the ones `MoeFP8` takes
+(`docs/MOE-W4.md`, `docs/IQR.md`; both K here are 1536, twelve whole 128 blocks), for the block
+linears rotated int8 (`i8*bf16[1x128]/fwht128`) or bf16. Calibrated quantisers (`gptq`, `awq`,
+`autoround` with `calib=`) need the Grams an engine run records, which needs the graph; until then
+a recipe is uncalibrated, or weighted by an `--imatrix`.
+
+## What serving needs
+
+Blocks of this tree cover the shape of most of it: `MoeFP8` with `router_k` runs a routed arm in a
+latent (as `nemotronh` does), `ManifoldConn` is a four-stream connection with a mixing matrix this
+model lacks, `GlmMla` and `GlmIndexer` are a sparse MLA behind a pooled indexer, and
+`PleLayer` is a hashed n-gram table read on the host. None is this model's arithmetic as it
+stands. New: the indexer's gated f32 pooling with M-RoPE on the pooled keys, the Engram's
+per-stream gate, the sliding MLA with sinks and a value-wide gate, 3-D M-RoPE positions and the
+newline tokens in `core/mm`, the tower, and DFly2, whose forward is in the serving engines (vLLM,
+SGLang), not in the transformers port.
+

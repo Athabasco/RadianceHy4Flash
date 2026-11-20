@@ -602,6 +602,14 @@ python3 data/imatrix_merge.py imatrix_unsloth.gguf_file imatrix-merged.gguf
 rad-convert /srv/models/deepseek-ai/DeepSeek-V4.1-Flash --add engram-tables.safetensors \
     --recipe data/recipes/deepseek41-ud-iq1s.recipe --imatrix imatrix-merged.gguf \
     --chat-template chat_template.jinja -o deepseek-v4.1-flash-ud-iq1s.rad
+
+# Tencent Hy4-flash from the bf16 release: the Engram hash constants computed first (the release
+# ships the tables and the token map, not the hash), the routed experts four-bit, the Engram tables
+# E4M3 rows. arch/hyv4flash declares the weights and no graph, so the container converts and
+# inspects and does not serve yet (docs/ARCHITECTURES.md)
+python3 data/hy4flash_engram_tables.py /srv/models/tencent/Hy4-flash engram-tables.safetensors
+rad-convert /srv/models/tencent/Hy4-flash --add engram-tables.safetensors \
+    --recipe data/recipes/hy4-flash-w4nl64-rtn.recipe -o hy4-flash-w4nl64.rad
 ```
 
 ### 3.3 Inspect a container
