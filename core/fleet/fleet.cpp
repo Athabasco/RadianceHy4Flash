@@ -279,6 +279,7 @@ public:
     int run();
 
 private:
+    friend struct FleetHostFillTestAccess;
     struct Model;
 
     /* The broker one load hands its engine: the fleet's grant, for that model. */
@@ -2185,7 +2186,15 @@ void Fleet::fill_tick() {
             best_used = used;
         }
     }
-    if (best) (void)start_op(*best, kFill);
+    if (best) {
+        /* Optional warming commits host mappings and submits copies. Do not start another batch
+         * while a response holds any engine: "quiet" above excludes pending lifecycle work,
+         * not active serving. A request arriving after this check may overlap the current batch;
+         * the next batch waits for it. Demand-driven restore is unaffected. */
+        for (const auto& model : models_)
+            if (front_.activity(model->entry.name).leases > 0) return;
+        (void)start_op(*best, kFill);
+    }
 }
 
 /* A live restore's rest that found no device memory (an allocation of another model's took it
