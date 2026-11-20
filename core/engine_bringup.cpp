@@ -4713,6 +4713,19 @@ int Engine::configure_kv() {
  * part, runs beside other engines'. */
 static std::mutex g_bringup_mu;
 
+void Engine::seal_base_weights() {
+    /* Base weights remain reconstructible from their container. Runtime adapter factors
+     * and slot tables occupy the separate persistent arena; that mutable arena keeps its
+     * normal parking copies. The mover refills weights at their current residency on return.
+     * A future in-place weight merge must opt its modified weights out of owner refill: dirty
+     * invalidation alone cannot preserve a value that differs from the container. */
+    for (auto& r : ranks_)
+        if (char* base = static_cast<char*>(r->pools.weights().base())) {
+            dev_page_seal(base);
+            if (file_) dev_page_refilled(base);
+        }
+}
+
 int Engine::start() {
     EngineScope es(owner_, cfg_.served_model_name.c_str());
     std::unique_lock<std::mutex> bringup(g_bringup_mu);
@@ -5335,18 +5348,7 @@ int Engine::start() {
             RAD_INFO("card %d settled at %s free, against %s",
                      r->device, humanb(got).c_str(), asked.c_str());
     }
-    /* The weights pool is written after the load only by the mover's expert moves, and each such
-     * write invalidates the host copies of the chunks it touches (dev_page_invalidate), so the
-     * pool's copies stay exact between them: sealed, a park after the first only unmaps
-     * (docs/MULTIMODEL.md §7.2). Not with runtime adapters, which are copied into the pool. */
-    if (!cfg_.lora.enabled())
-        for (auto& r : ranks_)
-            if (char* base = static_cast<char*>(r->pools.weights().base())) {
-                dev_page_seal(base);
-                /* From a container, the pool's own source: a park unmaps it with no copy, and a
-                 * restore reads it again (refill_weights). */
-                if (file_) dev_page_refilled(base);
-            }
+    seal_base_weights();
     /* Bringup done: everything this engine loads is loaded. From here the stuck-exit watchdog
      * treats a device that advances nothing as a hang; before here it treats it as a slow load
      * (device.h's dev_engine_ready). */
