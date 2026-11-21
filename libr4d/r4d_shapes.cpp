@@ -524,6 +524,14 @@ extern "C" int r4d_shape_mla_project_kv(const RadParam* p, int n_p, int operand,
         opd(D, M, h, absorb ? l : vd) };
     R4D_PICK(d);
 }
+extern "C" int r4d_shape_mla_expand_gate(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), h = pi(p, n_p, "heads"), kd = pi(p, n_p, "k_dim"),
+                  vd = pi(p, n_p, "v_dim"), l = pi(p, n_p, "latent_dim");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc d[] = { opd(D, M, h, l), opd(D, h * (kd + vd), l), opd(D, M, h * vd),
+        opd(D, M, h, vd) };
+    R4D_PICK(d);
+}
 extern "C" int r4d_shape_mla_kv_split(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), h = pi(p, n_p, "heads"), kd = pi(p, n_p, "k_dim"),
                   vd = pi(p, n_p, "v_dim"), r = pi(p, n_p, "rope_dim");

@@ -662,6 +662,13 @@ static const RadParamSpec pMlaProjectKv[] = {
 static const RadOperandSpec oMlaProjectKv[] = {
     {"x", RAD_OPD_IN, 0}, {"w", RAD_OPD_WEIGHT, 0}, {"y", RAD_OPD_OUT, 0},
 };
+/* mla_expand_gate: mla_project_kv's expand with gate_mul folded into its store (libr4d only). */
+static const RadParamSpec pMlaExpandGate[] = {
+    P_INT("M"), P_INT("heads"), P_INT("k_dim"), P_INT("v_dim"), P_INT("latent_dim"), P_STR("dtype"),
+};
+static const RadOperandSpec oMlaExpandGate[] = {
+    {"x", RAD_OPD_IN, 0}, {"w", RAD_OPD_WEIGHT, 0}, {"g", RAD_OPD_IN, 0}, {"y", RAD_OPD_OUT, 0},
+};
 static const RadParamSpec pMlaKvSplit[] = {
     P_INT("M"), P_INT("heads"), P_INT("k_dim"), P_INT("v_dim"), P_INT("rope_dim"), P_STR("dtype"),
 };
@@ -3792,6 +3799,10 @@ static const RadOpSchema kSchemas[] = {
            "Per-head absorption or expansion through the checkpoint's kv_b, rows head-major with each head's "
            "k_dim key rows then its v_dim value rows. absorb: [M,heads,k_dim] -> [M,heads,latent]; expand: "
            "[M,heads,latent] -> [M,heads,v_dim]. mla_project with unequal K and V widths."),
+    SCHEMA("mla_expand_gate", pMlaExpandGate, oMlaExpandGate,
+           "mla_project_kv's expand followed by gate_mul in one launch: y = round(f32(round(sum_j "
+           "x[m,h,j] * w[h*(k_dim+v_dim) + k_dim + c][j])) * sigmoid(f32(g[m, h*v_dim + c]))). "
+           "Byte-identical to the two ops it replaces."),
     SCHEMA("mla_kv_split", pMlaKvSplit, oMlaKvSplit,
            "kvb [N, heads*(k_dim+v_dim)] and k_rope [N, rope_dim] -> k [N, heads, k_dim+rope_dim] (the rope "
            "part shared by every head) and v [N, heads, v_dim]. A copy."),
@@ -5248,6 +5259,10 @@ static const RadConstraint cMlaProjectKv[] = {
     C_EQ("v_dim", 256), C_EQ("latent_dim", 512), C_IN("mode", "absorb expand"),
     C_IN("dtype", "bf16"),
 };
+static const RadConstraint cMlaExpandGate[] = {
+    C_GE("M", 1), C_LE("M", 65535), C_GE("heads", 1), C_LE("heads", 64), C_EQ("k_dim", 192),
+    C_EQ("v_dim", 256), C_EQ("latent_dim", 512), C_IN("dtype", "bf16"),
+};
 static const RadConstraint cMlaKvSplit[] = {
     C_GE("M", 1), C_GE("heads", 1), C_GE("k_dim", 1), C_GE("v_dim", 1), C_GE("rope_dim", 1),
     C_IN("dtype", "bf16"),
@@ -6315,6 +6330,14 @@ static const RadConstraint cLogitsVocab[] = { C_DIV("n_embd", 256), C_IN("dtype"
 
 /* No tunable axes. */
 #define NOTUNE nullptr, 0, nullptr
+
+/* mla_project_kv / mla_expand_gate (r4d_mla_kv_bf16.hip): token tiles of 16 a wave. Every value
+ * computes every output element with the same WMMAs in the same order (a token's bytes depend on
+ * its own row only), so the axis moves time, not bits (tests/r4d_emu/test_mla_kv.cpp walks it). */
+static const int64_t kMlaKvMb[] = { 0, 1, 2, 4, 8 };
+static const RadTunable tMlaKv[] = {
+  { "mb", kMlaKvMb, NELEM(kMlaKvMb), 0, "16-token tiles a wave shares each kv_b fragment over; 0 = by M (1 up to 16 rows, 4 past them)" },
+};
 
 /* The prefetch's workgroups. It runs beside a collective or a latency-bound kernel and should fill
  * that window's memory bandwidth without taking the compute units the other lane needs. */
@@ -8583,9 +8606,15 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 { "mla_project_kv_bf16", "mla_project_kv", "attn",
   "absorbed MLA's per-head projections, K and V widths apart",
   "heads 1..64, k_dim 192, v_dim 256, latent 512, M 1..65535", "bf16",
-  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaProjectKv), NOTUNE,
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaProjectKv), ROW(tMlaKv), nullptr,
   nullptr, nullptr, r4d_rad_mla_project_kv, nullptr, nullptr, nullptr,
   r4d_shape_mla_project_kv },
+{ "mla_expand_gate_bf16", "mla_expand_gate", "attn",
+  "the latent attention's output expanded through kv_b's value rows and gated, one rounding each",
+  "heads 1..64, k_dim 192, v_dim 256, latent 512, M 1..65535", "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaExpandGate), ROW(tMlaKv), nullptr,
+  nullptr, nullptr, r4d_rad_mla_expand_gate, nullptr, nullptr, nullptr,
+  r4d_shape_mla_expand_gate, nullptr, r4d_fuse_mla_expand_gate },
 { "mla_kv_split_bf16", "mla_kv_split", "attn", "kv_b output split into k and v heads, a copy",
   "any heads and widths; 16-byte accesses when the widths and pitches are multiples of 8",
   "bf16",
@@ -11664,6 +11693,9 @@ extern "C" int rad_kernel_chain(int i) {
          * query heads a KV head, and the int8 cache's store */
         "attn_decode_h128_gqa4_i8", "attn_decode_h128_gqa4_bf16kv",
         "kv_store_i8",
+        /* Hy4-flash's kv_b projections at decode heights (M <= 64; r4d_mla_kv_bf16.hip), the
+         * absorption and the expansion, alone or with the gate folded in */
+        "mla_project_kv_bf16", "mla_expand_gate_bf16",
     };
     for (const char* p : kChained)
         if (std::strcmp(k->name, p) == 0) return 2;

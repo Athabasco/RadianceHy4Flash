@@ -1,81 +1,284 @@
 // r4d_mla_kv_bf16.hip -- Hy4-flash's kv_b read apart from the sink attention kernels:
 // mla_project_kv (absorbed MLA's per-head projections with unequal K and V widths) and
-// mla_kv_split (the kv_b output laid out as k and v heads for the non-absorbed prefill).
+// mla_kv_split (the kv_b output laid out as k and v heads for the non-absorbed prefill), and
+// mla_expand_gate (the expansion with the attention gate's product folded into its store).
 //
-// mla_project_kv is r4d_mla.hip's project_absorb_rows / project_expand_rows with the head's block
-// generalised (kernels/mla_sink_attn.md section 5): head h's rows of the checkpoint's kv_b start at
-// h * (k_dim + v_dim), its k_dim key rows first and then its v_dim value rows. Compiled for
+// mla_project_kv: head h's rows of the checkpoint's kv_b start at h * (k_dim + v_dim), its k_dim key
+// rows first and then its v_dim value rows (kernels/mla_sink_attn.md section 5). Compiled for
 // (k_dim, v_dim, latent) = (192, 256, 512), up to 64 heads.
 //   absorb: y[m,h,j] = sum_{c<192} a[m,h,c] * b[h*448 + c][j]            [M,H,192] -> [M,H,512]
 //   expand: y[m,h,c] = sum_{j<512} a[m,h,j] * b[h*448 + 192 + c][j]      [M,H,512] -> [M,H,256]
-// The sums run in one fixed order (absorb: c ascending; expand: each lane's share of j ascending,
-// then r4d_xor_sum<32>) whatever the group size R is, so a row's bytes do not depend on the batch
-// it is in. They use fused multiply-adds where libref does not, so a result is within one bf16 ulp
-// of libref's, not byte-equal.
+// mla_expand_gate is expand with gate_mul's epilogue: ag = bf16(f32(bf16(sum)) * sigmoid(f32(g))),
+// byte-equal to the expand followed by gate_mul (r4d_ihc_bf16.hip's formula, the same expf).
 //
+// The law (kernels/perf.md section 3.3, WP16.3): gfx12's bf16 WMMA, 16x16x16, the output columns
+// as the A operand's rows and the tokens as B's columns, f32 accumulators, one rounding at the
+// store. absorb: the 192 in steps of 16 ascending, one chain. expand: the 512 in four quarters,
+// each a chain of eight steps ascending from zero, the quarters added in order ((q0 + q1) + q2) + q3
+// in f32. A token's 16 products of a step and the accumulator it adds them to are its own, so its
+// bytes depend on its own input row only: not on M, on the tile it shares (a token column past M
+// reads the last row and is never stored), on `mb` (token tiles a wave, a rad-tune axis), on the
+// column tiles a wave takes or on the grid. A different sum order from the scalar kernel this
+// replaced (an fma chain): within one bf16 ulp of libref's, as that one was.
+//
+// Fragments (gfx12 wave32): a lane holds row (A) / column (B) lane % 16 and the eight k
+// 8 * (lane / 16) + e. Absorb's A is the key block read across its rows, Wk[c][col] at c along
+// the fragment: global_load_tr_b128 gives it from eight 16-byte row pieces, one load a lane, which
+// is what a latent-major copy of the key block (perf.md's phase B) would give, without a second
+// stored form of kv_b. Expand's A rows are kv_b's value rows (contiguous). The tokens' fragments are
+// 16-byte loads of the token's own row. Operands off the 16-byte grid (a pitched view, a slice
+// starting off it) take every fragment element by element: the same fragments into the same WMMAs
+// (perf.md's phase A), so the same bytes.
+//
+// A workgroup is four waves. absorb: a wave takes NC column tiles of 16 (two past 16 rows) and MB
+// token tiles; expand: the workgroup takes one column tile, a wave a quarter of the contraction
+// and MB token tiles, the partial sums meeting in LDS. Each A fragment is loaded once for its MB
+// token tiles, each token fragment once for its NC column tiles, two chunks of steps in flight.
+//
+// Chained forms (r4d_chain.h): the aligned path at NC 1, chosen at decode heights (M <= 64).
 // mla_kv_split is a copy: k[i,h,0:kd] = kvb[i, h*(kd+vd) : +kd], k[i,h,kd:kd+r] = k_rope[i],
 // v[i,h,:] = kvb[i, h*(kd+vd)+kd : +vd]. One thread a 16 bytes of output.
 #include <hip/hip_runtime.h>
 #include "r4d_args.h"
+#include "r4d_chain.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
 #include <cstdint>
 
 namespace {
 
-constexpr int kKd = 192, kVd = 256, kLatent = 512;
+constexpr int kKd = 192, kVd = 256, kLatent = 512, kRows = kKd + kVd;
 
 struct KvProjectMeta {
-    long xr, xh, wp, yr, yh;
-    int rows, heads;
+    long xr, xh, wp, yr, yh, gr;
+    int rows;
 };
 
-template <int R>
-__global__ __launch_bounds__(128) void kv_absorb_rows(const uint16_t* x, const uint16_t* w,
-                                                      uint16_t* y, KvProjectMeta m) {
-    const int col = blockIdx.x * 128 + threadIdx.x, head = blockIdx.y, r0 = blockIdx.z * R;
-    if (col >= kLatent) return;
-    const uint16_t* xr[R];
+__device__ __forceinline__ v8f kvp_wmma(v8s a, v8s b, v8f c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
+}
+/* gate_mul's sigmoid (r4d_ihc_bf16.hip ihc_sigmoid), for the fused store */
+__device__ __forceinline__ float kvp_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
+
+/* Eight consecutive bf16: one 16-byte load (VEC) or eight. */
+template <bool VEC>
+__device__ __forceinline__ v8s kvp_ld8(const uint16_t* p) {
+    if constexpr (VEC) {
+        return *(const v8s*)p;
+    } else {
+        v8s v;
 #pragma unroll
-    for (int r = 0; r < R; ++r) xr[r] = x + (long)min(r0 + r, m.rows - 1) * m.xr + head * m.xh;
-    float sum[R];
-#pragma unroll
-    for (int r = 0; r < R; ++r) sum[r] = 0;
-    for (int j = 0; j < kKd; ++j) {
-        const float wv = bf16_to_f32(w[((long)head * (kKd + kVd) + j) * m.wp + col]);
-#pragma unroll
-        for (int r = 0; r < R; ++r) sum[r] = fmaf(bf16_to_f32(xr[r][j]), wv, sum[r]);
+        for (int e = 0; e < 8; ++e) v[e] = (short)p[e];
+        return v;
     }
-#pragma unroll
-    for (int r = 0; r < R; ++r)
-        if (r0 + r < m.rows) y[(long)(r0 + r) * m.yr + head * m.yh + col] = f32_to_bf16(sum[r]);
 }
 
-template <int R>
-__global__ __launch_bounds__(128) void kv_expand_rows(const uint16_t* x, const uint16_t* w,
-                                                      uint16_t* y, KvProjectMeta m) {
-    const int lane = threadIdx.x & 31, col = blockIdx.x * 4 + (threadIdx.x >> 5), head = blockIdx.y,
-              r0 = blockIdx.z * R;
-    const uint16_t* xr[R];
+/* The weight's fragment for output columns [o0, o0 + 16) at contraction step k0. `wb` is the
+ * head's first row of the block read (its key rows for absorb, its value rows for expand). */
+template <bool ABSORB, bool VEC>
+__device__ __forceinline__ v8s kvp_wfrag(const uint16_t* wb, long wp, int o0, int k0, int lane) {
+    if constexpr (ABSORB) {
+        /* A[col][c] = Wk[c][col]: lane l names row c = k0 + 8 (l / 16) + l % 8 at columns
+         * o0 + 8 ((l / 8) % 2), and receives column o0 + l % 16 across its group's eight rows */
+        if constexpr (VEC) {
+            return load_tr_b128(wb + (long)(k0 + 8 * (lane >> 4) + (lane & 7)) * wp + o0 +
+                                8 * ((lane >> 3) & 1));
+        } else {
+            const uint16_t* p = wb + (long)(k0 + 8 * (lane >> 4)) * wp + o0 + (lane & 15);
+            v8s v;
 #pragma unroll
-    for (int r = 0; r < R; ++r) xr[r] = x + (long)min(r0 + r, m.rows - 1) * m.xr + head * m.xh;
-    const uint16_t* const wr = w + ((long)head * (kKd + kVd) + kKd + col) * m.wp;
-    float sum[R];
-#pragma unroll
-    for (int r = 0; r < R; ++r) sum[r] = 0;
-    for (int j = lane; j < kLatent; j += 32) {
-        const float wv = bf16_to_f32(wr[j]);
-#pragma unroll
-        for (int r = 0; r < R; ++r) sum[r] = fmaf(bf16_to_f32(xr[r][j]), wv, sum[r]);
+            for (int e = 0; e < 8; ++e) v[e] = (short)p[(long)e * wp];
+            return v;
+        }
+    } else {
+        return kvp_ld8<VEC>(wb + (long)(o0 + (lane & 15)) * wp + k0 + 8 * (lane >> 4));
     }
-    float mine = 0;
+}
+
+/* The contraction steps a wave loads at once, two such chunks in flight (one computed while the
+ * next one loads): as many as keep the fragments and accumulators near 176 VGPRs, since the load
+ * latency is what a wave with few tiles waits on (a decode launch; expand's long contraction).
+ * Changes when a fragment is loaded, not what is summed. */
+/* Expand's contraction is split in four (kSplit): wave q of a workgroup sums j in [128 q,
+ * 128 q + 128) for the workgroup's one column tile, and the four partial sums are added in wave
+ * order, ((p0 + p1) + p2) + p3, before the rounding. Part of the law at every M: a token's bytes
+ * still depend on its own row only. Absorb's 192 are one wave's. */
+template <bool ABSORB>
+constexpr int kvp_split() { return ABSORB ? 1 : 4; }
+constexpr int kvp_threads(bool) { return 128; }
+
+template <bool ABSORB, int MB, int NC>
+constexpr int kvp_chunk() {
+    constexpr int KS = (ABSORB ? kKd : kLatent) / 16 / kvp_split<ABSORB>();
+    int best = 1;
+    for (int kc = 1; kc <= KS / 2; ++kc)
+        if (KS % (2 * kc) == 0 && 8 * kc * (NC + MB) + 8 * NC * MB <= 176) best = kc;
+    return best;
+}
+
+template <bool ABSORB, int MB, int NC, bool VEC, bool GATE>
+__device__ __forceinline__ void kvp_body(const uint16_t* __restrict__ x,
+                                         const uint16_t* __restrict__ w,
+                                         const uint16_t* __restrict__ g, uint16_t* __restrict__ y,
+                                         const KvProjectMeta& m) {
+    constexpr int S = kvp_split<ABSORB>(), K = (ABSORB ? kKd : kLatent) / S, KS = K / 16,
+                  KC = kvp_chunk<ABSORB, MB, NC>(), NCH = KS / KC;
+    static_assert(KS % (2 * KC) == 0, "chunks in pairs");
+    static_assert(S == 1 || NC == 1, "a split workgroup takes one column tile");
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, head = blockIdx.y;
+    /* S 1: the four waves take four column tiles (of NC each); S 4: one, a quarter of k each */
+    const int o0 = (S == 1 ? blockIdx.x * 4 + wave : blockIdx.x) * 16 * NC, t0 = blockIdx.z * 16 * MB;
+    const int kq = S == 1 ? 0 : wave * K;
+    const uint16_t* const wb = w + ((long)head * kRows + (ABSORB ? 0 : kKd)) * m.wp + (ABSORB ? 0 : kq);
+    /* A token past M reads the last row: its column of the tile is never stored, and no other
+     * column reads it (a WMMA output is its own row of A times its own column of B). */
+    const uint16_t* xp[MB];
 #pragma unroll
-    for (int r = 0; r < R; ++r) {
-        sum[r] = r4d_xor_sum<32>(sum[r]);
-        if (lane == r) mine = sum[r];
+    for (int r = 0; r < MB; ++r) {
+        const int t = min(t0 + 16 * r + (lane & 15), m.rows - 1);
+        xp[r] = x + (long)t * m.xr + (long)head * m.xh + kq + 8 * (lane >> 4);
     }
-    if (lane < R && r0 + lane < m.rows)
-        y[(long)(r0 + lane) * m.yr + head * m.yh + col] = f32_to_bf16(mine);
+    v8f acc[NC][MB];
+#pragma unroll
+    for (int n = 0; n < NC; ++n)
+#pragma unroll
+        for (int r = 0; r < MB; ++r)
+#pragma unroll
+            for (int e = 0; e < 8; ++e) acc[n][r][e] = 0.0f;
+    v8s a0[KC][NC], b0[KC][MB], a1[KC][NC], b1[KC][MB];
+    auto load = [&](v8s (&a)[KC][NC], v8s (&b)[KC][MB], int c) {
+#pragma unroll
+        for (int q = 0; q < KC; ++q) {
+            const int k0 = 16 * (c * KC + q);
+#pragma unroll
+            for (int n = 0; n < NC; ++n) a[q][n] = kvp_wfrag<ABSORB, VEC>(wb, m.wp, o0 + 16 * n, k0, lane);
+#pragma unroll
+            for (int r = 0; r < MB; ++r) b[q][r] = kvp_ld8<VEC>(xp[r] + k0);
+        }
+    };
+    auto step = [&](const v8s (&a)[KC][NC], const v8s (&b)[KC][MB]) {
+#pragma unroll
+        for (int q = 0; q < KC; ++q)
+#pragma unroll
+            for (int n = 0; n < NC; ++n)
+#pragma unroll
+                for (int r = 0; r < MB; ++r) acc[n][r] = kvp_wmma(a[q][n], b[q][r], acc[n][r]);
+    };
+    load(a0, b0, 0);
+#pragma unroll 1
+    for (int c = 0; c < NCH; c += 2) {
+        load(a1, b1, c + 1);
+        step(a0, b0);
+        if (c + 2 < NCH) load(a0, b0, c + 2);
+        step(a1, b1);
+    }
+    if constexpr (S > 1) {
+        /* the partial sums through LDS; wave r % 4 adds and stores token tile r */
+        __shared__ float part[S][MB][32][8];
+#pragma unroll
+        for (int r = 0; r < MB; ++r)
+#pragma unroll
+            for (int e = 0; e < 8; ++e) part[wave][r][lane][e] = acc[0][r][e];
+        __syncthreads();
+#pragma unroll
+        for (int r = 0; r < MB; ++r) {
+            if (r % S != wave) continue;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                float v = part[0][r][lane][e];
+#pragma unroll
+                for (int q = 1; q < S; ++q) v += part[q][r][lane][e];
+                acc[0][r][e] = v;
+            }
+        }
+    }
+    /* lane l holds token t0 + 16 r + l % 16 at the output columns o0 + 16 n + 8 (l / 16) + e */
+#pragma unroll
+    for (int r = 0; r < MB; ++r) {
+        if (S > 1 && r % S != wave) continue;
+        const long t = t0 + 16 * r + (lane & 15);
+        if (t >= m.rows) continue;
+#pragma unroll
+        for (int n = 0; n < NC; ++n) {
+            const int c = o0 + 16 * n + 8 * (lane >> 4);
+            uint16_t* const yp = y + t * m.yr + (long)head * m.yh + c;
+            uint16_t o[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) o[e] = f32_to_bf16(acc[n][r][e]);
+            if constexpr (GATE) {
+                const v8s gv = kvp_ld8<VEC>(g + t * m.gr + (long)head * kVd + c);
+#pragma unroll
+                for (int e = 0; e < 8; ++e)
+                    o[e] = f32_to_bf16(bf16_to_f32(o[e]) * kvp_sigmoid(bf16_to_f32((uint16_t)gv[e])));
+            }
+            if constexpr (VEC) {
+                uint4 v;
+                v.x = (uint32_t)o[0] | (uint32_t)o[1] << 16;
+                v.y = (uint32_t)o[2] | (uint32_t)o[3] << 16;
+                v.z = (uint32_t)o[4] | (uint32_t)o[5] << 16;
+                v.w = (uint32_t)o[6] | (uint32_t)o[7] << 16;
+                *(uint4*)yp = v;
+            } else {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) yp[e] = o[e];
+            }
+        }
+    }
+}
+
+template <bool ABSORB, int MB, int NC, bool VEC, bool GATE, typename CH>
+__global__ __launch_bounds__(kvp_threads(ABSORB)) void kv_project_wmma(const uint16_t* __restrict__ x,
+                                                       const uint16_t* __restrict__ w,
+                                                       const uint16_t* __restrict__ g,
+                                                       uint16_t* __restrict__ y, KvProjectMeta m) {
+    if constexpr (CH::on) r4d_chain_wait();
+    kvp_body<ABSORB, MB, NC, VEC, GATE>(x, w, g, y, m);
+    if constexpr (CH::on) r4d_chain_done();
+}
+
+/* The launch: grid (column blocks, heads, token groups of 16 MB). */
+template <bool ABSORB, int MB, int NC, bool VEC, bool GATE, typename CH>
+int kvp_emit(RadStream s, unsigned heads, const uint16_t* x, const uint16_t* w, const uint16_t* g,
+             uint16_t* y, const KvProjectMeta& m) {
+    constexpr int OUT = ABSORB ? kLatent : kVd, PER = 16 * NC * (kvp_split<ABSORB>() == 1 ? 4 : 1);
+    static_assert(OUT % PER == 0, "the workgroups' column tiles divide the output");
+    const unsigned groups = (unsigned)((m.rows + 16 * MB - 1) / (16 * MB));
+    return R4D_EMIT(s, (kv_project_wmma<ABSORB, MB, NC, VEC, GATE, CH>),
+                    dim3(OUT / PER, heads, groups), dim3(kvp_threads(ABSORB)), 0, x, w, g, y, m);
+}
+
+template <bool ABSORB, bool GATE>
+int kvp_pick(RadStream s, unsigned heads, int mb, bool vec, bool chain, const uint16_t* x,
+             const uint16_t* w, const uint16_t* g, uint16_t* y, const KvProjectMeta& m) {
+    if (!vec) return kvp_emit<ABSORB, 1, 1, false, GATE, R4dUnchained>(s, heads, x, w, g, y, m);
+    if (chain) {
+        switch (mb) {
+            case 1: return kvp_emit<ABSORB, 1, 1, true, GATE, r4dchain>(s, heads, x, w, g, y, m);
+            case 2: return kvp_emit<ABSORB, 2, 1, true, GATE, r4dchain>(s, heads, x, w, g, y, m);
+            case 4: return kvp_emit<ABSORB, 4, 1, true, GATE, r4dchain>(s, heads, x, w, g, y, m);
+            default: return kvp_emit<ABSORB, 8, 1, true, GATE, r4dchain>(s, heads, x, w, g, y, m);
+        }
+    }
+    /* absorb: two column tiles a wave past decode heights, half the token fragments' traffic;
+     * expand's split workgroup takes one */
+    if (!ABSORB || m.rows <= 16) {
+        switch (mb) {
+            case 1: return kvp_emit<ABSORB, 1, 1, true, GATE, R4dUnchained>(s, heads, x, w, g, y, m);
+            case 2: return kvp_emit<ABSORB, 2, 1, true, GATE, R4dUnchained>(s, heads, x, w, g, y, m);
+            case 4: return kvp_emit<ABSORB, 4, 1, true, GATE, R4dUnchained>(s, heads, x, w, g, y, m);
+            default: return kvp_emit<ABSORB, 8, 1, true, GATE, R4dUnchained>(s, heads, x, w, g, y, m);
+        }
+    }
+    if constexpr (ABSORB) {
+        switch (mb) {
+            case 1: return kvp_emit<true, 1, 2, true, GATE, R4dUnchained>(s, heads, x, w, g, y, m);
+            case 2: return kvp_emit<true, 2, 2, true, GATE, R4dUnchained>(s, heads, x, w, g, y, m);
+            case 4: return kvp_emit<true, 4, 2, true, GATE, R4dUnchained>(s, heads, x, w, g, y, m);
+            /* eight token tiles take one column tile: two would need 256 VGPRs and spill */
+            default: return kvp_emit<true, 8, 1, true, GATE, R4dUnchained>(s, heads, x, w, g, y, m);
+        }
+    }
+    return R4D_NO(RAD_E_INVAL);
 }
 
 // One thread a chunk of C elements (8 for 16-byte accesses, 1 otherwise) of one (row, head): the
@@ -109,48 +312,69 @@ __global__ __launch_bounds__(256) void kv_split_kernel(
 
 }  // namespace
 
+/* The `mb` law (the row's tunable, 0 = this): one token tile a wave up to 16 rows, four past them,
+ * so a prefill launch reads kv_b's block once for every 64 tokens (measured on the R9700 over 1, 2,
+ * 4 and 8 at 8 to 64 heads and M 1 to 1024: four is the fastest or within a few percent of it
+ * from 32 rows on, in both modes). Bit-neutral. */
+static int kvp_mb(long long M, long long tuned) {
+    if (tuned == 1 || tuned == 2 || tuned == 4 || tuned == 8) return (int)tuned;
+    return M <= 16 ? 1 : 4;
+}
+
+/* mla_project_kv (gate null) and mla_expand_gate (gate the [M, heads * v_dim] logits). */
+static int kvp_launch(const RadArgs* a, RadStream s, const RadTensor* x, const RadTensor* w,
+                      const RadTensor* gt, const RadTensor* y, bool absorb) {
+    if (x->dtype != RAD_BF16 || w->dtype != RAD_BF16 || y->dtype != RAD_BF16 ||
+        (gt && gt->dtype != RAD_BF16))
+        return R4D_NO(RAD_E_DTYPE);
+    const long h = r4d_geti_or(a, "heads", 0);
+    if (h < 1 || h > 64 || r4d_geti_or(a, "k_dim", 0) != kKd || r4d_geti_or(a, "v_dim", 0) != kVd ||
+        r4d_geti_or(a, "latent_dim", 0) != kLatent)
+        return R4D_NO(RAD_E_SHAPE);
+    const long xw = absorb ? kKd : kLatent, yw = absorb ? kLatent : kVd;
+    /* [M, heads * width] or [M, heads, width]: a token's heads are one row, a head a slice. */
+    long long M = 0, My = 0, Mg = 0;
+    const long long xr = r4d_rows_pitch(x, h * xw, &M), yr = r4d_rows_pitch(y, h * yw, &My);
+    const long long gr = gt ? r4d_rows_pitch(gt, h * kVd, &Mg) : 0;
+    if (xr < 0 || yr < 0 || gr < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M < 1 || M > 65535 || My != M || (gt && Mg != M)) return R4D_NO(RAD_E_SHAPE);
+    if (w->rank != 2 || w->shape[0] != h * kRows || w->shape[1] != kLatent || w->stride[1] != 1 ||
+        w->stride[0] < kLatent)
+        return R4D_NO(RAD_E_SHAPE);
+    const KvProjectMeta m{ (long)xr, xw, (long)w->stride[0], (long)yr, yw, (long)gr, (int)M };
+    const auto* xp = (const uint16_t*)x->data;
+    const auto* wp = (const uint16_t*)w->data;
+    const auto* gp = gt ? (const uint16_t*)gt->data : nullptr;
+    auto* yp = (uint16_t*)y->data;
+    /* 16-byte fragments, load_tr's row pieces and 16-byte stores need every row on the grid */
+    const bool vec = xr % 8 == 0 && yr % 8 == 0 && gr % 8 == 0 && m.wp % 8 == 0 &&
+                     r4d_aligned(xp, 16) && r4d_aligned(wp, 16) && r4d_aligned(yp, 16) &&
+                     (!gp || r4d_aligned(gp, 16));
+    const int mb = kvp_mb(M, r4d_geti_or(a, "mb", 0));
+    const bool chain = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
+    const unsigned H = (unsigned)h;
+    if (absorb) return kvp_pick<true, false>(s, H, mb, vec, chain, xp, wp, nullptr, yp, m);
+    if (gp) return kvp_pick<false, true>(s, H, mb, vec, chain, xp, wp, gp, yp, m);
+    return kvp_pick<false, false>(s, H, mb, vec, chain, xp, wp, nullptr, yp, m);
+}
+
 extern "C" int r4d_rad_mla_project_kv(const RadArgs* a, RadStream s) {
     const RadTensor* x = r4d_opt(a, 0);
     const RadTensor* w = r4d_opt(a, 1);
     const RadTensor* y = r4d_opt(a, 2);
     if (!x || !w || !y) return R4D_NO(RAD_E_INVAL);
-    if (x->dtype != RAD_BF16 || w->dtype != RAD_BF16 || y->dtype != RAD_BF16)
-        return R4D_NO(RAD_E_DTYPE);
     const char* mode = r4d_gets(a, "mode");
     const bool absorb = mode && !std::strcmp(mode, "absorb"),
                expand = mode && !std::strcmp(mode, "expand");
-    const long h = r4d_geti_or(a, "heads", 0);
-    if ((!absorb && !expand) || h < 1 || h > 64 || r4d_geti_or(a, "k_dim", 0) != kKd ||
-        r4d_geti_or(a, "v_dim", 0) != kVd || r4d_geti_or(a, "latent_dim", 0) != kLatent)
-        return R4D_NO(RAD_E_SHAPE);
-    const long xw = absorb ? kKd : kLatent, yw = absorb ? kLatent : kVd;
-    /* [M, heads * width] or [M, heads, width]: a token's heads are one row, a head a slice. */
-    long long M = 0, My = 0;
-    const long long xr = r4d_rows_pitch(x, h * xw, &M), yr = r4d_rows_pitch(y, h * yw, &My);
-    if (xr < 0 || yr < 0) return R4D_NO(RAD_E_STRIDE);
-    if (M < 1 || M > 65535 || My != M) return R4D_NO(RAD_E_SHAPE);
-    if (w->rank != 2 || w->shape[0] != h * (kKd + kVd) || w->shape[1] != kLatent ||
-        w->stride[1] != 1 || w->stride[0] < kLatent)
-        return R4D_NO(RAD_E_SHAPE);
-    const KvProjectMeta m{ (long)xr, xw, (long)w->stride[0], (long)yr, yw, (int)M, (int)h };
-    const auto* xp = (const uint16_t*)x->data;
-    const auto* wp = (const uint16_t*)w->data;
-    auto* yp = (uint16_t*)y->data;
-    const int R = M >= 8 ? 8 : M >= 4 ? 4 : M >= 2 ? 2 : 1;
-#define R4D_KVP(RR)                                                                              \
-    do {                                                                                         \
-        const unsigned groups = (unsigned)((M + RR - 1) / RR);                                   \
-        if (absorb)                                                                              \
-            return R4D_EMIT(s, (kv_absorb_rows<RR>), dim3(kLatent / 128, (unsigned)h, groups),   \
-                            dim3(128), 0, xp, wp, yp, m);                                        \
-        return R4D_EMIT(s, (kv_expand_rows<RR>), dim3(kVd / 4, (unsigned)h, groups), dim3(128), \
-                        0, xp, wp, yp, m);                                                       \
-    } while (0)
-    if (R == 8) R4D_KVP(8);
-    if (R == 4) R4D_KVP(4);
-    if (R == 2) R4D_KVP(2);
-    R4D_KVP(1);
-#undef R4D_KVP
+    if (!absorb && !expand) return R4D_NO(RAD_E_SHAPE);
+    return kvp_launch(a, s, x, w, nullptr, y, absorb);
+}
+
+/* Operands: [0] x (the latent attention's output) [1] w (kv_b) [2] g (the gate's logits) [3] y */
+extern "C" int r4d_rad_mla_expand_gate(const RadArgs* a, RadStream s) {
+    const RadTensor *x = r4d_opt(a, 0), *w = r4d_opt(a, 1), *g = r4d_opt(a, 2), *y = r4d_opt(a, 3);
+    if (!x || !w || !g || !y) return R4D_NO(RAD_E_INVAL);
+    return kvp_launch(a, s, x, w, g, y, false);
 }
 
 extern "C" int r4d_rad_mla_kv_split(const RadArgs* a, RadStream s) {

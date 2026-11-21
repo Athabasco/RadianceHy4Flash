@@ -616,7 +616,7 @@ list(APPEND R4D_EMU_HIP ${R4D_DIR}/r4d_ihc_bf16.hip ${R4D_DIR}/r4d_engram_bf16.h
                         ${R4D_DIR}/r4d_mla_kv_bf16.hip)
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc kda mla moefuse kvres
                   dsa lili vit)
-list(APPEND R4D_EMU_TESTS attn_kv_sink hy4 mla_sink)
+list(APPEND R4D_EMU_TESTS attn_kv_sink hy4 mla_sink mla_kv)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -659,7 +659,8 @@ else()
                 ${R4D_EMU}/test_moefuse.cpp ${R4D_EMU}/test_kvres.cpp
                 ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_lili.cpp
                 ${R4D_EMU}/test_vit.cpp ${R4D_EMU}/test_attn_kv_sink.cpp
-                ${R4D_EMU}/test_hy4.cpp ${R4D_EMU}/test_mla_sink.cpp)
+                ${R4D_EMU}/test_hy4.cpp ${R4D_EMU}/test_mla_sink.cpp
+                ${R4D_EMU}/test_mla_kv.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -696,7 +697,7 @@ else()
   endif()
 endif()
 if(R4D_EMU_BUILT)
-  foreach(t pick norm escale qsa lora f32 mhc kda mla moefuse kvres dsa lili vit hy4 mla_sink)
+  foreach(t pick norm escale qsa lora f32 mhc kda mla moefuse kvres dsa lili vit hy4 mla_sink mla_kv)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # Hy4-flash's non-absorbed prefill (attn_kv_sink_h256): about 4 s.
@@ -715,7 +716,9 @@ if(R4D_EMU_BUILT)
   # The LoRA pair has a libref oracle, and the test holds the emulated kernels to it when it can
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within
   # rounding, and that test needs it.
-  set_tests_properties(r4d_emu_lora r4d_emu_kda r4d_emu_hy4 PROPERTIES
+  # r4d_emu_mla_kv: the kv_b projections on WMMA against libref, their law and the fused gate.
+  set_tests_properties(r4d_emu_mla_kv PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
+  set_tests_properties(r4d_emu_lora r4d_emu_kda r4d_emu_hy4 r4d_emu_mla_kv PROPERTIES
                        ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
   # A seeded random sweep, mostly prefill shapes on the WMMA kernel, which the emulator runs at
   # about 2 s a case: `slow`. `r4d_emu_attn sweep 200` is a longer run by hand, a superset of it.

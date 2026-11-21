@@ -174,7 +174,7 @@ static void wave_barrier(int w) {
  * lanes that met at different ops (a cross-lane op called under divergence, each side reaching
  * one) are reported, not combined. */
 enum { kOpBpermute = 1 << 24, kOpReadlane = 2 << 24, kOpBallot = 3 << 24, kOpDpp = 4 << 24,
-       kOpPermlanex16 = 5 << 24 };
+       kOpPermlanex16 = 5 << 24, kOpLoadTr = 6 << 24 };
 static const int* exchange(int v, int* lane, int tag) {
     const int t = (int)S.f[S.cur].tid.x, w = t >> 5;
     const unsigned par = S.xparity[t]++ & 1u;
@@ -340,9 +340,28 @@ int emu_permlanex16(int, int src, unsigned sel_lo, unsigned sel_hi, bool, bool) 
     const unsigned sel = (r < 8 ? sel_lo >> (4 * r) : sel_hi >> (4 * (r - 8))) & 15u;
     return s[(16 - (l & 16)) | (int)sel];
 }
-emu_v8s emu_load_tr_b128(const void*) {
-    std::fprintf(stderr, "emu: global_load_tr_b128 is not emulated\n");
-    std::abort();
+/* global_load_tr_b128 (gfx12): an 8x8 transpose of 16-bit elements in each group of eight lanes.
+ * Lane i of a group names a 16-byte row; lane j of the group receives element j of each of the
+ * eight rows, row i in element i. The addresses go round the wave in two exchanges (a pointer is
+ * two words), then every lane reads its column of its group's rows. */
+emu_v8s emu_load_tr_b128(const void* p) {
+    const uint64_t a = (uint64_t)(uintptr_t)p;
+    int l;
+    const int* s = exchange((int)(uint32_t)a, &l, kOpLoadTr);
+    uint32_t lo[8];
+    for (int i = 0; i < 8; ++i) lo[i] = (uint32_t)s[(l & ~7) + i];
+    s = exchange((int)(uint32_t)(a >> 32), &l, kOpLoadTr | 1);
+    emu_v8s v;
+    for (int i = 0; i < 8; ++i) {
+        const uint64_t ai = (uint64_t)lo[i] | (uint64_t)(uint32_t)s[(l & ~7) + i] << 32;
+        if (ai & 15) {
+            std::fprintf(stderr, "emu: global_load_tr_b128 row address %p is not 16-byte aligned (kernel %s)\n",
+                         (void*)(uintptr_t)ai, emu_last_kernel);
+            std::abort();
+        }
+        v[i] = ((const short*)(uintptr_t)ai)[l & 7];
+    }
+    return v;
 }
 
 /* Dynamic LDS: a mapping whose last page is inaccessible, the buffer placed against it with its

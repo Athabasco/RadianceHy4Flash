@@ -498,6 +498,7 @@ int r4d_rad_ihc_pre(const RadArgs*, RadStream);
 int r4d_rad_ihc_post(const RadArgs*, RadStream);
 int r4d_rad_gate_mul(const RadArgs*, RadStream);
 int r4d_rad_mla_project_kv(const RadArgs*, RadStream);
+int r4d_rad_mla_expand_gate(const RadArgs*, RadStream);
 int r4d_rad_mla_kv_split(const RadArgs*, RadStream);
 int r4d_rad_engram_ids(const RadArgs*, RadStream);
 int r4d_rad_engram_norm(const RadArgs*, RadStream);
@@ -983,6 +984,7 @@ int r4d_shape_ihc_pre(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_ihc_post(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_gate_mul(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_mla_project_kv(const RadParam*, int, int, RadOpdDesc*);
+int r4d_shape_mla_expand_gate(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_mla_kv_split(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_engram_ids(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_engram_norm(const RadParam*, int, int, RadOpdDesc*);
@@ -1118,6 +1120,7 @@ int r4d_fuse_gdn_conv_recurrent_update(const RadParam*, int, uint64_t, int, RadF
 int r4d_fuse_qk_norm_rope_gate_kv_store(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_qkv_norm_rope_kv_store(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_add_rmsnorm(const RadParam*, int, uint64_t, int, RadFuseStep*);
+int r4d_fuse_mla_expand_gate(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_qk_norm_rope_gate_kv_store_streamed(const RadParam*, int, uint64_t, int,
                                                  RadFuseStep*);
 int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam*, int, uint64_t, int, RadFuseStep*);

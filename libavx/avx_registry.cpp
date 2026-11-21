@@ -206,6 +206,9 @@ static const RadParamSpec pAttnKvSink[] = { P_INT("M"), P_INT("N"), P_INT("heads
 static const RadOperandSpec oAttnKvSink[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_q"),
     OPD("cu_k"), WGT("sinks"), OUT("out") };
 static const RadOperandSpec oGateMul[] = { OPD("a"), OPD("g"), OUT("y") };
+static const RadParamSpec pMlaExpandGate[] = { P_INT("M"), P_INT("heads"), P_INT("k_dim"),
+    P_INT("v_dim"), P_INT("latent_dim"), P_STR("dtype") };
+static const RadOperandSpec oMlaExpandGate[] = { OPD("x"), WGT("w"), OPD("g"), OUT("y") };
 static const RadParamSpec pIdxPoolGated[] = { P_INT("M"), P_INT("n"), P_INT("ratio"),
     P_INT("rotary_dim"), P_F64("eps"), P_F64("theta"), P_STR("mode"), P_STRO("sections"),
     P_INTO("block_size"), P_STR("dtype") };
@@ -1170,6 +1173,9 @@ static const RadOpSchema kSchemas[] = {
   "Dense causal attention with a key prefix, a window and a sink. Sequence s has m_s query rows and "
   "n_s >= m_s key rows (cu_q, cu_k); query i sits at key index p = n_s - m_s + i and sees j <= p "
   "with p - j < window (window 0: all). out = sum exp(s_j) v_j / (sum exp(s_j) + exp(sink[h]))." },
+{ "mla_expand_gate", ARR(pMlaExpandGate), ARR(oMlaExpandGate),
+  "mla_project_kv's expand followed by gate_mul in one op: y = round(f32(round(sum_j x[m,h,j] * "
+  "w[h*(k_dim+v_dim) + k_dim + c][j])) * sigmoid(f32(g[m, h*v_dim + c]))), the pair's bytes." },
 { "gate_mul", ARR(pMnD), ARR(oGateMul),
   "y = round(f32(a) * sigmoid(f32(g))): one rounding. act_mul's sigmoid form rounds the sigmoid "
   "first, which is a different bf16 result." },
@@ -1892,6 +1898,8 @@ SIMPLE("avx_attn_kv_sink", "attn_kv_sink", "attn", "prefix attention with a wind
        DT_FLOAT, L(attn_kv_sink)),
 SIMPLE("avx_gate_mul", "gate_mul", "elem", "a * sigmoid(g) with one rounding", DT_FLOAT,
        L(gate_mul)),
+SIMPLE("avx_mla_expand_gate", "mla_expand_gate", "attn", "the expansion then gate_mul, the pair itself",
+       DT_FLOAT, L(mla_expand_gate)),
 SIMPLE("avx_idx_pool_gated", "idx_pool_gated", "attn",
        "compressed indexer group key: gated pool, norm, rotary", DT_FLOAT, L(idx_pool_gated)),
 SIMPLE("avx_idx_pool_gated_fp8", "idx_pool_gated_fp8", "attn",

@@ -535,6 +535,39 @@ AVX_KERNEL(gate_mul) {
     return RAD_OK;
 }
 
+/* ================================================================== mla_expand_gate */
+
+/* mla_project_kv's expand into y, then gate_mul over y in place: the pair it stands for, literally
+ * (libref's, on libavx's two kernels: a host graph that declares the fusion runs what the pair
+ * would). Operands: x, w, g [M, heads * v_dim], y [M, heads, v_dim]. */
+AVX_KERNEL(mla_expand_gate) {
+    if (!rad_args_have(a, 4)) return RAD_E_INVAL;
+    const int64_t H = p_int(a, "heads", 0), vd = p_int(a, "v_dim", 0);
+    if (H < 1 || vd < 1) return RAD_E_SHAPE;
+    std::vector<RadParam> pe(a->p, a->p + a->n_p);
+    RadParam mode{};
+    mode.key = "mode"; mode.kind = RAD_P_STR; mode.sval = "expand";
+    pe.push_back(mode);
+    RadTensor te[3] = { a->t[0], a->t[1], a->t[3] };
+    RadArgs e = *a;
+    e.t = te; e.n_t = 3; e.p = pe.data(); e.n_p = (int)pe.size();
+    const int rc = AVX_FN(avx_mla_project_kv)(&e, stream);
+    if (rc != RAD_OK) return rc;
+    /* y as [M, heads * v_dim]: a token's heads are one row */
+    RadTensor y = a->t[3];
+    if (y.rank == 3) {
+        if (y.stride[2] != 1 || y.stride[1] != vd || y.shape[1] != H || y.shape[2] != vd) return RAD_E_STRIDE;
+        y.rank = 2; y.shape[1] = H * vd; y.stride[1] = 1;
+    }
+    RadParam pg[2] = {};
+    pg[0].key = "n"; pg[0].kind = RAD_P_INT; pg[0].ival = H * vd;
+    pg[1].key = "dtype"; pg[1].kind = RAD_P_STR; pg[1].sval = p_str(a, "dtype", "bf16");
+    RadTensor tg[3] = { y, a->t[2], y };
+    RadArgs g = *a;
+    g.t = tg; g.n_t = 3; g.p = pg; g.n_p = 2;
+    return AVX_FN(avx_gate_mul)(&g, stream);
+}
+
 /* ================================================================== the compressed indexer */
 
 namespace {

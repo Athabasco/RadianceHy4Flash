@@ -33960,13 +33960,15 @@ static void hy4_misc_case(const Plugin& pl) {
     }
 }
 
-/* mla_project_kv through the checkpoint's kv_b, both modes, 8 to 64 heads, M across the group sizes. */
+/* mla_project_kv through the checkpoint's kv_b, both modes, 8 to 64 heads, M across the tile sizes and
+ * the mb law (1, then 4 token tiles a wave past 16 rows). */
 static void hy4_mla_project_kv_case(const Plugin& pl) {
-    if (!sel("mla_project_kv_bf16")) return;
+    const bool sp = sel("mla_project_kv_bf16"), sf = sel("mla_expand_gate_bf16");
+    if (!sp && !sf) return;
     for (const char* mode : { "absorb", "expand" })
         for (int64_t H : { 8, 16, 32, 64 })
-            for (int64_t M : { 1, 3, 9 }) {
-                if (H == 64 && M == 3) continue;
+            for (int64_t M : { 1, 3, 9, 33, 130 }) {
+                if (H == 64 && (M == 3 || M == 130)) continue;
                 const bool ab = !std::strcmp(mode, "absorb");
                 const int64_t kd = 192, vd = 256, L = 512, xw = ab ? kd : L, yw = ab ? L : vd;
                 Hy4Rng rng((uint32_t)(H * 13 + M + (ab ? 0 : 99)));
@@ -33984,36 +33986,115 @@ static void hy4_mla_project_kv_case(const Plugin& pl) {
                          fmt("mla_project_kv %s vs libref: heads %lld M %lld", mode, (long long)H,
                              (long long)M), ps, ops);
             }
-    /* a row's bytes do not depend on the batch it is in: the same row alone and among nine */
-    for (const char* mode : { "absorb", "expand" }) {
-        const bool ab = !std::strcmp(mode, "absorb");
-        const int64_t H = 16, kd = 192, vd = 256, L = 512, xw = ab ? kd : L, yw = ab ? L : vd;
-        const RadKernelInfo* row = find(pl, "mla_project_kv_bf16");
-        if (!row) { ok("mla_project_kv row", false, "row absent"); return; }
-        Hy4Rng rng(4242);
-        std::vector<uint16_t> hx((size_t)(9 * H * xw)), hw((size_t)(H * (kd + vd) * L));
-        for (auto& v : hx) v = h_to_bf16(rng.n());
-        for (auto& v : hw) v = h_to_bf16(rng.n() * 0.05f);
-        void* dx = dalloc(hx.size() * 2); void* dw = dalloc(hw.size() * 2);
-        void* y9 = dalloc((size_t)(9 * H * yw) * 2); void* y1 = dalloc((size_t)(H * yw) * 2);
-        st_memcpy(dx, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
-        st_memcpy(dw, hw.data(), hw.size() * 2, hipMemcpyHostToDevice);
-        int64_t last = 8;   /* the ninth row's bytes, alone */
-        std::vector<RadTensor> t9 = { T(dx, RAD_BF16, { 9, H, xw }), T(dw, RAD_BF16, { H * (kd + vd), L }),
-                                      T(y9, RAD_BF16, { 9, H, yw }) };
-        std::vector<RadTensor> t1 = { T((char*)dx + last * H * xw * 2, RAD_BF16, { 1, H, xw }),
-                                      T(dw, RAD_BF16, { H * (kd + vd), L }), T(y1, RAD_BF16, { 1, H, yw }) };
-        std::vector<RadParam> p9 = { PI("M", 9), PI("heads", H), PI("k_dim", kd), PI("v_dim", vd),
-                                     PI("latent_dim", L), PS("mode", mode), PS("dtype", "bf16") };
-        std::vector<RadParam> p1 = p9;
-        p1[0] = PI("M", 1);
-        run_case(row, t9, p9);
-        run_case(row, t1, p1);
-        std::vector<uint8_t> a((size_t)(H * yw) * 2), b((size_t)(H * yw) * 2);
-        st_memcpy(a.data(), (char*)y9 + last * H * yw * 2, a.size(), hipMemcpyDeviceToHost);
-        st_memcpy(b.data(), y1, b.size(), hipMemcpyDeviceToHost);
-        ok(fmt("mla_project_kv %s: a row's bytes do not depend on the batch", mode).c_str(), a == b);
-    }
+    /* The law (r4d_mla_kv_bf16.hip, WP16.3): a token's bytes are its own row's, whatever M, `mb`
+     * (every value of the row's axis), the chained form or the operand layout (16-byte fragments
+     * and global_load_tr_b128, or the element path a pitched operand takes): every row of every
+     * run equal to the same token launched alone. And mla_expand_gate equal to the expansion
+     * followed by gate_mul, bit for bit (its fusion claim). */
+    const RadKernelInfo* row = find(pl, "mla_project_kv_bf16");
+    const RadKernelInfo* fused = find(pl, "mla_expand_gate_bf16");
+    const RadKernelInfo* gmul = find(pl, "gate_mul_bf16");
+    if (!row || !fused || !gmul) { ok("mla_project_kv rows", false, "a row is absent"); return; }
+    for (const char* mode : { "absorb", "expand" })
+        for (const int64_t H : { 16, 64 }) {
+            const bool ab = !std::strcmp(mode, "absorb");
+            const int64_t kd = 192, vd = 256, L = 512, xw = ab ? kd : L, yw = ab ? L : vd, M = 70;
+            const int64_t XW = H * xw, YW = H * yw, GW = H * vd, WR = H * (kd + vd);
+            Hy4Rng rng((uint32_t)(4242 + H + (ab ? 0 : 1)));
+            std::vector<uint16_t> hx((size_t)(M * XW)), hw((size_t)(WR * L)), hg((size_t)(M * GW));
+            for (auto& v : hx) v = h_to_bf16(rng.n());
+            for (auto& v : hw) v = h_to_bf16(rng.n() * 0.05f);
+            for (auto& v : hg) v = h_to_bf16(rng.n() * 3.0f);
+            /* the aligned operands and a pitched copy of each, one element off the 16-byte grid */
+            auto up = [&](const std::vector<uint16_t>& h, int64_t rows, int64_t cols, int64_t pitch,
+                          int64_t off) {
+                std::vector<uint16_t> p((size_t)(off + rows * pitch), 0x7e7e);
+                for (int64_t i = 0; i < rows; ++i)
+                    std::memcpy(&p[(size_t)(off + i * pitch)], &h[(size_t)(i * cols)], (size_t)cols * 2);
+                void* d = dalloc(p.size() * 2);
+                st_memcpy(d, p.data(), p.size() * 2, hipMemcpyHostToDevice);
+                return (uint16_t*)d + off;
+            };
+            uint16_t *dx = up(hx, M, XW, XW, 0), *dw = up(hw, WR, L, L, 0), *dg = up(hg, M, GW, GW, 0);
+            uint16_t *px = up(hx, M, XW, XW + 3, 1), *pw = up(hw, WR, L, L + 3, 1),
+                     *pg = up(hg, M, GW, GW + 3, 1);
+            auto T2 = [](void* d, int64_t r, int64_t c, int64_t pitch) {
+                RadTensor t = T(d, RAD_BF16, { r, c });
+                t.stride[0] = pitch;
+                return t;
+            };
+            auto prm = [&](int64_t m, long long mb, long long chain, bool gate) {
+                std::vector<RadParam> ps = { PI("M", m), PI("heads", H), PI("k_dim", kd), PI("v_dim", vd),
+                                             PI("latent_dim", L), PS("dtype", "bf16"), PI("mb", mb),
+                                             PI("chain", chain) };
+                if (!gate) ps.push_back(PS("mode", mode));
+                return ps;
+            };
+            /* y of rows [r0, r0 + m) through `r`, packed on the host */
+            auto launch = [&](const RadKernelInfo* r, int64_t r0, int64_t m, long long mb, long long chain,
+                              bool pitched, bool gate) {
+                const int64_t xp = pitched ? XW + 3 : XW, wp = pitched ? L + 3 : L,
+                              gp = pitched ? GW + 3 : GW, ypt = pitched ? YW + 3 : YW;
+                uint16_t* y = (uint16_t*)dalloc((size_t)(m * ypt + 8) * 2) + (pitched ? 1 : 0);
+                std::vector<RadTensor> ts = { T2((pitched ? px : dx) + r0 * xp, m, XW, xp),
+                                              T2(pitched ? pw : dw, WR, L, wp) };
+                if (gate) ts.push_back(T2((pitched ? pg : dg) + r0 * gp, m, GW, gp));
+                ts.push_back(T2(y, m, YW, ypt));
+                std::vector<RadParam> ps = prm(m, mb, chain, gate);
+                run_case(r, ts, ps);
+                std::vector<uint16_t> o((size_t)(m * YW)), rowb((size_t)ypt);
+                for (int64_t i = 0; i < m; ++i) {
+                    st_memcpy(rowb.data(), y + i * ypt, (size_t)YW * 2, hipMemcpyDeviceToHost);
+                    std::memcpy(&o[(size_t)(i * YW)], rowb.data(), (size_t)YW * 2);
+                }
+                return o;
+            };
+            std::vector<uint16_t> alone((size_t)(M * YW));
+            for (int64_t t = 0; t < M; ++t) {
+                const auto o = launch(row, t, 1, 0, 0, false, false);
+                std::memcpy(&alone[(size_t)(t * YW)], o.data(), o.size() * 2);
+            }
+            bool same = true;
+            std::string where;
+            for (const long long chain : { 0, 1 })
+                for (const long long mb : { 0, 1, 2, 4, 8 })
+                    for (const int64_t m : { M, (int64_t)9 }) {
+                        const auto o = launch(row, 0, m, mb, chain, false, false);
+                        if (!std::equal(o.begin(), o.end(), alone.begin())) {
+                            same = false;
+                            where = fmt("M %lld mb %lld chain %lld", (long long)m, mb, chain);
+                        }
+                    }
+            const auto tail = launch(row, 5, M - 5, 0, 0, false, false);
+            if (!std::equal(tail.begin(), tail.end(), alone.begin() + 5 * YW)) { same = false; where = "rows 5.."; }
+            const auto pit = launch(row, 0, M, 0, 0, true, false);
+            if (pit != alone) { same = false; where = "pitched"; }
+            ok(fmt("mla_project_kv %s heads %lld: a token's bytes do not depend on M, mb, the chained form or "
+                   "the operand layout", mode, (long long)H).c_str(), same, where);
+            if (ab) continue;
+            /* the fused gate against gate_mul over the expansion */
+            uint16_t* dao = up(alone, M, YW, YW, 0);
+            uint16_t* dag = (uint16_t*)dalloc((size_t)(M * GW) * 2);
+            {
+                std::vector<RadTensor> ts = { T2(dao, M, GW, GW), T2(dg, M, GW, GW), T2(dag, M, GW, GW) };
+                std::vector<RadParam> ps = { PI("M", M), PI("n", GW), PS("dtype", "bf16") };
+                run_case(gmul, ts, ps);
+            }
+            std::vector<uint16_t> want((size_t)(M * GW));
+            st_memcpy(want.data(), dag, want.size() * 2, hipMemcpyDeviceToHost);
+            bool fsame = true;
+            for (const long long chain : { 0, 1 })
+                for (const long long mb : { 0, 1, 4, 8 })
+                    for (const bool pitched : { false, true }) {
+                        if (pitched && (chain || mb)) continue;
+                        const auto o = launch(fused, 0, M, mb, chain, pitched, true);
+                        if (o != want) { fsame = false; where = fmt("mb %lld chain %lld%s", mb, chain, pitched ? " pitched" : ""); }
+                    }
+            const auto o9 = launch(fused, 0, 9, 0, 1, false, true);
+            if (!std::equal(o9.begin(), o9.end(), want.begin())) { fsame = false; where = "M 9 chained"; }
+            ok(fmt("mla_expand_gate heads %lld == mla_project_kv expand + gate_mul, bit for bit", (long long)H).c_str(),
+               fsame, where);
+        }
 }
 
 /* mla_kv_split: a copy, byte for byte; the 16-byte path, a pitched one and the scalar path. */

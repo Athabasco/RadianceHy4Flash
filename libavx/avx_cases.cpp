@@ -236,6 +236,9 @@ std::vector<Case> build_cases() {
                 add("mla_project_kv", { HI("M", 2), HI("heads", 2), HI("k_dim", 192), HI("v_dim", 256),
                                         HI("latent_dim", 512), HS("mode", mode), HS("dtype", "bf16") });
             }
+        if (!std::strcmp(dt, "bf16"))
+            add("mla_expand_gate", { HI("M", 3), HI("heads", 2), HI("k_dim", 192), HI("v_dim", 256),
+                                     HI("latent_dim", 512), HS("dtype", "bf16") });
         for (const char* mode : { "prefill", "verify" })
             add("kda_update", { HI("M", 3), HI("heads", 2), HI("head_k", 32), HI("head_v", 32),
                                 HF("lower_bound", -5), HF("scale", 0.1767766952966369),

@@ -628,6 +628,40 @@ extern "C" int r4d_fuse_qkv_norm_rope_kv_store(const RadParam* p, int n_p, uint6
 }
 
 /* ==========================================================================================
+ * mla_expand_gate -- mla_project_kv's expand, then gate_mul over its output.
+ * (row: mla_expand_gate_bf16; kernel: libr4d/r4d_mla_kv_bf16.hip, kv_project_wmma with GATE)
+ *
+ * Operands: [0] x  [1] w  [2] g  [3] y
+ *
+ * One temporary, the expansion's bf16 output: the fused store rounds the sum to bf16 and widens
+ * it back before the product, which is what gate_mul reads from that buffer. */
+extern "C" int r4d_fuse_mla_expand_gate(const RadParam* p, int n_p, uint64_t present, int step,
+                                        RadFuseStep* out) {
+    (void)present;
+    if (!out) return RAD_E_INVAL;
+    const int64_t heads = pi(p, n_p, "heads"), vd = pi(p, n_p, "v_dim");
+    if (heads <= 0 || vd <= 0) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "mla_project_kv");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "heads").mirror(p, n_p, "k_dim")
+         .mirror(p, n_p, "v_dim").mirror(p, n_p, "latent_dim").pstr("mode", "expand")
+         .mirror(p, n_p, "dtype");
+        /* x, w, y = the temporary */
+        return s.wire({ 0, 1, RAD_FUSE_TMP(0) });
+    }
+    case 1: {
+        Step s(out, "gate_mul");
+        s.mirror(p, n_p, "M").pint("n", heads * vd).mirror(p, n_p, "dtype");
+        /* a = the expansion, g, y */
+        return s.wire({ RAD_FUSE_TMP(0), 2, 3 });
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
  * add_rmsnorm -- add (x += a), then rmsnorm of the x it wrote.
  * (row: add_rmsnorm_bf16; kernel: libr4d/r4d_model_bf16.hip, add_rmsnorm_kernel)
  *

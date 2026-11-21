@@ -1106,6 +1106,18 @@ int ref_attn_kv_sink_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* 
     return o.finish("attn_kv_sink", operand, out);
 }
 
+int ref_mla_expand_gate_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), h = gi(p, n_p, "heads", 0), kd = gi(p, n_p, "k_dim", 0),
+                  vd = gi(p, n_p, "v_dim", 0), l = gi(p, n_p, "latent_dim", 0);
+    if (M < 1 || h < 1 || kd < 1 || vd < 1 || l < 1) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(RAD_BF16, { M, h, l });             /* x */
+    o.t(RAD_BF16, { h * (kd + vd), l });    /* w */
+    o.t(RAD_BF16, { M, h * vd });           /* g */
+    o.t(RAD_BF16, { M, h, vd });            /* y */
+    return o.finish("mla_expand_gate", operand, out);
+}
+
 int ref_gate_mul_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
