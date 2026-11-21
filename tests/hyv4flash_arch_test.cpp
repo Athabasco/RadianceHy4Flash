@@ -1246,6 +1246,23 @@ TEST(dfly2_is_a_block_drafter_of_block_depth_plus_one_with_window_1) {
     CHECK_EQ(count_op(d.b, "dfly_sel"), 0);
 }
 
+/* --draft-suffix beside DFly2 (WP13.8b): with the drafter in the container the probe says its
+ * depth is fixed, so the core cuts a suffix chain to num-speculative-tokens instead of widening the
+ * verify window past the block (DFly2 would decline the wider max_spec). No depth is stated
+ * (auto keeps speculation off), and a container without the drafter states nothing. */
+TEST(the_probe_keeps_a_suffix_chain_inside_dfly2s_block) {
+    MetaKV m = dfly_meta();
+    RadArchProbe p{};
+    CHECK_OK(hyv4flash::probe(m.meta(), &p));
+    CHECK_EQ(p.draft_depth_fixed, 1);
+    CHECK_EQ(p.draft_depth, 0);
+    MetaKV plain = mini_meta();
+    RadArchProbe q{};
+    CHECK_OK(hyv4flash::probe(plain.meta(), &q));
+    CHECK_EQ(q.draft_depth_fixed, 0);
+    CHECK_EQ(q.draft_depth, 0);
+}
+
 /* §3.3 / §6: one engine step -- the trunk step (with its snapshots), the empty context pass, the
  * query pass at depth 5, 3 and 1 -- is lint clean as a whole; the context pass issues nothing; the
  * query pass none of the trunk's key-side, selection, Engram or hyper-connection ops; and it

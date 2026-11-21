@@ -1137,9 +1137,15 @@ static void step(RadCtx* c, const RadBatch* batch) {
  *
  * No draft depth: DFly2 serves 1 to 5 (hyv4flash_dfly.h), but what a draft pass costs against a
  * verify row is not measured (kernels/dfly2.md §9, R-2), so `--num-speculative-tokens auto` keeps
- * speculation off and a deployment asks for the depth it wants. */
+ * speculation off and a deployment asks for the depth it wants.
+ *
+ * With DFly2 in the container the depth is fixed in the sense the core reads it for
+ * `--draft-suffix`: the block is the verify window (block = max_spec + 1), so a suffix chain is
+ * cut to num-speculative-tokens rather than widening the window past the block, which DFly2 would
+ * decline (kernels/dfly2.md §8.4). With no depth stated, `auto` and rad-convert are unaffected. */
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
+    out->draft_depth_fixed = top(meta, "dfly_num_hidden_layers", 0) > 0 ? 1 : 0;
     out->chain_pays = RAD_CHAIN_ALWAYS;
     out->kv_stream_ok = 1;
     return RAD_OK;

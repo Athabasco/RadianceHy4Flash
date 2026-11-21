@@ -1772,6 +1772,18 @@ sensitive between 0.80 and 0.90. The engine keeps 48 recorded passes instead of 
 chain makes more pass shapes than 24 hold: 3352 recordings per benchmark became 1472, +1.7% tokens a
 second for this mode); the other modes make no more pass shapes than 24 hold.
 
+Over a block drafter's coupled walk (a block drafter with `draft-coupling: on`, no tree) the block is
+one pass and costs the same whatever the verify carries, so the depth is the **prefix** of the block
+the next verify carries. Every law of the block is known before that verify is issued, so there is
+no lag: draft j is verified while draft j - 1 is and either j <= `draft-depth-min` or the product of
+the walk's largest probabilities up to j (`top`) or of its drawn tokens' probabilities before j
+(`path`) is at least `draft-depth-stop`; `draft-depth-lag` does not apply. Exact for the same reason
+(the rule reads Q_1 .. Q_j and the path x_1 .. x_{j-1}, never x_j's own mass, never Q_{j+1}, never the
+target; `tests/mtp_rrs_test.cpp` drives the real coupled walk with the two controls that fail). The
+host waits for the walk's state copy before it issues the next verify (`draft depth adaptive
+(block)` at startup). A greedy row has no law and verifies the whole block. `draft-depth-load: on`
+picks the prefixes of a step's rows by the same cost model, one block pass counting as one round.
+
 **Several sequences in one step: `draft-depth-load: on`.** The stop rule prices a draft as one stream pays
 for it: its verify row and the head round that makes it. With several sequences drafting in one step the
 prices part. A round is one pass for every row, a verify row is each row's own, the row that takes the
@@ -1840,7 +1852,11 @@ It works with the normal fixed MTP chain, with `draft-depth: adaptive` (the adap
 the head's `num-speculative-tokens` rounds; the suffix window only widens the verify) and with
 `draft-verify: traversal` (a suffix row carries no coupled state, so it is a leaf of the walk). It is
 refused with `draft-verify: block` (the block verify decides a head chain as a whole), with
-`draft-window: adaptive`, and on a block drafter.
+`draft-window: adaptive`, and on a block drafter that proposes a tree. Beside a block drafter's chain
+(DFlash2, Hy4-flash's DFly2) the verify window stays the block: a `draft-suffix-max` past
+`num-speculative-tokens` is cut to it (with a warning) where the plugin says its depth is fixed and
+refused otherwise; the drafter's context pass mirrors every row a suffix step verified (DFly2 keeps no
+draft cache at all), so a suffix step leaves no hole.
 
 How it is built: the verify window (`num-speculative-tokens` for every buffer, ring and kernel band)
 becomes `max(num-speculative-tokens, draft-suffix-max)` while the head keeps drafting its own
@@ -2707,7 +2723,7 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `spec-ngram: K` | 0 | prompt lookup alone: up to K drafts a step from the sequence's own n-grams, each proposal verified when it pays at the measured step cost; a container that declares a draft head is refused; sets the window to K (§4.6) |
 | `spec-ngram-min: N`, `spec-ngram-max: N` | 2, 4 | the pattern lengths prompt lookup tries, longest first (at most 15), wherever it drafts |
 | `draft-window: MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, for a serial draft head or prompt lookup alone (§4.6) |
-| `draft-depth: MODE` | fixed | `adaptive` stops a coupled serial chain within the step once the product of the head's probabilities along it falls below `draft-depth-stop`; the next verify carries only the drafts made (§4.6). Needs `draft-coupling: on` and `draft-window: fixed` |
+| `draft-depth: MODE` | fixed | `adaptive` stops a coupled serial chain within the step once the product of the head's probabilities along it falls below `draft-depth-stop`; the next verify carries only the drafts made; over a coupled block drafter's walk it verifies the prefix of the block the same rule admits, with no lag (§4.6). Needs `draft-coupling: on`, `draft-window: fixed` and no draft tree |
 | `draft-depth-max: N` | auto | `draft-depth: adaptive`: the deepest chain (auto: `num-speculative-tokens`) |
 | `draft-depth-min: N` | 1 | `draft-depth: adaptive`: rounds that always run |
 | `draft-depth-stop: P` | 0.85 | `draft-depth: adaptive`: the chain goes on while its confidence is at least P |
@@ -2722,7 +2738,7 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `draft-depth-load-row-ms: LIST` | built in | `draft-depth-load: on`: a verify row's milliseconds by drafting sequences 1..8 |
 | `draft-depth-load-round-ms: LIST` | built in | `draft-depth-load: on`: a draft round's milliseconds by drafting sequences 1..8 |
 | `draft-depth-load-jump-ms: LIST` | built in | `draft-depth-load: on`: what a verify of more than 16, 32, 48, 64 query rows costs on top, in milliseconds (up to four numbers) |
-| `draft-suffix: MODE` | off | SuffixDecoding as a step selector on a serial head's chain: a step whose sequence's own history recurs (the last `draft-suffix-min-match` tokens occurred before) verifies the earlier continuation instead of the head's draft; lossless; with the fixed chain, `draft-verify: traversal` and `draft-depth: adaptive`, not `draft-verify: block` (§4.6) |
+| `draft-suffix: MODE` | off | SuffixDecoding as a step selector on a drafter's chain (a serial head's, or a block drafter's whose window stays its block): a step whose sequence's own history recurs (the last `draft-suffix-min-match` tokens occurred before) verifies the earlier continuation instead of the head's draft; lossless; with the fixed chain, `draft-verify: traversal` and `draft-depth: adaptive`, not `draft-verify: block` (§4.6) |
 | `draft-suffix-min-match: L`, `draft-suffix-max: N`, `draft-suffix-min-score: D` | 6, 7, 0.3 | the shortest match (1..12), the most rows of a suffix step (1..32; widens the verify window to max(`num-speculative-tokens`, N); at most 7 on Flash-Next), and the path score under which the chain is cut |
 | `draft-short-from: N` | auto | a block drafter that declares a shorter block runs it from N decoding sequences on, its own block again two below or at one sequence; 0 never; auto never for a chain and 2 for a tree drafter, which then verifies the short block's nodes (§4.6) |
 | `draft-coupling: MODE` | off | `on`: a linear MTP drafter with a 2-bit candidate head (Qwen3.8-Flash-Next) samples each proposal from its reranked top-8 and the sampler maximally couples the target's draw to it. The output distribution is unchanged and a fixed seed yields other tokens than `off`. The head's law is taken at temperature 1, so it pays at high request temperatures and costs at low ones: on Flash-Next TP2 at 2x R9700, tokens per decode step +18% at temperature 1.0 and c1, +11% at 0.7 and c4, -4% at 0.3. Greedy rows are unchanged by coupling. Qwen35's native U2 head couples its global top eight without reranking ([IQR-V4 conversion](IQR.md#keeping-the-native-mtp-head-with-a-split-target)). A DFlash2 drafter (Qwen3.5/3.8) couples its candidate walk instead: each position is sampled from the softmax of the walk's own scores over its best eight candidates, at temperature 0.6 (fixed in `qwen35_fp8`, where acceptance peaked); on Qwen3.8-27B MXFP4 TP2 at 2x R9700 and request temperature 1, tokens per verify step +8% on held-out prompts at c4 (3.53 to 3.82) and decode +2..8% per stream at c1/c4. Any other drafter is refused at startup |

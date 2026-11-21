@@ -2107,6 +2107,32 @@ TEST(a_block_drafter_after_a_prefix_hit_proposes_what_a_cold_run_does) {
     }
 }
 
+/* The block levers' refusals on a block drafter that proposes a tree (the tiny 31B's DFlash2, whose
+ * plugin turns trees on and which declares no coupled walk): the suffix selector replaces a chain,
+ * and the adaptive prefix needs a coupled chain, so both are refused at startup by name rather than
+ * served as something else. The
+ * levers themselves are mtp_rrs_test's (the rule over the real coupled walk) and sched_test's (a
+ * block drafter's suffix step, per-row prefixes issued ahead). */
+TEST(a_tree_proposing_block_drafter_refuses_the_suffix_selector_and_the_adaptive_prefix) {
+    REQUIRE(world().ok);
+    struct Case { std::vector<std::string> args; const char* want; };
+    const Case cases[] = {
+        { { "--draft-suffix", "on" }, "it needs a drafter's chain, not a block drafter's tree" },
+        { { "--draft-coupling", "on", "--kernels", "libref,spechub", "--draft-depth", "adaptive" },
+          "declared no coupled MTP planes" },
+    };
+    for (const Case& k : cases) {
+        std::vector<std::string> a = { "--num-speculative-tokens", "7", "--no-prefix-cache" };
+        a.insert(a.end(), k.args.begin(), k.args.end());
+        const Ran r = radiance(world().g31_df2, a, {}, 120);
+        if (r.status == 0 || r.status == 124 || !has(r.log, k.want))
+            fprintf(stderr, "    %s exited %d:\n%s\n", k.args[0].c_str(), r.status, tail(r.log, 20).c_str());
+        CHECK(r.status != 0);
+        CHECK(r.status != 124);
+        CHECK(has(r.log, k.want));
+    }
+}
+
 /* A prompt resumed from a window snapshot, on the tiny 31B: gemma4_bf16 declares the sliding layers
  * windowed, and the cache does not index them (arch/gemma4's tiny model declares them full and takes
  * no snapshot). A 600-token prompt takes a snapshot a block short of its end at the default
