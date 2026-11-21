@@ -1211,7 +1211,10 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     out->kv_stream_ok = 1;
     /* declare() honours RadBuildCtx::shape_probe (probe_model above): the core sizes the arena's
      * levels, lends their tops to the expert slab and arms the prefill stager. */
-    out->shape_probe_ok = 1;
+    {   /* RADIANCE_HY4_SHAPE_PROBE=0: no sizing declares (an A/B switch, hy4-perf). */
+        const char* e = std::getenv("RADIANCE_HY4_SHAPE_PROBE");
+        out->shape_probe_ok = (e && *e && std::strcmp(e, "0") == 0) ? 0 : 1;
+    }
     return RAD_OK;
 }
 
