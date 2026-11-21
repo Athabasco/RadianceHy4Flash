@@ -705,6 +705,7 @@ int r4d_rad_qsa_tail_store  (const RadArgs*, RadStream);
 int r4d_rad_qsa_work        (const RadArgs*, RadStream);
 int r4d_rad_idx_pool_gated  (const RadArgs*, RadStream);
 int r4d_rad_idx_pool_gated_fp8(const RadArgs*, RadStream);
+int r4d_rad_idx_pool_gated_i8(const RadArgs*, RadStream);
 int r4d_rad_idx_score       (const RadArgs*, RadStream);
 int r4d_rad_sample_chain    (const RadArgs*, RadStream);
 
@@ -880,6 +881,8 @@ int r4d_rad_swiglu_step(const RadArgs*, RadStream);
 int r4d_rad_dsa_pool(const RadArgs*, RadStream);
 int r4d_shape_dsa_pool(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_dsa_query(const RadArgs*, RadStream);
+int r4d_rad_dsa_query_i8(const RadArgs*, RadStream);
+int r4d_shape_dsa_query_i8(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_dsa_query(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_gemm_nt_f32(const RadArgs*, RadStream);
 int r4d_shape_gemm_nt_f32(const RadParam*, int, int, RadOpdDesc*);

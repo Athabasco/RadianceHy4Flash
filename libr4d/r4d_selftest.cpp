@@ -19264,7 +19264,7 @@ static void mhc_check(const Plugin& pl, const char* name, int64_t rows, int64_t 
     const bool grouped = !std::strcmp(row->op, "router_sigmoid_group_topk");
     const bool routed = grouped || !std::strcmp(row->op, "router_sigmoid_topk");
     const bool pooled = !std::strcmp(row->op, "dsa_pool");
-    const bool query = !std::strcmp(row->op, "dsa_query");
+    const bool query = !std::strcmp(row->op, "dsa_query") || !std::strcmp(row->op, "dsa_query_i8");
     const bool projection = !std::strcmp(row->op, "gemm_nt_f32");
     std::vector<RadParam> ps = { PI("M", rows + 7), PS("dtype", routed ? "f32" : "bf16") };
     if (routed) {
@@ -19421,6 +19421,9 @@ static void mhc_check(const Plugin& pl, const char* name, int64_t rows, int64_t 
                 if (ht.dtype == RAD_F8E4M3) {
                     expected = rad_fp8e4m3_to_f32(((const uint8_t*)ht.data)[off]);
                     actual = rad_fp8e4m3_to_f32(got[128 + (size_t)off]);
+                } else if (ht.dtype == RAD_I8) {
+                    expected = (float)((const int8_t*)ht.data)[off];
+                    actual = (float)(int8_t)got[128 + (size_t)off];
                 } else if (ht.dtype == RAD_I32) {
                     expected = (float)((const int32_t*)ht.data)[off];
                     actual = (float)((const int32_t*)(got.data() + 128))[off];
@@ -19520,8 +19523,9 @@ static void glm_index_layout_check(const Plugin& pl) {
 }
 
 static void dsa_score_check(const Plugin& pl, int64_t rows, int64_t blocks, bool packed = false,
-                            int64_t heads_n = 32) {
-    const auto* row = find(pl, heads_n == 16 ? "dsa_score_fp8_h16" : "dsa_score_fp8");
+                            int64_t heads_n = 32, bool i8 = false) {
+    const auto* row = find(pl, i8 ? (heads_n == 16 ? "dsa_score_i8_h16" : "dsa_score_i8")
+                                  : (heads_n == 16 ? "dsa_score_fp8_h16" : "dsa_score_fp8"));
     if (!row || !g_plugin) {
         ok("DSA scorer", false, "row or plugin missing");
         return;
@@ -19546,7 +19550,8 @@ static void dsa_score_check(const Plugin& pl, int64_t rows, int64_t blocks, bool
     }
     const int64_t seqs = rows > 1 ? 2 : 1;
     std::vector<RadParam> ps = { PI("M", rows),        PI("n", 128),     PI("heads", heads_n),
-                                 PI("blocks", blocks), PI("seqs", seqs), PS("dtype", "fp8_e4m3") };
+                                 PI("blocks", blocks), PI("seqs", seqs),
+                                 PS("dtype", i8 ? "int8" : "fp8_e4m3") };
     std::vector<RadTensor> host, device;
     std::vector<std::vector<uint8_t>> bytes(9);
     std::vector<void*> allocations;
@@ -19582,7 +19587,9 @@ static void dsa_score_check(const Plugin& pl, int64_t rows, int64_t blocks, bool
                                                       2001) -
                                                 1000) /
                                         1000;
-                        if (t.dtype == RAD_F8E4M3)
+                        if (t.dtype == RAD_I8)
+                            ((int8_t*)t.data)[off] = (int8_t)std::lrintf(v * 127);
+                        else if (t.dtype == RAD_F8E4M3)
                             ((uint8_t*)t.data)[off] = rad_f32_to_fp8e4m3(v * 16);
                         else if (t.dtype == RAD_F32)
                             ((float*)t.data)[off] = i == 1   ? std::ldexp(1.0f, -6 - (r + h) % 3)
@@ -19682,8 +19689,8 @@ static void dsa_score_check(const Plugin& pl, int64_t rows, int64_t blocks, bool
     for (int64_t r = 0; r < rows; ++r)
         for (int64_t b = blocks * 4; b < out.stride[0] * 4; ++b)
             guards = guards && got[128 + (size_t)r * out.stride[0] * 4 + b] == 0xa5;
-    ok(fmt("DSA FP8 WMMA %lld heads M=%lld blocks=%lld, signed gates, ragged cu, max error %.8g",
-           (long long)heads_n, (long long)rows, (long long)blocks, max_error)
+    ok(fmt("DSA %s WMMA %lld heads M=%lld blocks=%lld, signed gates, ragged cu, max error %.8g",
+           i8 ? "INT8" : "FP8", (long long)heads_n, (long long)rows, (long long)blocks, max_error)
            .c_str(),
        matches);
     ok("DSA scorer guards and pitched output", guards);
@@ -28235,12 +28242,13 @@ static void idx_pool_case(const Plugin& pl) {
 /* idx_pool_gated_fp8 against libref on the same bytes: the packed u8 cache pages (codes and the
  * scale at byte 128; the last four bytes of a page and skipped pages untouched) and q/scale. The
  * device keeps libref's order for every sum, so the bytes must match. */
-static void idx_pool_fp8_case(const Plugin& pl) {
-    const char* what = "idx_pool_gated_fp8 against libref";
-    const RadKernelInfo* r = find(pl, "idx_pool_gated_fp8");
-    const RadKernelInfo* ref = usel_libref_row("idx_pool_gated_fp8");
+static void idx_pool_fp8_case(const Plugin& pl, bool i8 = false) {
+    const char* what = i8 ? "idx_pool_gated_i8 against libref" : "idx_pool_gated_fp8 against libref";
+    const char* row_name = i8 ? "idx_pool_gated_i8" : "idx_pool_gated_fp8";
+    const RadKernelInfo* r = find(pl, row_name);
+    const RadKernelInfo* ref = usel_libref_row(row_name);
     if (!r) { ok(what, false, "row absent"); return; }
-    if (!ref) { skip(what, "libref's idx_pool_gated_fp8 unavailable"); return; }
+    if (!ref) { skip(what, i8 ? "libref's idx_pool_gated_i8 unavailable" : "libref's idx_pool_gated_fp8 unavailable"); return; }
     const int64_t n = 128, ratio = 4, pitch = 144;
     for (int64_t W : { (int64_t)3, (int64_t)37 }) {
         for (int mode = 0; mode < 2; ++mode) {
@@ -28301,7 +28309,7 @@ static void idx_pool_fp8_case(const Plugin& pl) {
                     T(wg_, RAD_F32, { n, n }), T(ape_, RAD_F32, { ratio, n }),
                     T(gain_, RAD_F32, { n }),
                     imrope ? T(pos_, RAD_I32, { W, 3 }) : T(pos_, RAD_I32, { W }),
-                    T(page_, RAD_I32, { W }), c, T(q_, RAD_F8E4M3, { W, n }),
+                    T(page_, RAD_I32, { W }), c, T(q_, i8 ? RAD_I8 : RAD_F8E4M3, { W, n }),
                     T(sc_, RAD_F32, { W, 1 }) };
             };
             std::vector<RadParam> ps = { PI("M", W), PI("n", n), PI("ratio", ratio),
@@ -28325,8 +28333,29 @@ static void idx_pool_fp8_case(const Plugin& pl) {
             const int rrc = ref->launch(&a, nullptr);
             int64_t nq = 0, nc = 0, ns = 0;
             for (size_t i = 0; i < dq.size(); ++i) nq += dq[i] != rq[i];
-            for (size_t i = 0; i < dcache.size(); ++i) nc += dcache[i] != rcache[i];
-            for (size_t i = 0; i < dsc.size(); ++i) ns += dsc[i] != rsc[i];
+            if (!i8) {
+                for (size_t i = 0; i < dcache.size(); ++i) nc += dcache[i] != rcache[i];
+                for (size_t i = 0; i < dsc.size(); ++i) ns += dsc[i] != rsc[i];
+            } else {
+                /* An int8 scale is amax / 127, not a power of two, so a 1-ulp difference of the f32
+                 * key (libm / OCML) shows in it, where E4M3's power-of-two scale hides it: the
+                 * codes and every other byte are exact, the scales agree to 2 ulp. */
+                auto close = [](float x, float y) {
+                    return std::fabs(x - y) <= 2.4e-7f * std::fabs(y);
+                };
+                for (size_t i = 0; i < dcache.size(); ++i) {
+                    const size_t off = i % (size_t)pitch;
+                    if (off >= 128 && off < 132) continue;
+                    nc += dcache[i] != rcache[i];
+                }
+                for (int64_t p = 0; p < pages; ++p) {
+                    float dv, rv;
+                    std::memcpy(&dv, &dcache[(size_t)(p * pitch + 128)], 4);
+                    std::memcpy(&rv, &rcache[(size_t)(p * pitch + 128)], 4);
+                    ns += !close(dv, rv);
+                }
+                for (size_t i = 0; i < dsc.size(); ++i) ns += !close(dsc[i], rsc[i]);
+            }
             bool untouched = true;
             for (int64_t p = 0; p < pages; ++p) {
                 bool written = false;
@@ -36843,6 +36872,11 @@ static void device_phase(const Plugin& pl) {
         idx_pool_fp8_case(pl);
     }
 
+    if (sel("idx_pool_gated_i8")) {
+        if (!g_case) std::printf("\nthe INT8 indexer's group key, against libref\n");
+        idx_pool_fp8_case(pl, true);
+    }
+
     if (sel("idx_score_bf16")) {
         if (!g_case) std::printf("\nthe indexer's group score, against libref\n");
         idx_score_case(pl);
@@ -37301,6 +37335,10 @@ static void device_phase(const Plugin& pl) {
         for (int64_t rows : { 1, 32, 64, 128, 1056 })
             for (int pattern : { 0, 1, 2, 3 }) mhc_check(pl, "dsa_query_fp8", rows, 128, pattern);
     }
+    if (sel("dsa_query_i8")) {
+        for (int64_t rows : { 1, 32, 64, 128, 1056 })
+            for (int pattern : { 0, 1, 2, 3 }) mhc_check(pl, "dsa_query_i8", rows, 128, pattern);
+    }
     if (sel("gemm_nt_f32_bf16")) {
         for (int64_t rows : { 1, 2, 4, 33 })
             for (int64_t cols : { 32, 288 }) mhc_check(pl, "gemm_nt_f32_bf16", rows, cols, 4096);
@@ -37331,6 +37369,19 @@ static void device_phase(const Plugin& pl) {
         dsa_score_check(pl, 1, 17, true, 16);
         dsa_score_check(pl, 4, 257, true, 16);
         dsa_score_check(pl, 4, 32768, true, 16);
+    }
+    for (bool h16 : { false, true }) {
+        if (!sel(h16 ? "dsa_score_i8_h16" : "dsa_score_i8")) continue;
+        if (!g_case)
+            std::printf("\nthe %d-head INT8 DSA scorer (iu8 WMMA), against libref\n", h16 ? 16 : 32);
+        const int64_t hn = h16 ? 16 : 32;
+        dsa_score_check(pl, 1, 17, false, hn, true);
+        dsa_score_check(pl, 7, 257, false, hn, true);
+        dsa_score_check(pl, 33, 17, false, hn, true);
+        dsa_score_check(pl, 4, 32768, false, hn, true);
+        dsa_score_check(pl, 1, 17, true, hn, true);
+        dsa_score_check(pl, 4, 257, true, hn, true);
+        dsa_score_check(pl, 4, 32768, true, hn, true);
     }
     if (sel("mla_attn_bf16")) {
         mla_check(pl, 1, 1, 3);

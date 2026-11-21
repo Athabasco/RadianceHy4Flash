@@ -145,6 +145,8 @@ std::vector<Case> build_cases() {
         if (!std::strcmp(dt, "bf16"))
             add("dsa_query", { HI("M", 7), HI("n", 128), HS("dtype", "bf16") });
         if (!std::strcmp(dt, "bf16"))
+            add("dsa_query_i8", { HI("M", 7), HI("n", 128), HS("dtype", "bf16") });
+        if (!std::strcmp(dt, "bf16"))
             add("gemm_nt_f32", { HI("M", 4), HI("N", 32), HI("K", 129), HS("dtype", "bf16") });
         if (!std::strcmp(dt, "bf16"))
             for (const char* mode : { "absorb", "expand" })
@@ -155,6 +157,10 @@ std::vector<Case> build_cases() {
                                HI("seqs", 2), HS("dtype", "fp8_e4m3") });
             add("dsa_score", { HI("M", 3), HI("n", 128), HI("heads", 16), HI("blocks", 70),
                                HI("seqs", 2), HS("dtype", "fp8_e4m3") });
+            add("dsa_score", { HI("M", 3), HI("n", 128), HI("heads", 16), HI("blocks", 70),
+                               HI("seqs", 2), HS("dtype", "int8") });
+            add("dsa_score", { HI("M", 3), HI("n", 128), HI("heads", 32), HI("blocks", 17),
+                               HI("seqs", 2), HS("dtype", "int8") });
         }
         for (int norm : { 0, 1 })
             add("router_sigmoid_topk",
@@ -225,6 +231,12 @@ std::vector<Case> build_cases() {
         add("idx_pool_gated_fp8", { HI("M", 3), HI("n", 32), HI("ratio", 4), HI("rotary_dim", 12),
                                     HF("eps", 1e-5), HF("theta", 1e4), HS("mode", "imrope_gptj"),
                                     HS("sections", "2 2 2"), HS("dtype", dt) });
+        add("idx_pool_gated_i8", { HI("M", 3), HI("n", 128), HI("ratio", 4), HI("rotary_dim", 64),
+                                   HF("eps", 1e-5), HF("theta", 1e7), HS("mode", "gptj"),
+                                   HS("dtype", dt) });
+        add("idx_pool_gated_i8", { HI("M", 3), HI("n", 32), HI("ratio", 4), HI("rotary_dim", 12),
+                                   HF("eps", 1e-5), HF("theta", 1e4), HS("mode", "imrope_gptj"),
+                                   HS("sections", "2 2 2"), HS("dtype", dt) });
         add("idx_score", { HI("M", 5), HI("n", 128), HI("heads", 16), HI("blocks", 70),
                            HI("seqs", 2), HS("dtype", dt) });
         add("idx_score", { HI("M", 4), HI("n", 36), HI("heads", 3), HI("blocks", 9),

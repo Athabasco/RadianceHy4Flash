@@ -817,6 +817,12 @@ extern "C" int r4d_shape_dsa_query(const RadParam* p, int n_p, int operand, RadO
                              opd((uint32_t)RAD_F32, M, 1) };
     R4D_PICK(l);
 }
+extern "C" int r4d_shape_dsa_query_i8(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    const RadOpdDesc l[] = { opd((uint32_t)RAD_BF16, M, n), opd((uint32_t)RAD_I8, M, n),
+                             opd((uint32_t)RAD_F32, M, 1) };
+    R4D_PICK(l);
+}
 extern "C" int r4d_shape_mla_project(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), h = pi(p, n_p, "heads"), d = pi(p, n_p, "head_dim"),
                   l = pi(p, n_p, "latent_dim");
@@ -886,10 +892,12 @@ extern "C" int r4d_shape_mla_attn_sel_sink(const RadParam* p, int n_p, int opera
 extern "C" int r4d_shape_dsa_score(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), H = pi(p, n_p, "heads");
     const int64_t B = pi(p, n_p, "blocks"), S = pi(p, n_p, "seqs"), pages = S * B;
-    const RadOpdDesc l[] = { opd((uint32_t)RAD_F8E4M3, M, H, n),
+    const char* dts = r4d_pgets(p, n_p, "dtype");
+    const uint32_t qk = dts && !std::strcmp(dts, "int8") ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
+    const RadOpdDesc l[] = { opd(qk, M, H, n),
                              opd((uint32_t)RAD_F32, M, H),
                              opd((uint32_t)RAD_F32, M, H),
-                             opd((uint32_t)RAD_F8E4M3, pages, n),
+                             opd(qk, pages, n),
                              opd((uint32_t)RAD_F32, pages),
                              opd_idx(S, B, pages),
                              opd_idx(S + 1, 0, M, -1, RAD_OPD_F_IDX_CU),

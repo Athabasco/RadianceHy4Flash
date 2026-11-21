@@ -199,7 +199,7 @@ struct Uniform {
 /* ================================================================== schemas */
 TEST(every_hy4_op_has_a_schema_with_f64_floats_and_str_enums_and_a_shape_description) {
     const char* ops[] = { "ihc_pre", "ihc_post", "mla_project_kv", "mla_attn_paged_sink",
-        "mla_attn_sel_sink", "mla_kv_split", "attn_kv_sink", "gate_mul", "idx_pool_gated", "idx_pool_gated_fp8",
+        "mla_attn_sel_sink", "mla_kv_split", "attn_kv_sink", "gate_mul", "idx_pool_gated", "idx_pool_gated_fp8", "idx_pool_gated_i8",
         "idx_score", "engram_ids", "engram_norm", "engram_gate", "dfly_sel" };
     const char* f64[] = { "eps", "hc_eps", "post_mag", "scale", "theta" };
     const char* str[] = { "dtype", "mode", "sections" };
@@ -247,6 +247,8 @@ TEST(every_hy4_op_describes_all_its_operands_at_a_typical_geometry) {
                               S("mode", "gptj"), S("dtype", "bf16") } },
         { "idx_pool_gated_fp8", { RAD_INT("M", 5), RAD_INT("n", 16), RAD_INT("ratio", 4), RAD_INT("rotary_dim", 8),
                                   S("mode", "gptj"), S("dtype", "bf16") } },
+        { "idx_pool_gated_i8", { RAD_INT("M", 5), RAD_INT("n", 16), RAD_INT("ratio", 4), RAD_INT("rotary_dim", 8),
+                                 S("mode", "gptj"), S("dtype", "bf16") } },
         { "idx_score", { RAD_INT("M", 5), RAD_INT("n", 16), RAD_INT("heads", 2), RAD_INT("blocks", 7),
                          RAD_INT("seqs", 2), S("dtype", "bf16") } },
         { "engram_ids", { RAD_INT("M", 5), RAD_INT("heads", 10), RAD_INT("ngram", 3), RAD_INT("pad", 2),
@@ -818,6 +820,139 @@ TEST(idx_pool_gated_fp8_is_the_unrounded_key_through_the_hadamard_into_e4m3_page
         .i("ratio", ratio).i("rotary_dim", rd).d("eps", 1e-5).d("theta", 1e7).s("mode", "gptj")
         .s("dtype", "bf16");
     CHECK_EQ(run("idx_pool_gated_fp8", g), (int)RAD_E_INVAL);
+}
+
+/* The INT8 indexer's key: the same f32 key through the same Hadamard, then symmetric int8 codes at
+ * an f32 scale amax / 127 (amax floored at 1e-4), nearest even, clamped to +-127; the packed page
+ * is the fp8 page's layout. The test quantises idx_pool_gated's f32 key in the open. */
+TEST(idx_pool_gated_i8_is_the_unrounded_key_through_the_hadamard_into_symmetric_int8_pages) {
+    const int64_t n = 128, ratio = 4, rd = 64, W = 5;
+    uint32_t st = 777u;
+    auto rnd = [&]() { st = st * 1664525u + 1013904223u; return ((st >> 8) / 16777216.0f) * 2 - 1; };
+    T kb(RAD_BF16, {W * ratio, n}), kf(RAD_F32, {W * ratio, n}), wv(RAD_F32, {n, n}),
+        wg(RAD_F32, {n, n}), ape(RAD_F32, {ratio, n}), gain(RAD_F32, {n});
+    for (int64_t i = 0; i < W * ratio * n; ++i) {
+        st_dt(RAD_BF16, kb.t.data, i, 1.5f * rnd());
+        st_dt(RAD_F32, kf.t.data, i, kb.at(i));
+    }
+    for (int64_t i = 0; i < n * n; ++i) { st_dt(RAD_F32, wv.t.data, i, 0.15f * rnd());
+                                          st_dt(RAD_F32, wg.t.data, i, 0.15f * rnd()); }
+    for (int64_t i = 0; i < ratio * n; ++i) st_dt(RAD_F32, ape.t.data, i, rnd());
+    for (int64_t i = 0; i < n; ++i) st_dt(RAD_F32, gain.t.data, i, 1.0f + 0.2f * rnd());
+    T pos(RAD_I32, {W}); pos.n({0, 4, 4000, 123456, 2052});
+    T key(RAD_F32, {W, n});
+    A a; a.t(kf).t(wv).t(wg).t(ape).t(gain).t(pos).tnull().tnull().t(key).i("M", W).i("n", n)
+        .i("ratio", ratio).i("rotary_dim", rd).d("eps", 1e-5).d("theta", 1e7).s("mode", "gptj")
+        .s("dtype", "f32");
+    REQUIRE_EQ(run("idx_pool_gated", a), (int)RAD_OK);
+
+    const int64_t pitch = 144, pages = W + 2;
+    T q(RAD_I8, {W, n}), sc(RAD_F32, {W, 1}), page(RAD_I32, {W});
+    T cache(RAD_U8, {pages, 1, 4, 34});
+    cache.mem.assign((size_t)(pages * pitch) + 8, 0x5a);
+    cache.t.data = cache.mem.data();
+    cache.t.stride[0] = pitch;
+    page.n({6, 0, -1, 3, 9});
+    A f; f.t(kb).t(wv).t(wg).t(ape).t(gain).t(pos).t(page).t(cache).t(q).t(sc).i("M", W).i("n", n)
+        .i("ratio", ratio).i("rotary_dim", rd).d("eps", 1e-5).d("theta", 1e7).s("mode", "gptj")
+        .s("dtype", "bf16");
+    REQUIRE_EQ(run("idx_pool_gated_i8", f), (int)RAD_OK);
+    const int64_t pg[W] = {6, 0, -1, 3, 9};
+    for (int64_t w = 0; w < W; ++w) {
+        float v[128];
+        for (int64_t c = 0; c < n; ++c) v[c] = key.at(w * n + c);
+        for (int64_t h = 1; h < n; h *= 2)
+            for (int64_t i = 0; i < n; i += 2 * h)
+                for (int64_t j = 0; j < h; ++j) {
+                    const float lo = v[i + j], hi = v[i + j + h];
+                    v[i + j] = lo + hi;
+                    v[i + j + h] = lo - hi;
+                }
+        float am = 1e-4f;
+        for (int64_t c = 0; c < n; ++c) { v[c] *= 1.0f / std::sqrt(128.0f); am = std::max(am, std::fabs(v[c])); }
+        const float scale = am * (1.0f / 127.0f);
+        CHECK_EQ(sc.at(w), scale);
+        int bad = 0, top = 0;
+        double err = 0, ref = 0;
+        for (int64_t c = 0; c < n; ++c) {
+            const int want = (int)std::nearbyint(std::clamp(v[c] * (1.0f / scale), -127.0f, 127.0f));
+            const int got = ((const int8_t*)q.t.data)[w * n + c];
+            bad += want != got;
+            top = std::max(top, std::abs(got));
+            err += std::pow(got * scale - v[c], 2);
+            ref += (double)v[c] * v[c];
+            if (pg[w] >= 0 && pg[w] < pages)
+                CHECK_EQ((int)(int8_t)cache.mem[(size_t)(pg[w] * pitch + c)], got);
+        }
+        CHECK_EQ(bad, 0);
+        CHECK_EQ(top, 127);                       /* the absmax channel uses the whole range */
+        CHECK(std::sqrt(err / ref) < 0.01);       /* int8's 7 bits, against E4M3's 0.04 */
+        if (pg[w] >= 0 && pg[w] < pages) {
+            float stored;
+            std::memcpy(&stored, &cache.mem[(size_t)(pg[w] * pitch + 128)], 4);
+            CHECK_EQ(stored, scale);
+            for (int64_t b = 132; b < pitch; ++b) CHECK_EQ((int)cache.mem[(size_t)(pg[w] * pitch + b)], 0x5a);
+        }
+    }
+    for (int64_t p : {1, 2, 4, 5})
+        for (int64_t b = 0; b < pitch; ++b) CHECK_EQ((int)cache.mem[(size_t)(p * pitch + b)], 0x5a);
+    page.n({6, 6, -1, 3, 9});
+    CHECK_EQ(run("idx_pool_gated_i8", f), (int)RAD_E_INVAL);
+}
+
+/* dsa_query_i8 and dsa_score at dtype int8: the codes are the Hadamard in f32 at amax / 127 per
+ * row, and the score is sum_h w_h relu(scale_q scale_k q_i8 . k_i8) with an exact integer dot. */
+TEST(dsa_query_i8_and_the_int8_score_agree_with_an_open_coded_reference) {
+    const int64_t n = 128, H = 16, M = 3, B = 6;
+    uint32_t st = 4242u;
+    auto rnd = [&]() { st = st * 1664525u + 1013904223u; return ((st >> 8) / 16777216.0f) * 2 - 1; };
+    T x(RAD_BF16, {M * H, n}), q(RAD_I8, {M * H, n}), qs(RAD_F32, {M * H, 1});
+    for (int64_t i = 0; i < M * H * n; ++i) st_dt(RAD_BF16, x.t.data, i, 2.0f * rnd());
+    A a; a.t(x).t(q).t(qs).i("M", M * H).i("n", n).s("dtype", "bf16");
+    REQUIRE_EQ(run("dsa_query_i8", a), (int)RAD_OK);
+    for (int64_t r = 0; r < M * H; ++r) {
+        float v[128];
+        for (int64_t c = 0; c < n; ++c) v[c] = x.at(r * n + c);
+        for (int64_t h = 1; h < n; h *= 2)
+            for (int64_t i = 0; i < n; i += 2 * h)
+                for (int64_t j = 0; j < h; ++j) {
+                    const float lo = v[i + j], hi = v[i + j + h];
+                    v[i + j] = lo + hi;
+                    v[i + j + h] = lo - hi;
+                }
+        float am = 1e-4f;
+        for (int64_t c = 0; c < n; ++c) { v[c] *= 1.0f / std::sqrt(128.0f); am = std::max(am, std::fabs(v[c])); }
+        const float scale = am * (1.0f / 127.0f);
+        CHECK_EQ(qs.at(r), scale);
+        for (int64_t c = 0; c < n; ++c)
+            CHECK_EQ((int)((const int8_t*)q.t.data)[r * n + c],
+                     (int)std::nearbyint(std::clamp(v[c] * (1.0f / scale), -127.0f, 127.0f)));
+    }
+    /* Keys: B pages of codes and scales; one sequence of B live blocks. */
+    T kc(RAD_I8, {B, n}), ks(RAD_F32, {B}), gate(RAD_F32, {M, H}), bt(RAD_I32, {1, B}),
+        cu(RAD_I32, {2}), nc(RAD_I32, {1}), out(RAD_F32, {M, B});
+    for (int64_t i = 0; i < B * n; ++i)
+        ((int8_t*)kc.t.data)[i] = (int8_t)std::lrintf(rnd() * 127);
+    for (int64_t b = 0; b < B; ++b) st_dt(RAD_F32, ks.t.data, b, 0.002f * (1 + b));
+    for (int64_t i = 0; i < M * H; ++i) st_dt(RAD_F32, gate.t.data, i, rnd());
+    bt.n({5, 4, 3, 2, 1, 0}); cu.n({0, M}); nc.n({B});
+    A s; s.t(q).t(qs).t(gate).t(kc).t(ks).t(bt).t(cu).t(nc).t(out).i("M", M).i("n", n).i("heads", H)
+        .i("blocks", B).i("seqs", 1).s("dtype", "int8");
+    REQUIRE_EQ(run("dsa_score", s), (int)RAD_OK);
+    for (int64_t r = 0; r < M; ++r)
+        for (int64_t b = 0; b < B; ++b) {
+            const int64_t page = ((const int32_t*)bt.t.data)[b];
+            double total = 0;
+            for (int64_t h = 0; h < H; ++h) {
+                long long dot = 0;
+                for (int64_t c = 0; c < n; ++c)
+                    dot += (long long)((const int8_t*)q.t.data)[(r * H + h) * n + c] *
+                           ((const int8_t*)kc.t.data)[page * n + c];
+                total += std::max((double)dot, 0.0) * qs.at(r * H + h) * gate.at(r * H + h);
+            }
+            total *= ks.at(page) / std::sqrt((double)(H * n));
+            CHECK_NEAR(out.at(r * B + b), total, 1e-4 * (1.0 + std::fabs(total)));
+        }
 }
 
 TEST(idx_score_matches_hf_logits_and_masks_what_is_not_a_complete_block) {

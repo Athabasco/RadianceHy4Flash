@@ -54,7 +54,7 @@ __device__ __forceinline__ int imrope_comp(int j, int sec_h, int sec_w) {
     uint16_t* __restrict__ cache, uint16_t* __restrict__ out, int W, int k_ld, int out_ld,      \
     long cache_pitch, int pages, int pos_ld, int rd, float eps, double theta, int sec_h,        \
     int sec_w, int gain_bf16, uint8_t* __restrict__ q8, float* __restrict__ qs, long q_ld,      \
-    long qs_ld, float norm
+    long qs_ld, float norm, int i8
 /* FP8 (idx_pool_gated_fp8): nothing is rounded to bf16; the f32 key goes through the 128-wide
  * Hadamard (r4d_fwht_wave, a wave a group, four consecutive channels a lane), times `norm`, and into
  * E4M3 codes at a power-of-two scale: dsa_pool's packed page (`cache` as bytes, the scale at byte
@@ -202,10 +202,18 @@ __device__ __forceinline__ void idx_pool_gated_body(IDX_POOL_PARAMS) {
         }
 #pragma unroll
         for (int mask = 16; mask; mask >>= 1) am = fmaxf(am, __shfl_xor(am, mask, 32));
-        const uint32_t bits = __float_as_uint(am * (1.0f / 448.0f));
-        const float sc =
-            __uint_as_float((bits & 0x7f800000u) + ((bits & 0x7fffffu) ? 0x800000u : 0));
-        const uint32_t packed = q8_pack4<false>(v[0], v[1], v[2], v[3], 1.0f / sc);
+        /* i8 (idx_pool_gated_i8): symmetric int8 codes at an f32 scale amax / 127, else E4M3 at a
+         * power-of-two scale. */
+        float sc;
+        uint32_t packed;
+        if (i8) {
+            sc = am * (1.0f / 127.0f);
+            packed = q8_pack4<true>(v[0], v[1], v[2], v[3], 1.0f / sc);
+        } else {
+            const uint32_t bits = __float_as_uint(am * (1.0f / 448.0f));
+            sc = __uint_as_float((bits & 0x7f800000u) + ((bits & 0x7fffffu) ? 0x800000u : 0));
+            packed = q8_pack4<false>(v[0], v[1], v[2], v[3], 1.0f / sc);
+        }
         if (q8) {
             uint8_t* dst = q8 + (size_t)w * q_ld + lane * 4;
             if (((uintptr_t)dst & 3) == 0)
@@ -232,7 +240,7 @@ void idx_pool_gated_kernel(IDX_POOL_PARAMS) {
     if (CH::on) r4d_chain_wait();
     idx_pool_gated_body<GPW, IMROPE, FP8>(k, wv, wg, ape, gain, pos, page, cache, out, W, k_ld,
                                           out_ld, cache_pitch, pages, pos_ld, rd, eps, theta,
-                                          sec_h, sec_w, gain_bf16, q8, qs, q_ld, qs_ld, norm);
+                                          sec_h, sec_w, gain_bf16, q8, qs, q_ld, qs_ld, norm, i8);
     if (CH::on) r4d_chain_done();
 }
 #undef IDX_POOL_PARAMS
@@ -249,7 +257,7 @@ enum { IP_K = 0, IP_WV = 1, IP_WG = 2, IP_APE = 3, IP_GAIN = 4, IP_POS = 5, IP_P
 
 /* `fp8`: idx_pool_gated_fp8, whose operand 8 is the codes `q` and 9 their `scale`, and whose cache
  * is dsa_pool's packed u8 page. */
-static int pool_entry(const RadArgs* a, RadStream stream, bool fp8) {
+static int pool_entry(const RadArgs* a, RadStream stream, bool fp8, bool i8 = false) {
     const RadTensor* k  = r4d_opt(a, IP_K);
     const RadTensor* wv = r4d_opt(a, IP_WV);
     const RadTensor* wg = r4d_opt(a, IP_WG);
@@ -284,7 +292,7 @@ static int pool_entry(const RadArgs* a, RadStream stream, bool fp8) {
         sec_h = h; sec_w = w;
     }
     if (k->dtype != RAD_BF16 || (ou && ou->dtype != RAD_BF16) ||
-        (ca && ca->dtype != (fp8 ? RAD_U8 : RAD_BF16)) || (q8 && q8->dtype != RAD_F8E4M3) ||
+        (ca && ca->dtype != (fp8 ? RAD_U8 : RAD_BF16)) || (q8 && q8->dtype != (i8 ? RAD_I8 : RAD_F8E4M3)) ||
         (qs && qs->dtype != RAD_F32))
         return R4D_NO(RAD_E_DTYPE);
     if (wv->dtype != RAD_F32 || wg->dtype != RAD_F32 || ap->dtype != RAD_F32 ||
@@ -361,7 +369,7 @@ static int pool_entry(const RadArgs* a, RadStream stream, bool fp8) {
              (const int32_t*)r4d_p(pg), (uint16_t*)r4d_wp(ca), (uint16_t*)r4d_wp(ou), (int)W,    \
              (int)kp, (int)op, (long)cache_pitch, (int)pages, (int)pos_ld, (int)rd, eps_f,       \
              (double)theta_f, (int)sec_h, (int)sec_w, gain_bf16, (uint8_t*)r4d_wp(q8),          \
-             (float*)r4d_wp(qs), (long)q_ld, (long)qs_ld, norm)
+             (float*)r4d_wp(qs), (long)q_ld, (long)qs_ld, norm, i8 ? 1 : 0)
 #define R4D_IPOOL_CH(G_, IM_) (chain ? R4D_IPOOL(G_, IM_, r4dchain) : R4D_IPOOL(G_, IM_, R4dUnchained))
     if (wide) return imrope ? R4D_IPOOL_CH(kWideGroups, true) : R4D_IPOOL_CH(kWideGroups, false);
     return imrope ? R4D_IPOOL_CH(1, true) : R4D_IPOOL_CH(1, false);
@@ -375,4 +383,7 @@ extern "C" int r4d_rad_idx_pool_gated(const RadArgs* a, RadStream stream) {
 }
 extern "C" int r4d_rad_idx_pool_gated_fp8(const RadArgs* a, RadStream stream) {
     return pool_entry(a, stream, true);
+}
+extern "C" int r4d_rad_idx_pool_gated_i8(const RadArgs* a, RadStream stream) {
+    return pool_entry(a, stream, true, true);
 }

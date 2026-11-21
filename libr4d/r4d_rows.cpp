@@ -3406,6 +3406,9 @@ static const RadOpSchema kSchemas[] = {
            "Per-head query absorption or value expansion through the shared [head,(K|V),latent] BF16 matrix."),
     SCHEMA("dsa_score", pDsaScore, oDsaScore,
            "Per-head ReLU of FP8 dot products, then signed head gates and scales; invalid history is -inf."),
+    SCHEMA("dsa_query_i8", pMnDtype, oQuantActFp8,
+           "dsa_query's INT8 form: normalized Hadamard in f32, symmetric int8 codes at an f32 scale "
+           "max(amax, 1e-4) / 127 per query head row, nearest even, clamped to +-127."),
     SCHEMA("dsa_pool", pDsaPool, oDsaPool,
            "Channel-wise softmax pooling with learned position bias, BF16, normalized Hadamard, BF16, power-of-two FP8."),
     SCHEMA("dsa_query", pMnDtype, oQuantActFp8,
@@ -4140,6 +4143,12 @@ static const RadOpSchema kSchemas[] = {
            "`rotary_dim` channels rotated as adjacent pairs at the group's first position (mode "
            "gptj, or imrope_gptj with `sections`, pos [3, W]) and rounded again. Written to "
            "cache[page[w]] and/or out[w]."),
+    SCHEMA("idx_pool_gated_i8", pIdxPoolGated, oIdxPoolGatedFp8,
+           "idx_pool_gated_fp8's key (f32, no bf16 rounding, the 128-wide Hadamard times n^-0.5) as "
+           "symmetric INT8 codes at an f32 scale max(amax, 1e-4) / 127, nearest even, clamped to "
+           "+-127 (RADIANCE_HY4_INDEXER=int8). Written to the packed u8 cache page ([pages, 1, 4, "
+           "34]: 128 int8 codes, f32 scale at byte 128; n 128) and/or q [W, n] i8 with scale [W, 1] "
+           "f32."),
     SCHEMA("idx_pool_gated_fp8", pIdxPoolGated, oIdxPoolGatedFp8,
            "idx_pool_gated's group key kept in f32 (no rounding after the norm or the rotation), "
            "then quantised as vLLM's IndexPool does: ascending-stride Walsh-Hadamard transform "
@@ -5341,6 +5350,14 @@ static const RadConstraint cDsaScore[] = {
 static const RadConstraint cDsaScore16[] = {
     C_GE("M", 1),      C_LE("M", 65535), C_EQ("n", 128),           C_EQ("heads", 16),
     C_GE("blocks", 1), C_GE("seqs", 1),  C_IN("dtype", "fp8_e4m3")
+};
+static const RadConstraint cDsaScoreI8[] = {
+    C_GE("M", 1),      C_LE("M", 65535), C_EQ("n", 128),           C_EQ("heads", 32),
+    C_GE("blocks", 1), C_GE("seqs", 1),  C_IN("dtype", "int8")
+};
+static const RadConstraint cDsaScoreI816[] = {
+    C_GE("M", 1),      C_LE("M", 65535), C_EQ("n", 128),           C_EQ("heads", 16),
+    C_GE("blocks", 1), C_GE("seqs", 1),  C_IN("dtype", "int8")
 };
 static const RadConstraint cMlaAttn[] = {
     C_GE("M", 1),      C_LE("M", 65535),  C_EQ("latent_dim", 512), C_GE("heads", 1),
@@ -7172,6 +7189,16 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDsaScore16), NOTUNE,
   nullptr, nullptr, r4d_rad_dsa_score, nullptr, nullptr, nullptr,
   r4d_shape_dsa_score },
+{ "dsa_score_i8", "dsa_score", "attn", "32-head INT8 WMMA index scoring over paged keys",
+  "n=128, heads=32; ragged sequences and pitched tensors", "int8 codes, f32 scales and gates",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDsaScoreI8), NOTUNE,
+  nullptr, nullptr, r4d_rad_dsa_score, nullptr, nullptr, nullptr,
+  r4d_shape_dsa_score },
+{ "dsa_score_i8_h16", "dsa_score", "attn", "16-head INT8 WMMA index scoring over paged keys (Hy4-flash)",
+  "n=128, heads=16; ragged sequences and pitched tensors", "int8 codes (iu8 WMMA, int32 sums), f32 scales and gates",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDsaScoreI816), NOTUNE,
+  nullptr, nullptr, r4d_rad_dsa_score, nullptr, nullptr, nullptr,
+  r4d_shape_dsa_score },
 { "mla_attn_paged_bf16", "mla_attn_paged", "attn",
   "dense causal latent attention with a rotary part, a wave a (row, head), split history",
   "latent_dim=512, rope_dim=64, heads<=64, block_size<=256; one page table a sequence",
@@ -7208,6 +7235,11 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDsaQuery), NOTUNE,
   nullptr, nullptr, r4d_rad_dsa_query, nullptr, nullptr, nullptr,
   r4d_shape_dsa_query },
+{ "dsa_query_i8", "dsa_query_i8", "attn", "normalized index queries as int8 in wave-local registers",
+  "n=128; flattened heads and pitched rows", "bf16 input, int8 codes and f32 scale amax / 127",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDsaQuery), NOTUNE,
+  nullptr, nullptr, r4d_rad_dsa_query_i8, nullptr, nullptr, nullptr,
+  r4d_shape_dsa_query_i8 },
 { "gemm_nt_f32_bf16", "gemm_nt_f32", "gemm", "F32 routing and index gate projection",
   "N<=512, K<=16384; pitched rows", "bf16 input, f32 weights and output",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cGemmNtF32), NOTUNE,
@@ -9817,6 +9849,18 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cIdxPoolGated), NOTUNE,
   nullptr, nullptr, r4d_rad_idx_pool_gated_fp8, nullptr, nullptr, nullptr,
+  nullptr },
+/* The INT8 indexer's key (RADIANCE_HY4_INDEXER=int8): idx_pool_gated_fp8's kernel, the last step
+ * symmetric int8 codes at an f32 scale amax / 127. Byte-equal to libref. */
+{ "idx_pool_gated_i8", "idx_pool_gated_i8", "attn",
+  "pool 4 token keys into one f32 indexer key (gated softmax pool, norm, rotary), then the "
+  "128-wide Hadamard and symmetric int8 codes at an f32 scale amax / 127",
+  "n 128, ratio 4, any even rotary_dim up to 128, mode gptj or imrope_gptj",
+  "bf16 keys, f32 wv/wg/ape, f32 or bf16 gain, i32 positions and pages, dsa_pool's packed u8 cache "
+  "page, int8 codes and f32 scales",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cIdxPoolGated), NOTUNE,
+  nullptr, nullptr, r4d_rad_idx_pool_gated_i8, nullptr, nullptr, nullptr,
   nullptr },
 { "idx_pool_gated_f32", "idx_pool_gated", "attn",
   "pool 4 token keys into one indexer key: gated softmax pool in f32, norm, rotary at the group's "

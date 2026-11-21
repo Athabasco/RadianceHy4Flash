@@ -42,10 +42,12 @@ struct Shape {
      * (group_topk - 1 closed ones plus its own), and the context at or below which a sparse
      * layer attends densely (group_topk * ratio, HF's `candidate_topk`) */
     int64_t ix_heads = 0, ix_dim = 0, ix_pool = 0, ix_group_topk = 0, dense_limit = 0;
-    /* RADIANCE_HY4_INDEXER=fp8: the group keys and queries as vLLM's IndexPool keeps them (the
-     * f32 key through a 128-wide Hadamard into E4M3 at a power-of-two scale, GLM's dsa_* forms),
-     * instead of HF's bf16 keys and f32 scores (the default, `exact`). */
+    /* RADIANCE_HY4_INDEXER=fp8 or int8: the group keys and queries on GLM's packed page, quantised
+     * (fp8: E4M3 at a power-of-two scale, vLLM's IndexPool; int8: symmetric, f32 scale amax / 127)
+     * instead of HF's bf16 keys and f32 scores (the default, `exact`). ix_fp8 is the packed wiring
+     * and is set for both; ix_i8 selects the int8 codes. */
     bool ix_fp8 = false;
+    bool ix_i8 = false;
     /* Engram: `layers` are layer indices (the config's ids are one above them) */
     std::vector<int> engram_layers;
     std::vector<int64_t> engram_rows;   /* each layer's table, the sum of its head moduli */

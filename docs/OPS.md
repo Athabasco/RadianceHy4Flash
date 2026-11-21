@@ -3960,6 +3960,14 @@ head (which rounds to bf16 after its transform), the score `dsa_score` at `heads
 `index_head`'s output cast to f32 as the gates (its `(heads n)^-0.5` is `idx_score`'s `w_h`
 scale). libr4d serves both (`idx_pool_gated_fp8`, byte-equal to libref; `dsa_score_fp8_h16`).
 
+**`idx_pool_gated_i8`** is the INT8 indexer's key (`RADIANCE_HY4_INDEXER=int8`): `idx_pool_gated_fp8`'s
+f32 key and Hadamard, then symmetric int8 codes at the f32 scale `max(amax, 1e-4) / 127`, nearest even,
+clamped to +-127. Operands, the packed page (`n` 128: 128 int8 codes, the f32 scale at byte 128) and the
+`q [M, n]` i8 / `scale [M, 1]` outputs as `idx_pool_gated_fp8`'s. **`dsa_query_i8`** is `dsa_query`'s
+int8 form (the Hadamard kept in f32, absmax / 127 a row). `dsa_score` with `dtype` `int8` reads i8
+queries and the packed (or separate) i8 keys; libr4d rows `idx_pool_gated_i8`, `dsa_query_i8`,
+`dsa_score_i8_h16` / `dsa_score_i8` (iu8 WMMA, int32 sums), byte-equal / exact against libref.
+
 ### `engram_ids`, `engram_norm`, `engram_gate`
 
 Engram (`HYV4FlashEngramLayer`): a hashed n-gram lookup added to the hc streams in front of a layer.

@@ -1262,7 +1262,7 @@ TEST(op_vocabulary) {
         /* Hy4-flash: independent hyper-connections, sink attention, the compressed indexer, Engram. */
         "ihc_pre", "ihc_post", "mla_project_kv", "mla_attn_paged_sink", "mla_attn_sel_sink",
         "mla_kv_split", "attn_kv_sink", "gate_mul", "mla_expand_gate", "idx_pool_gated", "idx_score", "engram_ids",
-        "engram_norm", "engram_gate", "idx_pool_gated_fp8", "dfly_sel", "rmsnorm_ihc_junction",
+        "engram_norm", "engram_gate", "idx_pool_gated_fp8", "idx_pool_gated_i8", "dsa_query_i8", "dfly_sel", "rmsnorm_ihc_junction",
         "kda_update", "ssd_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
         "seg_softmax_pool",
@@ -10847,6 +10847,8 @@ std::vector<Geo> geometries() {
                                        .d("theta", 1e4).s("mode", "gptj").s("dtype", "f32")),
         G("idx_pool_gated_fp8", "M", 3, a.i("M", R).i("n", 8).i("ratio", 4).i("rotary_dim", 4).d("eps", 1e-6)
                                            .d("theta", 1e4).s("mode", "gptj").s("dtype", "f32")),
+        G("idx_pool_gated_i8", "M", 3, a.i("M", R).i("n", 8).i("ratio", 4).i("rotary_dim", 4).d("eps", 1e-6)
+                                          .d("theta", 1e4).s("mode", "gptj").s("dtype", "f32")),
         G("dfly_sel", "M", 6, a.i("M", R).i("blocks_in", 4).i("blocks", 6).i("ratio", 4).i("seqs", 2)),
         G("idx_score", "M", 4, a.i("M", R).i("n", 8).i("heads", 2).i("blocks", 3).i("seqs", 2)
                                   .s("dtype", "f32")),
@@ -10857,6 +10859,7 @@ std::vector<Geo> geometries() {
                                .s("dtype", "fp8_e4m3")),
         G("dsa_pool", "M", 3, a.i("M", R).i("n", 8).i("ratio", 4).s("dtype", "bf16")),
         G("dsa_query", "M", 3, a.i("M", R).i("n", 8).s("dtype", "bf16")),
+        G("dsa_query_i8", "M", 3, a.i("M", R).i("n", 8).s("dtype", "bf16")),
         G("gemm_nt_f32", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "bf16")),
         G("swiglu_clamped", "M", 3, a.i("M", R).i("n", 8).d("limit", 0.5).s("dtype", "f32")),
         G("swiglu_step", "M", 3, a.i("M", R).i("n", 8).d("limit", 0.5).s("dtype", "f32")),

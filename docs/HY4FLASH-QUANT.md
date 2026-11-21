@@ -37,9 +37,11 @@ position parameters are not quantisable (a recipe naming one is refused at decla
 - **Streamed sparse KV** (`--kv-resident N`, [KV-STREAMING.md](KV-STREAMING.md)): the sparse latent group lives
   in host memory and a ring of N tokens x max_seqs stays on the card; only worth it past the ring floor
   (32768 tokens a sequence). Bit-identical to resident on gpu-mini.
-- **Optional FP8 indexer**: `RADIANCE_HY4_INDEXER=fp8` (default `exact`; other values refused). Opt-in and
-  not part of "ready": on dummies its selection differs from the exact path (Jaccard ~0.97-0.99), so your KL
-  with real weights decides whether to use it.
+- **Optional quantised indexer**: `RADIANCE_HY4_INDEXER=fp8` or `int8` (default `exact`; other values
+  refused). `fp8` is E4M3 at a power-of-two scale, `int8` symmetric int8 at an f32 scale per key / query head
+  row; both use the same packed 136-byte page. Opt-in and not part of "ready": on dummies the selection
+  differs from the exact path (see notes/idxint8.md for fp8 / int8 Jaccard and KL), so your KL with real
+  weights decides which, if any, to use.
 - **Chained launches are on** for Hy4-flash decode (about 8 % faster on gpu-mini); nothing to set.
 - **TP4 and `tcq_rows`**: unchanged, already in the section on tensor parallelism below (128 rows on the
   gate_ups, 256 on the attention projections); a trellis container with other runs is refused at TP4.

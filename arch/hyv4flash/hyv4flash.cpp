@@ -669,8 +669,8 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
             d.n_head_kv = 1;
             d.head_dim = s.ix_dim / 8;
             if (s.ix_fp8) {
-                /* dsa_pool's packed page: 128 E4M3 codes and the f32 scale, four rows of 34
-                 * bytes (GLM's kv_dsa_index). */
+                /* dsa_pool's packed page: 128 E4M3 (or int8) codes and the f32 scale, four rows of
+                 * 34 bytes (GLM's kv_dsa_index). */
                 d.dtype = RAD_U8;
                 d.head_dim = 17;
             }
@@ -790,11 +790,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.force_absorbed = e && !std::strcmp(e, "absorbed");
         /* The indexer's numerics: HF's (the default) or vLLM's FWHT + FP8 (hyv4flash_indexer.h). */
         const char* ix = std::getenv("RADIANCE_HY4_INDEXER");
-        if (ix && *ix && std::strcmp(ix, "exact") && std::strcmp(ix, "fp8"))
-            return refuse("RADIANCE_HY4_INDEXER is 'exact' (the default) or 'fp8'");
-        s.ix_fp8 = ix && !std::strcmp(ix, "fp8");
+        if (ix && *ix && std::strcmp(ix, "exact") && std::strcmp(ix, "fp8") &&
+            std::strcmp(ix, "int8"))
+            return refuse("RADIANCE_HY4_INDEXER is 'exact' (the default), 'fp8' or 'int8'");
+        s.ix_i8 = ix && !std::strcmp(ix, "int8");
+        s.ix_fp8 = s.ix_i8 || (ix && !std::strcmp(ix, "fp8"));   /* the packed-page wiring */
         if (s.ix_fp8 && s.ix_dim != 128)
-            return refuse("RADIANCE_HY4_INDEXER=fp8 needs an indexer head of 128 (dsa_pool's page)");
+            return refuse("RADIANCE_HY4_INDEXER=fp8/int8 needs an indexer head of 128 (the packed page)");
     }
 
     /* The token embedding and the head. The release ships its own lm_head (`tie_word_embeddings`

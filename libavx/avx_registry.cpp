@@ -1216,6 +1216,11 @@ static const RadOpSchema kSchemas[] = {
   "E4M3 codes at scale 2^ceil(log2(max(amax, 1e-4) / 448)), nearest even, nothing rounded to "
   "bf16 in between. Written to the packed u8 cache page (dsa_pool's [pages, 1, 4, 34]: 128 codes, "
   "f32 scale at byte 128; n 128) and/or q [W, n] E4M3 with scale [W, 1] f32." },
+{ "idx_pool_gated_i8", ARR(pIdxPoolGated), ARR(oIdxPoolGatedFp8),
+  "idx_pool_gated_fp8's key (f32, no bf16 rounding, the 128-wide Hadamard times n^-0.5) as symmetric "
+  "INT8 codes at an f32 scale max(amax, 1e-4) / 127, nearest even, clamped to +-127 (the "
+  "RADIANCE_HY4_INDEXER=int8 form). Written to the packed u8 cache page ([pages, 1, 4, 34]: 128 int8 "
+  "codes, f32 scale at byte 128; n 128) and/or q [W, n] i8 with scale [W, 1] f32." },
 { "idx_score", ARR(pIdxScore), ARR(oIdxScore),
   "Group scores of the compressed indexer: w_h = gate[m][h] * (heads*n)^-0.5, d_h = q[m][h] . key, "
   "score = (sum_{h < heads/2} w_h relu(d_h)) + (sum_{h >= heads/2} w_h relu(d_h)). A block past "
@@ -1241,6 +1246,9 @@ static const RadOpSchema kSchemas[] = {
   "BF16 activations times F32 weights, F32 accumulation and output; preserves routing and index gate precision." },
 { "dsa_query", ARR(pMnD), ARR(oQuantFp8),
   "Normalized Hadamard, BF16 boundary and power-of-two E4M3 quantization per query head." },
+{ "dsa_query_i8", ARR(pMnD), ARR(oQuantFp8),
+  "dsa_query's INT8 form: normalized Hadamard in f32, symmetric int8 codes at an f32 scale "
+  "max(amax, 1e-4) / 127 per query head row, nearest even, clamped to +-127." },
 { "dsa_pool", ARR(pDsaPool), ARR(oDsaPool),
   "Channel-wise softmax pooling with learned position bias, BF16, normalized Hadamard, BF16, power-of-two FP8." },
 { "swiglu_step", ARR(pSwigluClamped), ARR(oGateUp),
@@ -1938,6 +1946,9 @@ SIMPLE("avx_idx_pool_gated", "idx_pool_gated", "attn",
 SIMPLE("avx_idx_pool_gated_fp8", "idx_pool_gated_fp8", "attn",
        "compressed indexer group key in f32, Hadamard and E4M3 (the FP8 indexer)", DT_FLOAT,
        L(idx_pool_gated_fp8)),
+SIMPLE("avx_idx_pool_gated_i8", "idx_pool_gated_i8", "attn",
+       "compressed indexer group key in f32, Hadamard and int8 (the INT8 indexer)", DT_FLOAT,
+       L(idx_pool_gated_i8)),
 SIMPLE("avx_idx_score", "idx_score", "attn", "compressed indexer group scores", DT_FLOAT,
        L(idx_score)),
 SIMPLE("avx_engram_ids", "engram_ids", "vocab", "Engram hash ids and mask", DT_ANY,
@@ -1954,6 +1965,8 @@ SIMPLE("avx_dsa_pool", "dsa_pool", "attn", "learned compressed FP8 index keys", 
        L(dsa_pool)),
 SIMPLE("avx_dsa_query", "dsa_query", "attn", "normalized FP8 index queries", DT_FLOAT,
        L(dsa_query)),
+SIMPLE("avx_dsa_query_i8", "dsa_query_i8", "attn", "normalized int8 index queries", DT_FLOAT,
+       L(dsa_query_i8)),
 SIMPLE("avx_gemm_nt_f32", "gemm_nt_f32", "gemm", "F32 routing projection", DT_FLOAT,
        L(gemm_nt_f32)),
 SIMPLE("avx_mla_project", "mla_project", "attn", "absorbed MLA projections", DT_FLOAT,

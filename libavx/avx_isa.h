@@ -78,7 +78,7 @@ int         avx_par_force(int threads);
     X(router_sigmoid_topk)                                                                        \
     X(router_sigmoid_group_topk)                                                                  \
     X(dsa_pool)                                                                                   \
-    X(dsa_query)                                                                                  \
+    X(dsa_query)            X(dsa_query_i8)         X(idx_pool_gated_i8)                          \
     X(gemm_nt_f32)                                                                                \
     X(mla_project)                                                                                \
     X(dsa_score)                                                                                  \

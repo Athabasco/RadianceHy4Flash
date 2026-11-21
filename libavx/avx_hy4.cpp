@@ -672,7 +672,7 @@ namespace {
 /* `fp8` 0: idx_pool_gated. `fp8` 1: idx_pool_gated_fp8, the key kept in f32 (nothing rounded), then
  * the ascending-stride Walsh-Hadamard transform times n^-0.5 and E4M3 codes at a power-of-two
  * scale, into dsa_pool's packed cache page and/or q/scale (libref's ref_idx_pool_gated_fp8). */
-int pool_gated(const RadArgs* a, bool fp8) {
+int pool_gated(const RadArgs* a, bool fp8, bool i8 = false) {
     if (a->n_t < 6 || !rad_args_have(a, 6)) return RAD_E_INVAL;
     const RadTensor &k = a->t[0], &wv = a->t[1], &wg = a->t[2], &ape = a->t[3], &gain = a->t[4],
                     &pos = a->t[5];
@@ -727,7 +727,7 @@ int pool_gated(const RadArgs* a, bool fp8) {
                 return RAD_E_SHAPE;
         }
         if (q) {
-            if (q->dtype != RAD_F8E4M3 || qs->dtype != RAD_F32) return RAD_E_DTYPE;
+            if (q->dtype != (i8 ? RAD_I8 : RAD_F8E4M3) || qs->dtype != RAD_F32) return RAD_E_DTYPE;
             if (!matrix(*q, W, n) || !matrix(*qs, W, 1)) return RAD_E_SHAPE;
         }
     }
@@ -810,12 +810,22 @@ int pool_gated(const RadArgs* a, bool fp8) {
                 z[d] = z[d] * norm;
                 am = std::max(am, std::fabs(z[d]));
             }
-            int exponent = 0;
-            const float fraction = std::frexp(am * (1.0f / 448.0f), &exponent);
-            const float scale = std::ldexp(1.0f, exponent - (fraction == 0.5f));
+            float scale;
             uint8_t codes[256];
-            for (int64_t d = 0; d < n; ++d)
-                codes[d] = rad_f32_to_fp8e4m3(std::clamp(z[d] / scale, -448.0f, 448.0f));
+            if (i8) {
+                /* idx_pool_gated_i8: symmetric int8 at an f32 scale amax / 127 (libref). */
+                scale = am * (1.0f / 127.0f);
+                const float inv = 1.0f / scale;
+                for (int64_t d = 0; d < n; ++d)
+                    codes[d] = (uint8_t)(int8_t)std::nearbyint(
+                        std::clamp(z[d] * inv, -127.0f, 127.0f));
+            } else {
+                int exponent = 0;
+                const float fraction = std::frexp(am * (1.0f / 448.0f), &exponent);
+                scale = std::ldexp(1.0f, exponent - (fraction == 0.5f));
+                for (int64_t d = 0; d < n; ++d)
+                    codes[d] = rad_f32_to_fp8e4m3(std::clamp(z[d] / scale, -448.0f, 448.0f));
+            }
             if (q) {
                 for (int64_t d = 0; d < n; ++d)
                     ((uint8_t*)q->data)[rowoff(q, w, n) + d * laststride(q)] = codes[d];
@@ -845,6 +855,7 @@ int pool_gated(const RadArgs* a, bool fp8) {
 
 AVX_KERNEL(idx_pool_gated) { return pool_gated(a, false); }
 AVX_KERNEL(idx_pool_gated_fp8) { return pool_gated(a, true); }
+AVX_KERNEL(idx_pool_gated_i8) { return pool_gated(a, true, true); }
 
 /* score[m][b] = sum_h w_h relu(q[m][h] . key_b), w_h = gate[m][h] (heads n)^-0.5, the heads summed
  * as two halves in ascending order and the halves added. Blocks past nc[seq], with a page < 0 or

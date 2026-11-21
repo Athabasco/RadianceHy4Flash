@@ -9,6 +9,9 @@
 #include <cmath>
 
 namespace {
+/* I8: the Hadamard stays f32 (no bf16 boundary), symmetric int8 codes at an f32 scale amax / 127
+ * (libref's ref_dsa_query_i8). */
+template <bool I8>
 __global__ void dsa_query_kernel(const uint16_t* x, uint8_t* q, float* scale, long xp, long qp,
                                  long sp, int rows) {
     const int lane = threadIdx.x & 31, r = blockIdx.x * 4 + (threadIdx.x >> 5);
@@ -20,15 +23,21 @@ __global__ void dsa_query_kernel(const uint16_t* x, uint8_t* q, float* scale, lo
     float am = 1e-4f;
 #pragma unroll
     for (int d = 0; d < 4; ++d) {
-        v[d] = bf16_to_f32(f32_to_bf16(v[d] * 0.08838834764831845f));
+        v[d] = I8 ? v[d] * 0.08838834764831845f
+                  : bf16_to_f32(f32_to_bf16(v[d] * 0.08838834764831845f));
         am = fmaxf(am, fabsf(v[d]));
     }
 #pragma unroll
     for (int mask = 16; mask; mask >>= 1) am = fmaxf(am, __shfl_xor(am, mask, 32));
-    const uint32_t bits = __float_as_uint(am * (1.0f / 448.0f));
-    const float sc = __uint_as_float((bits & 0x7f800000u) + ((bits & 0x7fffffu) ? 0x800000u : 0));
+    float sc;
+    if (I8) {
+        sc = am * (1.0f / 127.0f);
+    } else {
+        const uint32_t bits = __float_as_uint(am * (1.0f / 448.0f));
+        sc = __uint_as_float((bits & 0x7f800000u) + ((bits & 0x7fffffu) ? 0x800000u : 0));
+    }
     if (!lane) scale[(long)r * sp] = sc;
-    const uint32_t packed = q8_pack4<false>(v[0], v[1], v[2], v[3], 1.0f / sc);
+    const uint32_t packed = q8_pack4<I8>(v[0], v[1], v[2], v[3], 1.0f / sc);
     uint8_t* dst = q + (long)r * qp + lane * 4;
     if (((uintptr_t)dst & 3) == 0)
         *(uint32_t*)dst = packed;
@@ -37,10 +46,11 @@ __global__ void dsa_query_kernel(const uint16_t* x, uint8_t* q, float* scale, lo
         for (int d = 0; d < 4; ++d) dst[d] = (uint8_t)(packed >> (8 * d));
     }
 }
-int query_body(const RadArgs* a, RadStream stream) {
+int query_body(const RadArgs* a, RadStream stream, bool i8) {
     if (!a || a->n_t < 3) return RAD_E_INVAL;
     const auto &x = a->t[0], &q = a->t[1], &s = a->t[2];
-    if (x.dtype != RAD_BF16 || q.dtype != RAD_F8E4M3 || s.dtype != RAD_F32) return RAD_E_DTYPE;
+    if (x.dtype != RAD_BF16 || q.dtype != (i8 ? RAD_I8 : RAD_F8E4M3) || s.dtype != RAD_F32)
+        return RAD_E_DTYPE;
     if (!x.data || !q.data || !s.data) return RAD_E_INVAL;
     if (r4d_geti_or(a, "n", 0) != 128 || x.rank != 2 || q.rank != 2 || s.rank != 2 ||
         x.shape[0] < 1 || x.shape[0] > INT_MAX - 3 || x.shape[1] != 128 ||
@@ -48,9 +58,12 @@ int query_body(const RadArgs* a, RadStream stream) {
         s.shape[1] != 1 || x.stride[1] != 1 || q.stride[1] != 1 || s.stride[1] != 1 ||
         x.stride[0] < 128 || q.stride[0] < 128 || s.stride[0] < 1)
         return RAD_E_SHAPE;
-    return R4D_EMIT(stream, dsa_query_kernel, dim3((x.shape[0] + 3) / 4), dim3(128), 0,
-                    (const uint16_t*)x.data, (uint8_t*)q.data, (float*)s.data, x.stride[0],
-                    q.stride[0], s.stride[0], (int)x.shape[0]);
+#define QUERY(I8_)                                                                                 \
+    R4D_EMIT(stream, (dsa_query_kernel<I8_>), dim3((x.shape[0] + 3) / 4), dim3(128), 0,            \
+             (const uint16_t*)x.data, (uint8_t*)q.data, (float*)s.data, x.stride[0], q.stride[0],  \
+             s.stride[0], (int)x.shape[0])
+    return i8 ? QUERY(true) : QUERY(false);
+#undef QUERY
 }
 struct ScoreMeta {
     long qr, qh, qsr, qsc, gr, gc, kr, ksr, btr, btc, cur, ncr, op;
@@ -64,8 +77,9 @@ __device__ uint32_t bytes4(const uint8_t* p) {
 /* `kWaves` waves cover the heads, 16 a wave (two for GLM's 32, one for Hy4-flash's 16), and reuse
  * the query across `kScoreTiles` 16-key tiles, one up to 32 blocks and two past them. FP8 dot products stay on WMMA; scales and the signed per-head gates
  * fold only after the per-head ReLU. The query operands start at a part's first row, so only the
- * sequence lookup sees the step row (`row0 + r`). */
-template <int kScoreTiles, int kWaves>
+ * sequence lookup sees the step row (`row0 + r`). I8: the same tile on v_wmma_i32_16x16x16_iu8 (the
+ * fp8 rate) over int8 codes; an exact int32 sum (<= 128 * 127 * 127) is read back as a float. */
+template <int kScoreTiles, int kWaves, bool I8>
 __global__ void dsa_score_kernel(const uint8_t* q, const float* qs, const float* gate,
                                  const uint8_t* k, const float* ks, const int* bt, const int* cu,
                                  const int* nc, float* out, ScoreMeta m) {
@@ -119,14 +133,14 @@ __global__ void dsa_score_kernel(const uint8_t* q, const float* qs, const float*
         const auto a = r4d_fp8::frag<128>(qa, wave * 16, d, lane);
 #pragma unroll
         for (int tile = 0; tile < kScoreTiles; ++tile)
-            acc[tile] = r4d_fp8::mma(a, r4d_fp8::frag<128>(kb, tile * 16, d, lane), acc[tile]);
+            acc[tile] = r4d_fp8::mma8<I8>(a, r4d_fp8::frag<128>(kb, tile * 16, d, lane), acc[tile]);
     }
 #pragma unroll
     for (int tile = 0; tile < kScoreTiles; ++tile) {
         float value = 0;
 #pragma unroll
         for (int j = 0; j < 8; ++j)
-            value += fmaxf(acc[tile][j], 0.0f) * coefficients[wave * 16 + (lane >> 4) * 8 + j];
+            value += fmaxf(r4d_fp8::acc_val<I8>(acc[tile][j]), 0.0f) * coefficients[wave * 16 + (lane >> 4) * 8 + j];
         value += __shfl_xor(value, 16, 32);
         if (lane < 16) partial[wave][tile * 16 + lane] = value;
     }
@@ -143,6 +157,8 @@ __global__ void dsa_rebase_kernel(const int* cu, int* out, long cs, long os, int
     for (int i = threadIdx.x; i < n; i += blockDim.x) out[(long)i * os] = cu[(long)i * cs] - row0;
 }
 int score_body(const RadArgs* a, RadStream stream) {
+    const char* dts = r4d_gets(a, "dtype");
+    const bool i8 = dts && !std::strcmp(dts, "int8");
     if (!a || a->n_t < 9) return RAD_E_INVAL;
     RadTensor q = a->t[0], qs = a->t[1], g = a->t[2];
     RadTensor k = a->t[3], ks = a->t[4];
@@ -158,7 +174,7 @@ int score_body(const RadArgs* a, RadStream stream) {
         ks.rank = 1;
         ks.shape[0] = k.shape[0];
         ks.stride[0] = k.stride[0] / 4;
-        k.dtype = RAD_F8E4M3;
+        k.dtype = i8 ? RAD_I8 : RAD_F8E4M3;
         k.rank = 2;
         k.shape[1] = 128;
         k.stride[1] = 1;
@@ -202,7 +218,8 @@ int score_body(const RadArgs* a, RadStream stream) {
         if (cu_part->rank != 1 || cu_part->shape[0] != cu.shape[0] || cu_part->stride[0] < 1)
             return RAD_E_SHAPE;
     }
-    if (q.dtype != RAD_F8E4M3 || k.dtype != RAD_F8E4M3 || qs.dtype != RAD_F32 ||
+    const auto qk = i8 ? RAD_I8 : RAD_F8E4M3;
+    if (q.dtype != qk || k.dtype != qk || qs.dtype != RAD_F32 ||
         g.dtype != RAD_F32 || ks.dtype != RAD_F32 || o.dtype != RAD_F32 || bt.dtype != RAD_I32 ||
         cu.dtype != RAD_I32 || nc.dtype != RAD_I32)
         return RAD_E_DTYPE;
@@ -234,9 +251,10 @@ int score_body(const RadArgs* a, RadStream stream) {
                                 cu_part->stride[0], (int)cu.shape[0], (int)row0);
         if (rc != RAD_OK) return rc;
     }
-#define SCORE(NT) (H == 16 ? SCORE1(NT, 1) : SCORE1(NT, 2))
-#define SCORE1(NT, NW)                                                                             \
-    R4D_EMIT(stream, (dsa_score_kernel<NT, NW>), dim3((m.blocks + 16 * NT - 1) / (16 * NT), m.rows), \
+#define SCORE(NT) (i8 ? (H == 16 ? SCORE1(NT, 1, true) : SCORE1(NT, 2, true))                      \
+                      : (H == 16 ? SCORE1(NT, 1, false) : SCORE1(NT, 2, false)))
+#define SCORE1(NT, NW, I8_)                                                                        \
+    R4D_EMIT(stream, (dsa_score_kernel<NT, NW, I8_>), dim3((m.blocks + 16 * NT - 1) / (16 * NT), m.rows), \
              dim3(32 * NW), 0, (const uint8_t*)q.data, (const float*)qs.data, (const float*)g.data,     \
              (const uint8_t*)k.data, (const float*)ks.data, (const int*)bt.data,                   \
              (const int*)cu.data, (const int*)nc.data, (float*)o.data, m)
@@ -332,7 +350,10 @@ int pool_body(const RadArgs* a, RadStream stream) {
 }
 extern "C" int r4d_rad_dsa_pool(const RadArgs* a, RadStream stream) { return pool_body(a, stream); }
 extern "C" int r4d_rad_dsa_query(const RadArgs* a, RadStream stream) {
-    return query_body(a, stream);
+    return query_body(a, stream, false);
+}
+extern "C" int r4d_rad_dsa_query_i8(const RadArgs* a, RadStream stream) {
+    return query_body(a, stream, true);
 }
 extern "C" int r4d_rad_dsa_score(const RadArgs* a, RadStream stream) {
     return score_body(a, stream);

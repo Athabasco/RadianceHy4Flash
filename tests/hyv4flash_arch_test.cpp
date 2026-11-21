@@ -482,16 +482,20 @@ TEST(a_streamed_sparse_group_stores_to_its_mirror_and_resolves_between_select_an
     }
 }
 
-/* RADIANCE_HY4_INDEXER=fp8: the key cache becomes dsa_pool's packed page and the score dsa_score
- * over dsa_query's codes; anything but exact/fp8, and an indexer head other than 128, is refused. */
-TEST(the_fp8_indexer_swaps_the_key_cache_and_the_score_for_the_dsa_forms) {
+/* RADIANCE_HY4_INDEXER=fp8 / int8: the key cache becomes the packed page and the score dsa_score
+ * over the query codes (E4M3 through dsa_query, int8 through dsa_query_i8); anything else, and an
+ * indexer head other than 128, is refused. */
+TEST(the_quantised_indexers_swap_the_key_cache_and_the_score_for_the_dsa_forms) {
     auto wide_ix = [](MetaKV& k) { k.set("index_head_dim", "128"); };
-    setenv("RADIANCE_HY4_INDEXER", "fp8", 1);
-    Declared small;
-    CHECK_EQ(small.rc, RAD_E_UNSUPPORTED);              /* mini's indexer head is 16 */
-    unsetenv("RADIANCE_HY4_INDEXER");
-    for (int fp8 = 0; fp8 < 2; ++fp8) {
-        if (fp8) setenv("RADIANCE_HY4_INDEXER", "fp8", 1);
+    for (const char* mode : { "fp8", "int8" }) {
+        setenv("RADIANCE_HY4_INDEXER", mode, 1);
+        Declared small;
+        CHECK_EQ(small.rc, RAD_E_UNSUPPORTED);              /* mini's indexer head is 16 */
+        unsetenv("RADIANCE_HY4_INDEXER");
+    }
+    for (int m = 0; m < 3; ++m) {   /* exact, fp8, int8 */
+        const bool q = m > 0, i8 = m == 2;
+        if (q) setenv("RADIANCE_HY4_INDEXER", i8 ? "int8" : "fp8", 1);
         MetaKV mk = mini_meta();
         wide_ix(mk);
         RadBuilder b;
@@ -502,17 +506,19 @@ TEST(the_fp8_indexer_swaps_the_key_cache_and_the_score_for_the_dsa_forms) {
         unsetenv("RADIANCE_HY4_INDEXER");
         if (rc != RAD_OK) fputs(err.c_str(), stderr);
         REQUIRE_EQ(rc, RAD_OK);
-        CHECK_EQ(count_op(b, "idx_pool_gated_fp8"), fp8 ? 2 : 0);
-        CHECK_EQ(count_op(b, "idx_pool_gated"), fp8 ? 0 : 2);
-        CHECK_EQ(count_op(b, "dsa_query"), fp8 ? 2 : 0);
-        CHECK_EQ(count_op(b, "dsa_score"), fp8 ? 2 : 0);
-        CHECK_EQ(count_op(b, "idx_score"), fp8 ? 0 : 2);
+        CHECK_EQ(count_op(b, "idx_pool_gated_fp8"), m == 1 ? 2 : 0);
+        CHECK_EQ(count_op(b, "idx_pool_gated_i8"), i8 ? 2 : 0);
+        CHECK_EQ(count_op(b, "idx_pool_gated"), q ? 0 : 2);
+        CHECK_EQ(count_op(b, "dsa_query"), m == 1 ? 2 : 0);
+        CHECK_EQ(count_op(b, "dsa_query_i8"), i8 ? 2 : 0);
+        CHECK_EQ(count_op(b, "dsa_score"), q ? 2 : 0);
+        CHECK_EQ(count_op(b, "idx_score"), q ? 0 : 2);
         const RecKV* ixk = kv_named(b, "kv_index_keys");
         REQUIRE(ixk != nullptr);
-        CHECK_EQ(ixk->d.dtype, fp8 ? RAD_U8 : RAD_BF16);
-        CHECK_EQ(ixk->d.head_dim, fp8 ? 17 : 16);
+        CHECK_EQ(ixk->d.dtype, q ? RAD_U8 : RAD_BF16);
+        CHECK_EQ(ixk->d.head_dim, q ? 17 : 16);
         CHECK_EQ(block_of(b, "kv_index_keys"), 4);
-        if (fp8) {
+        if (q) {
             const RecOp* sc = find_op(b, "dsa_score");
             CHECK_EQ(pint(sc, "heads"), 2);
             CHECK_EQ(pint(sc, "n"), 128);
@@ -523,7 +529,7 @@ TEST(the_fp8_indexer_swaps_the_key_cache_and_the_score_for_the_dsa_forms) {
         hyv4flash::step(&c, &k->b);
         CHECK_LINT(b, &c);
         CHECK(c.step_fail.empty());
-        CHECK_EQ(count_issued(b, c, fp8 ? "dsa_score" : "idx_score"), 2);
+        CHECK_EQ(count_issued(b, c, q ? "dsa_score" : "idx_score"), 2);
         CHECK_EQ(count_issued(b, c, "mla_attn_sel_sink"), 2);
     }
     setenv("RADIANCE_HY4_INDEXER", "bf16", 1);

@@ -722,7 +722,7 @@ int ref_idx_pool_gated(const RadArgs* a, RadStream) {
  * Walsh-Hadamard transform, times n^-0.5, and E4M3 codes at scale 2^ceil(log2(max(amax, 1e-4) /
  * 448)), nearest even. Unlike dsa_pool, nothing is rounded to bf16 between the transform and the
  * codes. The packed cache page is dsa_pool's: 128 codes, then the f32 scale at byte 128. */
-int ref_idx_pool_gated_fp8(const RadArgs* a, RadStream) {
+static int pool_quant(const RadArgs* a, bool i8) {
     PoolArgs P;
     if (const int rc = pool_args(a, P)) return rc;
     const RadTensor* page = a->n_t > 6 ? t_in(a, 6) : nullptr;
@@ -743,7 +743,7 @@ int ref_idx_pool_gated_fp8(const RadArgs* a, RadStream) {
         if (!pages_unique(page, W, cache->shape[0])) return RAD_E_INVAL;
     }
     if (q) {
-        if (q->dtype != RAD_F8E4M3 || sc->dtype != RAD_F32) return RAD_E_DTYPE;
+        if (q->dtype != (i8 ? RAD_I8 : RAD_F8E4M3) || sc->dtype != RAD_F32) return RAD_E_DTYPE;
         if (!matrix(*q, W, n) || !matrix(*sc, W, 1)) return RAD_E_SHAPE;
     }
     REF_PAR_FOR_DYN(W * 2 * n * n * P.ratio)
@@ -763,12 +763,22 @@ int ref_idx_pool_gated_fp8(const RadArgs* a, RadStream) {
             v[d] = v[d] * norm;
             am = std::max(am, std::fabs(v[d]));
         }
-        int exponent = 0;
-        const float fraction = std::frexp(am * (1.0f / 448.0f), &exponent);
-        const float scale = std::ldexp(1.0f, exponent - (fraction == 0.5f));
+        float scale;
         uint8_t codes[256];
-        for (int64_t d = 0; d < n; ++d)
-            codes[d] = f32_to_fp8e4m3(std::clamp(v[d] / scale, -448.0f, 448.0f));
+        if (i8) {
+            /* Symmetric int8: scale = amax / 127 in f32, codes rint(v * (1 / scale)) clamped to
+             * +-127 (r4d's q8_pack4<true>). */
+            scale = am * (1.0f / 127.0f);
+            const float inv = 1.0f / scale;
+            for (int64_t d = 0; d < n; ++d)
+                codes[d] = (uint8_t)(int8_t)std::nearbyint(std::clamp(v[d] * inv, -127.0f, 127.0f));
+        } else {
+            int exponent = 0;
+            const float fraction = std::frexp(am * (1.0f / 448.0f), &exponent);
+            scale = std::ldexp(1.0f, exponent - (fraction == 0.5f));
+            for (int64_t d = 0; d < n; ++d)
+                codes[d] = f32_to_fp8e4m3(std::clamp(v[d] / scale, -448.0f, 448.0f));
+        }
         if (q) {
             for (int64_t d = 0; d < n; ++d)
                 ((uint8_t*)q->data)[rowoff(q, w, n) + d * laststride(q)] = codes[d];
@@ -785,6 +795,14 @@ int ref_idx_pool_gated_fp8(const RadArgs* a, RadStream) {
     }
     return RAD_OK;
 }
+
+int ref_idx_pool_gated_fp8(const RadArgs* a, RadStream) { return pool_quant(a, false); }
+
+/* idx_pool_gated_fp8's INT8 form (RADIANCE_HY4_INDEXER=int8): the same f32 key and Hadamard, then
+ * symmetric int8 codes at an f32 scale amax / 127 (amax floored at 1e-4), nearest even, clamped to
+ * +-127: the packed page holds 128 int8 codes and the f32 scale at byte 128 (the fp8 page's
+ * layout). q is [W, n] i8 with scale [W, 1] f32. */
+int ref_idx_pool_gated_i8(const RadArgs* a, RadStream) { return pool_quant(a, true); }
 
 /* score[m][b] = sum_h w_h relu(q[m][h] . key_b), w_h = gate[m][h] (heads n)^-0.5, summed over the
  * first and the second half of the heads separately and then added. Keys b < nc[seq] with a valid

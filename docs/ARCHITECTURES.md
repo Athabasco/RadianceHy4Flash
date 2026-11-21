@@ -3444,7 +3444,7 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   plain `rmsnorm_ihc_junction`) unless `RADIANCE_HY4_JUNCTION_TP4=1`; `RADIANCE_HY4_JUNCTION=0`
   keeps the unfused chain everywhere. By-value kernel-argument structs of the wide all-reduce
   family are padding-free (a recorded pass's audit compares argument bytes).
-- **The FP8 indexer** (`RADIANCE_HY4_INDEXER=fp8`; `exact`, the default, is HF's numerics). The
+- **The FP8 and INT8 indexers** (`RADIANCE_HY4_INDEXER=fp8` or `int8`; `exact`, the default, is HF's numerics). The
   key cache and the score take vLLM's IndexPool numerics on GLM's forms: `idx_pool_gated_fp8`
   keeps the pooled, normed, rotated group key in f32 and writes its 128-wide Hadamard into E4M3
   codes at a power-of-two scale in `dsa_pool`'s packed page (136 bytes a group instead of 256),
@@ -3455,6 +3455,11 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   1.2e-2 mean, top-1 agreement 94.8 %, at TP1 and TP2; every tensor but the scores stays within
   the HF tolerance when HF is conditioned on the FP8 selection. The HF parity harness compares the
   exact path; the FP8 path is compared with it.
+  `int8` is the same wiring with symmetric int8 codes: `idx_pool_gated_i8` writes the Hadamard-rotated key
+  as int8 at an f32 scale `max(amax, 1e-4) / 127` into the same 136-byte packed page, `dsa_query_i8` does
+  the query a head row at a time, and `dsa_score` at `dtype int8` scores on `v_wmma_i32_16x16x16_iu8` with
+  int32 sums (`sum_h w_h relu(sq sk q.k)`). An absmax scale beat a power-of-two one in the host study.
+  The comparison of exact, fp8 and int8 is in notes/idxint8.md.
 - **Streamed KV on the cards** (`gpu-mini`, 60000-token prompt, `--kv-resident 32768`: a ring of
   8192 blocks under a 15104-block context): greedy tokens and logprobs are bit-identical to the
   resident run at TP1 and TP2, and with the FP8 indexer; a request's 48 decode steps resolve 94
