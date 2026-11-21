@@ -12,9 +12,9 @@
  *   val  = engram_value(e) + bias      [T, n]
  *   h   += engram_gate(key, val, h)    per stream, in place; masked rows (pad, image, video) untouched
  *
- * The norms' eps is HF's `nn.RMSNorm(dim)` default, finfo(dtype).eps, and an open decision
- * (DECISIONS U1): RADIANCE_HY4_ENGRAM_EPS=bf16 (0.0078125, the default: HF in bf16, the friend's
- * reference), f32 (1.19e-7: HF in f32, the parity harness, and vLLM), or a number. */
+ * The norms' eps is HF's `nn.RMSNorm(dim)` default, finfo(dtype).eps (DECISIONS U1):
+ * RADIANCE_HY4_ENGRAM_EPS=f32 (1.19e-7, the default: HF in f32, vLLM, llama.cpp and the friend's
+ * reference `ref/reference.py`), bf16 (0.0078125: HF run in bf16), or a number. */
 #ifndef HYV4FLASH_ENGRAM_H
 #define HYV4FLASH_ENGRAM_H
 
@@ -24,14 +24,14 @@ namespace hyv4flash {
 
 inline double engram_eps() {
     const char* e = std::getenv("RADIANCE_HY4_ENGRAM_EPS");
-    if (!e || !*e || !std::strcmp(e, "bf16")) return 0.0078125;
-    if (!std::strcmp(e, "f32")) return 1.1920928955078125e-07;
+    if (!e || !*e || !std::strcmp(e, "f32")) return 1.1920928955078125e-07;
+    if (!std::strcmp(e, "bf16")) return 0.0078125;
     char* end = nullptr;
     const double v = std::strtod(e, &end);
     if (end != e && !*end && v > 0) return v;
     fprintf(stderr, "radiance: hyv4flash: RADIANCE_HY4_ENGRAM_EPS='%s' is none of bf16, f32 or a "
-                    "positive number; using bf16 (0.0078125)\n", e);
-    return 0.0078125;
+                    "positive number; using f32 (1.19e-7)\n", e);
+    return 1.1920928955078125e-07;
 }
 
 /* The planes every Engram layer shares. */

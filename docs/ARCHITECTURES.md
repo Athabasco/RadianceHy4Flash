@@ -3465,8 +3465,8 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   resident run at TP1 and TP2, and with the FP8 indexer; a request's 48 decode steps resolve 94
   times with about 25 700 misses.
 - **The Engram norms' eps** is `finfo(dtype).eps` in the reference (DECISIONS U1):
-  `RADIANCE_HY4_ENGRAM_EPS=bf16` (0.0078125, the default), `f32` (1.19e-7, the harness's parity
-  mode) or a number.
+  `RADIANCE_HY4_ENGRAM_EPS=f32` (1.19e-7, the default: HF in f32, vLLM, llama.cpp and the friend's
+  reference; the harness's parity mode), `bf16` (0.0078125, HF run in bf16) or a number.
 - **Debug taps.** `RADIANCE_HY4_TAPS=1` declares a PERSIST `dbg.<key>.<l>` buffer and a copy for each
   key of the harness's tap contract (`resid`, `resid_mid`, `stream_in`, `attn_hc_x`,
   `attn_hc_post`, `attn_out`, `mlp_out`, `engram_out`, `engram_hash_ids`, `router_*`, `moe_*`,

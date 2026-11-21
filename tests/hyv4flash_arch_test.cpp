@@ -229,8 +229,8 @@ TEST(the_mini_graph_declares_every_layer_kind) {
     const RecOp* ih = find_op(b, "ihc_pre");
     CHECK(std::fabs(pflt(ih, "post_mag") - 2.0) < 1e-12);
     CHECK(std::fabs(pflt(ih, "hc_eps") - 1e-6) < 1e-15);
-    /* The Engram eps is the bf16 default (DECISIONS U1) unless the switch says f32. */
-    CHECK(std::fabs(pflt(find_op(b, "engram_norm"), "eps") - 0.0078125) < 1e-12);
+    /* The Engram eps is the f32 default (DECISIONS U1) unless the switch says bf16. */
+    CHECK(std::fabs(pflt(find_op(b, "engram_norm"), "eps") - 1.1920928955078125e-07) < 1e-20);
 
     /* The caches (PLAN §1.3). */
     const RecKV* swk = kv_named(b, "kv_latent_sliding");
