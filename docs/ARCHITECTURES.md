@@ -3444,6 +3444,37 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   plain `rmsnorm_ihc_junction`) unless `RADIANCE_HY4_JUNCTION_TP4=1`; `RADIANCE_HY4_JUNCTION=0`
   keeps the unfused chain everywhere. By-value kernel-argument structs of the wide all-reduce
   family are padding-free (a recorded pass's audit compares argument bytes).
+- **Arena levels and the prefill stager.** The probe sets `shape_probe_ok`, and a sizing declare
+  (`RadBuildCtx::shape_probe`) fills a thread-local model of its own, so the core declares again at
+  256 and 1024 rows (4x steps below the chunk), lends the arena above a level to the expert slab
+  while the steps stay that small, and arms the prefill stager for a step above the largest level
+  (`placement: expert_tiered`). gpu-mini at a 3000-token chunk: 167 MiB at 256 tokens, 658 MiB at
+  1024, of 1.88 GiB. `attn_kv_sink`'s `N` (the non-absorbed prefill's keys, which followed the step
+  size) is a capacity in all three libraries. A calibration run refuses its sizing declares (no
+  loan). The friend's plugin measured the loan at 10.6 -> 24 tok/s on the real model at TP2.
+- **Shared int8 inputs and the fused int8 producers** (the friend's `q8_fed` sharing). Linears that
+  read one bf16 input and the same codes (K, scale group, rotation) quantise once: q_a, kv_a and the
+  gate (the attention norm's output), q_nope and q_rope (the normed q residual), and the latent and
+  the shared expert's gate_up (the feed-forward norm's output); the leader writes a pair of its own
+  (`trunk_codes.<role>.*`). Where libr4d serves them, the q residual's norm writes q_b's rotated
+  codes itself (`rmsnorm_had_quant_i8g`, q_a then writes `q_a_raw`) and the dense and shared MLPs'
+  gate writes their down's (`gated_had_quant_i8g`). MoeFP8's `router_fuse` runs the selection and
+  the expert sort as one `router_sigmoid_topk_scatter` at decode and verify heights. All
+  byte-identical (greedy tokens and logprobs equal on gpu-mini at TP1/TP2, drafter off and depth 5,
+  bf16, 128-group int8 and IQ8R + w4nl64 containers). The 128-group rotated quantisers
+  (`had_quant_act_i8g`, `rmsnorm_had_quant_i8g`, the experts' `had_quant_act_fp8`) run their
+  chained forms (`chained` 1, `Geom::chain_q8`), since every GEMM around them chains. Launches of a
+  recorded gpu-mini decode pass: bf16 132 -> 129, int8 170 -> 148. Switches (default on):
+  `RADIANCE_HY4_SHARE_CODES`, `RADIANCE_HY4_FUSED_QUANT`, `RADIANCE_HY4_ROUTER_FUSE`,
+  `RADIANCE_HY4_CHAIN_Q8`. Not fused: the attention norm and the feed-forward norm are the
+  junction's (`rmsnorm_ihc_junction`), and o_proj's input comes out of `mla_expand_gate`.
+- **The Engram table on disk** (`ngram-placement: disk`). The ids and the gathered rows are
+  host-domain buffers (as `rad_block_ple.h`'s), so libavx's host gather reads and writes them in the
+  host arena; a device gather (vram, ram) reads and writes them over the link. A prefill chunk's
+  `engram_ids` also hashes up to two steps of the following prompt (`RadBatch::n_ahead`) into
+  `ahead_ids`, and the gather hands them to libavx's reader thread (the friend's `ahead_ids`), so the
+  next chunk's rows are read while this one computes; `RADIANCE_HY4_ENGRAM_AHEAD=0` turns it off.
+  Before this the plugin's device-domain ids made a disk-placed table crash the first prefill.
 - **The FP8 and INT8 indexers** (`RADIANCE_HY4_INDEXER=fp8` or `int8`; `exact`, the default, is HF's numerics). The
   key cache and the score take vLLM's IndexPool numerics on GLM's forms: `idx_pool_gated_fp8`
   keeps the pooled, normed, rotated group key in f32 and writes its 128-wide Hadamard into E4M3

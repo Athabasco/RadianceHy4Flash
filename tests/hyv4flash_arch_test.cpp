@@ -266,6 +266,22 @@ TEST(the_mini_graph_declares_every_layer_kind) {
     CHECK(find_w(b, "blk.1.engram_mult") != nullptr);
     /* The Engram table is model-level, so --ngram-placement keeps it off the cards. */
     CHECK_EQ(find_w(b, "blk.1.engram_table.weight")->d.group.layer, -1);
+    /* ...and with it on disk libavx's host gather reads the ids and writes the rows in the host
+     * arena (a device gather reads them over the link): host-domain planes, as rad_block_ple.h's.
+     * Device buffers there crashed the first prefill. The read-ahead ids are host planes too. */
+    for (const char* n : { "eg.ids", "eg.rows", "eg.ids_ahead" }) {
+        const RecBuf* eb = find_b(b, n);
+        REQUIRE(eb != nullptr);
+        CHECK_EQ(eb->d.domain, (int)RAD_DOMAIN_HOST);
+    }
+    CHECK_EQ(find_b(b, "eg.mask")->d.domain, (int)RAD_DOMAIN_DEVICE);
+    /* The prefill hash writes the following prompt's ids, which the gather reads. */
+    const RecOp* gat = find_op(b, "embed_lookup_q");
+    REQUIRE(gat != nullptr);
+    rad_buf ahead_h = 0;
+    for (size_t k = 0; k < b.bufs.size(); ++k)
+        if (b.bufs[k].name == "eg.ids_ahead") ahead_h = (rad_buf)(k + 1);
+    CHECK(in(gat->reads, ahead_h));
     /* q_b's rows per head: nope then rope, a piece a head. */
     const RecMap* qn = find_map(b, "blk.1.attn_q_nope.weight");
     REQUIRE(qn != nullptr);
