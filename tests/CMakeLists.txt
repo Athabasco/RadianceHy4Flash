@@ -15,7 +15,7 @@
 # depending on core/build/'s builder. With the archive linked, a new ABI call missing from the fake
 # would pull in rad_builder.cpp.o and collide on every rad_decl_* symbol; without it the error is a
 # single undefined reference.
-set(RAD_TESTS_NO_CORE minimaxh3_limits_test arch_test bailing_hybrid_arch_test breeze_arch_test flint_arch_test glm5next_test hyv4flash_arch_test museglimmer_test nemotron35_test spark25_arch_test nemotronh_test)
+set(RAD_TESTS_NO_CORE minimaxh3_limits_test arch_test bailing_hybrid_arch_test breeze_arch_test flint_arch_test glm5next_test hyv4flash_arch_test hyv4flash_calib_test museglimmer_test nemotron35_test spark25_arch_test nemotronh_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and
@@ -390,6 +390,10 @@ set(RAD_E2E_DEPS radiance rad-convert libref libquant nemotron35_embed qwen35_bf
                  llama_dense_fp8 llama_fp8 qwenimage21)
 if(TARGET libavx)
   list(APPEND RAD_E2E_DEPS libavx)
+endif()
+if(TARGET hyv4flash_calib_test)
+  target_compile_definitions(hyv4flash_calib_test PRIVATE
+    RAD_CALIB_ST2GRAM="${CMAKE_SOURCE_DIR}/tools/calib_st2gram.py")
 endif()
 foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test spark25_convert_test
           hyv4flash_convert_test)

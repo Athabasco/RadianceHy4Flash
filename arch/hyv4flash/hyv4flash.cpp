@@ -44,6 +44,7 @@
 #include "hyv4flash_indexer.h"
 #include "hyv4flash_moe.h"
 #include "hyv4flash_engram.h"
+#include "hyv4flash_calib.h"
 
 #include "chat.h"
 
@@ -86,6 +87,7 @@ struct Model {
     std::vector<Engram> engrams;
     Tap t_embed{}, t_hc_head{}, t_final{};
     bool force_absorbed = false;
+    Calib calib{};   /* --calib-dir: the trunk's Hessians (hyv4flash_calib.h) */
 };
 static std::unique_ptr<Model> models[MAX_SLOTS];
 
@@ -674,6 +676,8 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
                                  [&](int layer) { return expert_manifest(b, m, layer, msrc->cfg); }));
     RAD_ARCH_TRY(lay.hc_ffn.declare_post(b, s, T, m.tr.h, m.tr.post, m.tr.y));
     RAD_ARCH_TRY(lay.t_resid.declare(b, nm, T, "resid", l, RAD_BF16, s.hc * E, m.tr.h));
+    RAD_ARCH_TRY(m.calib.layer(b, g, s, l, m.tr.xn, lay.attn, !lay.sliding, lay.ffn,
+                               lay.engram >= 0 ? &m.engrams[(size_t)lay.engram] : nullptr));
     return RAD_OK;
 }
 
@@ -732,6 +736,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     Names& nm = m.nm;
     Shape& s = m.s;
     Geom& g = m.g;
+    RAD_ARCH_TRY(map_cli_to_env(ctx));   /* before the first block reads RADIANCE_CALIB_* */
     RAD_ARCH_TRY(read_shape(s, meta));
     RAD_ARCH_TRY(split_ranks(s, ctx->world_size ? ctx->world_size : 1, ctx->rank));
     RAD_ARCH_TRY(geom_from(g, meta, ctx, "bf16", RAD_BF16));
@@ -807,6 +812,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (!m.kv_engram) return RAD_E_INVAL;
         if (s.engram_pad < 0) return refuse("the config has Engram layers and no engram_pad_id");
     }
+    RAD_ARCH_TRY(m.calib.begin(b, nm, g, ctx, s));
     m.engrams.resize(s.engram_layers.size());
     m.layers.resize((size_t)s.n_layer);
     for (int l = 0; l < (int)s.n_layer; ++l) RAD_ARCH_TRY(trunk_layer(b, m, l, &msrc[(size_t)l]));
@@ -827,6 +833,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                      RAD_INT("n_embd", E), RAD_STR("dtype", "bf16") },
                    { m.head }, { m.logit_input }, { m.logits });
     HY4_NEED(m.op_norm && m.op_gather && m.op_head, "rmsnorm / gather_rows / logits_gemm");
+    RAD_ARCH_TRY(m.calib.output(b, g, s, m.final_hidden));
 
     /* A container carries what the model can serve, so the drafter and the tower are declared
      * wherever the checkpoint has them and the caller left room (rad-convert's --max-spec 0
@@ -912,15 +919,20 @@ static void step(RadCtx* c, const RadBatch* batch) {
 
     for (size_t i = 0; i < m.layers.size(); ++i) {
         const Layer& l = m.layers[i];
-        if (l.engram >= 0 && !m.engrams[(size_t)l.engram].step(c, batch)) return;
+        if (l.engram >= 0) {
+            if (!m.engrams[(size_t)l.engram].step(c, batch)) return;
+            m.calib.after_engram(c, (int)i, T);
+        }
         l.t_stream_in.step(c, brows(m.tr.h, T), T);
         l.hc_attn.pre(c, m.tr.h, m.tr.x, m.tr.post, T);
         l.t_attn_x.step(c, brows(m.tr.x, T), T);
         l.t_attn_post.step(c, brows(m.tr.post, T), T);
         RAD_ISSUE_N(c, l.op_attn_norm, T, brows(m.tr.x, T), RAD_W(l.attn_gain), brows(m.tr.xn, T));
         if (!l.attn.front(c, batch)) return;
+        m.calib.after_front(c, (int)i, l.attn, T);
         if (!l.sliding && !l.ix.step(c, batch, p)) return;
         l.attn.core(c, batch, p, m.iw.sel, m.iw.len);
+        m.calib.after_attn(c, (int)i, T);
         l.hc_attn.post_add(c, m.tr.y, m.tr.post, m.tr.h, T);
         l.t_mid.step(c, brows(m.tr.h, T), T);
 
@@ -929,7 +941,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
         l.t_ffn_post.step(c, brows(m.tr.post, T), T);
         RAD_ISSUE_N(c, l.op_ffn_norm, T, brows(m.tr.x, T), RAD_W(l.ffn_gain), brows(m.tr.xn, T));
         l.t_ffn_in.step(c, brows(m.tr.xn, T), T);
+        m.calib.after_ffn_norm(c, (int)i, T);
         if (!l.ffn.step(c, batch)) return;
+        m.calib.after_ffn(c, (int)i, T);
         l.hc_ffn.post_add(c, m.tr.y, m.tr.post, m.tr.h, T);
         l.t_resid.step(c, brows(m.tr.h, T), T);
     }
@@ -943,6 +957,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
         RAD_ISSUE_N(c, m.op_head, batch->n_out, brows(m.logit_input, batch->n_out), RAD_W(m.head),
                     brows(m.logits, batch->n_out));
     }
+    m.calib.after_step(c, T);
 }
 } // namespace hyv4flash
 
