@@ -104,8 +104,21 @@ enum class Kind { Image, Video, Audio };
  *           <image_end>; a video one <vid_start>, then per temporal group the text `Time: T s`
  *           and <|video|>*N rows, the groups separated by <|vid_frame_separator|> and closed by
  *           <vid_end>, T the group's first frame time (the reference stamps a group once, after
- *           repeating the last frame to a whole group). */
-enum class Family { QwenVL, Gemma4, Lfm2, UnlimitedOcr, Glm5Next, Pixtral, Radio, MuseGlimmer };
+ *           repeating the last frame to a whole group).
+ *   HyV4Flash  Tencent Hy4-flash's (HYV4VL's processors): a picture resized as QwenVL's
+ *           smart_resize does into its pixel band with PIL's bicubic, a video frame to the largest
+ *           whole merged-patch grid that never upscales and keeps every frame's tokens within the
+ *           clip budget (HYV4VLVideoProcessor.smart_resize); patches (channel, y, x) normalised by
+ *           the image's mean and deviation (CLIP's by default) or the video's (0.5); temporal 1, a
+ *           video frame its own segment. Every merged row of a picture or frame ends in one
+ *           newline token whose row the tower writes (the projector's image_newline), so a
+ *           segment is rows_h x (rows_w) output rows with rows_w = grid_w / merge + 1, and the
+ *           rotary grid wraps at that width: the reference's 3-D positions exactly. A picture is
+ *           spelled <image_start> pad*N <image_end>, a video <video_start> pad*(frames N)
+ *           <video_end>, no timestamps; every placeholder, the newline ones included, is the pad
+ *           id, which is what the Engram hash and its mask read. */
+enum class Family { QwenVL, Gemma4, Lfm2, UnlimitedOcr, Glm5Next, Pixtral, Radio, MuseGlimmer,
+                    HyV4Flash };
 
 struct VisionConfig {
     Family  family = Family::QwenVL;
@@ -127,6 +140,12 @@ struct VisionConfig {
     int32_t max_frame_rows = 768;
     float   mean[3] = { 0.5f, 0.5f, 0.5f };
     float   stdv[3] = { 0.5f, 0.5f, 0.5f };
+    /* HyV4Flash: a video's own normalisation (its processor's IMAGENET_STANDARD 0.5 defaults,
+     * where the image processor's are CLIP's), and the one-frame pixel cap of its smart_resize
+     * (`video_preprocessor.max_image_size.longest_edge`). */
+    float   vmean[3] = { 0.5f, 0.5f, 0.5f };
+    float   vstdv[3] = { 0.5f, 0.5f, 0.5f };
+    int64_t video_frame_max_pixels = 0;
     int32_t tok_image = -1, tok_video = -1, tok_start = -1, tok_end = -1;
     /* MuseGlimmer: the video run's own markers, <vid_start>, <vid_end> and the groups'
      * <|vid_frame_separator|> (a picture shares tok_start and tok_end). A container that numbers
@@ -480,6 +499,8 @@ private:
     std::vector<int32_t> tok_tiles_;
     int video_gemma4(const Video& v, std::shared_ptr<Item>* out, std::string* why) const;
     int video_muse(const Video& v, std::shared_ptr<Item>* out, std::string* why) const;
+    int image_hy(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
+    int video_hy(const Video& v, std::shared_ptr<Item>* out, std::string* why) const;
 
     VisionConfig cfg_{};
     AudioConfig  acfg_{};
@@ -527,6 +548,13 @@ int muse_size(int64_t h, int64_t w, int32_t factor, int64_t max_tokens, int64_t*
  * 24 fps. */
 std::vector<int64_t> sample_frames_muse(const VideoInfo& info, double fps, int32_t temporal,
                                         int32_t num_frames);
+
+/* HYV4VLVideoProcessor.smart_resize: the largest whole merged-patch frame (`factor` pixels a cell)
+ * that never upscales, keeps a frame within `max_frame_px` pixels and `frames` frames of
+ * rows * (cols + 1) tokens (a newline a row) within `max_px / factor^2` tokens, its aspect on the
+ * ray of the frame's own. Refuses an aspect over 200:1 as the reference does. */
+int hy_video_size(int64_t h, int64_t w, int64_t frames, int32_t factor, int64_t max_px,
+                  int64_t max_frame_px, int64_t* oh, int64_t* ow, std::string* why);
 
 /* Radio's tile for a picture of w x h pixels (NVIDIA's _compute_target_patches, Python's
  * round-half-even included) and for a video frame (_compute_target_patches_video), in patches. */

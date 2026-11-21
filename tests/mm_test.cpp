@@ -25,6 +25,7 @@
 #include "gemma4u_golden.h"
 #include "glimmer_golden.h"
 #include "glm5_golden.h"
+#include "hy4_mm_golden.h"
 #include "radio_golden.h"
 #include "imaging_golden.h"
 #include "lfm2_golden.h"
@@ -291,6 +292,193 @@ std::vector<int64_t> first_and_last(const VideoInfo& info, const void*) {
 }
 
 }  /* namespace */
+
+/* ================================================================== Hy4-flash (Family::HyV4Flash) */
+namespace {
+
+/* config.json's markers and a mini band the golden's picture lands in. */
+VisionConfig hy_cfg() {
+    VisionConfig c;
+    c.family = Family::HyV4Flash;
+    c.patch = 16;
+    c.temporal = 1;
+    c.merge = 2;
+    c.image_min_pixels = 32 * 32 * 4;
+    c.image_max_pixels = 96 * 96;
+    c.video_min_pixels = 32 * 32;
+    c.video_max_pixels = 33554432;
+    c.video_frame_max_pixels = 1048576;
+    c.min_frames = 2;
+    c.max_frames = 1024;
+    c.tok_image = 120120;
+    c.tok_video = 120124;
+    c.tok_start = 120118;
+    c.tok_end = 120119;
+    c.tok_video_start = 120122;
+    c.tok_video_end = 120123;
+    const float m[3] = { 0.48145466f, 0.4578275f, 0.40821073f };
+    const float d[3] = { 0.26862954f, 0.26130258f, 0.27577711f };
+    for (int i = 0; i < 3; ++i) { c.mean[i] = m[i]; c.stdv[i] = d[i]; }
+    c.max_patches = 4096;
+    return c;
+}
+
+float bf16f(uint16_t v) {
+    uint32_t u = (uint32_t)v << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
+}  /* namespace */
+
+TEST(hy4_video_sizes_are_the_references) {
+    for (int i = 0; i < kHyVidN; ++i) {
+        const long long* v = kHyVid + 8 * i;
+        int64_t oh = 0, ow = 0;
+        std::string why;
+        CHECK_OK(hy_video_size(v[0], v[1], v[2], (int32_t)v[3], v[4], v[5], &oh, &ow, &why));
+        CHECK_EQ(oh, (int64_t)v[6]);
+        CHECK_EQ(ow, (int64_t)v[7]);
+    }
+    int64_t oh = 0, ow = 0;
+    std::string why;
+    CHECK_EQ(hy_video_size(10, 2100, 2, 32, 33554432, 1048576, &oh, &ow, &why), RAD_E_INVAL);
+}
+
+/* The picture's patches against HYV4VLImageProcessorPil's: the reference emits them in raster
+ * order, radiance in merge-block order (the merger's view), so radiance's row of patch (y, x) is
+ * looked up for every reference value. Each value is the reference's f32 rounded to bf16; the
+ * fused normalisation may land one bf16 step away on a value that sits on a rounding edge. */
+TEST(hy4_pictures_patchify_as_the_reference_does) {
+    Processor p;
+    REQUIRE_EQ(p.init(hy_cfg(), [](const std::string&) { return std::vector<int32_t>{ 1 }; }), (int)RAD_OK);
+    std::shared_ptr<Item> it;
+    std::string why;
+    REQUIRE_EQ(p.image_from(frame(0, kHyImgH, kHyImgW), &it, &why), (int)RAD_OK);
+    CHECK_EQ(it->grid_t, kHyImgGrid[0]);
+    CHECK_EQ(it->grid_h, kHyImgGrid[1]);
+    CHECK_EQ(it->grid_w, kHyImgGrid[2]);
+    REQUIRE_EQ(it->patch_dim, (int64_t)kHyImgDim);
+    const int gh = it->grid_h, gw = it->grid_w, m = 2;
+    /* A merged row of (gw / 2) cells and its newline: the rows, the pads and the rotary width. */
+    CHECK_EQ(it->rows_h, gh / m);
+    CHECK_EQ(it->rows_w, gw / m + 1);
+    CHECK_EQ(it->seg_rows, (gh / m) * (gw / m + 1));
+    CHECK_EQ(it->n_rows(), (int64_t)it->seg_rows);
+    REQUIRE_EQ(it->expand.size(), (size_t)it->seg_rows + 2);
+    CHECK_EQ(it->expand.front(), 120118);
+    CHECK_EQ(it->expand.back(), 120119);
+    for (size_t i = 1; i + 1 < it->expand.size(); ++i) CHECK_EQ(it->expand[i], 120120);
+    const int n = (int)it->n_patch * kHyImgDim;
+    int far = 0, steps = 0, checked = 0;
+    for (int f = 0; f < n; f += kHyImgStride, ++checked) {
+        const int raster = f / kHyImgDim, e = f % kHyImgDim;
+        const int y = raster / gw, x = raster % gw;
+        const int ours = (((y / m) * (gw / m) + x / m) * m + y % m) * m + x % m;
+        const float got = bf16f(it->pixels[(size_t)ours * kHyImgDim + e]);
+        const float want = kHyImgVals[f / kHyImgStride];
+        const float tol = std::fabs(want) * (1.0f / 128.0f) + 1e-6f;
+        if (got != bf16f(rad_f32_to_bf16(want))) ++steps;
+        if (std::fabs(got - want) > tol) ++far;
+    }
+    CHECK_EQ(far, 0);
+    CHECK(steps * 100 <= checked);   /* a rounding edge now and then, never a pattern */
+    /* The coordinates the tower reads invert the merge-block order. */
+    std::vector<int32_t> planes((size_t)(4 * it->n_patch));
+    it->coords(0, it->n_patch, planes.data());
+    for (int y = 0; y < gh; ++y)
+        for (int x = 0; x < gw; ++x) {
+            const int ours = (((y / m) * (gw / m) + x / m) * m + y % m) * m + x % m;
+            CHECK_EQ(planes[(size_t)ours], y);
+            CHECK_EQ(planes[(size_t)(it->n_patch + ours)], x);
+        }
+}
+
+TEST(hy4_rotary_layout_is_get_rope_index_newlines_included) {
+    VisionConfig c = hy_cfg();
+    Processor p;
+    REQUIRE_EQ(p.init(c, [](const std::string&) { return std::vector<int32_t>{ 1 }; }), (int)RAD_OK);
+    /* A picture of 4 x 6 patches and a clip of two 4 x 4 frames, as the golden's prompt. */
+    Video v;
+    v.frames = { frame(1, 64, 64), frame(2, 64, 64) };
+    v.index = { 0, 1 };
+    v.info.fps = 2.0;
+    std::shared_ptr<Item> img, vid;
+    std::string why;
+    REQUIRE_EQ(p.image_from(frame(0, kHyImgH, kHyImgW), &img, &why), (int)RAD_OK);
+    REQUIRE_EQ(p.video_from(v, &vid, &why), (int)RAD_OK);
+    CHECK_EQ(vid->grid_t, 2);
+    CHECK_EQ(vid->grid_h, 4);
+    CHECK_EQ(vid->grid_w, 4);
+    CHECK_EQ(vid->n_seg, 2);
+    REQUIRE_EQ(vid->expand.size(), (size_t)(2 * vid->seg_rows + 2));
+    CHECK_EQ(vid->expand.front(), 120122);
+    CHECK_EQ(vid->expand.back(), 120123);
+    CHECK_EQ(vid->seg_at[1] - vid->seg_at[0], vid->seg_rows);
+
+    PromptMedia pm;
+    Placed a; a.item = img; a.tok = kHyRopeImageAt;
+    Placed b; b.item = vid; b.tok = kHyRopeVideoAt;
+    pm.items = { a, b };
+    pm.layout();
+    REQUIRE_EQ(pm.rope.runs.size(), (size_t)3);
+    int off = 0;
+    for (int32_t i = 0; i < kHyRopeN; ++i) {
+        int32_t q[3];
+        pm.rope.at(i, q);
+        if (q[0] != kHyRopeT[i] || q[1] != kHyRopeH[i] || q[2] != kHyRopeW[i]) {
+            if (off < 4)
+                std::fprintf(stderr, "    token %d: (%d, %d, %d), reference (%d, %d, %d)\n", i,
+                             q[0], q[1], q[2], kHyRopeT[i], kHyRopeH[i], kHyRopeW[i]);
+            ++off;
+        }
+    }
+    CHECK_EQ(off, 0);
+    int32_t q[3];
+    pm.rope.at(kHyRopeN + 3, q);
+    CHECK_EQ(q[0], kHyRopeN + 3 + kHyRopeDelta);
+    CHECK_EQ(q[2], q[0]);
+}
+
+TEST(hy4_reads_its_processor_from_the_container) {
+    const char* keys[] = { "model_type", "vision_config.num_hidden_layers",
+                           "vision_config.patch_size", "vision_config.spatial_merge_size",
+                           "vision_config.temporal_patch_size", "image_token_id",
+                           "video_token_id", "image_start_token_id", "image_end_token_id",
+                           "video_start_token_id", "video_end_token_id",
+                           "preprocessor.min_pixels", "video_preprocessor.image_mean" };
+    const char* vals[] = { "hy_v4_flash", "27", "16", "2", "1", "120120", "120124", "120118",
+                           "120119", "120122", "120123", "65536", "" };
+    RadModelMeta mt{};
+    mt.n_kv = (int)(sizeof(keys) / sizeof(keys[0]));
+    mt.kv_key = keys;
+    mt.kv_val = vals;
+    VisionConfig c;
+    std::string why;
+    REQUIRE_EQ(c.from_meta(mt, &why), (int)RAD_OK);
+    CHECK(c.family == Family::HyV4Flash);
+    CHECK_EQ(c.patch_dim(), (int64_t)768);
+    CHECK_EQ(c.factor(), 32);
+    CHECK_EQ(c.image_min_pixels, (int64_t)65536);
+    CHECK_EQ(c.image_max_pixels, (int64_t)2048 * 2048);
+    CHECK_EQ(c.video_max_pixels, (int64_t)33554432);
+    CHECK_EQ(c.video_frame_max_pixels, (int64_t)1048576);
+    CHECK_EQ(c.min_frames, 2);
+    CHECK_EQ(c.max_frames, 1024);
+    CHECK_EQ(c.tok_video_end, 120123);
+    /* CLIP's mean for pictures, 0.5 for video: the two classes' defaults. */
+    CHECK_EQ(c.mean[0], 0.48145466f);
+    CHECK_EQ(c.stdv[2], 0.27577711f);
+    CHECK_EQ(c.vmean[1], 0.5f);
+    vals[12] = "0.4 0.4 0.4";
+    VisionConfig d;
+    REQUIRE_EQ(d.from_meta(mt, &why), (int)RAD_OK);
+    CHECK_EQ(d.vmean[2], 0.4f);
+    vals[4] = "2";
+    VisionConfig e;
+    CHECK_EQ(e.from_meta(mt, &why), RAD_E_UNSUPPORTED);
+}
 
 TEST(every_admitted_picture_format_decodes) {
     if (!decoder_available()) SKIP("no media decoder in this build");
