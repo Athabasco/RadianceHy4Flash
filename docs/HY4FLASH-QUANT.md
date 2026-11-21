@@ -62,6 +62,15 @@ What is served (all of it measured only on random-weight dummies):
 The IQR trellis (experts or trunk) is decoded by libr4d only: such a container serves on the cards, not
 on the host. libavx has no w6nl64 kernel; on the host a w6nl64 container runs on libref.
 
+A trellis is tail-biting over runs of `tcq_rows` rows down each column, and a tensor-parallel rank
+takes only whole runs: the loader refuses a row shard that cuts one (`rows [a, b) ... cut a N-row
+trellis run`). For a row-sharded trellis linear, `tcq_rows` must divide the rows a rank takes of each
+stacked part at every TP you mean to serve: Hy4-flash at TP4 takes 3456 rows a part of the dense
+`ffn_gate_up`, 384 of `ffn_gate_up_shexp`, 384 of an expert's gate_up and 1536 / 512 / 2048 of
+`attn_q_nope` / `attn_q_rope` / `attn_gate` (8 sparse heads), so the recipe runs 128 rows on the
+gate_ups and 256 on the attention projections. A container converted with other runs serves at the
+TPs its runs divide, and is refused at the others.
+
 ## KL against your HF reference
 
 `radiance --kld-ref DIR` scores a container against a directory of recorded log-probabilities

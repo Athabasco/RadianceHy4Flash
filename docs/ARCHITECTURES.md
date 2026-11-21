@@ -3734,13 +3734,15 @@ Engram rows, the seven prompts, 9230 positions; mean / median KL in nats, top-1)
 | `hy4-flash-w5nl64-rtn` | 2.7e-2 / 7.6e-3, 0.84 | |
 | `hy4-flash-w6nl64-rtn` | 1.8e-2 / 3.7e-3, 0.88 | 1.7e-2 / 3.7e-3, 0.88 |
 | `hy4-flash-i8` | 2.2e-2 / 1.9e-3, 0.90 | 2.2e-2 / 1.9e-3, 0.90 |
-| `hy4-flash-iqr-gptq` (Grams of a TP1 calibration run on the cards, 6 x 1024 tokens) | 6.4e-2 / 1.9e-2, 0.75 | 9.0e-2 / 4.4e-2, 0.68 |
+| `hy4-flash-iqr-gptq` (Grams of a TP1 calibration run on the cards, 6 x 1024 tokens) | 6.4e-2 / 1.9e-2, 0.75 | 6.4e-2 / 1.9e-2, 0.75 |
 
 TP2 against TP1 of the same container (median KL, top-1): bf16 2.6e-4 / 0.96, `i8` 1.1e-3 / 0.92,
-`w6nl64-rtn` 2.4e-3 / 0.90, `iqr-gptq` 1.9e-2 / 0.77 -- the IQR container moves about eight times
-more between the ranks than the other forms. Its routed experts alone (the u4 trellis gate_up and the
-`w6nl64` down, GPTQ, sliced at TP2) give 8.0e-3 median KL at TP1 and at TP2, so the extra movement
-comes from the trunk's trellis linears; not explained yet.
+`w6nl64-rtn` 2.4e-3 / 0.90, `iqr-gptq` 1.9e-3 / 0.90. The IQR container first gave 1.9e-2 / 0.77
+here: its shared expert's gate_up ([256 | 256] rows) had 256-row trellis runs, and a TP2 rank takes 128
+rows of each part, so the rank decoded half a run as a whole one (the first three rows of every cut
+took their states from the wrong codes). The loader now refuses a shard that cuts a trellis run, and
+the recipe runs the gate_ups' trellis over 128 rows (also what Hy4-flash needs at TP4); the IQR row
+above is that container (its gate_ups re-quantised, everything else reused).
 The host (libavx, TP1) gives the same for the forms it reads: `w4nl64-rtn` 5.3e-2 / 2.4e-2, 0.75;
 `i8` 2.2e-2 / 1.9e-3, 0.90. The IQR trellis has no host kernel.
 
