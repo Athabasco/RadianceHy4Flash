@@ -10,9 +10,10 @@
 #   CALIB=<grams dir> rad-convert <Hy4-flash checkpoint> --add engram-tables.safetensors \
 #       --recipe data/recipes/hy4-flash-w4nl64-gptq.recipe -o hy4-flash-w4nl64-gptq.rad
 #
-# Add one `gptq` line a trunk linear to fit the trunk too once its quantised forms are served
-# (PLAN WP10); the Grams for it are in the same directory under the declared weight stem
-# (`blk.L.attn_q_a`, `blk.L.attn_q_nope`, `blk.L.ffn_latent_in`, ...).
+# Add one `gptq` line a trunk linear to fit the trunk too (hy4-flash-i8.recipe's lines with
+# `gptq codes=i8 group=128 scale=bf16 transform=fwht128 damp=0.01 calib=$CALIB`, or
+# hy4-flash-iqr-gptq.recipe's u5 trellis); the Grams for it are in the same directory under the
+# declared weight stem (`blk.L.attn_q_a`, `blk.L.attn_q_nope`, `blk.L.ffn_latent_in`, ...).
 #
 # PATTERN                     QUANTISER  OPTIONS
 blk.*.ffn_*_exps.*.weight     gptq       table=w4nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* scale2_value=0.0001220703125 transform=fwht128 rule=search cd=3 calib=$CALIB

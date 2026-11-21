@@ -7,10 +7,11 @@
 #   rad-convert <Hy4-flash checkpoint> --recipe data/recipes/hy4-flash-w4nl64-rtn.recipe \
 #       -o hy4-flash-w4nl64.rad
 #
-# Round to nearest with a searched scale, uncalibrated: GPTQ needs each layer's input Grams, which
-# an engine run records (RADIANCE_CALIB_DIR), and arch/hyv4flash has no graph to run yet. The other
-# recipes of this form are GPTQ against calibration for that reason, and this one is a size and
-# plumbing baseline, not a quality claim: nothing has measured it.
+# Round to nearest with a searched scale, uncalibrated: a size and plumbing baseline, and the boot
+# container a calibration run can record from (hy4-flash-w4nl64-gptq.recipe is the fitted form).
+# Served clamped in every layer (swiglu_clamped, then had_quant_act_fp8 into the down projection's
+# rotated E4M3 codes), whole a rank at one rank and a slice of every expert (768 / 384 columns) at
+# two and four. Measured only on the harness's random-weight minis (PLAN A8).
 #
 # The experts are 41 layers of 512, each a gate_up of [3072, 1536] and a down of [1536, 1536] in the
 # 1536-wide latent: 148.6B of the trunk's 155.5B parameters, 277 GiB in bf16 and 71.3 GiB here.

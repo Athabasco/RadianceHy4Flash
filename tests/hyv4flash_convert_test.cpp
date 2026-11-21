@@ -394,6 +394,41 @@ TEST(the_w4nl64_recipe_stores_every_routed_expert_as_four_bit_codes) {
     CHECK_EQ(f.find("blk.1.engram_table.weight")->n_planes, (uint32_t)2);
 }
 
+/* The five- and six-bit codebook recipes: every routed expert as u5 / u6 codes into a 32 / 64-entry
+ * table at E4M3 scales a 64 of K (w5nl64a8h, w6nl64a8h), nothing else touched. */
+TEST(the_w5nl64_and_w6nl64_recipes_store_every_routed_expert_at_their_width) {
+    const Fixture& fx = fixture();
+    REQUIRE(fx.ok);
+    for (int bits : { 5, 6 }) {
+        std::string log;
+        const std::string out = fx.dir / ("w" + std::to_string(bits) + ".rad");
+        const std::string rec = std::string(RAD_E2E_RECIPES) + "/hy4-flash-w" +
+                                std::to_string(bits) + "nl64-rtn.recipe";
+        REQUIRE_EQ(fx.convert(out, { "--recipe", rec }, &log), 0);
+        RadFile f;
+        REQUIRE_EQ(f.open(out.c_str()), RAD_OK);
+        for (int l = 1; l < 3; ++l)
+            for (int e = 0; e < NE; ++e)
+                for (const char* proj : { "ffn_gate_up_exps", "ffn_down_exps" }) {
+                    const std::string n = "blk." + std::to_string(l) + "." + proj + "." +
+                                          std::to_string(e) + ".weight";
+                    const RadFileEntry* en = f.find(n);
+                    REQUIRE(en != nullptr);
+                    const RadEncoding& enc = f.encoding(*en);
+                    CHECK_EQ(enc.plane[0].dtype, (uint32_t)(bits == 5 ? RAD_U5 : RAD_U6));
+                    const RadEncPlane* t = rad_enc_plane(&enc, "table");
+                    REQUIRE(t != nullptr);
+                    CHECK_EQ(t->extent[1], (int64_t)1 << bits);
+                    const RadEncPlane* sc = rad_enc_plane(&enc, "scale");
+                    REQUIRE(sc != nullptr);
+                    CHECK_EQ(sc->dtype, (uint32_t)RAD_F8E4M3);
+                    CHECK_EQ(sc->block[1], (int64_t)64);
+                }
+        CHECK_EQ(f.find("blk.1.ffn_latent_in.weight")->n_planes, (uint32_t)1);
+        CHECK_EQ(f.find("output.weight")->n_planes, (uint32_t)1);
+    }
+}
+
 TEST(the_hash_constants_come_from_an_added_file) {
     const Fixture& fx = fixture();
     REQUIRE(fx.ok);

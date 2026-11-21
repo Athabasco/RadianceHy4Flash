@@ -8,7 +8,7 @@ The canonical weight is an affine `u6` code plane with a 64-entry `f32` table, `
 
 The container's six-bit codes are packed LSB-first. At load, `libr4d` arranges each row as the permuted low nibbles followed by two bit planes (the high magnitude bit and sign). Both arrangements occupy `6*K/8` code bytes per row. The kernel expands the two 16-entry halves of the magnitude table to E4M3, selects between them and merges sign before the existing FP8 WMMA. The loader checks the entire table, the fixed upper scale, transform and shape; same-width encodings with different semantics are refused.
 
-A trellis gate reads rotated INT8 activations; W6NL down reads a separately quantized rotated E4M3 gated intermediate, like W5NL. The architecture must select that producer and the W6 kernel for the down projection. The BF16 protected experts retain their separate path.
+A trellis gate reads rotated INT8 activations; W6NL down reads a separately quantized rotated E4M3 gated intermediate, like W5NL. The architecture must select that producer and the W6 kernel for the down projection. The BF16 protected experts retain their separate path. A layer that clamps its SwiGLU (`swiglu_limit`, Hy4-flash in every layer) is served too: `swiglu_clamped` writes the clamped bf16 product and `had_quant_act_fp8` quantises it into that rotated E4M3 pair (clamp, then quantise; one launch more than the fused unclamped form).
 
 ## Codebook pilot
 

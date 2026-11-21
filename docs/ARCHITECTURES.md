@@ -3448,12 +3448,16 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   their own scores); past that point the two runs are compared with HF only. The rotary tables in
   bf16 (PLAN D5) would move a tensor by 5e-4 to 1.3e-3, a twentieth of the bf16 trunk's noise: the
   f32 tables stay.
+- **Quantised forms** ([below](#quantised-hy4-flash)): routed experts in the w4nl64 / w5nl64 /
+  w6nl64 codebooks, rotated int8 or the IQR trellis, clamped in every layer; trunk linears and the
+  lm_head int8 (the trunk also in the forms the rotated int8 GEMM decodes, the u5 trellis among
+  them); the Engram table as E4M3 rows.
 - **Not served, refused by name**: a world other than 1, 2 or 4, or one the heads, the dense and
-  shared widths or the vocabulary do not divide; a quantised kv_b, embedding, lm_head, trunk linear
-  or f32 parameter at declare; quantised routed experts at the step at one rank (a container in
-  `hy4-flash-w4nl64-rtn.recipe`'s form converts, and its layers declare their experts as the
-  manifest does) and at declare at more ranks; a library without an exact all-reduce at more
-  ranks; pictures and the drafter.
+  shared widths or the vocabulary do not divide; at declare a quantised kv_b (DECISIONS U2),
+  embedding, Engram projection or f32 parameter, a trunk linear in a form that reads E4M3 codes
+  (block fp8, MXFP4: no producer of this graph writes them), quantised experts whose width does not
+  split into whole 128-column groups a rank; a library without an exact all-reduce at more ranks;
+  pictures and the drafter.
 
 ### Tensor parallelism
 
@@ -3466,6 +3470,7 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
 | layer 0 `ffn_gate_up` / `ffn_down` | rows of each half / columns | 6912 / 3456 |
 | shared expert `ffn_gate_up_shexp` / `ffn_down_shexp` | the same | 768 / 384 |
 | routed experts, bf16 (and every calibration run) | whole experts a rank, `expert_base = rank * E / world` | 256 / 128 experts |
+| routed experts, quantised | every expert a rank, gate_up by rows of each half, down by columns | 768 / 384 of 1536 columns |
 | `output.weight` (lm_head) | rows by vocabulary, logits `[rows, n_vocab / world]` | 60416 / 30208 |
 | streams, iHC, every norm, `token_embd`, Engram, indexer, router, `q_a`, `kv_a`, `ffn_latent_in/out`, the caches | replicated | |
 
@@ -3474,9 +3479,9 @@ behind each and the calibration read the sum): behind `attn_output`, before `att
 behind the feed-forward's sum (the dense MLP's, or the routed arm through the replicated
 `ffn_latent_out` plus the shared expert's slice, one reduction for both, `MoeFP8` with
 `no_reduce`), before `ffn_post_norm`. The latent caches are the same on every rank (MLA has one
-latent for all heads). The slice of every expert's width that quantised serving will use (768 / 384,
-whole 128-column groups, `Ffn::place`) is computed but not served: quantised experts are WP10, and
-MoeFP8 serves a bf16 expert only whole. At more than one rank the taps of a rank's partial values
+latent for all heads). Quantised experts are a slice of every expert's width (768 / 384, whole
+128-column groups, `Ffn::place`), each rank's routed partial summed by the same reduction; MoeFP8
+serves a bf16 expert only whole. At more than one rank the taps of a rank's partial values
 (`attn_gate_logits`, `moe_experts_out`, `moe_routed_out`, `moe_shared_out`) are left out and
 `attn_o_proj` is tapped behind its reduction.
 
@@ -3501,6 +3506,9 @@ rad-info -v hy4-flash-w4nl64.rad
 | `hy4-flash-bf16.recipe` | bf16 | E4M3 rows at a bf16 scale each, 60.2 GiB | bf16 | 352.5 GiB |
 | `hy4-flash-w4nl64-rtn.recipe` | the `w4nl` codebook at an E4M3 scale a 64 of K, rotated, round to nearest: 71.3 GiB | as above | bf16 | 147.1 GiB |
 | `hy4-flash-w4nl64-gptq.recipe` | the same form, GPTQ against `CALIB=<grams dir>` ([Calibrating](#calibrating-hy4-flash)) | as above | bf16 | 147.1 GiB |
+| `hy4-flash-w5nl64-rtn.recipe`, `hy4-flash-w6nl64-rtn.recipe` | the `w5nl` / `w6nl` codebook at an E4M3 scale a 64 of K, rotated | as above | bf16 | |
+| `hy4-flash-i8.recipe` | rotated int8 | as above | trunk linears rotated int8, lm_head int8; kv_b, indexer, router, iHC, norms, Engram projections, embedding bf16 | |
+| `hy4-flash-iqr-gptq.recipe` | gate_up the u4 IQR trellis, down `w6nl64`, GPTQ | as above | wide trunk projections the u5 trellis, the narrow ones and kv_a rotated int8, lm_head int8, GPTQ | |
 
 The sizes are `rad-convert --plan-only`'s over the release's 1964 tensors (43753 declared weights,
 41984 of them expert projections), which is how the name map was checked against the release: its
@@ -3629,10 +3637,13 @@ Notes that are not in the commands:
   prompts without router near-ties (bf16 partial sums; a flipped expert pick moves a deeper layer's
   Gram by more), and `rad-convert` with the gptq recipe finds every file. `--tp` 1, 2 and 4 are
   the ranks the plugin serves.
-- **Quantised experts are not served yet** (WP10): calibrate the bf16 container, not
-  `hy4-flash-w4nl64-rtn.recipe`'s, and the KL step 5 can only score a candidate this build serves
-  (bf16 today). Trunk `gptq` lines in a recipe are refused at declare for the same reason; the
-  Grams for them are already in `grams/` under the weight stems of the table above.
+- **The boot container.** Calibrating `hy4-flash-w4nl64-rtn.recipe`'s container works too (run on
+  `mini`): the experts' tap then reads the rotated E4M3 codes the routed GEMMs contract, the Grams
+  are in that domain, and libquant reads them as such; the trunk's taps read the bf16 planes either
+  way. The bf16 container's Grams are the checkpoint's own activations, the better default.
+- **Trunk lines.** A recipe's trunk `gptq` lines (`hy4-flash-i8.recipe` with `gptq ... calib=$CALIB`,
+  `hy4-flash-iqr-gptq.recipe`) find their Grams under the weight stems of the table above; run on
+  `mini` (every trunk linear and expert projection found its file, the container serves).
 - **Accuracy of the Grams.** On `mini`, the Grams equal `X^T X` of the plugin's own debug taps
   (`RADIANCE_HY4_TAPS=1`, `RADIANCE_DUMP_BUF`) at TP1 to 2e-8 (f32 accumulation), and `X^T X` of the
   transformers f32 activations to 0.3% to 1.6% relative Frobenius (bf16 rounding of the activations
@@ -3642,6 +3653,51 @@ Notes that are not in the commands:
 
 Tests: `hyv4flash_calib_test` (the site table against the declared weights, `--calib-layers`, the
 environment mapping, one Gram a site per step, `calib_st2gram.py`'s output).
+
+## Quantised Hy4-flash
+
+What a container's encodings make of the served graph (PLAN §4.3). Each weight is read at the
+encoding it is stored in; nothing is chosen by a flag.
+
+| weights | forms | read by |
+|---|---|---|
+| routed experts (K 1536 both) | `w4nl64a8h`, `w5nl64a8h`, `w6nl64a8h` (the codebooks at E4M3 scales a 64 of K under 2^-13, rotated) | `MoeFP8` on the rotated E4M3 arm: the latent's codes by `had_quant_act_fp8`, the clamped product's by `swiglu_clamped` then `had_quant_act_fp8` |
+| | rotated int8 (`i8*bf16[1x128]/fwht128`), the IQR trellis (`trellis:...scale=f32[1x*],scale.col`), `w4nl64` beside them | `MoeFP8` on the rotated int8 arm: `had_quant_act_i8g` for both inputs; a `w5nl64` / `w6nl64` down behind a trellis gate_up reads the clamped product's rotated E4M3 pair |
+| | bf16 | `moe_gemm`, whole experts a rank |
+| trunk linears (`attn_q_a`, `attn_q_nope`, `attn_q_rope`, `attn_kv_a`, `attn_gate`, `attn_output`, layer 0's `ffn_gate_up` / `ffn_down`, the shared expert, `ffn_latent_in` / `ffn_latent_out`, the indexer's) | bf16; int8 rotated or not, IQ8R; the forms the i8a8h GEMM decodes (the IQR trellis such as u5, rotated u4 / u5 with a zero point) | `Lin` (`hyv4flash_common.h`): `LinearFP8` at the weight's own encoding; an int8 one quantises its input from the bf16 plane (`had_quant_act_i8g` / `quant_act_i8g`) into the rank's code pair of that width, right before its GEMM |
+| `output.weight` | bf16, int8 (unrotated) | `logits_gemm` at the codes' dtype |
+| Engram table | bf16, E4M3 rows at a bf16 scale a row | `embed_lookup_q` |
+| kv_b, router, iHC, sinks, norms, pooling, Engram projections, `token_embd` | as shipped | refused by name when a recipe touched them |
+
+The clamp: every layer clamps the routed SwiGLU (gate <= 10, |up| <= 10). The clamped product is
+written in bf16 and quantised after it (clamp, then quantise), at one launch more than the unclamped
+fused quantiser, in every form. At two and four ranks quantised experts are a slice of every
+expert's width (768 / 384), bf16 experts and calibration runs whole experts a rank. The IQR trellis
+(experts and trunk) is decoded by libr4d alone: such a container serves on the cards, not on the
+host. libavx has no `w6nl64a8h` row: a `w6nl64` container serves on the host through libref.
+
+Measured on the harness's random-weight minis (host, `libref`; KL of the logits against the bf16
+container with the same Engram rows, `--kld-record` / `--kld-ref`, the six prompts of
+`ref/prompts.json`, 180 positions; RTN unless noted; `mini4q` is `mini4` at widths the forms take
+on four ranks: an expert 512 wide, dense ff 1024, q_lora and v 128):
+
+| container | mini TP1 | mini6 TP1 | mini4q TP1 / TP2 / TP4 |
+|---|---|---|---|
+| experts `w4nl64` | 1.1e-2 / 0.86 | 4.4e-2 / 0.69 | 1.5e-2 / 0.84, 1.5e-2 / 0.87, 1.5e-2 / 0.84 |
+| experts `w5nl64` | 4.2e-3 / 0.91 | 1.4e-2 / 0.84 | 4.9e-3 / 0.91, 4.8e-3 / 0.90, 4.8e-3 / 0.90 |
+| experts `w6nl64` | 1.8e-3 / 0.91 | 6.4e-3 / 0.83 | 2.3e-3 / 0.93, 2.4e-3 / 0.94, 2.5e-3 / 0.97 |
+| experts int8 | 1.6e-4 / 0.99 | 6.8e-4 / 0.96 | 1.9e-4 / 0.99, 2.3e-4 / 0.99, 2.1e-4 / 0.98 |
+| trunk int8 + int8 head | 1.1e-3 / 0.87 | 3.5e-2 / 0.73 | 1.8e-3 / 0.87, 1.6e-3 / 0.90, 1.5e-3 / 0.92 |
+| everything int8 (`hy4-flash-i8.recipe`'s form) | | | 1.9e-3 / 0.89, 1.7e-3 / 0.89, 1.7e-3 / 0.93 |
+| trunk int8 + head + `w4nl64` experts | 1.3e-2 / 0.86 | 9.8e-2 / 0.58 | 1.9e-2 / 0.83, 1.9e-2 / 0.84, 1.8e-2 / 0.83 |
+| the same, GPTQ against the `mini` Grams (186 tokens) | 5.5e-3 / 0.83 | | |
+
+(median KL in nats / top-1 agreement.) The median follows the bits; the mean and the tails do not:
+on these random weights the indexer's scores tie exactly and the router's are near ties (WP3, WP7),
+and a perturbation as small as int8 rounding in the layers before them flips a selection, which
+moves every later position of that prompt (the `indexer` prompt and, on `mini6` with its five
+sparse layers, every prompt past the dense limit). bf16 against itself is 2.7e-7. No real weight
+has been through any of these recipes.
 
 ## What serving needs
 
