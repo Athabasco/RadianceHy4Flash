@@ -1,0 +1,405 @@
+/* hyv4flash_attn.h -- Hy4-flash's gated MLA with a learned sink, both layer kinds.
+ *
+ *   q   = q_b(rmsnorm(q_a(x)))            served as two linears over q_b's rows, the heads' nope
+ *                                         rows and their rope rows (as bailing_hybrid does)
+ *   row = [rmsnorm(kv_a(x)[:L]) | rope(kv_a(x)[L:])]   the cache row, one KV head of (L + R) / 2
+ *   g   = attn_gate(x)                    heads * v wide, acting after the expansion
+ *   o   = rmsnorm(o_proj(ao * sigmoid(g)))
+ *
+ * The attention itself takes one of two paths (PLAN §1.2):
+ *   absorbed      q_nope through kv_b's key rows into the latent (mla_project_kv absorb), the
+ *                 latent attention over the paged cache (mla_attn_paged_sink, or mla_attn_sel_sink
+ *                 over the indexer's table), the latent expanded through kv_b's value rows
+ *   non-absorbed  the step's latent rows through kv_b (a GEMM), split into per-head keys and
+ *                 values (mla_kv_split), dense attention with the sink (attn_kv_sink)
+ * Decode and verify rows are absorbed. A step whose prefill sequences all start at position 0
+ * (nothing of them cached) runs those rows non-absorbed, unless the sparse layers select (context
+ * past the dense limit), which is absorbed for every row. RADIANCE_HY4_PREFILL=absorbed sends every
+ * row down the absorbed path. A prefill row with a cached prefix is absorbed too: gathering the
+ * cached rows back into a contiguous key block is not built (no op serves the paged read).
+ *
+ * The sparse layers' indexer (hyv4flash_indexer.h) runs between the cache store and the
+ * attention. */
+#ifndef HYV4FLASH_ATTN_H
+#define HYV4FLASH_ATTN_H
+
+#include "hyv4flash_common.h"
+
+namespace hyv4flash {
+
+/* What a step's attention does, decided once a step on the host (every layer and rank agrees). */
+struct StepPlan {
+    int64_t T = 0, S = 0, D = 0, DT = 0, P = 0;
+    bool nonabs = false;   /* the prefill rows [DT, T) run non-absorbed */
+    bool select = false;   /* the sparse layers attend through the indexer's selection */
+    int64_t live = 0;      /* the indexer's live block columns */
+};
+
+/* The planes of one attention geometry, shared by its layers. */
+struct AttnWire {
+    rad_buf qa = 0;       /* [T, q_lora] q_a's output, normed in place (HF's q_resid) */
+    rad_buf q_nope = 0;   /* [T, H*nope] */
+    rad_buf q_rope = 0;   /* [T, H*R] rotated in place */
+    rad_buf row = 0;      /* [T, L + R] the cache row */
+    rad_buf q_lat = 0;    /* [T, H*L] the absorbed query */
+    rad_buf lat = 0;      /* [T, H*L] the latent attention's output */
+    rad_buf q_full = 0;   /* [T, H, nope + R] the non-absorbed query */
+    rad_buf latc = 0;     /* [T, L] the normed latent, contiguous (a GEMM reads whole rows) */
+    rad_buf kvb = 0;      /* [T, H*(nope + v)] kv_b over the step's latent rows */
+    rad_buf k = 0;        /* [T, H*(nope + R)] */
+    rad_buf v = 0;        /* [T, H*v] */
+    rad_buf ao = 0;       /* [T, H*v] the attention's output */
+    rad_buf gate = 0;     /* [T, H*v] attn_gate's logits */
+    rad_buf ag = 0;       /* [T, H*v] gated */
+    rad_buf o = 0;        /* [T, n] o_proj's output */
+    rad_buf cu_p = 0;     /* [max_seqs + 1] i32: the prefill sequences' bounds rebased to 0 */
+    int declare(RadBuilder* b, Names& nm, const Shape& s, const AttnGeom& a, int64_t T,
+                int64_t seqs, const char* tag) {
+        auto bf = [&](const char* n, std::initializer_list<int64_t> shape) {
+            return decl_b(b, nm.f("%s.%s", tag, n), RAD_BF16, shape);
+        };
+        const int64_t H = a.heads, L = s.kv_lora, R = a.qk_rope;
+        qa = bf("q_a", { T, s.q_lora });
+        q_nope = bf("q_nope", { T, H * a.qk_nope });
+        q_rope = bf("q_rope", { T, H * R });
+        row = bf("kv_row", { T, L + R });
+        q_lat = bf("q_latent", { T, H * L });
+        lat = bf("attn_latent", { T, H * L });
+        q_full = bf("q_full", { T, H, a.qk() });
+        latc = bf("latent", { T, L });
+        kvb = bf("kv_b", { T, a.kv_width() });
+        k = bf("k", { T, H * a.qk() });
+        v = bf("v", { T, H * a.v });
+        ao = bf("attn_value", { T, a.v_width() });
+        gate = bf("attn_gate", { T, a.v_width() });
+        ag = bf("attn_gated", { T, a.v_width() });
+        o = bf("o_proj", { T, s.n_embd });
+        cu_p = decl_b(b, nm.f("%s.cu_prefill", tag), RAD_I32, { seqs + 1 });
+        return qa && q_nope && q_rope && row && q_lat && lat && q_full && latc && kvb && k && v && ao &&
+                       gate && ag && o && cu_p
+                   ? RAD_OK
+                   : RAD_E_INVAL;
+    }
+};
+
+struct Indexer;   /* hyv4flash_indexer.h */
+
+struct Attn {
+    Shape s{};
+    AttnGeom a{};
+    AttnWire w{};
+    Geom g{};
+    int layer = 0;
+    bool sliding = false;
+    int64_t bs = 0, window = 0;
+    rad_buf xa = 0, ya = 0;
+    rad_kvgroup kv = 0;
+    LinearFP8 q_a{}, q_nope{}, q_rope{}, kv_a{}, gate{}, out{};
+    rad_weight qa_gain = 0, kv_gain = 0, post_gain = 0, kv_b = 0, sinks = 0;
+    rad_op op_qa_norm = 0, op_kv_norm = 0, op_q_rope = 0, op_k_rope = 0, op_store = 0;
+    rad_op op_absorb = 0, op_paged = 0, op_sel = 0, op_expand = 0;
+    rad_op op_lat_copy = 0, op_kvb = 0, op_split = 0, op_qn_copy = 0, op_qr_copy = 0, op_dense = 0, op_rebase = 0;
+    rad_op op_gate = 0, op_post_norm = 0;
+    Tap t_in_norm{}, t_q_resid{}, t_kv_latent{}, t_gate{}, t_o_proj{}, t_out{};
+
+    /* `ap` is the checkpoint's `model.layers.<l>.self_attn`. `group` is the layer's latent KV
+     * group, declared by the caller right before this (its block size is this layer's ops'). */
+    int declare(RadBuilder* b, Names& nm, const Shape& shape, const Geom& geom, int l,
+                bool is_sliding, const AttnWire& wire, rad_buf in, rad_buf outb, rad_kvgroup group,
+                int64_t block, const char* ap, bool first_of_group) {
+        s = shape;
+        g = geom;
+        layer = l;
+        sliding = is_sliding;
+        a = sliding ? s.sliding : s.sparse;
+        w = wire;
+        xa = in;
+        ya = outb;
+        kv = group;
+        bs = block;
+        window = sliding ? s.window : 0;
+        const int64_t T = g.max_tok, H = a.heads, L = s.kv_lora, R = a.qk_rope, N = a.qk_nope;
+        const double theta = sliding ? s.theta_sliding : s.theta_sparse;
+        const auto grp = grp_layer(l);
+        auto act = [](rad_buf x) {
+            ActFP8 v{};
+            v.x = x;
+            return v;
+        };
+        RAD_ARCH_TRY(rad_bind_layer_kv(b, l, kv));
+
+        RAD_ARCH_TRY(q_a.declare(b, nm, g, nm.f("blk.%d.attn_q_a", l), s.q_lora, s.n_embd,
+                                 RAD_SHARD_NONE, grp, { nm.ckpt("%s.q_a_proj.weight", ap) },
+                                 act(xa), w.qa));
+        qa_gain = decl_f32(b, nm.f("blk.%d.attn_q_a_norm.weight", l),
+                           nm.ckpt("%s.q_a_layernorm.weight", ap), { s.q_lora }, grp);
+        if (!qa_gain) return RAD_E_INVAL;
+        op_qa_norm = decl_rmsnorm(b, T, s.q_lora, s.eps, qa_gain, w.qa, w.qa);
+        HY4_NEED(op_qa_norm, "rmsnorm");
+
+        /* q_b's rows are head-major, a head's nope rows then its rope rows: one row map a part,
+         * a piece a head, eight pieces a map (successive ROWS maps extend one name). */
+        const char* qsrc = nm.ckpt("%s.q_b_proj.weight", ap);
+        auto part = [&](const char* name, int64_t off, int64_t width) -> int {
+            for (int64_t h0 = 0; h0 < H; h0 += 8) {
+                RadNameMap m = map_base(name, RAD_MAP_ROWS);
+                for (int64_t h = h0; h < std::min<int64_t>(h0 + 8, H); ++h) {
+                    m.src[m.n_src] = qsrc;
+                    m.src_index[m.n_src] = (int)(h * a.qk() + off);
+                    m.src_rows[m.n_src] = width;
+                    ++m.n_src;
+                }
+                RAD_ARCH_TRY(rad_decl_name_map(b, &m));
+            }
+            return RAD_OK;
+        };
+        RAD_ARCH_TRY(part(nm.f("blk.%d.attn_q_nope.weight", l), 0, N));
+        RAD_ARCH_TRY(part(nm.f("blk.%d.attn_q_rope.weight", l), N, R));
+        q_nope.mapped = q_rope.mapped = true;
+        RAD_ARCH_TRY(q_nope.declare(b, nm, g, nm.f("blk.%d.attn_q_nope", l), H * N, s.q_lora,
+                                    RAD_SHARD_NONE, grp, { qsrc }, act(w.qa), w.q_nope));
+        RAD_ARCH_TRY(q_rope.declare(b, nm, g, nm.f("blk.%d.attn_q_rope", l), H * R, s.q_lora,
+                                    RAD_SHARD_NONE, grp, { qsrc }, act(w.qa), w.q_rope));
+
+        /* kv_a's rows are the latent then the shared rotary key (`kv_a_proj_with_mqa`). */
+        RAD_ARCH_TRY(kv_a.declare(b, nm, g, nm.f("blk.%d.attn_kv_a", l), L + R, s.n_embd,
+                                  RAD_SHARD_NONE, grp,
+                                  { nm.ckpt("%s.kv_a_proj_with_mqa.weight", ap) }, act(xa), w.row));
+        kv_gain = decl_f32(b, nm.f("blk.%d.attn_kv_a_norm.weight", l),
+                           nm.ckpt("%s.kv_a_layernorm.weight", ap), { L }, grp);
+        if (!kv_gain) return RAD_E_INVAL;
+        op_kv_norm = decl_rmsnorm(b, T, L, s.eps, kv_gain, w.row, w.row);
+        op_q_rope = decl_rope_gptj(b, T, H, R, theta, w.q_rope);
+        op_k_rope = decl_rope_gptj(b, T, 1, R, theta, w.row);
+        HY4_NEED(op_kv_norm && op_q_rope && op_k_rope, "rmsnorm / rope (gptj)");
+        /* The cache row as one KV head of (L + R) / 2, its first half in the K slot and the rest in
+         * the V slot (bailing_hybrid's arrangement). The first op after the group to carry a
+         * block size claims it. */
+        op_store = mk(b, "kv_store",
+                      { RAD_RANGE("M", 1, T), RAD_INT("head_dim", (L + R) / 2),
+                        RAD_INT("n_head_kv", 1), RAD_INT("block_size", bs),
+                        RAD_STR("kv_dtype", "bf16") },
+                      {}, { w.row }, {});
+        HY4_NEED(op_store, "kv_store");
+        if (first_of_group && rad_kv_block_size(b, kv) != bs) {
+            fprintf(stderr, "radiance: hyv4flash: layer %d's latent cache took a block of %lld "
+                            "tokens; its ops are declared at %lld\n",
+                    l, (long long)rad_kv_block_size(b, kv), (long long)bs);
+            return RAD_E_INVAL;
+        }
+
+        /* kv_b stays plain bf16 (DECISIONS U2): the absorbed ops read its per-head blocks. */
+        const char* bn = nm.f("blk.%d.attn_kv_b.weight", l);
+        RAD_ARCH_TRY(map_copy(b, bn, nm.ckpt("%s.kv_b_proj.weight", ap)));
+        if (!is_plain_bf16(b, bn)) {
+            RadEncoding e{};
+            char en[256] = "";
+            if (weight_enc(b, bn, &e)) rad_enc_format(&e, en, sizeof en);
+            fprintf(stderr, "radiance: hyv4flash: '%s' is %s; kv_b must stay plain bf16, because "
+                            "the absorbed attention reads its per-head key and value blocks "
+                            "(DECISIONS U2). Convert it without a recipe rule.\n", bn, en);
+            return RAD_E_UNSUPPORTED;
+        }
+        kv_b = decl_w(b, bn, RAD_BF16, { a.kv_width(), L }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
+                      grp);
+        sinks = decl_f32(b, nm.f("blk.%d.attn_sinks.weight", l),
+                         nm.ckpt("%s.learnable_sink_param", ap), { H }, grp);
+        if (!kv_b || !sinks) return RAD_E_INVAL;
+
+        RAD_ARCH_TRY(gate.declare(b, nm, g, nm.f("blk.%d.attn_gate", l), a.v_width(), s.n_embd,
+                                  RAD_SHARD_NONE, grp, { nm.ckpt("%s.linear_gate.weight", ap) },
+                                  act(xa), w.gate));
+
+        RAD_ARCH_TRY(t_in_norm.declare(b, nm, T, "attn_in_norm", l, RAD_BF16, s.n_embd, xa));
+        RAD_ARCH_TRY(t_q_resid.declare(b, nm, T, "attn_q_resid", l, RAD_BF16, s.q_lora, w.qa));
+        RAD_ARCH_TRY(t_kv_latent.declare(b, nm, T, "attn_kv_latent", l, RAD_BF16, L, w.row));
+        RAD_ARCH_TRY(t_gate.declare(b, nm, T, "attn_gate_logits", l, RAD_BF16, a.v_width(), w.gate));
+        return RAD_OK;
+    }
+
+    /* The attention proper and the output, declared after the sparse layer's indexer: `sel` and
+     * `len` are its table (0 on a sliding layer). Declaration order is liveness. */
+    int declare_core(RadBuilder* b, Names& nm, const char* ap, rad_buf sel, rad_buf len) {
+        const int64_t T = g.max_tok, H = a.heads, L = s.kv_lora, R = a.qk_rope, N = a.qk_nope;
+        const double scale = 1.0 / std::sqrt((double)a.qk());
+        const int l = layer;
+        const auto grp = grp_layer(l);
+        auto act = [](rad_buf x) {
+            ActFP8 v{};
+            v.x = x;
+            return v;
+        };
+        auto proj = [&](const char* mode, rad_buf in_, rad_buf out_) {
+            return mk(b, "mla_project_kv",
+                      { RAD_RANGE("M", 1, T), RAD_INT("heads", H), RAD_INT("k_dim", N),
+                        RAD_INT("v_dim", a.v), RAD_INT("latent_dim", L), RAD_STR("mode", mode),
+                        RAD_STR("dtype", "bf16") },
+                      { kv_b }, { in_ }, { out_ });
+        };
+        op_absorb = proj("absorb", w.q_nope, w.q_lat);
+        op_paged = mk(b, "mla_attn_paged_sink",
+                      { RAD_RANGE("M", 1, T), RAD_INT("heads", H), RAD_INT("latent_dim", L),
+                        RAD_INT("rope_dim", R), RAD_INT("block_size", bs),
+                        RAD_INT("window", window), RAD_F64("scale", scale),
+                        RAD_STR("dtype", "bf16") },
+                      { sinks }, { w.q_lat, w.q_rope }, { w.lat });
+        op_expand = proj("expand", w.lat, w.ao);
+        HY4_NEED(op_absorb && op_expand, "mla_project_kv");
+        HY4_NEED(op_paged, "mla_attn_paged_sink");
+        if (!sliding) {
+            op_sel = mk(b, "mla_attn_sel_sink",
+                        { RAD_RANGE("M", 1, T), RAD_INT("heads", H), RAD_INT("latent_dim", L),
+                          RAD_INT("rope_dim", R), RAD_INT("blocks", s.ix_group_topk),
+                          RAD_INT("block_size", bs), RAD_F64("scale", scale),
+                          RAD_STR("dtype", "bf16") },
+                        { sinks }, { w.q_lat, w.q_rope, sel, len }, { w.lat });
+            HY4_NEED(op_sel, "mla_attn_sel_sink");
+        }
+
+        /* The non-absorbed prefill. */
+        op_lat_copy = decl_copy(b, T, L, RAD_BF16, w.row, w.latc);
+        op_kvb = mk(b, "gemm_nt",
+                    { RAD_RANGE("M", 1, T), RAD_INT("N", a.kv_width()), RAD_INT("K", L),
+                      RAD_STR("dtype", "bf16") },
+                    { kv_b }, { w.latc }, { w.kvb });
+        op_split = mk(b, "mla_kv_split",
+                      { RAD_RANGE("M", 1, T), RAD_INT("heads", H), RAD_INT("k_dim", N),
+                        RAD_INT("v_dim", a.v), RAD_INT("rope_dim", R), RAD_STR("dtype", "bf16") },
+                      {}, { w.kvb, w.row }, { w.k, w.v });
+        op_qn_copy = decl_copy(b, T, H * N, RAD_BF16, w.q_nope, w.q_full);
+        op_qr_copy = decl_copy(b, T, H * R, RAD_BF16, w.q_rope, w.q_full);
+        op_rebase = mk(b, "sub_i32", { RAD_RANGE("M", 1, g.max_seqs + 1) }, {}, {}, { w.cu_p });
+        op_dense = mk(b, "attn_kv_sink",
+                      { RAD_RANGE("M", 1, T), RAD_INT("N", T), RAD_INT("heads", H),
+                        RAD_INT("head_dim", a.qk()), RAD_INT("window", window),
+                        RAD_F64("scale", scale), RAD_STR("dtype", "bf16") },
+                      { sinks }, { w.q_full, w.k, w.v, w.cu_p }, { w.ao });
+        HY4_NEED(op_lat_copy && op_kvb, "cast / gemm_nt");
+        HY4_NEED(op_split, "mla_kv_split");
+        HY4_NEED(op_qn_copy && op_qr_copy, "cast");
+        HY4_NEED(op_rebase, "sub_i32");
+        HY4_NEED(op_dense, "attn_kv_sink");
+
+        op_gate = mk(b, "gate_mul",
+                     { RAD_RANGE("M", 1, T), RAD_INT("n", a.v_width()), RAD_STR("dtype", "bf16") },
+                     {}, { w.ao, w.gate }, { w.ag });
+        HY4_NEED(op_gate, "gate_mul");
+        RAD_ARCH_TRY(out.declare(b, nm, g, nm.f("blk.%d.attn_output", l), s.n_embd, a.v_width(),
+                                 RAD_SHARD_NONE, grp, { nm.ckpt("%s.o_proj.weight", ap) },
+                                 act(w.ag), w.o));
+        post_gain = decl_f32(b, nm.f("blk.%d.attn_post_norm.weight", l),
+                             nm.ckpt("%s.post_proj_norm.weight", ap), { s.n_embd }, grp);
+        if (!post_gain) return RAD_E_INVAL;
+        op_post_norm = decl_rmsnorm(b, T, s.n_embd, s.eps, post_gain, w.o, ya);
+        HY4_NEED(op_post_norm, "rmsnorm");
+
+        RAD_ARCH_TRY(t_o_proj.declare(b, nm, T, "attn_o_proj", l, RAD_BF16, s.n_embd, w.o));
+        RAD_ARCH_TRY(t_out.declare(b, nm, T, "attn_out", l, RAD_BF16, s.n_embd, ya));
+        return RAD_OK;
+    }
+
+    /* The front: projections, norms, rotary and the cache store. */
+    bool front(RadCtx* c, const RadBatch* batch) const {
+        const auto* kb = kv_batch(batch, kv);
+        if (!kb || !kb->slot_mapping || !kb->block_table || !kb->seqused) {
+            rad_step_fail(c, "hyv4flash: the latent cache's slot mapping, block table and "
+                             "sequence lengths are missing");
+            return false;
+        }
+        const int64_t T = batch->n_tok, L = s.kv_lora, R = a.qk_rope;
+        auto act = [](rad_buf x) {
+            ActFP8 v{};
+            v.x = x;
+            return v;
+        };
+        const RadOperand pos = praw(batch->positions, RAD_I32, T);
+        t_in_norm.step(c, brows(xa, T), T);
+        q_a.step(c, act(xa), w.qa, T);
+        RAD_ISSUE_N(c, op_qa_norm, T, brows(w.qa, T), RAD_W(qa_gain), brows(w.qa, T));
+        t_q_resid.step(c, brows(w.qa, T), T);
+        q_nope.step(c, act(w.qa), w.q_nope, T);
+        q_rope.step(c, act(w.qa), w.q_rope, T);
+        kv_a.step(c, act(xa), w.row, T);
+        RAD_ISSUE_N(c, op_kv_norm, T, bcol(w.row, 0, L, T), RAD_W(kv_gain), bcol(w.row, 0, L, T));
+        t_kv_latent.step(c, bcol(w.row, 0, L, T), T);
+        RAD_ISSUE_N(c, op_q_rope, T, brows(w.q_rope, T), pos);
+        RAD_ISSUE_N(c, op_k_rope, T, bcol(w.row, L, R, T), pos);
+        const int64_t half = (L + R) / 2;
+        RAD_ISSUE_N(c, op_store, T, bcol(w.row, 0, half, T), bcol(w.row, half, half, T),
+                    praw(kb->slot_mapping, RAD_I32, T), kv_cache(kv, layer));
+        gate.step(c, act(xa), w.gate, T);
+        t_gate.step(c, brows(w.gate, T), T);
+        return true;
+    }
+
+    /* The absorbed attention over sequences [0, S) (rows [0, rows)) of the paged cache. */
+    void paged(RadCtx* c, const RadBatch* batch, int64_t S, int64_t rows) const {
+        if (S <= 0 || rows <= 0) return;
+        const auto* kb = kv_batch(batch, kv);
+        RAD_ISSUE_N(c, op_paged, rows, brows(w.q_lat, rows), brows(w.q_rope, rows),
+                    kv_cache(kv, layer), praw2(kb->block_table, RAD_I32, S, kb->block_table_pitch),
+                    praw(kb->seqused, RAD_I32, S), praw(batch->cu_seqlens, RAD_I32, S + 1),
+                    RAD_W(sinks), brows(w.lat, rows));
+    }
+
+    /* The non-absorbed attention over the prefill rows [DT, T), every key this step's. */
+    void dense(RadCtx* c, const RadBatch* batch, const StepPlan& p) const {
+        const int64_t T = p.T, DT = p.DT, M = T - DT, L = s.kv_lora, R = a.qk_rope,
+                      H = a.heads, N = a.qk_nope, Q = a.qk();
+        RAD_ISSUE_N(c, op_lat_copy, M, bcol_at(w.row, DT, L + R, 0, L, M),
+                    brow_slice(w.latc, DT, M, L));
+        RAD_ISSUE_N(c, op_kvb, M, brow_slice(w.latc, DT, M, L), RAD_W(kv_b),
+                    brow_slice(w.kvb, DT, M, a.kv_width()));
+        RAD_ISSUE_N(c, op_split, M, brow_slice(w.kvb, DT, M, a.kv_width()),
+                    bcol_at(w.row, DT, L + R, L, R, M), brow_slice(w.k, DT, M, H * Q),
+                    brow_slice(w.v, DT, M, H * a.v));
+        RadOperand qn = brow_slice(w.q_full, DT, M, H * Q), qr = qn;
+        qn.cols = N;
+        qr.offset += N;
+        qr.cols = R;
+        RAD_ISSUE_N(c, op_qn_copy, M, brow_slice(w.q_nope, DT, M, H * N), qn);
+        RAD_ISSUE_N(c, op_qr_copy, M, brow_slice(w.q_rope, DT, M, H * R), qr);
+        const int32_t* cu = batch->cu_seqlens + p.D;
+        RAD_ISSUE_N(c, op_rebase, p.P + 1, praw(cu, RAD_I32, p.P + 1), praw(cu, RAD_I32, 1),
+                    brows(w.cu_p, p.P + 1));
+        RAD_ISSUE_N(c, op_dense, M, brow_slice(w.q_full, DT, M, H * Q),
+                    brow_slice(w.k, DT, M, H * Q), brow_slice(w.v, DT, M, H * a.v),
+                    brows(w.cu_p, p.P + 1), brows(w.cu_p, p.P + 1), RAD_W(sinks),
+                    brow_slice(w.ao, DT, M, a.v_width()));
+    }
+
+    /* The attention proper and everything after it. `sel`/`len`: the indexer's table, issued
+     * already (sparse layers on a selecting step). */
+    void core(RadCtx* c, const RadBatch* batch, const StepPlan& p, rad_buf sel, rad_buf len) const {
+        const int64_t T = p.T;
+        auto act = [](rad_buf x) {
+            ActFP8 v{};
+            v.x = x;
+            return v;
+        };
+        const bool selecting = !sliding && p.select;
+        const int64_t abs_rows = selecting ? T : p.nonabs ? p.DT : T;
+        const int64_t abs_seqs = p.nonabs && !selecting ? p.D : p.S;
+        if (abs_rows > 0) {
+            RAD_ISSUE_N(c, op_absorb, abs_rows, brows(w.q_nope, abs_rows), RAD_W(kv_b),
+                        brows(w.q_lat, abs_rows));
+            if (selecting)
+                RAD_ISSUE_N(c, op_sel, T, brows(w.q_lat, T), brows(w.q_rope, T),
+                            kv_cache(kv, layer), brows(sel, T), brows(len, T), RAD_W(sinks),
+                            brows(w.lat, T));
+            else
+                paged(c, batch, abs_seqs, abs_rows);
+            RAD_ISSUE_N(c, op_expand, abs_rows, brows(w.lat, abs_rows), RAD_W(kv_b),
+                        brows(w.ao, abs_rows));
+        }
+        if (p.nonabs && !selecting && p.P > 0) dense(c, batch, p);
+        RAD_ISSUE_N(c, op_gate, T, brows(w.ao, T), brows(w.gate, T), brows(w.ag, T));
+        out.step(c, act(w.ag), w.o, T);
+        t_o_proj.step(c, brows(w.o, T), T);
+        RAD_ISSUE_N(c, op_post_norm, T, brows(w.o, T), RAD_W(post_gain), brows(ya, T));
+        t_out.step(c, brows(ya, T), T);
+    }
+};
+
+}  // namespace hyv4flash
+#endif

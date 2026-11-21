@@ -1,7 +1,6 @@
 /* hyv4flash -- Tencent Hy4-flash (`model_type: hy_v4_flash`, HYV4FlashForConditionalGeneration)
- * from its bf16 checkpoint: the weight manifest and the checkpoint name map, which is what
- * rad-convert needs to quantise the release into a container. docs/ARCHITECTURES.md describes the
- * model and its traps.
+ * from its bf16 checkpoint: the text trunk's serving graph at one rank, and the weight manifest and
+ * checkpoint name map rad-convert needs. docs/ARCHITECTURES.md describes the model and its traps.
  *
  *   42 layers over four hyper-connection streams (iHC: a read gate and a write gate a block, no
  *     mixing matrix), hidden 3072, vocab 120832, embedding and lm_head separate
@@ -17,19 +16,32 @@
  *   DFly2: a 5-layer drafter over the sparse layers' cache and selection
  *   vision: a 27-layer ViT (1152 wide, patch 16) and a two-convolution projector
  *
- * WHAT THIS PLUGIN IS. It declares every weight the release ships, under the logical names the
- * tree's blocks use for the same roles (blk.N.attn_q_a, blk.N.ffn_gate_up_exps.E, ...), each at
- * the encoding the container, checkpoint or recipe holds it in, and maps each to its checkpoint
- * tensors: the stacked experts one weight an expert, gate and up fused, the Engram's per-stream
- * projections and gains joined. It declares no op: this build has no kernel for the compressed
- * indexer's pooling, the Engram gate or DFly2, and a graph that stopped short of them would look
- * servable. rad_arch_step therefore fails by name, and a recipe's encodings are checked by the
- * quantisers and the core's decoder only, not by a kernel's layout hook (docs/ARCHITECTURES.md
- * lists which encodings the tree's kernels read for the same roles in other models).
+ * ============================== THE GRAPH (PLAN §1.2) ==============================
+ *
+ * A step: the token embedding copied into every stream; per layer the Engram add in front of
+ * layers 1, 11, 21 and 31 (hyv4flash_engram.h), the attention connection (ihc_pre, attn_norm),
+ * the attention (hyv4flash_attn.h, the sparse layers' indexer hyv4flash_indexer.h), ihc_post, the
+ * feed-forward connection, the feed-forward (hyv4flash_moe.h), ihc_post; at the end the head's
+ * collapse (ihc_pre over hc_head), the final norm and the lm_head into the declared logits.
+ *
+ * Served: one rank, the text trunk, bf16 weights (the Engram table also as E4M3 rows, the
+ * bf16 recipe). Refused by name: more ranks (WP7), a quantised trunk linear or expert (WP10), a
+ * quantised kv_b (DECISIONS U2) or f32 parameter, pictures (WP15). DFly2 and the tower are declared
+ * as the checkpoint holds them and not served (WP13, WP15).
+ *
+ * The caches (PLAN §1.3): the sliding layers' latent rows in a window group (block 16), the sparse
+ * layers' in a full group of block 4 (a page is one indexer group, so the indexer's table is the
+ * attention's), the indexer's pooled keys (block 4, one rotated key a page) and its raw-key tail
+ * (a linear state of ratio + speculation rows), and each Engram layer's token history (a CONV
+ * state of ngram - 1 ids).
  *
  * The geometry is read from the checkpoint's config and nothing is assumed about its size, so
- * the convert test runs on a model of a few kilobytes. */
-#include <arch/rad_arch.h>
+ * the convert test and the parity harness run on a model of a few kilobytes. */
+#include "hyv4flash_common.h"
+#include "hyv4flash_attn.h"
+#include "hyv4flash_indexer.h"
+#include "hyv4flash_moe.h"
+#include "hyv4flash_engram.h"
 
 #include "chat.h"
 
@@ -38,46 +50,42 @@
 #include <vector>
 
 namespace hyv4flash {
-using namespace rad::arch;
 
-/* One attention geometry: the sparse layers', the sliding layers', or the drafter's. */
-struct AttnGeom {
-    int64_t heads = 0, qk_nope = 0, qk_rope = 0, v = 0;
-    int64_t q_width() const { return heads * (qk_nope + qk_rope); }
-    int64_t kv_width() const { return heads * (qk_nope + v); }
-    int64_t v_width() const { return heads * v; }
-};
-
-struct Shape {
-    int64_t n_layer = 0, n_embd = 0, n_vocab = 0, hc = 0;
-    int64_t q_lora = 0, kv_lora = 0;
-    AttnGeom sparse{}, sliding{};
-    std::vector<int> is_sliding;   /* per layer */
-    std::vector<int> is_moe;       /* per layer */
-    /* feed-forward */
-    int64_t n_ff = 0, n_expert = 0, n_ff_exp = 0, latent = 0, n_ff_shared = 0;
-    /* the compressed indexer */
-    int64_t ix_heads = 0, ix_dim = 0, ix_pool = 0;
-    /* Engram: `layers` are layer indices (the config's ids are one above them) */
-    std::vector<int> engram_layers;
-    std::vector<int64_t> engram_rows;   /* each layer's table, the sum of its head moduli */
-    int64_t engram_ngram = 0, engram_heads = 0, engram_head_dim = 0, engram_map = 0;
-    /* DFly2 and the tower */
-    int64_t dfly_layers = 0;
-    int64_t v_layers = 0, v_embd = 0, v_ff = 0, v_patch = 0, v_chan = 0, v_merge = 0, v_pos = 0;
+struct Layer {
+    bool sliding = false;
+    int engram = -1;      /* index into Model::engrams, -1 for none */
+    Hyper hc_attn{}, hc_ffn{};
+    rad_weight attn_gain = 0, ffn_gain = 0;
+    rad_op op_attn_norm = 0, op_ffn_norm = 0;
+    Attn attn{};
+    Indexer ix{};
+    Ffn ffn{};
+    Tap t_stream_in{}, t_attn_x{}, t_attn_post{}, t_mid{}, t_ffn_x{}, t_ffn_post{}, t_ffn_in{},
+        t_resid{};
 };
 
 struct Model {
     Names nm{};
     Shape s{};
+    Geom g{};
     int64_t n_weights = 0;
+    Trunk tr{};
+    AttnWire aw_sparse{}, aw_sliding{};
+    IndexWire iw{};
+    MoeWire mw{};
+    EngramWire ew{};
+    rad_buf x0 = 0, dense_gu = 0, dense_ff = 0, dense_out = 0, final_hidden = 0, logit_input = 0,
+            logits = 0;
+    rad_kvgroup kv_sparse = 0, kv_sliding = 0, kv_index = 0, kv_tail = 0, kv_engram = 0;
+    rad_weight token = 0, head = 0, final_gain = 0;
+    rad_op embed = 0, op_stream = 0, op_norm = 0, op_gather = 0, op_head = 0;
+    Hyper hc_head{};
+    std::vector<Layer> layers;
+    std::vector<Engram> engrams;
+    Tap t_embed{}, t_hc_head{}, t_final{};
+    bool force_absorbed = false;
 };
 static std::unique_ptr<Model> models[MAX_SLOTS];
-
-static int refuse(const char* what) {
-    fprintf(stderr, "radiance: hyv4flash: %s\n", what);
-    return RAD_E_UNSUPPORTED;
-}
 
 /* ------------------------------------------------------------------ the config */
 static int64_t top(const RadModelMeta* m, const char* key, int64_t dflt) {
@@ -116,6 +124,29 @@ static int read_shape(Shape& s, const RadModelMeta* m) {
     s.ix_heads = txt(m, "index_n_heads", 0);
     s.ix_dim = txt(m, "index_head_dim", 0);
     s.ix_pool = txt(m, "compressed_indexer_compress_ratio", 0);
+    s.ix_group_topk = txt(m, "compressed_indexer_group_topk", 0);
+    s.dense_limit = s.ix_group_topk * s.ix_pool;
+    s.top_k = txt(m, "num_experts_per_tok", m->n_expert_used);
+    s.route_scale = meta_text_getf(m, "routed_scaling_factor", 1.0);
+    s.swiglu_limit = meta_text_getf(m, "swiglu_limit", 0.0);
+    s.norm_topk = txt(m, "norm_topk_prob", 1) != 0;
+    s.eps = m->rms_eps;
+    s.hc_eps = meta_text_getf(m, "hc_eps", 1e-6);
+    s.hc_mag = meta_text_getf(m, "hc_magnitude", 2.0);
+    /* The two layer kinds' rotary bases (HF keys them by layer type; the release config spells
+     * the sparse kind `deepseek_sparse_attention`, the port `indexed_attention`). */
+    s.theta_sliding = meta_text_getf(m, "rope_parameters.sliding_attention.rope_theta", 1e4);
+    s.theta_sparse = meta_text_getf(
+        m, "rope_parameters.deepseek_sparse_attention.rope_theta",
+        meta_text_getf(m, "rope_parameters.indexed_attention.rope_theta", 1e7));
+    /* A sliding row sees `sliding_window` keys, its own included (HF's sliding mask;
+     * `window_size` [511, 0] says the same as 511 before it). */
+    s.window = txt(m, "sliding_window", 0);
+    s.engram_pad = txt(m, "engram_pad_id", -1);
+    s.engram_fp8 = txt(m, "engram_fp8_embedding", 0) != 0;
+    s.engram_map = txt(m, "engram_lookup_table_size", s.n_vocab);
+    s.image_token = top(m, "image_token_id", -1);
+    s.video_token = top(m, "video_token_id", -1);
 
     if (s.n_layer < 1 || s.n_embd < 1 || s.n_vocab < 1 || s.hc < 1 || s.q_lora < 1 ||
         s.kv_lora < 1 || s.sparse.heads < 1 || s.sparse.qk_nope < 1 || s.sparse.qk_rope < 1 ||
@@ -152,9 +183,12 @@ static int read_shape(Shape& s, const RadModelMeta* m) {
         any_sparse = any_sparse || !s.is_sliding[(size_t)l];
         any_moe = any_moe || s.is_moe[(size_t)l];
     }
-    if (any_sparse && (s.ix_heads < 1 || s.ix_dim < 1 || s.ix_pool < 1))
-        return refuse("the config has sparse layers and lacks index_n_heads, index_head_dim or "
-                      "compressed_indexer_compress_ratio");
+    if (any_sparse && (s.ix_heads < 1 || s.ix_dim < 1 || s.ix_pool < 1 || s.ix_group_topk < 2))
+        return refuse("the config has sparse layers and lacks index_n_heads, index_head_dim, "
+                      "compressed_indexer_compress_ratio or compressed_indexer_group_topk");
+    bool any_sliding = false;
+    for (int64_t l = 0; l < s.n_layer; ++l) any_sliding = any_sliding || s.is_sliding[(size_t)l];
+    if (any_sliding && s.window < 1) return refuse("the config has sliding layers and no sliding_window");
     if (any_moe && (s.n_expert < 1 || s.n_ff_exp < 1 || s.latent < 1 || s.n_ff_shared < 1))
         return refuse("the config has MoE layers and lacks n_routed_experts, "
                       "moe_intermediate_size, routed_expert_hidden_size or n_shared_experts");
@@ -206,6 +240,9 @@ static int read_shape(Shape& s, const RadModelMeta* m) {
 }
 
 /* ------------------------------------------------------------------ declaring one weight */
+/* The manifest's declarations, for what this build declares and does not serve (DFly2, the tower,
+ * quantised routed experts): every weight at the encoding it is stored in, so rad-convert writes the
+ * whole release. The served graph's weights are declared by the blocks that read them. */
 struct Decl {
     RadBuilder* b;
     Model&      m;
@@ -278,8 +315,9 @@ struct Decl {
     }
 };
 
-/* ------------------------------------------------------------------ the blocks */
-/* Gated MLA. `scope` is "blk.<l>" or "dfly.blk.<l>", `ap` the checkpoint's `...self_attn`. */
+/* ------------------------------------------------------------------ the drafter's manifest */
+/* The drafter's gated MLA, declared as the checkpoint holds it (not served). `scope` is
+ * "dfly.blk.<l>", `ap` the checkpoint's `...self_attn`. */
 static int attention(Decl& d, Names& nm, const Shape& s, const AttnGeom& a, const char* scope,
                      const char* ap) {
     RadBuilder* b = d.b;
@@ -320,39 +358,6 @@ static int attention(Decl& d, Names& nm, const Shape& s, const AttnGeom& a, cons
     return RAD_OK;
 }
 
-/* The compressed indexer of a sparse layer. Its pooling (two projections, the in-group position
- * bias and the pooled key's norm) is f32 in the checkpoint and in the reference, which keeps it
- * there by name: a softmax over four slots loses near-ties in bf16 and recalls other groups. */
-static int indexer(Decl& d, Names& nm, const Shape& s, int l, const char* ap) {
-    RadBuilder* b = d.b;
-    const char* ip = nm.ckpt("%s.compressed_indexer", ap);
-    const char* query = nm.f("blk.%d.index_query.weight", l);
-    const char* head = nm.f("blk.%d.index_head.weight", l);
-    const char* key = nm.f("blk.%d.index_key.weight", l);
-    const char* key_n = nm.f("blk.%d.index_key_norm.weight", l);
-    const char* pool_v = nm.f("blk.%d.index_pool_value.weight", l);
-    const char* pool_g = nm.f("blk.%d.index_pool_gate.weight", l);
-    const char* pool_n = nm.f("blk.%d.index_pool_norm.weight", l);
-    const char* ape = nm.f("blk.%d.index_ape", l);
-    RAD_ARCH_TRY(map_copy(b, query, nm.ckpt("%s.query_projection.weight", ip)));
-    RAD_ARCH_TRY(map_copy(b, head, nm.ckpt("%s.head_weight_projection.weight", ip)));
-    RAD_ARCH_TRY(map_copy(b, key, nm.ckpt("%s.token_key_projection.weight", ip)));
-    RAD_ARCH_TRY(map_copy(b, key_n, nm.ckpt("%s.token_key_norm.weight", ip)));
-    RAD_ARCH_TRY(map_copy(b, pool_v, nm.ckpt("%s.key_value_projection.weight", ip)));
-    RAD_ARCH_TRY(map_copy(b, pool_g, nm.ckpt("%s.key_gate_projection.weight", ip)));
-    RAD_ARCH_TRY(map_copy(b, pool_n, nm.ckpt("%s.key_norm.weight", ip)));
-    RAD_ARCH_TRY(map_copy(b, ape, nm.ckpt("%s.intra_group_ape", ip)));
-    RAD_ARCH_TRY(d.mat(query, { s.ix_heads * s.ix_dim, s.q_lora }));
-    RAD_ARCH_TRY(d.mat(head, { s.ix_heads, s.n_embd }));
-    RAD_ARCH_TRY(d.mat(key, { s.ix_dim, s.n_embd }));
-    RAD_ARCH_TRY(d.f32(key_n, { s.ix_dim }));
-    RAD_ARCH_TRY(d.f32(pool_v, { s.ix_dim, s.ix_dim }));
-    RAD_ARCH_TRY(d.f32(pool_g, { s.ix_dim, s.ix_dim }));
-    RAD_ARCH_TRY(d.f32(pool_n, { s.ix_dim }));
-    RAD_ARCH_TRY(d.f32(ape, { s.ix_pool, s.ix_dim }));
-    return RAD_OK;
-}
-
 /* A gated MLP: gate and up fused, gate rows first, as every block of the tree reads them.
  * `scope` is the declared stem, `mp` the checkpoint's prefix; `shexp` names the shared expert.
  * A width of 0 is read from the checkpoint's down projection, `ff_dflt` where no model answers. */
@@ -367,194 +372,6 @@ static int mlp(Decl& d, Names& nm, const Shape& s, const char* scope, const char
     if (ff <= 0) ff = d.extent(dn, 1, ff_dflt);
     RAD_ARCH_TRY(d.mat(gu, { 2 * ff, s.n_embd }));
     RAD_ARCH_TRY(d.mat(dn, { s.n_embd, ff }));
-    return RAD_OK;
-}
-
-/* A latent MoE layer. The experts are two stacked tensors in the checkpoint, gate_up
- * [n_expert, 2 * n_ff_exp, latent] (gate rows first) and down [n_expert, latent, n_ff_exp], and
- * one weight an expert here, each expert its own movement unit of two slots: the unit the
- * placement planner tiers and the heat engine promotes (rad_block_moe_fp8.h). */
-static int moe(Decl& d, Names& nm, const Shape& s, int l, const char* mp) {
-    RadBuilder* b = d.b;
-    const char* router = nm.f("blk.%d.ffn_gate_inp.weight", l);
-    const char* corr = nm.f("blk.%d.ffn_gate_inp.correction", l);
-    const char* lat_in = nm.f("blk.%d.ffn_latent_in.weight", l);
-    const char* lat_out = nm.f("blk.%d.ffn_latent_out.weight", l);
-    const char* post = nm.f("blk.%d.ffn_post_norm.weight", l);
-    RAD_ARCH_TRY(map_copy(b, router, nm.ckpt("%s.gate.weight", mp)));
-    RAD_ARCH_TRY(map_copy(b, corr, nm.ckpt("%s.gate.e_score_correction_bias", mp)));
-    /* The checkpoint names the pair by direction in width: `routed_expert_down_proj` narrows the
-     * hidden state into the latent in front of the experts, `routed_expert_up_proj` widens their
-     * sum back. Neither is an expert's own down or up projection. */
-    RAD_ARCH_TRY(map_copy(b, lat_in, nm.ckpt("%s.routed_expert_down_proj.weight", mp)));
-    RAD_ARCH_TRY(map_copy(b, lat_out, nm.ckpt("%s.routed_expert_up_proj.weight", mp)));
-    RAD_ARCH_TRY(map_copy(b, post, nm.ckpt("%s.combine_output_norm.weight", mp)));
-    /* The router scores in f32 (the reference casts both operands), so it stays a float. */
-    RAD_ARCH_TRY(d.mat(router, { s.n_expert, s.n_embd }));
-    RAD_ARCH_TRY(d.f32(corr, { s.n_expert }));
-    RAD_ARCH_TRY(d.mat(lat_in, { s.latent, s.n_embd }));
-    RAD_ARCH_TRY(d.mat(lat_out, { s.n_embd, s.latent }));
-    RAD_ARCH_TRY(mlp(d, nm, s, nm.f("blk.%d", l), nm.ckpt("%s.shared_experts", mp),
-                     s.n_ff_shared, true));
-    RAD_ARCH_TRY(d.f32(post, { s.n_embd }));
-
-    const char* gu_src = nm.ckpt("%s.experts.gate_up_proj", mp);
-    const char* dn_src = nm.ckpt("%s.experts.down_proj", mp);
-    const int access = d.access;
-    d.access = RAD_ACCESS_CONDITIONAL;
-    /* Every map of the layer before its first declaration: an encoding is looked up through its
-     * map. */
-    for (int64_t e = 0; e < s.n_expert; ++e) {
-        RAD_ARCH_TRY(map_slice(b, nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l, (long long)e),
-                               gu_src, (int)e));
-        RAD_ARCH_TRY(map_slice(b, nm.f("blk.%d.ffn_down_exps.%lld.weight", l, (long long)e),
-                               dn_src, (int)e));
-    }
-    for (int64_t e = 0; e < s.n_expert; ++e) {
-        const char* w = nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l, (long long)e);
-        RAD_ARCH_TRY(d.put(w, RAD_BF16, { 2 * s.n_ff_exp, s.latent },
-                           grp_expert_slot(l, (int)e, 0)));
-    }
-    for (int64_t e = 0; e < s.n_expert; ++e) {
-        const char* w = nm.f("blk.%d.ffn_down_exps.%lld.weight", l, (long long)e);
-        RAD_ARCH_TRY(d.put(w, RAD_BF16, { s.latent, s.n_ff_exp }, grp_expert_slot(l, (int)e, 1)));
-    }
-    d.access = access;
-    return RAD_OK;
-}
-
-/* Joins `n` per-stream (or per-head) checkpoint tensors `<prefix><i><suffix>` along dim 0, eight
- * a map: successive CONCAT maps for one name extend it in call order. */
-static int map_join(RadBuilder* b, Names& nm, const char* declared, const char* prefix,
-                    const char* suffix, int64_t n) {
-    for (int64_t i = 0; i < n; i += 8) {
-        RadNameMap m = map_base(declared, RAD_MAP_CONCAT);
-        for (int64_t k = i; k < n && k < i + 8; ++k)
-            m.src[m.n_src++] = nm.ckpt("%s%lld%s", prefix, (long long)k, suffix);
-        RAD_ARCH_TRY(rad_decl_name_map(b, &m));
-    }
-    return RAD_OK;
-}
-
-/* The Engram memory in front of layer l. The reference keeps one module a stream (four key
- * projections, four key and four query norms, four branch scales) and one norm a hash head;
- * each family is joined here along dim 0, stream 0 or head 0 first, so the four key projections
- * are one GEMM and each gain family one operand.
- *
- * `engram_fp8_embedding` makes every looked-up row an E4M3 round trip under its own absmax
- * scale, so the bf16 table is not what the model reads. A recipe may store the table as E4M3 rows
- * (data/recipes/hy4-flash-bf16.recipe), at half the bytes and within one code step of the
- * reference, whose own division is in bf16 (the recipe's header has the measurement). Stored
- * bf16, the round trip is the reader's to apply.
- *
- * The hash is not in the checkpoint: the reference draws each layer's odd multipliers from
- * NumPy's generator at load and reads the head moduli from the config. They are declared
- * optional, under the names data/hy4flash_engram_tables.py writes for `rad-convert --add`. */
-static int engram(Decl& d, Names& nm, const Shape& s, int l, int64_t rows, const char* pre) {
-    RadBuilder* b = d.b;
-    const char* ep = nm.ckpt("%s.engram_layer", pre);
-    const int64_t E = s.n_embd, HD = s.engram_head_dim, H = s.engram_heads, W = H * HD;
-    const char* table = nm.f("blk.%d.engram_table.weight", l);
-    const char* map = nm.f("blk.%d.engram_token_map", l);
-    const char* mult = nm.f("blk.%d.engram_mult", l);
-    const char* vsz = nm.f("blk.%d.engram_vocab_sizes", l);
-    const char* off = nm.f("blk.%d.engram_offsets", l);
-    const char* head_n = nm.f("blk.%d.engram_head_norm.weight", l);
-    const char* key = nm.f("blk.%d.engram_key.weight", l);
-    const char* key_b = nm.f("blk.%d.engram_key.bias", l);
-    const char* key_n = nm.f("blk.%d.engram_key_norm.weight", l);
-    const char* query_n = nm.f("blk.%d.engram_query_norm.weight", l);
-    const char* value = nm.f("blk.%d.engram_value.weight", l);
-    const char* value_b = nm.f("blk.%d.engram_value.bias", l);
-    const char* value_g = nm.f("blk.%d.engram_value_gain.weight", l);
-    const char* branch = nm.f("blk.%d.engram_branch_scale.weight", l);
-    RAD_ARCH_TRY(map_copy(b, table, nm.ckpt("%s.multi_head_embedding.embedding.weight", ep)));
-    RAD_ARCH_TRY(map_copy(b, map, nm.ckpt("%s.lookup_table", ep)));
-    RAD_ARCH_TRY(map_copy(b, mult, nm.ckpt("engram.%d.hash_multipliers", l)));
-    RAD_ARCH_TRY(map_copy(b, vsz, nm.ckpt("engram.%d.head_vocab_sizes", l)));
-    RAD_ARCH_TRY(map_copy(b, off, nm.ckpt("engram.%d.head_offsets", l)));
-    RAD_ARCH_TRY(map_join(b, nm, head_n, nm.ckpt("%s.lookup_per_head_norms.", ep), ".weight", H));
-    RAD_ARCH_TRY(map_join(b, nm, key, nm.ckpt("%s.key_projs.", ep), ".weight", s.hc));
-    RAD_ARCH_TRY(map_join(b, nm, key_b, nm.ckpt("%s.key_projs.", ep), ".bias", s.hc));
-    RAD_ARCH_TRY(map_join(b, nm, key_n, nm.ckpt("%s.norm_key.", ep), ".weight", s.hc));
-    RAD_ARCH_TRY(map_join(b, nm, query_n, nm.ckpt("%s.norm_query.", ep), ".weight", s.hc));
-    RAD_ARCH_TRY(map_copy(b, value, nm.ckpt("%s.value_proj.weight", ep)));
-    RAD_ARCH_TRY(map_copy(b, value_b, nm.ckpt("%s.value_proj.bias", ep)));
-    RAD_ARCH_TRY(map_copy(b, value_g, nm.ckpt("%s.unified_pre_gamma", ep)));
-    RAD_ARCH_TRY(map_join(b, nm, branch, nm.ckpt("%s.unified_per_hc_scales.", ep), "", s.hc));
-
-    /* A vocabulary table, though not the token one: read a few rows a token, far too large for a
-     * card (rad_block_ple.h places Flash-Next's the same way). */
-    const int access = d.access;
-    d.access = RAD_ACCESS_VOCAB;
-    RAD_ARCH_TRY(d.put(table, RAD_BF16, { rows, HD }, grp_layer(l)));
-    d.access = access;
-    /* The token map's length is the tokenizer's, below the embedding's padded vocabulary. */
-    RAD_ARCH_TRY(d.put(map, RAD_I32, { d.extent(map, 0, s.n_vocab) }, grp_layer(l)));
-    /* I64: a multiplier times a compressed token id fills 63 bits. */
-    RAD_ARCH_TRY(d.put(mult, RAD_I64, { s.engram_ngram }, grp_layer(l), 1));
-    RAD_ARCH_TRY(d.put(vsz, RAD_I64, { H }, grp_layer(l), 1));
-    RAD_ARCH_TRY(d.put(off, RAD_I64, { H }, grp_layer(l), 1));
-    RAD_ARCH_TRY(d.f32(head_n, { W }));
-    RAD_ARCH_TRY(d.mat(key, { s.hc * E, W }));
-    RAD_ARCH_TRY(d.f32(key_b, { s.hc * E }));
-    RAD_ARCH_TRY(d.f32(key_n, { s.hc * E }));
-    RAD_ARCH_TRY(d.f32(query_n, { s.hc * E }));
-    RAD_ARCH_TRY(d.mat(value, { E, W }));
-    RAD_ARCH_TRY(d.f32(value_b, { E }));
-    RAD_ARCH_TRY(d.f32(value_g, { E }));
-    RAD_ARCH_TRY(d.f32(branch, { s.hc * E }));
-    return RAD_OK;
-}
-
-/* A hyper-connection: `fn` scores the flattened streams into 2 * hc logits (the read gate's hc,
- * then the write gate's), `base` their biases, `scale` one factor for each half. f32 in the
- * checkpoint, and the reference applies it in f32 whatever the model's dtype. */
-static int hyper(Decl& d, Names& nm, const Shape& s, const char* scope, const char* hp) {
-    RadBuilder* b = d.b;
-    const char* fn = nm.f("%s.fn", scope);
-    const char* base = nm.f("%s.base", scope);
-    const char* scale = nm.f("%s.scale", scope);
-    RAD_ARCH_TRY(map_copy(b, fn, nm.ckpt("%s.hc_fn", hp)));
-    RAD_ARCH_TRY(map_copy(b, base, nm.ckpt("%s.hc_base", hp)));
-    RAD_ARCH_TRY(map_copy(b, scale, nm.ckpt("%s.hc_scale", hp)));
-    RAD_ARCH_TRY(d.f32(fn, { 2 * s.hc, s.hc * s.n_embd }));
-    RAD_ARCH_TRY(d.f32(base, { 2 * s.hc }));
-    RAD_ARCH_TRY(d.f32(scale, { 2 }));
-    return RAD_OK;
-}
-
-static int trunk_layer(RadBuilder* b, Model& m, int l) {
-    Names& nm = m.nm;
-    const Shape& s = m.s;
-    Decl d{ b, m, l, RAD_ACCESS_PER_TOKEN };
-    const char* pre = nm.ckpt("model.layers.%d", l);
-    const char* ap = nm.ckpt("%s.self_attn", pre);
-    const char* mp = nm.ckpt("%s.mlp", pre);
-    for (size_t i = 0; i < s.engram_layers.size(); ++i)
-        if (s.engram_layers[i] == l) RAD_ARCH_TRY(engram(d, nm, s, l, s.engram_rows[i], pre));
-
-    RAD_ARCH_TRY(hyper(d, nm, s, nm.f("blk.%d.hc_attn", l),
-                       nm.ckpt("%s.hc_attn_layer.hc_pre", pre)));
-    const char* an = nm.f("blk.%d.attn_norm.weight", l);
-    RAD_ARCH_TRY(map_copy(b, an, nm.ckpt("%s.input_layernorm.weight", pre)));
-    RAD_ARCH_TRY(d.f32(an, { s.n_embd }));
-    const bool sliding = s.is_sliding[(size_t)l] != 0;
-    RAD_ARCH_TRY(attention(d, nm, s, sliding ? s.sliding : s.sparse, nm.f("blk.%d", l), ap));
-    if (!sliding) RAD_ARCH_TRY(indexer(d, nm, s, l, ap));
-
-    RAD_ARCH_TRY(hyper(d, nm, s, nm.f("blk.%d.hc_ffn", l),
-                       nm.ckpt("%s.hc_mlp_layer.hc_pre", pre)));
-    const char* fnorm = nm.f("blk.%d.ffn_norm.weight", l);
-    RAD_ARCH_TRY(map_copy(b, fnorm, nm.ckpt("%s.post_attention_layernorm.weight", pre)));
-    RAD_ARCH_TRY(d.f32(fnorm, { s.n_embd }));
-    if (s.is_moe[(size_t)l]) return moe(d, nm, s, l, mp);
-    /* A dense layer's sandwich norm is the layer's (`post_fc2_norm`), a MoE layer's the block's
-     * (`combine_output_norm`); one role, one declared name. */
-    const char* post = nm.f("blk.%d.ffn_post_norm.weight", l);
-    RAD_ARCH_TRY(map_copy(b, post, nm.ckpt("%s.post_fc2_norm.weight", mp)));
-    RAD_ARCH_TRY(mlp(d, nm, s, nm.f("blk.%d", l), mp, s.n_ff, false));
-    RAD_ARCH_TRY(d.f32(post, { s.n_embd }));
     return RAD_OK;
 }
 
@@ -676,49 +493,285 @@ static int tower(RadBuilder* b, Model& m) {
 }
 
 /* ------------------------------------------------------------------ declare */
+/* The KV groups, each declared right before the first op that claims its block size (the first
+ * op after a group that carries `block_size` binds it, rad_builder.cpp find_kv_consumer). */
+static rad_kvgroup latent_group(RadBuilder* b, Names& nm, bool sliding, int64_t window,
+                                int64_t row) {
+    RadKVGroupDecl d{};
+    d.kind = sliding ? RAD_KV_WINDOW : RAD_KV_FULL;
+    d.dtype = RAD_BF16;
+    d.window = sliding ? window : 0;
+    d.n_head_kv = 1;
+    d.head_dim = row / 2;
+    return rad_decl_kv_group(b, nm.f(sliding ? "kv_latent_sliding" : "kv_latent_sparse"), &d);
+}
+
+/* A layer's routed experts as the manifest declares them, one weight an expert (each its own
+ * movement unit of two slots), plane-wise views for a quantised encoding: what rad-convert needs of
+ * a layer whose routed arm this build does not serve (Ffn::served). The maps of the experts
+ * MoeFP8::probe read are already declared. */
+static int expert_manifest(RadBuilder* b, Model& m, int l, const MoeFP8::Config& pc) {
+    Names& nm = m.nm;
+    const Shape& s = m.s;
+    const char* mp = nm.ckpt("model.layers.%d.mlp", l);
+    const char* gu_src = nm.ckpt("%s.experts.gate_up_proj", mp);
+    const char* dn_src = nm.ckpt("%s.experts.down_proj", mp);
+    Decl d{ b, m, l, RAD_ACCESS_CONDITIONAL };
+    for (int64_t e = 0; e < s.n_expert; ++e) {
+        const char* gu = nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l, (long long)e);
+        const bool probed = pc.probed_layer == l && e >= pc.probed_expert &&
+                            e < pc.probed_expert + pc.probed_count;
+        if (!probed) RAD_ARCH_TRY(map_slice(b, gu, gu_src, (int)e));
+        RAD_ARCH_TRY(map_slice(b, nm.f("blk.%d.ffn_down_exps.%lld.weight", l, (long long)e),
+                               dn_src, (int)e));
+    }
+    for (int64_t e = 0; e < s.n_expert; ++e)
+        RAD_ARCH_TRY(d.put(nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l, (long long)e), RAD_BF16,
+                           { 2 * s.n_ff_exp, s.latent }, grp_expert_slot(l, (int)e, 0)));
+    for (int64_t e = 0; e < s.n_expert; ++e)
+        RAD_ARCH_TRY(d.put(nm.f("blk.%d.ffn_down_exps.%lld.weight", l, (long long)e), RAD_BF16,
+                           { s.latent, s.n_ff_exp }, grp_expert_slot(l, (int)e, 1)));
+    rad_note(b, "hyv4flash: layer %d's routed experts are quantised; declared for conversion, not "
+                "served by this build (WP10)", l);
+    return RAD_OK;
+}
+
+static int buffers(RadBuilder* b, Model& m) {
+    auto& s = m.s;
+    auto& g = m.g;
+    auto& nm = m.nm;
+    const int64_t T = g.max_tok, E = s.n_embd;
+    auto bf = [&](const char* n, std::initializer_list<int64_t> shape) {
+        return decl_b(b, nm.f("%s", n), RAD_BF16, shape);
+    };
+    m.tr.h = bf("streams", { T, s.hc * E });
+    m.tr.x = bf("hc_x", { T, E });
+    m.tr.post = decl_b(b, nm.f("hc_post"), RAD_F32, { T, s.hc });
+    m.tr.xn = bf("block_in", { T, E });
+    m.tr.y = bf("block_out", { T, E });
+    m.x0 = bf("embed", { T, E });
+    m.final_hidden = decl_b(b, nm.f("final_hidden"), RAD_BF16, { T, E }, RAD_BUF_PERSIST);
+    m.logit_input = bf("logit_input", { g.max_logit_rows, E });
+    m.logits = decl_b(b, nm.f("logits"), RAD_F32, { g.max_logit_rows, g.n_vocab });
+    if (!m.tr.h || !m.tr.x || !m.tr.post || !m.tr.xn || !m.tr.y || !m.x0 || !m.final_hidden ||
+        !m.logit_input || !m.logits)
+        return RAD_E_INVAL;
+    RAD_ARCH_TRY(rad_declare_logits(b, m.logits));
+    bool any_sparse = false, any_sliding = false, any_moe = false, any_dense = false;
+    for (int64_t l = 0; l < s.n_layer; ++l) {
+        (s.is_sliding[(size_t)l] ? any_sliding : any_sparse) = true;
+        (s.is_moe[(size_t)l] ? any_moe : any_dense) = true;
+    }
+    if (any_sparse) RAD_ARCH_TRY(m.aw_sparse.declare(b, nm, s, s.sparse, T, g.max_seqs, "sparse"));
+    if (any_sliding)
+        RAD_ARCH_TRY(m.aw_sliding.declare(b, nm, s, s.sliding, T, g.max_seqs, "sliding"));
+    if (any_sparse) RAD_ARCH_TRY(m.iw.declare(b, nm, s, g));
+    if (any_moe) RAD_ARCH_TRY(m.mw.declare(b, nm, s, g));
+    if (any_dense) {
+        m.dense_gu = bf("dense_gate_up", { T, 2 * s.n_ff });
+        m.dense_ff = bf("dense_ff", { T, s.n_ff });
+        m.dense_out = bf("dense_out", { T, E });
+        if (!m.dense_gu || !m.dense_ff || !m.dense_out) return RAD_E_INVAL;
+    }
+    if (!s.engram_layers.empty()) RAD_ARCH_TRY(m.ew.declare(b, nm, s, g));
+    return RAD_OK;
+}
+
+static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
+    Names& nm = m.nm;
+    const Shape& s = m.s;
+    const Geom& g = m.g;
+    const int64_t T = g.max_tok, E = s.n_embd;
+    Layer& lay = m.layers[(size_t)l];
+    lay.sliding = s.is_sliding[(size_t)l] != 0;
+    const auto grp = grp_layer(l);
+    const char* pre = nm.ckpt("model.layers.%d", l);
+    const char* ap = nm.ckpt("%s.self_attn", pre);
+
+    for (size_t i = 0; i < s.engram_layers.size(); ++i)
+        if (s.engram_layers[i] == l) {
+            lay.engram = (int)i;
+            Engram& eg = m.engrams[i];
+            RAD_ARCH_TRY(eg.declare(b, nm, s, g, l, s.engram_rows[i], m.ew, m.tr.h, m.kv_engram));
+        }
+    RAD_ARCH_TRY(lay.t_stream_in.declare(b, nm, T, "stream_in", l, RAD_BF16, s.hc * E, m.tr.h));
+
+    RAD_ARCH_TRY(lay.hc_attn.declare(b, nm, s, T, nm.f("blk.%d.hc_attn", l),
+                                     nm.ckpt("%s.hc_attn_layer.hc_pre.hc_fn", pre),
+                                     nm.ckpt("%s.hc_attn_layer.hc_pre.hc_base", pre),
+                                     nm.ckpt("%s.hc_attn_layer.hc_pre.hc_scale", pre), grp, false,
+                                     m.tr.h, m.tr.x, m.tr.post));
+    RAD_ARCH_TRY(lay.t_attn_x.declare(b, nm, T, "attn_hc_x", l, RAD_BF16, E, m.tr.x));
+    RAD_ARCH_TRY(lay.t_attn_post.declare(b, nm, T, "attn_hc_post", l, RAD_F32, s.hc, m.tr.post));
+    lay.attn_gain = decl_f32(b, nm.f("blk.%d.attn_norm.weight", l),
+                             nm.ckpt("%s.input_layernorm.weight", pre), { E }, grp);
+    if (!lay.attn_gain) return RAD_E_INVAL;
+    lay.op_attn_norm = decl_rmsnorm(b, T, E, s.eps, lay.attn_gain, m.tr.x, m.tr.xn);
+    HY4_NEED(lay.op_attn_norm, "rmsnorm");
+
+    /* The layer's latent group, declared before its first store; a sparse layer's indexer
+     * groups before the first pool. */
+    rad_kvgroup& kv = lay.sliding ? m.kv_sliding : m.kv_sparse;
+    const bool first_kv = !kv;
+    const AttnGeom& a = lay.sliding ? s.sliding : s.sparse;
+    if (!kv) kv = latent_group(b, nm, lay.sliding, s.window, s.kv_lora + a.qk_rope);
+    if (!kv) return RAD_E_INVAL;
+    const int64_t block = lay.sliding ? (int64_t)RAD_KV_BLOCK : s.ix_pool;
+    RAD_ARCH_TRY(lay.attn.declare(b, nm, s, g, l, lay.sliding,
+                                  lay.sliding ? m.aw_sliding : m.aw_sparse, m.tr.xn, m.tr.y, kv,
+                                  block, ap, first_kv));
+    if (!lay.sliding) {
+        if (!m.kv_tail) {
+            RadKVGroupDecl d{};
+            d.kind = RAD_KV_LINEAR;
+            d.dtype = RAD_BF16;
+            d.n_head_kv = 1;
+            d.state_dim[0] = m.iw.ring;
+            d.state_dim[1] = s.ix_dim;
+            m.kv_tail = rad_decl_kv_group(b, nm.f("kv_index_tail"), &d);
+            if (!m.kv_tail) return RAD_E_INVAL;
+        }
+        const bool first_ix = !m.kv_index;
+        if (!m.kv_index) {
+            /* One pooled key of ix_dim a page of four token slots: four rows of ix_dim / 4,
+             * K and V halves of ix_dim / 8 each. */
+            RadKVGroupDecl d{};
+            d.kind = RAD_KV_FULL;
+            d.dtype = RAD_BF16;
+            d.n_head_kv = 1;
+            d.head_dim = s.ix_dim / 8;
+            m.kv_index = rad_decl_kv_group(b, nm.f("kv_index_keys"), &d);
+            if (!m.kv_index) return RAD_E_INVAL;
+            /* The scorer reads every group of the history every step: resident. */
+            RAD_ARCH_TRY(rad_kv_group_dense_read(b, m.kv_index));
+        }
+        RAD_ARCH_TRY(lay.ix.declare(b, nm, s, g, l, m.iw, m.tr.xn, lay.attn.w.qa, m.kv_index,
+                                    m.kv_tail, kv, ap, first_ix));
+    }
+    RAD_ARCH_TRY(lay.attn.declare_core(b, nm, ap, lay.sliding ? 0 : m.iw.sel,
+                                       lay.sliding ? 0 : m.iw.len));
+    RAD_ARCH_TRY(lay.hc_attn.declare_post(b, s, T, m.tr.h, m.tr.post, m.tr.y));
+    RAD_ARCH_TRY(lay.t_mid.declare(b, nm, T, "resid_mid", l, RAD_BF16, s.hc * E, m.tr.h));
+
+    RAD_ARCH_TRY(lay.hc_ffn.declare(b, nm, s, T, nm.f("blk.%d.hc_ffn", l),
+                                    nm.ckpt("%s.hc_mlp_layer.hc_pre.hc_fn", pre),
+                                    nm.ckpt("%s.hc_mlp_layer.hc_pre.hc_base", pre),
+                                    nm.ckpt("%s.hc_mlp_layer.hc_pre.hc_scale", pre), grp, false,
+                                    m.tr.h, m.tr.x, m.tr.post));
+    RAD_ARCH_TRY(lay.t_ffn_x.declare(b, nm, T, "ffn_hc_x", l, RAD_BF16, E, m.tr.x));
+    RAD_ARCH_TRY(lay.t_ffn_post.declare(b, nm, T, "ffn_hc_post", l, RAD_F32, s.hc, m.tr.post));
+    lay.ffn_gain = decl_f32(b, nm.f("blk.%d.ffn_norm.weight", l),
+                            nm.ckpt("%s.post_attention_layernorm.weight", pre), { E }, grp);
+    if (!lay.ffn_gain) return RAD_E_INVAL;
+    lay.op_ffn_norm = decl_rmsnorm(b, T, E, s.eps, lay.ffn_gain, m.tr.x, m.tr.xn);
+    HY4_NEED(lay.op_ffn_norm, "rmsnorm");
+    RAD_ARCH_TRY(lay.t_ffn_in.declare(b, nm, T, "ffn_in_norm", l, RAD_BF16, E, m.tr.xn));
+    RAD_ARCH_TRY(lay.ffn.declare(b, nm, s, g, l, m.tr.xn, m.tr.y, m.mw, m.dense_gu, m.dense_ff,
+                                 m.dense_out, msrc,
+                                 [&](int layer) { return expert_manifest(b, m, layer, msrc->cfg); }));
+    RAD_ARCH_TRY(lay.hc_ffn.declare_post(b, s, T, m.tr.h, m.tr.post, m.tr.y));
+    RAD_ARCH_TRY(lay.t_resid.declare(b, nm, T, "resid", l, RAD_BF16, s.hc * E, m.tr.h));
+    return RAD_OK;
+}
+
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS ||
         rad_build_slot(ctx) >= MAX_SLOTS)
         return RAD_E_INVAL;
     if (ctx->world_size > 1)
-        return refuse("the manifest is declared whole, for one rank; it has no tensor-parallel "
-                      "split yet");
+        return refuse("this build serves one rank; the tensor-parallel split (heads, experts, "
+                      "the vocabulary) is WP7");
+    if (ctx->kv_dtype != RAD_DT_INVALID && ctx->kv_dtype != RAD_BF16)
+        return refuse("the latent and indexer caches are bf16; run with --kv-cache-dtype bf16");
     auto& slot = models[rad_build_slot(ctx)];
     slot = std::make_unique<Model>();
     Model& m = *slot;
     m.nm = Names(ctx->scope);
     Names& nm = m.nm;
     Shape& s = m.s;
+    Geom& g = m.g;
     RAD_ARCH_TRY(read_shape(s, meta));
+    RAD_ARCH_TRY(geom_from(g, meta, ctx, "bf16", RAD_BF16));
+    /* Every linear of this build reads the bf16 plane (a quantised one is refused by its
+     * LinearFP8): no activation codes are declared. */
+    g.w_bf16 = true;
+    {
+        const char* e = std::getenv("RADIANCE_HY4_PREFILL");
+        m.force_absorbed = e && !std::strcmp(e, "absorbed");
+    }
 
-    Decl d{ b, m, -1, RAD_ACCESS_VOCAB };
+    /* The token embedding and the head. The release ships its own lm_head (`tie_word_embeddings`
+     * false); a tied fine-tune reads the embedding. The reference runs the head in f32: the
+     * logits are f32 accumulations over the bf16 rows. */
     const char* token = nm.f("token_embd.weight");
-    const char* head = nm.f("output.weight");
-    const char* fin = nm.f("output_norm.weight");
+    const char* headn = nm.f("output.weight");
     RAD_ARCH_TRY(map_copy(b, token, "model.embed_tokens.weight"));
-    /* The release ships its own lm_head (`tie_word_embeddings` false); a tied fine-tune reads
-     * the embedding. The reference keeps the head in f32 by name, widened from these bf16 rows. */
-    RAD_ARCH_TRY(map_copy_alt(b, head, "lm_head.weight", "model.embed_tokens.weight"));
-    RAD_ARCH_TRY(map_copy(b, fin, "model.norm.weight"));
-    RAD_ARCH_TRY(d.put(token, RAD_BF16, { s.n_vocab, s.n_embd }, grp_model()));
-    RAD_ARCH_TRY(d.put(head, RAD_BF16, { s.n_vocab, s.n_embd }, grp_model()));
-    d.access = RAD_ACCESS_PER_TOKEN;
-    RAD_ARCH_TRY(d.put(fin, RAD_F32, { s.n_embd }, grp_model()));
-    /* The head's collapse of the streams: hc logits, one scale, and no write gate. */
-    const char* hfn = nm.f("hc_head.fn");
-    const char* hbase = nm.f("hc_head.base");
-    const char* hscale = nm.f("hc_head.scale");
-    RAD_ARCH_TRY(map_copy(b, hfn, "model.hc_head.hc_head_fn"));
-    RAD_ARCH_TRY(map_copy(b, hbase, "model.hc_head.hc_head_base"));
-    RAD_ARCH_TRY(map_copy(b, hscale, "model.hc_head.hc_head_scale"));
-    RAD_ARCH_TRY(d.put(hfn, RAD_F32, { s.hc, s.hc * s.n_embd }, grp_model()));
-    RAD_ARCH_TRY(d.put(hbase, RAD_F32, { s.hc }, grp_model()));
-    RAD_ARCH_TRY(d.put(hscale, RAD_F32, { 1 }, grp_model()));
+    RAD_ARCH_TRY(map_copy_alt(b, headn, "lm_head.weight", "model.embed_tokens.weight"));
+    for (const char* n : { token, headn })
+        if (!is_plain_bf16(b, n))
+            return refuse("a quantised embedding or lm_head is not served yet (WP10)");
+    m.token = decl_w(b, token, RAD_BF16, { s.n_vocab, s.n_embd }, RAD_ACCESS_VOCAB, RAD_SHARD_NONE,
+                     grp_model());
+    m.head = decl_w(b, headn, RAD_BF16, { s.n_vocab, s.n_embd }, RAD_ACCESS_VOCAB, RAD_SHARD_NONE,
+                    grp_model());
+    m.final_gain = decl_f32(b, nm.f("output_norm.weight"), "model.norm.weight", { s.n_embd },
+                            grp_model());
+    if (!m.token || !m.head || !m.final_gain) return RAD_E_INVAL;
+    m.n_weights += 3;
 
-    for (int64_t l = 0; l < s.n_layer; ++l) RAD_ARCH_TRY(trunk_layer(b, m, (int)l));
+    /* The routed arms' format, before any buffer (MoeFP8::probe maps each probed expert). */
+    std::vector<MoeFP8::Src> msrc((size_t)s.n_layer);
+    for (int l = 0; l < (int)s.n_layer; ++l)
+        if (s.is_moe[(size_t)l]) RAD_ARCH_TRY(Ffn::probe(b, nm, s, l, &msrc[(size_t)l]));
+
+    RAD_ARCH_TRY(buffers(b, m));
+    const int64_t T = g.max_tok, E = s.n_embd;
+    m.embed = mk(b, "embed_lookup",
+                 { RAD_RANGE("M", 1, T), RAD_INT("n_embd", E), RAD_INT("n_vocab", s.n_vocab),
+                   RAD_STR("dtype", "bf16") },
+                 { m.token }, {}, { m.x0 });
+    m.op_stream = decl_copy(b, T, E, RAD_BF16, m.x0, m.tr.h);
+    HY4_NEED(m.embed, "embed_lookup");
+    HY4_NEED(m.op_stream, "cast");
+    RAD_ARCH_TRY(m.t_embed.declare(b, nm, T, "embed", -1, RAD_BF16, E, m.x0));
+
+    if (!s.engram_layers.empty()) {
+        /* One CONV state a layer (each Engram layer advances its own window once a step): the last
+         * ngram - 1 token ids, i32. */
+        RadKVGroupDecl d{};
+        d.kind = RAD_KV_CONV;
+        d.dtype = RAD_I32;
+        d.conv_width = s.engram_ngram;
+        d.n_head_kv = 1;
+        d.head_dim = 1;
+        m.kv_engram = rad_decl_kv_group(b, nm.f("kv_engram_tokens"), &d);
+        if (!m.kv_engram) return RAD_E_INVAL;
+        if (s.engram_pad < 0) return refuse("the config has Engram layers and no engram_pad_id");
+    }
+    m.engrams.resize(s.engram_layers.size());
+    m.layers.resize((size_t)s.n_layer);
+    for (int l = 0; l < (int)s.n_layer; ++l) RAD_ARCH_TRY(trunk_layer(b, m, l, &msrc[(size_t)l]));
+
+    /* The head: the streams' collapse, the final norm, the lm_head over the sampled rows. */
+    RAD_ARCH_TRY(m.hc_head.declare(b, nm, s, T, nm.f("hc_head"), "model.hc_head.hc_head_fn",
+                                   "model.hc_head.hc_head_base", "model.hc_head.hc_head_scale",
+                                   grp_model(), true, m.tr.h, m.tr.x, 0));
+    RAD_ARCH_TRY(m.t_hc_head.declare(b, nm, T, "hc_head_out", -1, RAD_BF16, E, m.tr.x));
+    m.op_norm = decl_rmsnorm(b, T, E, s.eps, m.final_gain, m.tr.x, m.final_hidden);
+    RAD_ARCH_TRY(m.t_final.declare(b, nm, T, "final_hidden", -1, RAD_BF16, E, m.final_hidden));
+    m.op_gather = mk(b, "gather_rows",
+                     { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", E),
+                       RAD_STR("dtype", "bf16") },
+                     {}, { m.final_hidden }, { m.logit_input });
+    m.op_head = mk(b, "logits_gemm",
+                   { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", s.n_vocab),
+                     RAD_INT("n_embd", E), RAD_STR("dtype", "bf16") },
+                   { m.head }, { m.logit_input }, { m.logits });
+    HY4_NEED(m.op_norm && m.op_gather && m.op_head, "rmsnorm / gather_rows / logits_gemm");
+
     /* A container carries what the model can serve, so the drafter and the tower are declared
      * wherever the checkpoint has them and the caller left room (rad-convert's --max-spec 0
-     * leaves the drafter out). */
+     * leaves the drafter out). Neither is served by this build. */
     const bool dfly = s.dfly_layers > 0 && ctx->max_spec > 0;
     const bool vit = s.v_layers > 0 && s.v_embd > 0 && s.v_patch > 0 && s.v_merge > 0 &&
                      ctx->max_enc_patches > 0;
@@ -732,28 +785,109 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     rad_note(b,
              "Hy4-flash (hyv4flash): %lld layers over %lld streams, %lld sparse + %lld sliding "
-             "MLA, %lld latent MoE of %lld experts, %zu Engram tables, DFly2 %s, vision %s; "
-             "%lld weights declared",
+             "MLA (window %lld, dense to %lld keys), %lld latent MoE of %lld experts top-%lld, "
+             "%zu Engram tables (eps %g), DFly2 %s, vision %s; TP1, bf16%s",
              (long long)s.n_layer, (long long)s.hc, (long long)n_sparse,
-             (long long)(s.n_layer - n_sparse), (long long)n_moe, (long long)s.n_expert,
-             s.engram_layers.size(), dfly ? "declared" : "left out", vit ? "declared" : "left out",
-             (long long)m.n_weights);
-    rad_note(b, "hyv4flash declares the weight manifest and name map only: a container converts "
-                "and inspects, and does not serve until the graph is written");
+             (long long)(s.n_layer - n_sparse), (long long)s.window, (long long)s.dense_limit,
+             (long long)n_moe, (long long)s.n_expert, (long long)s.top_k, s.engram_layers.size(),
+             s.engram_layers.empty() ? 0.0 : engram_eps(),
+             dfly ? "declared (not served)" : "left out", vit ? "declared (not served)" : "left out",
+             taps_on() ? ", debug taps" : "");
     return RAD_OK;
 }
 
-/* Nothing unimplemented returns success: a step is refused by name. */
-static void step(RadCtx* c, const RadBatch*) {
-    rad_step_fail(c, "hyv4flash declares Hy4-flash's weights for rad-convert and has no serving "
-                     "graph yet; this container cannot run a step");
+/* ------------------------------------------------------------------ step */
+static StepPlan plan(const Model& m, const RadBatch* batch) {
+    StepPlan p;
+    p.T = batch->n_tok;
+    p.S = batch->n_seq;
+    batch_split(batch, &p.D, &p.DT);
+    p.P = p.S - p.D;
+    /* The longest context after the step, from the host mirrors. */
+    int64_t ctx_max = (int64_t)batch->max_ctx_len + batch->max_q_len;
+    int64_t zeros = 0;
+    if (batch->positions_h) {
+        ctx_max = 0;
+        for (int64_t t = 0; t < p.T; ++t) {
+            ctx_max = std::max<int64_t>(ctx_max, (int64_t)batch->positions_h[t] + 1);
+            if (t >= p.DT && batch->positions_h[t] == 0) ++zeros;
+        }
+    }
+    p.select = m.s.dense_limit > 0 && ctx_max > m.s.dense_limit;
+    /* Every prefill sequence of the step starts at position 0 (one row at 0 each): its keys are
+     * this step's rows, which the non-absorbed path reads. */
+    p.nonabs = !m.force_absorbed && batch->positions_h && p.P > 0 && zeros == p.P;
+    /* The indexer's live block columns: the reach the batch bounds on the host. */
+    const int64_t r = m.s.ix_pool > 0 ? m.s.ix_pool : 4;
+    int64_t live = ((int64_t)batch->max_ctx_len + p.T + batch->n_spec + r) / r + 1;
+    if (live > m.iw.blocks) live = m.iw.blocks;
+    if (m.kv_index)
+        if (const auto* ib = kv_batch(batch, m.kv_index))
+            if (live > ib->block_table_pitch) live = ib->block_table_pitch;
+    p.live = live < 1 ? 1 : live;
+    return p;
+}
+
+static void step(RadCtx* c, const RadBatch* batch) {
+    Model& m = *models[rad_slot(c)];
+    const auto& s = m.s;
+    const int64_t T = batch->n_tok, E = s.n_embd;
+    if (batch->enc || batch->draft_pass || batch->gen) {
+        rad_step_fail(c, "hyv4flash serves the text trunk; pictures, the DFly2 drafter and "
+                         "generator passes are not built (WP13, WP15)");
+        return;
+    }
+    if (batch->n_mm_rows > 0) {
+        rad_step_fail(c, "hyv4flash serves text; this step carries media rows (WP15)");
+        return;
+    }
+    const StepPlan p = plan(m, batch);
+    RAD_ISSUE_N(c, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.x0, T));
+    m.t_embed.step(c, brows(m.x0, T), T);
+    for (int64_t j = 0; j < s.hc; ++j)
+        RAD_ISSUE_N(c, m.op_stream, T, brows(m.x0, T), bcol(m.tr.h, j * E, E, T));
+
+    for (size_t i = 0; i < m.layers.size(); ++i) {
+        const Layer& l = m.layers[i];
+        if (l.engram >= 0 && !m.engrams[(size_t)l.engram].step(c, batch)) return;
+        l.t_stream_in.step(c, brows(m.tr.h, T), T);
+        l.hc_attn.pre(c, m.tr.h, m.tr.x, m.tr.post, T);
+        l.t_attn_x.step(c, brows(m.tr.x, T), T);
+        l.t_attn_post.step(c, brows(m.tr.post, T), T);
+        RAD_ISSUE_N(c, l.op_attn_norm, T, brows(m.tr.x, T), RAD_W(l.attn_gain), brows(m.tr.xn, T));
+        if (!l.attn.front(c, batch)) return;
+        if (!l.sliding && !l.ix.step(c, batch, p)) return;
+        l.attn.core(c, batch, p, m.iw.sel, m.iw.len);
+        l.hc_attn.post_add(c, m.tr.y, m.tr.post, m.tr.h, T);
+        l.t_mid.step(c, brows(m.tr.h, T), T);
+
+        l.hc_ffn.pre(c, m.tr.h, m.tr.x, m.tr.post, T);
+        l.t_ffn_x.step(c, brows(m.tr.x, T), T);
+        l.t_ffn_post.step(c, brows(m.tr.post, T), T);
+        RAD_ISSUE_N(c, l.op_ffn_norm, T, brows(m.tr.x, T), RAD_W(l.ffn_gain), brows(m.tr.xn, T));
+        l.t_ffn_in.step(c, brows(m.tr.xn, T), T);
+        if (!l.ffn.step(c, batch)) return;
+        l.hc_ffn.post_add(c, m.tr.y, m.tr.post, m.tr.h, T);
+        l.t_resid.step(c, brows(m.tr.h, T), T);
+    }
+    m.hc_head.pre(c, m.tr.h, m.tr.x, 0, T);
+    m.t_hc_head.step(c, brows(m.tr.x, T), T);
+    RAD_ISSUE_N(c, m.op_norm, T, brows(m.tr.x, T), RAD_W(m.final_gain), brows(m.final_hidden, T));
+    m.t_final.step(c, brows(m.final_hidden, T), T);
+    if (batch->n_out > 0) {
+        RAD_ISSUE_N(c, m.op_gather, batch->n_out, brows(m.final_hidden, T),
+                    praw(batch->out_ids, RAD_I32, batch->n_out), brows(m.logit_input, batch->n_out));
+        RAD_ISSUE_N(c, m.op_head, batch->n_out, brows(m.logit_input, batch->n_out), RAD_W(m.head),
+                    brows(m.logits, batch->n_out));
+    }
 }
 } // namespace hyv4flash
 
 #ifndef RAD_ARCH_NO_EXPORTS
-/* The manifest's state is indexed by slot (rad_build_slot). */
+/* The model's state is indexed by slot (rad_build_slot). */
 RAD_ARCH_MULTI_INSTANCE()
-RAD_ARCH_PLUGIN(hyv4flash, "hyv4flash", "", "0.1.0",
-                "Tencent Hy4-flash: the weight manifest and checkpoint name map (conversion only)")
+RAD_ARCH_PLUGIN(hyv4flash, "hyv4flash", "", "0.2.0",
+                "Tencent Hy4-flash: the text trunk at one rank (bf16), the weight manifest and "
+                "checkpoint name map")
 RAD_ARCH_CHAT_FORMAT(hyv4flash)
 #endif
