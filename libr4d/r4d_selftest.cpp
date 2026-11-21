@@ -37536,6 +37536,9 @@ static void device_phase(const Plugin& pl) {
     if (sel("swiglu_clamped_bf16")) {
         for (int64_t rows : { 1, 7, 33 })
             for (int64_t n : { 31, 259, 4096 }) mhc_check(pl, "swiglu_clamped_bf16", rows, n, 0);
+        /* A routed pass over a spanned prefill step: tokens x top_k rows (8192 x 16 on Hy4-flash),
+         * past the 65535 the kernel once refused (the rows are the grid's first dimension, 2^31 deep). */
+        for (int64_t rows : { 65536, 131072 }) mhc_check(pl, "swiglu_clamped_bf16", rows, 768, 0);
     }
     if (sel("swiglu_step_bf16")) {
         for (int64_t rows : { 1, 7, 33 })

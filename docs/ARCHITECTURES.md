@@ -3641,6 +3641,16 @@ are refused ("--draft-coupling on, but the architecture declared no coupled MTP 
 uncoupled (the coupled walk, WP13.8, is not built). `--spec-ngram` is refused beside a declared
 drafter (`RADIANCE_HY4_DFLY=0` gives prompt lookup alone).
 
+**Long prefills (`prefill-span`, `busy-prefill-chunk`).** The routed block runs one pass over the whole
+step (MoeFP8's `rows` is `max-num-batched-tokens`), so a routed pass is `tokens x top_k` rows: 8192 x 16
+= 131072 under `max-num-batched-tokens: 8192` (`prefill-span: 4`, `prefill-span-pass: step`, `prefill-span-first: on`).
+libr4d's `swiglu_clamped_bf16` and the fused `swiglu_clamped_quant` once refused past 65535 rows and stopped the engine
+at a 19.5K-token prompt; they serve up to 2^31 - 1 rows now. Leave `busy-prefill-chunk` at its default (`auto`): on this
+model the prefill stager overlaps from a 4097-token step, `auto` never holds a chunk under it, and an explicit
+`busy-prefill-chunk: 1088` (Flash-Next's value) is under it, which the startup warns about and which cost -26 % prefill
+(every routed layer then reads its pooled experts synchronously). An explicit N must be at least the stager's step
+(startup line `prefill staging: ...`, the warning names it; 4160 with a 64-token quantum).
+
 **Losslessness** is the gate, since a draft can never change the text: (1) `hyv4flash_arch_test`
 (the declared graph at one, two and four ranks, lint clean on every step kind, the query pass touching
 no trunk state, the refusals above, quantised linears at TP1 and TP2); (2) greedy ids and logprobs

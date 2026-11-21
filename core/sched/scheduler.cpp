@@ -1432,7 +1432,9 @@ void Scheduler::set_stage_rows(int64_t rows) {
             RAD_WARN("scheduler: --busy-prefill-chunk %lld is under the %lld-token step the prefill "
                      "stager overlaps at: a held-back chunk alone reads every routed layer's "
                      "pooled experts synchronously, which slows a long prefill far more than the "
-                     "smaller step saves", (long long)n, (long long)stage_rows_);
+                     "smaller step saves (leave it at auto, which keeps the floor, or set "
+                     "at least %lld)", (long long)n, (long long)stage_rows_,
+                     (long long)stage_rows_);
         return;
     }
     RAD_INFO("scheduler: --busy-prefill-chunk auto: a prefill chunk sharing a step leaves decode "

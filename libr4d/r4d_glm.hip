@@ -482,7 +482,7 @@ int clamped_body(const RadArgs* a, RadStream stream, bool step = false) {
     const float limit = (float)r4d_getf(a, "limit", 0);
     if (gu.dtype != RAD_BF16 || y.dtype != RAD_BF16) return RAD_E_DTYPE;
     if (n < 1 || n > INT_MAX / 2 || !std::isfinite(limit) || limit <= 0 || !gu.data || !y.data ||
-        gu.rank != 2 || y.rank != 2 || y.shape[0] < 1 || y.shape[0] > 65535 ||
+        gu.rank != 2 || y.rank != 2 || y.shape[0] < 1 || y.shape[0] > INT_MAX ||
         gu.shape[0] != y.shape[0] || gu.shape[1] != 2 * n || y.shape[1] != n || gu.stride[1] != 1 ||
         y.stride[1] != 1 || gu.stride[0] < 2 * n || y.stride[0] < n)
         return RAD_E_SHAPE;
@@ -549,7 +549,7 @@ int clamped_quant_body(const RadArgs* a, RadStream stream) {
         return RAD_E_DTYPE;
     if (r4d_geti_or(a, "group", 128) != 128 || n < 4 || n % 4 || n > INT_MAX / 2 ||
         !std::isfinite(limit) || limit <= 0 || !gu.data || !q.data || !sc.data || gu.rank != 2 ||
-        q.rank != 2 || sc.rank != 2 || gu.shape[0] < 1 || gu.shape[0] > 65535 ||
+        q.rank != 2 || sc.rank != 2 || gu.shape[0] < 1 || gu.shape[0] > INT_MAX ||
         gu.shape[1] != 2 * n || q.shape[0] != gu.shape[0] || q.shape[1] != n ||
         sc.shape[0] != gu.shape[0] || sc.shape[1] != nkb || gu.stride[1] != 1 || q.stride[1] != 1 ||
         sc.stride[1] != 1 || gu.stride[0] < 2 * n || q.stride[0] < n || sc.stride[0] < nkb ||

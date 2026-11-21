@@ -271,7 +271,7 @@ is positive and finite (GLM-5.3's is 10). The clip precedes the SiLU, and the ga
 clip.
 
 libr4d's `swiglu_clamped_bf16` serves bf16 in and out at any width, pitched rows, `M` up to
-65535.
+2^31 - 1 (a routed pass of a spanned step is 131072 rows on Hy4-flash).
 
 `swiglu_step` clips in the other order, as Ling-3.0 is served by vLLM and SGLang (vLLM's
 `SwigluStepAndMul`): `min(silu(gate), limit) * clamp(up, -limit, limit)` in f32, rounded once. The
