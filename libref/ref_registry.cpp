@@ -181,6 +181,9 @@ static const RadParamSpec pGridEmbedCpe[] = { P_INT("M"), P_INT("n"), P_INT("sid
                                               P_INTO("n_prefix") };
 static const RadOperandSpec oGridEmbedCpe[] = { INOUT("x"), WGT("table"), OPD("coord"),
                                                 WGT_O("prefix") };
+/* grid_embed_sf: the scale-factor resample, its offset in f64 (Hy4-flash's (size + 0.1) / side). */
+static const RadParamSpec pGridEmbedSf[] = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype"),
+                                             P_F64O("offset") };
 
 /* LiLiCorr's correlator (ref_lili.cpp). */
 static const RadParamSpec pLiliCand[] = { P_INT("M"), P_INT("k"), P_INT("world"), P_INT("steps"),
@@ -1312,6 +1315,14 @@ static const RadOpSchema kSchemas[] = {
   "top-left part: RADIO's cropped position embedding (CPE). Per axis two taps at (i + 0.5) * side / "
   "d - 0.5, clamped at 0 and into the table, blended along the row first; f32, rounded once before "
   "the add. A row whose coordinate row is negative is the k-th of `n_prefix` learned rows ahead of its segment (RADIO's class and register tokens), k its column: it gets `prefix[k]` instead, rounded the same way." },
+{ "grid_embed_sf", ARR(pGridEmbedSf), ARR(oGridEmbed),
+  "x += the side x side table resampled as torch's F.interpolate(bilinear, align_corners=False) "
+  "with scale_factor (size + offset) / side on each axis -- no antialias, the output side is the "
+  "grid's, and torch maps output i to src = (i + 0.5) / scale - 0.5 with 1 / scale formed in f64 "
+  "and rounded to f32, so the offset shifts the sampling grid (Hy4-flash's tower, offset 0.1); "
+  "an axis whose size is the table's side keeps scale 1, torch's identity. "
+  "Two taps an axis, src clamped at 0 and the upper tap into the table, the row blended first; "
+  "f32, rounded once to x's dtype before the add." },
 { "lili_cand", ARR(pLiliCand), ARR(oLiliCand),
   "LiLiCorr's candidates. `stats` [M, world * (2 + 2k)] f32 is each rank's sample_logprobs row, "
   "row-interleaved; the ranks merge to the log-normaliser and the k largest pairs by value, ties to "
@@ -1784,7 +1795,8 @@ static const RadOpSchema kSchemas[] = {
 { "rope", ARR(pRope), ARR(oRope),
   "Rotary embedding in place over the q and k heads of a fused [q|k|v] row; the v heads are left "
   "alone. `mode` is \"neox\" or \"gptj\", or a multi-component form: \"mrope\" (contiguous "
-  "`sections` of frequencies, one ladder), \"imrope\" (Qwen3-VL's interleaved sections) or "
+  "`sections` of frequencies, one ladder), \"imrope\" (Qwen3-VL's interleaved sections), "
+  "\"imrope_gptj\" (imrope's components over GPT-J's adjacent pairs, Hy4-flash's M-RoPE) or "
   "\"axial\" (contiguous sections, each on its own ladder -- a 2-D rotary). `positions` is [M], "
   "or [C, M] component-major for a multi-component mode; with [M] every component is that one. "
   "An f32 `positions` holds the positions as they are (fractional coordinates), an integer one "
@@ -2510,6 +2522,9 @@ SIMPLE("ref_grid_embed_aa", "grid_embed_aa", "elem",
 SIMPLE("ref_grid_embed_cpe", "grid_embed_cpe", "elem",
        "half-pixel bilinear resample of a position grid onto a square, cropped, added in", DT_FLOAT,
        ref_grid_embed_cpe),
+SIMPLE("ref_grid_embed_sf", "grid_embed_sf", "elem",
+       "half-pixel bilinear resample of a position grid at a stated scale factor, added in",
+       DT_FLOAT, ref_grid_embed_sf),
 SIMPLE("ref_lili_cand", "lili_cand", "draft", "LiLiCorr candidates and their features",
        DT_FLOAT, ref_lili_cand),
 SIMPLE("ref_lili_attn", "lili_attn", "draft", "LiLiCorr lattice attention with slot biases",

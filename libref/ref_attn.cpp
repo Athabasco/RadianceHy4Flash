@@ -806,7 +806,8 @@ namespace {
  *           frequency: the vision tower's 2-D rotary embedding over (row, column).
  * With one position component per token (rank-1 `positions`) every component is the same, and
  * mrope and imrope reduce to neox. */
-enum { ROPE_NEOX = 0, ROPE_GPTJ = 1, ROPE_MROPE = 2, ROPE_IMROPE = 3, ROPE_AXIAL = 4 };
+enum { ROPE_NEOX = 0, ROPE_GPTJ = 1, ROPE_MROPE = 2, ROPE_IMROPE = 3, ROPE_AXIAL = 4,
+       ROPE_IMROPE_GPTJ = 5 };
 
 struct RopeFreq {
     int   comp[REF_HD_MAX / 2];
@@ -833,7 +834,7 @@ static int rope_freqs(int mode, int64_t rot, int64_t den, float theta, const int
                 const int64_t j = i - start[c];
                 inv = 1.0f / ref_pow(theta, (float)(2 * j) / (float)(2 * sec[c]));
             }
-        } else if (n_sec >= 3 && mode == ROPE_IMROPE) {
+        } else if (n_sec >= 3 && (mode == ROPE_IMROPE || mode == ROPE_IMROPE_GPTJ)) {
             if (i % 3 == 1 && i < 3 * sec[1]) c = 1;
             else if (i % 3 == 2 && i < 3 * sec[2]) c = 2;
         }
@@ -849,8 +850,9 @@ static void rope_head(const RadTensor* t, int64_t base, int64_t ds, int64_t rot,
     for (int64_t i = 0; i < half; ++i) {
         const float ang = pos[f.comp[i]] * f.inv[i];
         const float c = ref_cos(ang) * magnitude, s = ref_sin(ang) * magnitude;
-        const int64_t i0 = (mode == ROPE_GPTJ) ? 2 * i : i;
-        const int64_t i1 = (mode == ROPE_GPTJ) ? 2 * i + 1 : i + half;
+        const bool adj = mode == ROPE_GPTJ || mode == ROPE_IMROPE_GPTJ;
+        const int64_t i0 = adj ? 2 * i : i;
+        const int64_t i1 = adj ? 2 * i + 1 : i + half;
         const float x0 = ldt(t, base + i0 * ds), x1 = ldt(t, base + i1 * ds);
         stt(t, base + i0 * ds, x0 * c - x1 * s);
         stt(t, base + i1 * ds, x0 * s + x1 * c);
@@ -935,8 +937,10 @@ int ref_rope(const RadArgs* a, RadStream) {
     const int64_t n_head_kv = p_int(a, "n_head_kv", 0);
     const float   theta     = p_f32(a, "theta", 10000.0f);
     const float   rscale    = p_f32(a, "scale", 1.0f);
-    static const char* kModes[] = { "neox", "gptj", "mrope", "imrope", "axial" };
-    const int mode = p_enum(a, "mode", kModes, 5, -1);
+    /* imrope_gptj is imrope's component rule over GPT-J's adjacent pairs (Hy4-flash's M-RoPE:
+     * pair j turns by the frequency j and the component imrope gives frequency j). */
+    static const char* kModes[] = { "neox", "gptj", "mrope", "imrope", "axial", "imrope_gptj" };
+    const int mode = p_enum(a, "mode", kModes, 6, -1);
     if (mode < 0) return RAD_E_UNSUPPORTED;
     int64_t rot = p_int(a, "rotary_dim", head_dim);
     if (head_dim <= 0 || n_head <= 0 || rot <= 0 || rot > head_dim || (rot & 1)) return RAD_E_SHAPE;
@@ -952,7 +956,7 @@ int ref_rope(const RadArgs* a, RadStream) {
     const int64_t M = multi ? pos->shape[1] : numel(pos);
     if (multi) {
         if (mode == ROPE_NEOX || mode == ROPE_GPTJ || n_sec <= 0) return RAD_E_SHAPE;
-        const int64_t need = mode == ROPE_IMROPE ? 3 : n_sec;
+        const int64_t need = (mode == ROPE_IMROPE || mode == ROPE_IMROPE_GPTJ) ? 3 : n_sec;
         if (n_comp < need || n_comp > 8) return RAD_E_SHAPE;
     }
     /* The proportional ladder (`head`) is HF's: the rotation spans the whole head, pair i being

@@ -2352,6 +2352,9 @@ static const RadOperandSpec oGridEmbedCpe[] = {
     { "coord",  RAD_OPD_IN,     0 },
     { "prefix", RAD_OPD_WEIGHT, 1 },
 };
+static const RadParamSpec pGridEmbedSf[] = {
+    P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype"), P_F64O("offset"),
+};
 static const RadParamSpec pGemmBias[] = {
     P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype"),
     { "act", RAD_P_STR, RAD_OPTIONAL },
@@ -3459,7 +3462,8 @@ static const RadOpSchema kSchemas[] = {
            "destination has no defined winner on a parallel machine."),
     SCHEMA("rope", pRope, oRope,
            "rotary embedding in place over the Q and K heads of a fused projection; the V heads "
-           "that follow are untouched. The multi-component modes (`mrope`, `imrope`, `axial`) "
+           "that follow are untouched. The multi-component modes (`mrope`, `imrope`, `axial`, "
+           "and `imrope_gptj`: imrope's components over GPT-J's adjacent pairs) "
            "take [C, M] component-major positions and `sections`; with [M] positions every "
            "component is that one, so mrope and imrope over a text batch are neox exactly."),
     SCHEMA("rope_rows", pRope, oRope,
@@ -3504,6 +3508,13 @@ static const RadOpSchema kSchemas[] = {
            "width), of which the grid keeps the top-left part: RADIO's cropped position embedding. "
            "Two taps an axis, the row blended first; f32, rounded once before the add. A row "
            "whose row coordinate is negative gets the learned prefix row its column names."),
+    SCHEMA("grid_embed_sf", pGridEmbedSf, oGridEmbed,
+           "x += the side x side table resampled as torch's F.interpolate(bilinear, "
+           "align_corners=False) with scale_factor (size + offset) / side an axis -- no "
+           "antialias; output i samples src = (i + 0.5) / scale - 0.5 with 1 / scale formed in f64 "
+           "and rounded to f32 (an axis of the table's own size keeps scale 1): Hy4-flash's "
+           "position embedding (offset 0.1). Two taps an axis, the "
+           "row blended first; f32, rounded once before the add."),
     SCHEMA("gemm_nt_bias", pGemmBias, oGemmBias,
            "y = res + act(a @ b^T + bias), rounded to bf16 after the biased product, after the "
            "activation and after the residual -- the unfused chain's three tensors."),
@@ -6247,7 +6258,7 @@ static const RadConstraint cKvStoreStreamedBf16[] = { C_GE("block_size", 1),
 static const RadConstraint cKvStoreI8[] = { C_GE("block_size", 1), C_DIV("head_dim", 4),
                                             C_LE("head_dim", 1024), C_IN("kv_dtype", "i8") };
 static const RadConstraint cRopeRow[]   = { C_GE("head_dim", 1),
-                                            C_IN("mode", "neox mrope gptj imrope axial") };
+                                            C_IN("mode", "neox mrope gptj imrope axial imrope_gptj") };
 /* The vision tower's rows. The GEMM stages 16-byte chunks, so K is a multiple of 8; the norm and
  * the position embedding take any width. */
 static const RadConstraint cLayernorm[] = { C_GE("n", 1), C_IN("dtype", "bf16") };
@@ -6832,6 +6843,15 @@ static const RadKernelInfo kKernels[] = {
   ROW(cGridEmbed), NOTUNE,
   nullptr, nullptr, r4d_rad_grid_embed_cpe, nullptr, nullptr, nullptr,
   r4d_shape_grid_embed_cpe },
+
+{ "grid_embed_sf_bf16", "grid_embed_sf", "elem",
+  "a learned position grid resampled half-pixel bilinear at a stated scale factor (Hy4-flash)",
+  "any n and side; coord [4, M] dense; one workgroup a row",
+  "bf16 x, bf16 or f32 table, i32 coord, f32 taps",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGridEmbed), NOTUNE,
+  nullptr, nullptr, r4d_rad_grid_embed_sf, nullptr, nullptr, nullptr,
+  r4d_shape_grid_embed },
 
 { "grid_embed_pad_bf16", "grid_embed_pad", "elem",
   "the position grid resampled half-pixel bilinear with zero-padded off-table taps and added in "

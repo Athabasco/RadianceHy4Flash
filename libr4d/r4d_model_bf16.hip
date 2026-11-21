@@ -2484,6 +2484,9 @@ static int rope_emit(const RadArgs* a, RadStream s, bool rows_form) {
         if (!std::strcmp(mode, "gptj")) gptj = 1;
         else if (!std::strcmp(mode, "mrope")) mc = 2;
         else if (!std::strcmp(mode, "imrope")) mc = 3;
+        /* imrope's components over GPT-J's adjacent pairs (Hy4-flash): rope_body's pairing and
+         * its component rule are independent, so this is the two flags together. */
+        else if (!std::strcmp(mode, "imrope_gptj")) { mc = 3; gptj = 1; }
         else if (!std::strcmp(mode, "axial")) mc = 4;
         else if (std::strcmp(mode, "neox")) return R4D_NO(RAD_E_SCHEMA);
     }

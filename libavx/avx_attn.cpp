@@ -1395,9 +1395,12 @@ AVX_KERNEL(rope) {
     const int64_t n_head_kv = p_int(a, "n_head_kv", 0);
     const float theta = p_f32(a, "theta", 10000.0f);
     const float rscale = p_f32(a, "scale", 1.0f);
-    static const char* kModes[] = { "neox", "gptj", "mrope", "imrope", "axial" };
-    const int mode = p_enum(a, "mode", kModes, 5, -1);
+    /* imrope_gptj (index 5): imrope's components over GPT-J's adjacent pairs (libref). */
+    static const char* kModes[] = { "neox", "gptj", "mrope", "imrope", "axial", "imrope_gptj" };
+    int mode = p_enum(a, "mode", kModes, 6, -1);
     if (mode < 0) return RAD_E_UNSUPPORTED;
+    const bool adjacent = mode == ROPE_GPTJ || mode == 5;
+    if (mode == 5) mode = ROPE_IMROPE;
     int64_t rot = p_int(a, "rotary_dim", head_dim);
     if (head_dim <= 0 || n_head <= 0 || rot <= 0 || rot > head_dim || (rot & 1)) return RAD_E_SHAPE;
     int64_t den;
@@ -1429,7 +1432,8 @@ AVX_KERNEL(rope) {
     /* The proportional ladder (`head`) is HF's: the rotation spans the whole head (pair i is
      * (i, i + head_dim/2)) and every frequency past rotary_dim/2 is zero (libref: ref_rope). */
     const int64_t nfreq = rot / 2;
-    if (den == head_dim && rot < head_dim && !multi && mode == ROPE_NEOX) rot = head_dim;
+    if (den == head_dim && rot < head_dim && !multi && mode == ROPE_NEOX && !adjacent)
+        rot = head_dim;
     const int64_t half = rot / 2;
     if (half > AVX_HD_MAX / 2) return RAD_E_UNSUPPORTED;
     float* invf = inv_freqs(half, den, theta);
@@ -1452,7 +1456,7 @@ AVX_KERNEL(rope) {
             comp[i] = c;
         }
     }
-    const int pair_mode = mode == ROPE_GPTJ ? ROPE_GPTJ : ROPE_NEOX;
+    const int pair_mode = adjacent ? ROPE_GPTJ : ROPE_NEOX;
     const RadYarn yarn = rad_yarn_args(a);
     if (!rad_yarn_valid(yarn)) return RAD_E_INVAL;
     if (yarn.factor != 0.0f) {

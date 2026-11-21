@@ -9548,6 +9548,77 @@ static void scale_case(const Plugin& pl) {
     }
 }
 
+/* grid_embed_sf_bf16 against libref's grid_embed_sf (Hy4-flash's position embedding): two segments
+ * of one pass, one of them at the table's own height (the identity axis), offset 0.1, a bf16
+ * and an f32 table. Both sides compute the same f32 expressions in the same order, so the bytes
+ * must agree. */
+static void grid_embed_sf_case(const Plugin& pl) {
+    const char* what = "grid_embed_sf against libref's grid_embed_sf";
+    const RadKernelInfo* r = find(pl, "grid_embed_sf_bf16");
+    const RadKernelInfo* ref = usel_libref_row("grid_embed_sf");
+    if (!r) { ok(what, false, "row absent"); return; }
+    if (!ref) { skip(what, "libref's grid_embed_sf unavailable"); return; }
+    const int64_t side = 8, n = 72;
+    const int segs[2][2] = { { 8, 6 }, { 4, 10 } };
+    int64_t M = 0;
+    for (const auto& g : segs) M += (int64_t)g[0] * g[1];
+    std::vector<int32_t> crd((size_t)(4 * M));
+    int64_t at = 0;
+    for (const auto& g : segs)
+        for (int y = 0; y < g[0]; ++y)
+            for (int x = 0; x < g[1]; ++x, ++at) {
+                crd[(size_t)at] = y;
+                crd[(size_t)(M + at)] = x;
+                crd[(size_t)(2 * M + at)] = g[0];
+                crd[(size_t)(3 * M + at)] = g[1];
+            }
+    for (const bool tf32 : { false, true }) {
+        std::vector<uint16_t> x0((size_t)(M * n)), tb((size_t)(side * side * n));
+        std::vector<float> tf((size_t)(side * side * n));
+        for (int64_t i = 0; i < M * n; ++i)
+            x0[(size_t)i] = h_to_bf16((float)std::sin(0.37 * (double)i) * 2.0f);
+        for (int64_t i = 0; i < side * side * n; ++i) {
+            tf[(size_t)i] = (float)std::cos(0.11 * (double)i + 0.5) * 3.0f;
+            tb[(size_t)i] = h_to_bf16(tf[(size_t)i]);
+            if (!tf32) tf[(size_t)i] = h_bf16(tb[(size_t)i]);
+        }
+        void* d_x = dalloc(x0.size() * 2);
+        void* d_t = dalloc(tf.size() * 4);
+        void* d_c = dalloc(crd.size() * 4);
+        if (!d_x || !d_t || !d_c) { ok(what, false, "hipMalloc failed"); return; }
+        st_memcpy(d_x, x0.data(), x0.size() * 2, hipMemcpyHostToDevice);
+        if (tf32) st_memcpy(d_t, tf.data(), tf.size() * 4, hipMemcpyHostToDevice);
+        else      st_memcpy(d_t, tb.data(), tb.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_c, crd.data(), crd.size() * 4, hipMemcpyHostToDevice);
+        std::vector<RadParam> ps = { PI("M", M), PI("n", n), PI("side", side), PF("offset", 0.1),
+                                     PS("dtype", "bf16") };
+        RadArgs a;
+        std::memset(&a, 0, sizeof a);
+        a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
+        const uint32_t tdt = tf32 ? RAD_F32 : RAD_BF16;
+        std::vector<RadTensor> ts = { T(d_x, RAD_BF16, { M, n }), T(d_t, tdt, { side * side, n }),
+                                      T(d_c, RAD_I32, { 4, M }) };
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        int rc = r->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        if (rc != RAD_OK) { ok(what, false, "launch rc=" + std::to_string(rc)); return; }
+        std::vector<uint16_t> got(x0.size());
+        st_memcpy(got.data(), d_x, got.size() * 2, hipMemcpyDeviceToHost);
+        std::vector<uint16_t> want = x0;
+        std::vector<RadTensor> th = { T(want.data(), RAD_BF16, { M, n }),
+                                      T(tf32 ? (void*)tf.data() : (void*)tb.data(), tdt,
+                                        { side * side, n }),
+                                      T(crd.data(), RAD_I32, { 4, M }) };
+        a.t = th.data(); a.n_t = (int)th.size();
+        rc = ref->launch(&a, nullptr);
+        if (rc != RAD_OK) { ok(what, false, "libref rc=" + std::to_string(rc)); return; }
+        int64_t diff = 0;
+        for (size_t i = 0; i < got.size(); ++i) diff += got[i] != want[i];
+        ok(fmt("%s (%s table, %lld rows)", what, tf32 ? "f32" : "bf16", (long long)M).c_str(),
+           diff == 0, "bytes differing: " + std::to_string(diff));
+    }
+}
+
 /* rope_bf16 against an f32 mirror of rope_kernel at each ladder width. `den` is the ladder's
  * width (`rot` for `rotary`/absent, `head_dim` for `head`). The V head must stay untouched. rel_l2
  * catches a wrong angle, which magnitude alone would not (rotation preserves length). */
@@ -28023,9 +28094,10 @@ static bool idx_pool_run(const Plugin& pl, const RadKernelInfo* ref, int64_t W, 
     for (size_t i = 0; i < k.size(); ++i) k[i] = hk[(size_t)(k_off * ratio * n) + i];
     const int64_t comps = imrope ? 3 : 1;
     std::vector<int32_t> pos((size_t)(comps * W));
+    /* [W, 3] under imrope_gptj: a group's components side by side (qsa_work's bpos). */
     for (int64_t c = 0; c < comps; ++c)
         for (int64_t w = 0; w < W; ++w)
-            pos[(size_t)(c * W + w)] = hpos[(size_t)(c * pos_ld + pos_off + w)];
+            pos[(size_t)(w * comps + c)] = hpos[(size_t)(c * pos_ld + pos_off + w)];
     std::vector<int32_t> page((size_t)W);
     for (int64_t w = 0; w < W; ++w) page[(size_t)w] = hpage[(size_t)(pos_off + w)];
 
@@ -28059,7 +28131,7 @@ static bool idx_pool_run(const Plugin& pl, const RadKernelInfo* ref, int64_t W, 
         return std::vector<RadTensor>{
             T(k_, RAD_BF16, { W * ratio, n }), T(wv_, RAD_F32, { n, n }), T(wg_, RAD_F32, { n, n }),
             T(ape_, RAD_F32, { ratio, n }), T(gain_, gain_bf16 ? RAD_BF16 : RAD_F32, { n }),
-            imrope ? T(pos_, RAD_I32, { 3, W }) : T(pos_, RAD_I32, { W }), T(page_, RAD_I32, { W }),
+            imrope ? T(pos_, RAD_I32, { W, 3 }) : T(pos_, RAD_I32, { W }), T(page_, RAD_I32, { W }),
             T(cache_, RAD_BF16, { pages, 1, 4, n / 4 }), T(out_, RAD_BF16, { W, n }) };
     };
     std::vector<RadParam> ps = { PI("M", W), PI("n", n), PI("ratio", ratio), PI("rotary_dim", 64),
@@ -36374,6 +36446,11 @@ static void device_phase(const Plugin& pl) {
     if (sel("rope_bf16")) {
         if (!g_case) std::printf("\nthe rotary ladder, against an f32 mirror of the kernel at each width\n");
         rope_ladder_case(pl);
+    }
+
+    if (sel("grid_embed_sf_bf16")) {
+        if (!g_case) std::printf("\nHy4-flash's position embedding, against libref\n");
+        grid_embed_sf_case(pl);
     }
 
     /* The audio generator's ops and the optional forms a speech model adds, each against libref's

@@ -218,6 +218,50 @@ __global__ __launch_bounds__(kThr) void grid_embed_cpe_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------- grid_embed_sf
+// ref_grid_embed_sf: Hy4-flash's position embedding, torch's half-pixel bilinear without
+// antialias at the stated scale factor (size + offset) / side an axis. A segment's size is in its
+// coordinate planes, so each row forms 1 / scale itself, in f64 rounded to f32 as torch's
+// area_pixel_compute_scale does; the row blended first, as libref.
+__device__ __forceinline__ void sf_taps(int at, int size, int side, double offset, int* t,
+                                        float* w) {
+    size = size < 1 ? 1 : size;
+    at = at < 0 ? 0 : (at >= size ? size - 1 : at);
+    /* An axis that keeps its size is torch's identity (scale 1), whatever the stated factor. */
+    const float inv = size == side ? 1.0f : (float)(1.0 / (((double)size + offset) / (double)side));
+    float src = inv * ((float)at + 0.5f) - 0.5f;
+    src = src < 0.0f ? 0.0f : src;
+    int i0 = (int)src;
+    i0 = i0 > side - 1 ? side - 1 : i0;
+    t[0] = i0;
+    t[1] = i0 < side - 1 ? i0 + 1 : i0;
+    float l = src - (float)i0;
+    l = l < 0.0f ? 0.0f : (l > 1.0f ? 1.0f : l);
+    w[1] = l;
+    w[0] = 1.0f - l;
+}
+
+template <bool TF32>
+__global__ __launch_bounds__(kThr) void grid_embed_sf_kernel(
+    unsigned short* __restrict__ x, const void* __restrict__ tab, const int32_t* __restrict__ crd,
+    uint32_t n, int side, uint32_t x_ld, uint32_t plane, double offset) {
+    const uint32_t m = blockIdx.x;
+    const int g[4] = { crd[m], crd[plane + m], crd[2 * plane + m], crd[3 * plane + m] };
+    unsigned short* __restrict__ xr = x + (size_t)m * x_ld;
+    int th[2], tw[2];
+    float wh[2], ww[2];
+    sf_taps(g[0], g[2], side, offset, th, wh);
+    sf_taps(g[1], g[3], side, offset, tw, ww);
+    for (uint32_t i = threadIdx.x; i < n; i += kThr) {
+        const float r0 = __fadd_rn(__fmul_rn(ww[0], ldw<TF32>(tab, (uint32_t)(th[0] * side + tw[0]) * n + i)),
+                                   __fmul_rn(ww[1], ldw<TF32>(tab, (uint32_t)(th[0] * side + tw[1]) * n + i)));
+        const float r1 = __fadd_rn(__fmul_rn(ww[0], ldw<TF32>(tab, (uint32_t)(th[1] * side + tw[0]) * n + i)),
+                                   __fmul_rn(ww[1], ldw<TF32>(tab, (uint32_t)(th[1] * side + tw[1]) * n + i)));
+        const float pe = bf2f(f32_to_bf16(__fadd_rn(__fmul_rn(wh[0], r0), __fmul_rn(wh[1], r1))));
+        xr[i] = f32_to_bf16(bf2f(xr[i]) + pe);
+    }
+}
+
 // ---------------------------------------------------------------------------- gemm_nt_bias
 #define VB_BK 64
 #define VB_PITCH (VB_BK + 8)      // 144-byte LDS rows, as in gemm_bf16_nt_tiled (bank spread)
@@ -702,6 +746,36 @@ extern "C" int r4d_rad_grid_embed_cpe(const RadArgs* a, RadStream stream) {
     return R4D_EMIT(stream, grid_embed_cpe_kernel<false>, dim3((uint32_t)M), dim3(kThr), 0,
                     (unsigned short*)r4d_wp(x), r4d_p(tab), (const int32_t*)r4d_p(crd),
                     (uint32_t)n, (int)side, (uint32_t)x_ld, plane, pp, (int)npre);
+}
+
+/* grid_embed_sf: grid_embed's operands and checks, the scale-factor resample. */
+extern "C" int r4d_rad_grid_embed_sf(const RadArgs* a, RadStream stream) {
+    const RadTensor* x   = r4d_opt(a, GE_X);
+    const RadTensor* tab = r4d_opt(a, GE_TAB);
+    const RadTensor* crd = r4d_opt(a, GE_CRD);
+    if (!x || !tab || !crd) return R4D_NO(RAD_E_INVAL);
+    if (x->dtype != RAD_BF16 || crd->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
+    if (tab->dtype != RAD_BF16 && tab->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(tab)) return R4D_NO(RAD_E_STRIDE);
+    const long long n = r4d_geti_or(a, "n", r4d_dim(tab, (int)tab->rank - 1));
+    const long long side = r4d_geti_or(a, "side", 0);
+    const double offset = r4d_getf(a, "offset", 0.0);
+    if (n <= 0 || side <= 0 || r4d_numel(tab) < side * side * n) return R4D_NO(RAD_E_SHAPE);
+    if (!(offset > -1.0) || offset != offset) return R4D_NO(RAD_E_INVAL);
+    long long M = 0;
+    const long long x_ld = r4d_rows_pitch(x, n, &M);
+    if (x_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (crd->rank != 2 || crd->shape[0] < 4 || crd->shape[1] < M || !r4d_contig(crd))
+        return R4D_NO(RAD_E_SHAPE);
+    if (M <= 0) return R4D_NO(RAD_E_SHAPE);
+    const uint32_t plane = (uint32_t)crd->shape[1];
+    if (tab->dtype == RAD_F32)
+        return R4D_EMIT(stream, grid_embed_sf_kernel<true>, dim3((uint32_t)M), dim3(kThr), 0,
+                        (unsigned short*)r4d_wp(x), r4d_p(tab), (const int32_t*)r4d_p(crd),
+                        (uint32_t)n, (int)side, (uint32_t)x_ld, plane, offset);
+    return R4D_EMIT(stream, grid_embed_sf_kernel<false>, dim3((uint32_t)M), dim3(kThr), 0,
+                    (unsigned short*)r4d_wp(x), r4d_p(tab), (const int32_t*)r4d_p(crd),
+                    (uint32_t)n, (int)side, (uint32_t)x_ld, plane, offset);
 }
 
 /* ------------------------------------------------------------------ gemm_nt_bias */

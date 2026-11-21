@@ -590,7 +590,7 @@ int pool_gated(const RadArgs* a, bool fp8) {
     const int64_t W = k.shape[0] / ratio;
     if (!matrix(wv, n, n) || !matrix(wg, n, n) || !matrix(ape, ratio, n) || gain.rank != 1 ||
         numel(&gain) != n || pos.rank != (imrope ? 2 : 1) ||
-        (imrope ? (pos.shape[0] != 3 || pos.shape[1] < W) : pos.shape[0] < W))
+        (imrope ? (pos.shape[1] != 3 || pos.shape[0] < W) : pos.shape[0] < W))
         return RAD_E_SHAPE;
     if (page && (page->rank != 1 || page->shape[0] < W)) return RAD_E_SHAPE;
     if (!fp8 && cache && (cache->rank != 4 || cache->shape[0] < 1 || cache->shape[1] != 1 ||
@@ -670,7 +670,7 @@ int pool_gated(const RadArgs* a, bool fp8) {
         for (int64_t c = 0; c < n; ++c) z[c] = rnd(ldt(&gain, c * gain.stride[0]) * (y[c] * inv));
         for (int64_t i = 0; i < rd / 2; ++i) {
             const int comp = imrope ? imrope_component(i, sec_h, sec_w) : 0;
-            const int64_t pv = imrope ? ld_int_dt(pos.dtype, pos.data, comp * pos.stride[0] + w * pos.stride[1])
+            const int64_t pv = imrope ? ld_int_dt(pos.dtype, pos.data, w * pos.stride[0] + comp * pos.stride[1])
                                       : ld_int_dt(pos.dtype, pos.data, w * pos.stride[0]);
             const float ang = (float)pv * ifq[i];
             const float cs = sc_cos(ang), sn = sc_sin(ang);

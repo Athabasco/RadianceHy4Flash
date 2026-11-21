@@ -5208,7 +5208,7 @@ static void hy4_cases(std::vector<Hand>& hs) {
          .dense(RAD_F32, { n, n }, hfill(523, 0.25f))
          .dense(RAD_F32, { ratio, n }, hfill(524))
          .dense(RAD_F32, { n }, hfill(525));
-        if (imrope) h.dense(RAD_I32, { 3, W }, [](int64_t i) { return (float)(4 * (i % 5) + 1000 * (i / 5)); });
+        if (imrope) h.dense(RAD_I32, { W, 3 }, [](int64_t i) { return (float)(4 * (i % 5) + 1000 * (i / 5)); });
         else        h.dense(RAD_I32, { W }, [](int64_t i) { return (float)(4 * i + 4096); });
         h.idx({ 3, -1, 0, 9, 2 })
          .dense(RAD_BF16, { 5, 1, 4, n / 4 }, sent_bf16, true)

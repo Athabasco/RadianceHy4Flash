@@ -608,6 +608,12 @@ std::vector<Case> build_cases() {
                             HS("dtype", dt), HF("yarn_factor", 2), HF("yarn_low", 14),
                             HF("yarn_high", 22), HF("yarn_magnitude", 1.069314718) });
     }
+    /* Hy4-flash's M-RoPE: imrope's components on GPT-J pairs, a rope-only slice of 64 (the
+     * latent key and each head's rope part), sections 12 10 10; with [3, M] positions drawn. */
+    for (const char* dt : { "f32", "bf16" })
+        add("rope", { HI("M", 12), HI("head_dim", 64), HI("n_head", 4), HI("n_head_kv", 0),
+                      HF("theta", 1e7), HF("scale", 1), HS("mode", "imrope_gptj"),
+                      HS("sections", "12 10 10"), HS("dtype", dt) });
     for (double magnitude : {2.0, (double)NAN}) {
         add("rope", { HI("M", 12), HI("head_dim", 128), HI("n_head", 4), HI("n_head_kv", 2),
                       HF("theta", 1e7), HF("scale", 1), HS("mode", "neox"),
@@ -746,6 +752,11 @@ std::vector<Case> build_cases() {
         add("grid_embed_cpe", { HI("M", 40), HI("n", 72), HI("side", 4), HS("dtype", dt) });
         add("grid_embed_cpe", { HI("M", 24), HI("n", 72), HI("side", 8), HI("n_prefix", 3),
                                 HS("dtype", dt) });
+        /* Hy4-flash's offset; the drawn grids reach the table's own side, the identity axis. */
+        add("grid_embed_sf", { HI("M", 20), HI("n", 72), HI("side", 16), HF("offset", 0.1),
+                               HS("dtype", dt) });
+        add("grid_embed_sf", { HI("M", 40), HI("n", 72), HI("side", 4), HF("offset", 0.1),
+                               HS("dtype", dt) });
     }
 
     /* LiLiCorr's lattice ops, at its geometry (7 positions of 8 candidates, 8 heads) narrowed in

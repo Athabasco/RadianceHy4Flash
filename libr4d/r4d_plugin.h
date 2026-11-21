@@ -919,6 +919,7 @@ int r4d_rad_layernorm       (const RadArgs*, RadStream);
 int r4d_rad_grid_embed      (const RadArgs*, RadStream);
 int r4d_rad_grid_embed_aa    (const RadArgs*, RadStream);
 int r4d_rad_grid_embed_cpe   (const RadArgs*, RadStream);
+int r4d_rad_grid_embed_sf    (const RadArgs*, RadStream);
 /* Muse's vision-tower coordinate ops (r4d_vit_muse.hip). */
 int r4d_rad_grid_embed_pad   (const RadArgs*, RadStream);
 int r4d_rad_window_order     (const RadArgs*, RadStream);

@@ -495,7 +495,7 @@ int pool_args(const RadArgs* a, PoolArgs& P) {
     const int64_t W = P.W;
     if (!matrix(*P.wv, n, n) || !matrix(*P.wg, n, n) || !matrix(*P.ape, ratio, n) ||
         P.gain->rank != 1 || numel(P.gain) != n || pos.rank != (P.imrope ? 2 : 1) ||
-        (P.imrope ? (pos.shape[0] != 3 || pos.shape[1] < W) : pos.shape[0] < W))
+        (P.imrope ? (pos.shape[1] != 3 || pos.shape[0] < W) : pos.shape[0] < W))
         return RAD_E_SHAPE;
     return RAD_OK;
 }
@@ -554,7 +554,7 @@ void pool_group(const PoolArgs& P, int64_t w, bool round, float* z) {
     for (int64_t i = 0; i < rd / 2; ++i) {
         const int comp = P.imrope ? imrope_component(i, P.sec_h, P.sec_w) : 0;
         const int64_t pv = P.imrope
-                               ? ld_int(pos.dtype, pos.data, comp * pos.stride[0] + w * pos.stride[1])
+                               ? ld_int(pos.dtype, pos.data, w * pos.stride[0] + comp * pos.stride[1])
                                : ld_int(pos.dtype, pos.data, w * pos.stride[0]);
         const float inv_freq = (float)(1.0 / std::pow(P.theta, (double)(2 * i) / (double)rd));
         const float ang = (float)pv * inv_freq;

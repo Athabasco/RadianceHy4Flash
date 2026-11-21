@@ -508,6 +508,66 @@ AVX_KERNEL(grid_embed_aa) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ grid_embed_sf */
+/* Adds the table resampled as torch's F.interpolate(bilinear, align_corners=False) with an explicit
+ * scale factor (size + offset) / side an axis (Hy4-flash's position embedding); libref's
+ * grid_embed_sf operation for operation. */
+static void sf_taps(int64_t at, int64_t size, int64_t side, double offset, int64_t t[2],
+                    float w[2]) {
+    if (size < 1) size = 1;
+    at = at < 0 ? 0 : (at >= size ? size - 1 : at);
+    /* An axis that keeps its size is torch's identity (scale 1), whatever the stated factor. */
+    const float inv = size == side ? 1.0f : (float)(1.0 / (((double)size + offset) / (double)side));
+    float src = inv * ((float)at + 0.5f) - 0.5f;
+    if (src < 0.0f) src = 0.0f;
+    int64_t i0 = (int64_t)src;
+    if (i0 > side - 1) i0 = side - 1;
+    t[0] = i0;
+    t[1] = i0 < side - 1 ? i0 + 1 : i0;
+    float l = src - (float)i0;
+    l = l < 0.0f ? 0.0f : (l > 1.0f ? 1.0f : l);
+    w[1] = l;
+    w[0] = 1.0f - l;
+}
+
+AVX_KERNEL(grid_embed_sf) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *tab = &a->t[1], *crd = &a->t[2];
+    const int64_t n = p_int(a, "n", tab->rank ? tab->shape[tab->rank - 1] : 0);
+    const int64_t side = p_int(a, "side", 0);
+    const RadParam* po = p_find(a, "offset");
+    const double offset = !po ? 0.0 : po->kind == RAD_P_F64 ? po->dval
+                        : po->kind == RAD_P_INT ? (double)po->ival : 0.0;
+    if (n <= 0 || side <= 0 || numel(tab) < side * side * n) return RAD_E_SHAPE;
+    if (!std::isfinite(offset) || offset <= -1.0) return RAD_E_INVAL;
+    const int64_t rows = rows_of(x, n);
+    if (rows <= 0 || crd->rank != 2 || crd->shape[0] < 4 || crd->shape[1] < rows)
+        return RAD_E_SHAPE;
+    const int64_t cs = crd->stride[0], ms = crd->stride[1];
+    const int64_t ts = laststride(tab);
+
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        int64_t g[4];
+        for (int c = 0; c < 4; ++c) g[c] = ldi(crd, c * cs + r * ms);
+        int64_t th[2], tw[2];
+        float wh[2], ww[2];
+        sf_taps(g[0], g[2], side, offset, th, wh);
+        sf_taps(g[1], g[3], side, offset, tw, ww);
+        const int64_t xb = rowoff(x, r, n), xs = laststride(x);
+        auto at = [&](int64_t y, int64_t c, int64_t i) {
+            return ldt(tab, rowoff(tab, y * side + c, n) + i * ts);
+        };
+        for (int64_t i = 0; i < n; ++i) {
+            const float r0 = ww[0] * at(th[0], tw[0], i) + ww[1] * at(th[0], tw[1], i);
+            const float r1 = ww[0] * at(th[1], tw[0], i) + ww[1] * at(th[1], tw[1], i);
+            const float pe = round_act(x->dtype, wh[0] * r0 + wh[1] * r1);
+            stt(x, xb + i * xs, ldt(x, xb + i * xs) + pe);
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ grid_embed_cpe */
 /* Adds the table resampled as torch's F.interpolate(bilinear, align_corners=False) does without
  * antialias, onto a square of the grid's larger side and cropped to the grid (RADIO's cropped

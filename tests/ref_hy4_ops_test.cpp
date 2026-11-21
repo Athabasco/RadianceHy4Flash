@@ -660,8 +660,17 @@ TEST(idx_pool_gated_matches_hf_pool_groups_and_rotary_for_gptj_and_imrope) {
     const int64_t n = pool_dims[0], ratio = pool_dims[1], rd = pool_dims[2], G = pool_dims[3];
     PoolCase c;
     for (int mode = 0; mode < 2; ++mode) {
-        T pos(RAD_I32, mode ? std::vector<int64_t>{3, G} : std::vector<int64_t>{G});
-        pos.n(mode ? pool_pos_imrope : pool_pos_gptj, mode ? 3 * G : G);
+        /* imrope_gptj takes [G, 3], a group's components side by side (qsa_work's bpos); the
+         * golden holds them component-major. */
+        T pos(RAD_I32, mode ? std::vector<int64_t>{G, 3} : std::vector<int64_t>{G});
+        if (mode) {
+            std::vector<int64_t> rows((size_t)(3 * G));
+            for (int64_t w = 0; w < G; ++w)
+                for (int c = 0; c < 3; ++c) rows[(size_t)(w * 3 + c)] = pool_pos_imrope[c * G + w];
+            pos.n(rows);
+        } else {
+            pos.n(pool_pos_gptj, G);
+        }
         T out(RAD_F32, {G, n});
         A a; a.t(c.k).t(c.wv).t(c.wg).t(c.ape).t(c.gain).t(pos).tnull().tnull().t(out).i("M", G).i("n", n)
             .i("ratio", ratio).i("rotary_dim", rd).d("eps", pool_eps_theta[0]).d("theta", pool_eps_theta[1])

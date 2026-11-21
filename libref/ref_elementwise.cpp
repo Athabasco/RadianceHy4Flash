@@ -316,6 +316,72 @@ int ref_grid_embed_cpe(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* grid_embed_sf: Hy4-flash's position embedding. The table resampled as torch's
+ * F.interpolate(mode="bilinear", align_corners=False) with an explicit scale_factor of
+ * (size + offset) / side per axis -- no antialias, and the output side is floor(side * scale) =
+ * size. Because the scale is given, torch maps output pixel i to src = (i + 0.5) / scale - 0.5 with
+ * 1 / scale computed in f64 and rounded to f32 (area_pixel_compute_scale), not side / size: the
+ * offset shifts the whole sampling grid; an axis whose size is the table's keeps scale 1 (torch's
+ * identity there, measured on 2.15). src clamps at 0, the upper tap into the table; the row
+ * blended first; f32, rounded once to x's dtype before the add. */
+static void sf_taps(int64_t at, int64_t size, int64_t side, double offset, int64_t t[2],
+                    float w[2]) {
+    if (size < 1) size = 1;
+    at = at < 0 ? 0 : (at >= size ? size - 1 : at);
+    /* An axis that keeps its size is torch's identity (scale 1), whatever the stated factor. */
+    const float inv = size == side ? 1.0f : (float)(1.0 / (((double)size + offset) / (double)side));
+    float src = inv * ((float)at + 0.5f) - 0.5f;
+    if (src < 0.0f) src = 0.0f;
+    int64_t i0 = (int64_t)src;
+    if (i0 > side - 1) i0 = side - 1;
+    t[0] = i0;
+    t[1] = i0 < side - 1 ? i0 + 1 : i0;
+    float l = src - (float)i0;
+    l = l < 0.0f ? 0.0f : (l > 1.0f ? 1.0f : l);
+    w[1] = l;
+    w[0] = 1.0f - l;
+}
+
+int ref_grid_embed_sf(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *tab = &a->t[1], *crd = &a->t[2];
+    const int64_t n = p_int(a, "n", tab->rank ? tab->shape[tab->rank - 1] : 0);
+    const int64_t side = p_int(a, "side", 0);
+    /* f64 as declared: 1 / scale is formed in double, as torch forms it. */
+    const RadParam* po = p_find(a, "offset");
+    const double offset = !po ? 0.0 : po->kind == RAD_P_F64 ? po->dval
+                        : po->kind == RAD_P_INT ? (double)po->ival
+                        : po->kind == RAD_P_STR && po->sval ? std::strtod(po->sval, nullptr) : 0.0;
+    if (n <= 0 || side <= 0 || numel(tab) < side * side * n) return RAD_E_SHAPE;
+    if (!std::isfinite(offset) || offset <= -1.0) return RAD_E_INVAL;
+    const int64_t rows = rows_of(x, n);
+    if (rows <= 0 || crd->rank != 2 || crd->shape[0] < 4 || crd->shape[1] < rows)
+        return RAD_E_SHAPE;
+    const int64_t cs = crd->stride[0], ms = crd->stride[1];
+    const int64_t ts = laststride(tab);
+
+    REF_PAR_FOR(rows * n * 4)
+    for (int64_t r = 0; r < rows; ++r) {
+        int64_t g[4];
+        for (int c = 0; c < 4; ++c) g[c] = ld_int(crd->dtype, crd->data, c * cs + r * ms);
+        int64_t th[2], tw[2];
+        float wh[2], ww[2];
+        sf_taps(g[0], g[2], side, offset, th, wh);
+        sf_taps(g[1], g[3], side, offset, tw, ww);
+        const int64_t xb = rowoff(x, r, n), xs = laststride(x);
+        auto at = [&](int64_t y, int64_t c, int64_t i) {
+            return ldt(tab, rowoff(tab, y * side + c, n) + i * ts);
+        };
+        for (int64_t i = 0; i < n; ++i) {
+            const float r0 = ww[0] * at(th[0], tw[0], i) + ww[1] * at(th[0], tw[1], i);
+            const float r1 = ww[0] * at(th[1], tw[0], i) + ww[1] * at(th[1], tw[1], i);
+            const float pe = round_dt(x->dtype, wh[0] * r0 + wh[1] * r1);
+            stt(x, xb + i * xs, ldt(x, xb + i * xs) + pe);
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ grid_embed_pad */
 /* The same learned table and operands as grid_embed's, resampled in the half-pixel-centre form
  * (align_corners=False) with grid_sample's padding_mode="zeros": taps whose UNCLAMPED index falls

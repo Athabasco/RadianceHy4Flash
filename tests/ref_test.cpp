@@ -1293,7 +1293,7 @@ TEST(op_vocabulary) {
         "gemm_nt", "gemm_nt_bias", "gemm_nt_q", "gemm_nt_q_bias", "grid_embed",
         /* Runtime LoRA's two halves, issued by the core beside a trunk GEMM. */
         "lora_shrink", "lora_expand", "lora_expand_mm",
-        "grid_embed_aa", "grid_embed_cpe", "grid_embed_pad", "window_order",
+        "grid_embed_aa", "grid_embed_cpe", "grid_embed_pad", "grid_embed_sf", "window_order",
         "attn_paged", "attn_dense", "kv_store", "kv_store_streamed", "rope", "rope_table",
         "attn_paged_sink",
         "qk_norm_rope", "qsa_block_key",
@@ -2088,6 +2088,44 @@ TEST(op_grid_embed_aa_is_torchs_antialiased_bilinear) {
         A a; a.t(x).t(tab).t(crd).i("M", M).i("n", n).i("side", side).s("dtype", "f32");
         CHECK_OK(run("grid_embed_aa", a));
         for (int i = 0; i < M * n; ++i) CHECK_NEAR(x.at(i), g.want[(size_t)i], 2e-5);
+    }
+}
+
+/* grid_embed_sf is torch's F.interpolate(bilinear, align_corners=False) at Hy4-flash's explicit
+ * scale_factor (size + 0.1) / side (values from torch 2.15): the 4 x 4 table onto 3 x 5, 2 x 2,
+ * 6 x 3 and 1 x 4 grids. The offset shifts every sample, so none of these equals grid_embed_cpe's
+ * or grid_embed_pad's resample at the same size. */
+TEST(op_grid_embed_sf_is_torchs_bilinear_at_the_stated_scale) {
+    const int side = 4, n = 2;
+    T tab(RAD_F32, {side * side, n});
+    tab.f({ -5.0f, -1.75f, 2.0f, 5.25f, -2.0f, 1.25f, 5.0f, -2.75f, 1.0f, 4.25f, -3.0f, 0.25f,
+            4.0f, -3.75f, 0.0f, 3.25f, -4.0f, -0.75f, 3.0f, -4.75f, -1.0f, 2.25f, -5.0f, -1.75f,
+            2.0f, 5.25f, -2.0f, 1.25f, 5.0f, -2.75f, 1.0f, 4.25f });
+    struct G { int h, w; std::vector<float> want; };
+    const G cases[] = {
+        { 3, 5, { -4.129032611846924f, -0.8790323734283447f, -0.4739086627960205f, 2.7760913372039795f, 0.16682475805282593f, 2.681056261062622f, 0.19528821110725403f, -0.06483257561922073f, 4.27419376373291f, -1.8790323734283447f, -1.1774190664291382f, 2.0725808143615723f, -0.6427894830703735f, -0.6333017349243164f, 0.6310878992080688f, -1.563251256942749f, 0.8421885967254639f, -0.5955092906951904f, -2.1774191856384277f, 1.0725809335708618f, 0.35483741760253906f, 3.604837417602539f, -0.3107208013534546f, 0.8989548683166504f, 1.2066730260849f, -0.8485138416290283f, 2.3744447231292725f, -0.4025924503803253f, -0.6451625823974609f, 2.604837417602539f } },
+        { 2, 2, { -1.3701814413070679f, 1.8798186779022217f, 1.4370750188827515f, -0.6632652878761292f, -0.4676869511604309f, -0.4166663587093353f, -0.28571420907974243f, 0.4387754201889038f } },
+        { 6, 3, { -3.9838709831237793f, -0.7338711023330688f, 0.25806474685668945f, 3.5080647468566895f, 3.080643653869629f, -1.6532249450683594f, -1.8544420003890991f, 1.3955577611923218f, 0.15666306018829346f, 1.0900319814682007f, 2.1212317943573f, -0.2102065533399582f, -0.05486496910452843f, 2.9726338386535645f, 0.21694836020469666f, -1.5211527347564697f, 0.40005403757095337f, 1.054202914237976f, -2.2864887714385986f, -0.3060549199581146f, 1.0101799964904785f, -1.658646583557129f, -2.8786349296569824f, -0.24669456481933594f, -0.9988100528717041f, 1.3742733001708984f, 1.1635377407073975f, -1.1562665700912476f, -1.1983064413070679f, 0.691961944103241f, 1.4193549156188965f, 4.669354438781738f, 1.0483866930007935f, -0.49193519353866577f, 2.0967750549316406f, 2.330643653869629f } },
+        { 1, 4, { -0.5909093618392944f, 2.659090518951416f, -1.0909088850021362f, -1.3409093618392944f, 2.409090518951416f, -1.8409087657928467f, -1.5909093618392944f, 1.6590907573699951f } },
+    };
+    for (const G& g : cases) {
+        const int M = g.h * g.w;
+        T x(RAD_F32, {M, n});
+        std::vector<float> zero((size_t)(M * n), 0.0f);
+        x.f(zero);
+        T crd(RAD_I32, {4, M});
+        std::vector<int64_t> c((size_t)(4 * M));
+        for (int r = 0; r < M; ++r) {
+            c[(size_t)r] = r / g.w;
+            c[(size_t)(M + r)] = r % g.w;
+            c[(size_t)(2 * M + r)] = g.h;
+            c[(size_t)(3 * M + r)] = g.w;
+        }
+        crd.n(c);
+        A a; a.t(x).t(tab).t(crd).i("M", M).i("n", n).i("side", side).d("offset", 0.1)
+                .s("dtype", "f32");
+        CHECK_OK(run("grid_embed_sf", a));
+        for (int i = 0; i < M * n; ++i) CHECK_NEAR(x.at(i), g.want[(size_t)i], 1e-5);
     }
 }
 
@@ -4450,6 +4488,62 @@ TEST(op_gemm_nt_bias_epilogue) {
     A f; f.t(a2).t(b2).t(bias2).t(res2).t(y2).i("M", 1).i("N", 1).i("K", 1).s("dtype", "bf16");
     CHECK_OK(run("gemm_nt_bias", f));
     CHECK_EQ(y2.at(0), rad_bf16_to_f32(rad_f32_to_bf16(258.0f + 2.25f)));
+}
+
+/* imrope_gptj (Hy4-flash's M-RoPE): imrope's component per frequency over GPT-J's adjacent pairs.
+ * With equal components it is gptj to the bit; with distinct ones pair j (channels 2j, 2j + 1)
+ * turns by frequency j at the component imrope gives j. A [M] position list is gptj. */
+TEST(op_rope_imrope_gptj_is_imropes_components_on_adjacent_pairs) {
+    const int64_t hd = 12, rot = 12;
+    std::vector<float> row(3 * hd);
+    for (int64_t i = 0; i < 3 * hd; ++i) row[(size_t)i] = 0.1f * (float)(i + 1);
+    T ref(RAD_F32, {1, 3 * hd}); ref.f(row);
+    T pos1(RAD_I32, {1}); pos1.n({7});
+    A a; a.t(ref).t(pos1).i("M", 1).i("head_dim", hd).i("n_head", 1).i("n_head_kv", 1)
+          .d("theta", 100).d("scale", 1).s("mode", "gptj").i("rotary_dim", rot);
+    CHECK_OK(run("rope", a));
+    {
+        T got(RAD_F32, {1, 3 * hd}); got.f(row);
+        T pos3(RAD_I32, {3, 1}); pos3.n({7, 7, 7});
+        A b; b.t(got).t(pos3).i("M", 1).i("head_dim", hd).i("n_head", 1).i("n_head_kv", 1)
+              .d("theta", 100).d("scale", 1).s("mode", "imrope_gptj").i("rotary_dim", rot)
+              .s("sections", "2 2 2");
+        CHECK_OK(run("rope", b));
+        for (int64_t i = 0; i < 3 * hd; ++i) CHECK_EQ(got.at(i), ref.at(i));
+        T one(RAD_F32, {1, 3 * hd}); one.f(row);
+        A c; c.t(one).t(pos1).i("M", 1).i("head_dim", hd).i("n_head", 1).i("n_head_kv", 1)
+              .d("theta", 100).d("scale", 1).s("mode", "imrope_gptj").i("rotary_dim", rot)
+              .s("sections", "2 2 2");
+        CHECK_OK(run("rope", c));
+        for (int64_t i = 0; i < 3 * hd; ++i) CHECK_EQ(one.at(i), ref.at(i));
+    }
+    {
+        T got(RAD_F32, {1, 2 * hd}); got.f(std::vector<float>(2 * hd, 1.0f));
+        T pos3(RAD_I32, {3, 1}); pos3.n({1, 2, 3});
+        A b; b.t(got).t(pos3).i("M", 1).i("head_dim", hd).i("n_head", 1).i("n_head_kv", 0)
+              .d("theta", 100).d("scale", 1).s("mode", "imrope_gptj").i("rotary_dim", rot)
+              .s("sections", "2 2 2");
+        CHECK_OK(run("rope", b));
+        const int comp[6] = { 0, 1, 2, 0, 1, 2 };
+        const float p[3] = { 1, 2, 3 };
+        for (int i = 0; i < 6; ++i) {
+            const float inv = 1.0f / std::pow(100.0f, (float)(2 * i) / (float)rot);
+            const float ang = p[comp[i]] * inv;
+            CHECK_NEAR(got.at(2 * i), std::cos(ang) - std::sin(ang), 1e-6);
+            CHECK_NEAR(got.at(2 * i + 1), std::sin(ang) + std::cos(ang), 1e-6);
+        }
+        /* Hy4-flash's real rule: sections 12 10 10 over 32 pairs leave pairs 30 and 31 on t. */
+        T wide(RAD_F32, {1, 64}); wide.f(std::vector<float>(64, 1.0f));
+        T pw(RAD_I32, {3, 1}); pw.n({0, 5, 9});
+        A w; w.t(wide).t(pw).i("M", 1).i("head_dim", 64).i("n_head", 1).i("n_head_kv", 0)
+              .d("theta", 1e4).d("scale", 1).s("mode", "imrope_gptj").s("sections", "12 10 10");
+        CHECK_OK(run("rope", w));
+        for (int j = 0; j < 32; ++j) {
+            const int c = j % 3 == 1 && j < 30 ? 1 : (j % 3 == 2 && j < 30 ? 2 : 0);
+            if (c == 0) { CHECK_EQ(wide.at(2 * j), 1.0f); CHECK_EQ(wide.at(2 * j + 1), 1.0f); }
+            else CHECK(wide.at(2 * j) != 1.0f);
+        }
+    }
 }
 
 /* The multi-component rotary. With every component of every token equal, the interleaved form is
@@ -10471,6 +10565,8 @@ std::vector<Geo> geometries() {
         G("window_order", "M", 12, a.i("M", R).i("window", 4)),
         G("grid_embed_aa", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),
         G("grid_embed_cpe", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),
+        G("grid_embed_sf", "M", 3, a.i("M", R).i("n", 8).i("side", 4).d("offset", 0.1)
+                                    .s("dtype", "f32")),
         G("lili_cand", "M", 3, a.i("M", R).i("k", 4).i("world", 1).i("steps", 3).i("n", 8)
                                 .s("dtype", "f32")),
         G("lili_attn", "M", 8, a.i("M", R).i("steps", 2).i("k", 2).i("n_head", 2).i("head_dim", 4)

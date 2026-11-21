@@ -157,7 +157,7 @@ __device__ __forceinline__ void idx_pool_gated_body(IDX_POOL_PARAMS) {
         if (rc >= 0 && w < W) {
             const int i = rc >> 1;
             const int comp = IMROPE ? imrope_comp(i, sec_h, sec_w) : 0;
-            const int pv = pos[(size_t)comp * pos_ld + w];
+            const int pv = IMROPE ? pos[(size_t)w * pos_ld + comp] : pos[w];
             const float inv_freq = (float)(1.0 / pow(theta, (double)(2 * i) / (double)rd));
             const float ang = (float)pv * inv_freq;
             const float cs = (float)cos((double)ang), sn = (float)sin((double)ang);
@@ -304,7 +304,8 @@ static int pool_entry(const RadArgs* a, RadStream stream, bool fp8) {
     if (gn->rank != 1 || gn->shape[0] != n || gn->stride[0] != 1) return R4D_NO(RAD_E_SHAPE);
     long long pos_ld = 0;
     if (imrope) {
-        if (po->rank != 2 || po->shape[0] != 3 || po->shape[1] < W || po->stride[1] != 1)
+        /* [W, 3]: a group's three components side by side, qsa_work's `bpos` under M-RoPE. */
+        if (po->rank != 2 || po->shape[1] != 3 || po->shape[0] < W || po->stride[1] != 1)
             return R4D_NO(RAD_E_SHAPE);
         pos_ld = po->stride[0];
     } else if (po->rank != 1 || po->shape[0] < W || po->stride[0] != 1) {

@@ -890,9 +890,9 @@ extern "C" int r4d_shape_rope(const RadParam* p, int n_p, int operand,
         ++nc;
         q = e;
     }
-    const bool multi = nc > 0 && (!std::strcmp(mode, "mrope") || !std::strcmp(mode, "imrope") ||
-                                  !std::strcmp(mode, "axial"));
-    if (multi && !std::strcmp(mode, "imrope")) nc = 3;
+    const bool im = !std::strcmp(mode, "imrope") || !std::strcmp(mode, "imrope_gptj");
+    const bool multi = nc > 0 && (!std::strcmp(mode, "mrope") || im || !std::strcmp(mode, "axial"));
+    if (multi && im) nc = 3;
     const RadOpdDesc l[] = {
         opd((uint32_t)RAD_BF16, M, row),
         /* Not a lookup: the kernel computes sincos from the value, so any non-negative integer is

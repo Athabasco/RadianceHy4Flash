@@ -540,6 +540,18 @@ int ref_grid_embed_cpe_shape(const RadParam* p, int n_p, int operand, RadOpdDesc
     return o.finish("grid_embed_cpe", operand, out);
 }
 
+/* grid_embed_sf's: grid_embed's operands; the coordinates drawn over the table's side. */
+int ref_grid_embed_sf_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), side = gi(p, n_p, "side", 0);
+    if (M <= 0 || n <= 0 || side <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, { M, n });              /* x, INOUT */
+    o.t(D, { side * side, n });    /* table */
+    o.t_idx({ 4, M }, side, -1, 0);
+    return o.finish("grid_embed_sf", operand, out);
+}
+
 /* LiLiCorr's ops. lili_cand declines: its stats rows (sample_logprobs' sorted pairs and positive
  * sums) are no draw; avx_check_hand.cpp builds them. The others draw freely. */
 int ref_lili_cand_shape(const RadParam*, int, int, RadOpdDesc*) { return RAD_E_UNSUPPORTED; }
@@ -1105,7 +1117,7 @@ int ref_gate_mul_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     return o.finish("gate_mul", operand, out);
 }
 
-/* W groups of `ratio` token keys; `pos` is the first token of each group (a plane [3, W] for
+/* W groups of `ratio` token keys; `pos` is the first token of each group (a [W, 3] list for
  * imrope_gptj). The cache and its page list are optional and not drawn. */
 int ref_idx_pool_gated_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
@@ -1123,7 +1135,7 @@ int ref_idx_pool_gated_shape(const RadParam* p, int n_p, int operand, RadOpdDesc
     o.t((uint32_t)RAD_F32, { n, n });                 /* wg */
     o.t((uint32_t)RAD_F32, { ratio, n });             /* ape */
     o.t((uint32_t)RAD_F32, { n });                    /* gain */
-    if (imrope) o.t_idx({ 3, M }, 4096, -1, 0);       /* pos */
+    if (imrope) o.t_idx({ M, 3 }, 4096, -1, 0);       /* pos: [W, 3], qsa_work's bpos */
     else o.t_idx({ M }, 4096, -1, 0);
     o.skip();                                         /* page */
     o.skip();                                         /* cache */
@@ -1149,7 +1161,7 @@ int ref_idx_pool_gated_fp8_shape(const RadParam* p, int n_p, int operand, RadOpd
     o.t((uint32_t)RAD_F32, { n, n });                 /* wg */
     o.t((uint32_t)RAD_F32, { ratio, n });             /* ape */
     o.t((uint32_t)RAD_F32, { n });                    /* gain */
-    if (imrope) o.t_idx({ 3, M }, 4096, -1, 0);       /* pos */
+    if (imrope) o.t_idx({ M, 3 }, 4096, -1, 0);       /* pos: [W, 3], qsa_work's bpos */
     else o.t_idx({ M }, 4096, -1, 0);
     o.skip();                                         /* page */
     o.skip();                                         /* cache */
@@ -2023,7 +2035,7 @@ int ref_rope_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     /* The fused row: n_head q heads, then n_head_kv each of k and v, head_dim wide. */
     o.t(D, { M, (nh + 2 * nkv) * hd });              /* qkv, INOUT */
     /* A multi-component mode with sections takes one position per component, component-major:
-     * the section count, or three for imrope. */
+     * the section count, or three for imrope and imrope_gptj. */
     const char* mode = gs(p, n_p, "mode");
     if (!mode) mode = "neox";
     const char* sec  = gs(p, n_p, "sections");
@@ -2035,9 +2047,9 @@ int ref_rope_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
         ++nc;
         q = e;
     }
-    const bool multi = nc > 0 && (!std::strcmp(mode, "mrope") || !std::strcmp(mode, "imrope") ||
-                                  !std::strcmp(mode, "axial"));
-    if (multi) o.t_idx({ !std::strcmp(mode, "imrope") ? 3 : nc, M }, M, -1, 0);
+    const bool im = !std::strcmp(mode, "imrope") || !std::strcmp(mode, "imrope_gptj");
+    const bool multi = nc > 0 && (!std::strcmp(mode, "mrope") || im || !std::strcmp(mode, "axial"));
+    if (multi) o.t_idx({ im ? 3 : nc, M }, M, -1, 0);
     else       o.t_idx({ M }, 0, -1, 0);             /* positions */
     return o.finish("rope", operand, out);
 }

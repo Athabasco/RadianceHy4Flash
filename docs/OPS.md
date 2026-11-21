@@ -210,6 +210,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `window_order` | `M`(range) `window` | `coord`, `cu` → `idx`, `inv`, `pos`, `cuw` |
 | `grid_embed_aa` | `M`(range) `n` `side` `dtype` | `x`:inout, `table`w, `coord` |
 | `grid_embed_cpe` | `M`(range) `n` `side` `dtype` `n_prefix`/opt | `x`:inout, `table`w, `coord`, `prefix`w? |
+| `grid_embed_sf` | `M`(range) `n` `side` `dtype` `offset`:f64/opt | `x`:inout, `table`w, `coord` |
 | `add` | `M`(range) `n` `dtype` `div`:f64/opt | `a`, `b` → `y` |
 | `mul` | `M`(range) `n` `dtype` | `a`, `b` → `y` |
 | `silu_mul` | `M`(range) `n` `dtype` | `gate_up` → `y` (splits `[M,2n]` into gate·up) |
@@ -369,6 +370,14 @@ permutation the identity and `cuw = cu`.
 half-pixel centres, widened by the scale when the grid is smaller than the table, its in-table taps
 normalised to sum to one; separable, f32, rounded once. A different function from `grid_embed`'s,
 so a different op rather than a mode a library could ignore.
+
+**`grid_embed_sf`** is Hy4-flash's position embedding: the table resampled with
+`F.interpolate(mode="bilinear", align_corners=False)` at an explicit `scale_factor` of
+`(size + offset) / side` an axis (the reference's `0.1`), no antialias. Torch then samples output
+`i` at `src = (i + 0.5) / scale - 0.5` with `1 / scale` formed in f64 and rounded to f32, not at
+`side / size`, so the offset shifts every sample; an axis whose size equals `side` keeps scale 1
+(torch's identity there). `src` clamps at 0, the upper tap into the table, the row is blended first;
+f32, rounded once to `x`'s dtype before the add. `coord` as `grid_embed`'s.
 
 **`grid_embed_cpe`** is RADIO's cropped position embedding: the table resampled with
 `F.interpolate(mode="bilinear", align_corners=False)` and no antialias onto a square whose side is
@@ -1076,7 +1085,11 @@ owns:
 - `imrope` interleaves: component 1 takes frequency `i` where `i % 3 == 1` and `i < 3 * s1`,
   component 2 where `i % 3 == 2` and `i < 3 * s2`, component 0 the rest (Qwen3-VL);
 - `axial` gives contiguous runs and restarts the frequency ladder in each, `theta^(-2j / (2 s_c))`
-  for the run's `j`-th frequency (a vision tower's 2-D rotary over row and column).
+  for the run's `j`-th frequency (a vision tower's 2-D rotary over row and column);
+- `imrope_gptj` is `imrope`'s component rule over GPT-J's adjacent pairs: pair `j` (channels
+  `2j, 2j + 1`) turns by frequency `j` at the component `imrope` gives frequency `j` (Hy4-flash's
+  M-RoPE, sections `12 10 10` over 32 pairs; pairs 30 and 31 read t). With `[M]` positions it is
+  `gptj` exactly.
 
 With `[M]` positions every component is that one position, so `mrope` and `imrope` over a text batch
 are exactly `neox`.
@@ -3752,8 +3765,8 @@ refuses the graph rather than resolving a similar op.
 | `engram_gate` | `M`(range) `n` `hc` `eps`:f64 `dtype` | `key`, `val`, `mask`, `w_key`w, `w_query`w, `w_val`w, `w_branch`w, `h`:inout |
 
 `embed_lookup_q` with a scale a row (Engram's table) and `qsa_select`'s `own` are described in their
-own sections; the rotary mode `imrope_gptj` lives in `idx_pool_gated` for now (below), and the
-`rope` op's mode comes with the vision package.
+own sections; the rotary mode `imrope_gptj` is `idx_pool_gated`'s (below) and `rope`'s (its
+multi-component modes).
 
 ### `ihc_pre`, `ihc_post`
 
@@ -3850,7 +3863,8 @@ then the last `rotary_dim` channels of `z`, adjacent pairs, at the group's FIRST
 `pos[w]`: `ang = pos * theta^(-2i/rotary_dim)` (f32), `z[2i] = round_k(a cos - b sin)`,
 `z[2i+1] = round_k(b cos + a sin)`. `round_k` is a rounding to `k`'s dtype (HF rounds to the token
 keys' dtype twice, after the norm and after the rotation; an f32 model rounds nothing). `mode` is
-`gptj` (`pos [M]`) or `imrope_gptj` (`pos [3, M]`, `sections "t h w"` summing to `rotary_dim / 2`:
+`gptj` (`pos [M]`) or `imrope_gptj` (`pos [M, 3]`, a group's three components side by side as
+`qsa_work` writes its `bpos` under M-RoPE, `sections "t h w"` summing to `rotary_dim / 2`:
 pair `j` turns by the h position when `j % 3 == 1` and `j < 3h`, by the w position when `j % 3 == 2`
 and `j < 3w`, else by t; with equal components it is `gptj`). The result goes to
 `cache[page[w]]` (`[pages, 1, 4, n/4]`, a page's `n` elements contiguous, a page < 0 or out of
