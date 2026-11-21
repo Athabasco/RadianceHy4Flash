@@ -319,6 +319,40 @@ TEST(every_step_kind_is_lint_clean) {
     CHECK_EQ(count_issued(a.b, c, "attn_kv_sink"), 0);
 }
 
+/* WP13.0: a verify step that crosses the dense limit issues other ops (the selection) than one of
+ * the same shape just below it, and the core's recording key holds only the rounded context bound.
+ * The plugin's pass key must therefore tell the two apart, or the second step of a request that
+ * crosses the limit is refused as issued differently from its recording (found on gpu-mini at
+ * context 2042, six rows). Prefill and mixed passes stay unkeyed. */
+TEST(the_pass_key_tells_a_selecting_step_from_a_dense_one) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    uint64_t keys[3] = {};
+    int sel[3] = {};
+    const int first[3] = { 8, 11, 12 };           /* rows first..first+5; the dense limit is 16 */
+    for (int i = 0; i < 3; ++i) {
+        auto k = kit(d.b, { 6 }, {});
+        for (int j = 0; j < 6; ++j) k->pos[(size_t)j] = first[i] + j;
+        k->b.max_ctx_len = 16;                    /* what the core keys: a rounded bound, equal for all three */
+        k->b.positions_h = k->pos.data();
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        keys[i] = hyv4flash::pass_key(&c, &k->b, nullptr);
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        sel[i] = count_issued(d.b, c, "mla_attn_sel_sink");
+    }
+    CHECK_EQ(sel[0], 0);                          /* rows 8..13: dense */
+    CHECK_EQ(sel[1], 2);                          /* rows 11..16: the last passes the limit */
+    CHECK_EQ(sel[2], 2);
+    CHECK(keys[0] != 0);
+    CHECK(keys[0] != keys[1]);
+    CHECK_EQ(keys[1], keys[2]);
+    auto pf = kit(d.b, {}, { 12 });
+    pf->b.positions_h = pf->pos.data();
+    RadCtx pc{ .b = &d.b, .batch = &pf->b };
+    CHECK_EQ(hyv4flash::pass_key(&pc, &pf->b, nullptr), (uint64_t)0);
+}
+
 /* RADIANCE_HY4_TAPS=1: the harness's buffers (ref/README.md "Tap contract"), PERSIST, and a step
  * that writes them stays lint clean. */
 TEST(the_debug_taps_are_persistent_buffers_and_lint_clean) {

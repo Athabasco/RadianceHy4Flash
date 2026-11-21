@@ -986,6 +986,21 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     out->kv_stream_ok = 1;
     return RAD_OK;
 }
+
+/* The recording key's own part (WP13.0). The core keys a pass by shapes and the context bound it
+ * rounds; what this step issues also depends on exact positions: whether any row is past the dense
+ * limit (a selecting step issues the query side and qsa_select on the sparse layers, plan().select)
+ * and whether the prefill sequences start at 0 (plan().nonabs). Without this, a verify of 6 rows at
+ * context 2042 and one at 2043 share a key, and the second one is refused as issued differently
+ * from its recording (or, between audits, replays the dense pass on a selecting step). */
+static uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t*) {
+    if (!c || !batch) return 0;
+    /* Prefill and mixed passes split their KV by the live context, which no key here carries:
+     * unrecorded, as they were without this callback. */
+    if (batch->phase != RAD_PHASE_DECODE) return 0;
+    const StepPlan p = plan(*models[rad_slot(c)], batch);
+    return 1u | (p.select ? 2u : 0u) | (p.nonabs ? 4u : 0u);
+}
 } // namespace hyv4flash
 
 #ifndef RAD_ARCH_NO_EXPORTS
@@ -996,4 +1011,7 @@ RAD_ARCH_PLUGIN(hyv4flash, "hyv4flash", "", "0.2.0",
                 "Tencent Hy4-flash: the text trunk at 1, 2 or 4 ranks (bf16), the weight manifest and "
                 "checkpoint name map")
 RAD_ARCH_CHAT_FORMAT(hyv4flash)
+extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
+    return hyv4flash::pass_key(c, batch, used_max_h);
+}
 #endif
