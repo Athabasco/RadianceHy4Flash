@@ -712,3 +712,14 @@ headings name the removed patch files, whose diffs are in git history.
       connection closes with the unread bytes still on it. Tests: transport_test
       (a_stalled_drain_dies_on_its_deadline, a_refusal_closes_the_connection,
       the_inflight_body_budget).
+
+  patches/0023-jinja-str-format-and-none-membership.patch
+
+      Applies from vendor/llama/ with `patch -p1`. Hy4-flash's chat template (tests/data/chat/hy4flash)
+      builds every special token with `'<｜hy_start{}｜>'.format(HYTK)` and tests
+      `reasoning_effort not in [...]` with a none on the left; the lifted engine had no str.format and
+      threw on `None in [..]`, and the probe swallows the throw, so the template rendered as unusable.
+      value.cpp: `format` with positional fields ("{}", "{0}", "{{" / "}}"); names, attribute access and
+      format specs are refused by name. runtime.cpp: `none in <list>` / `not in` is a membership test
+      with the equality the engine already uses. Tests: chat_test and hyv4flash_chat_test (the golden
+      renders); drop with the next refresh if upstream carries both.
