@@ -812,7 +812,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (!m.kv_engram) return RAD_E_INVAL;
         if (s.engram_pad < 0) return refuse("the config has Engram layers and no engram_pad_id");
     }
-    RAD_ARCH_TRY(m.calib.begin(b, nm, g, ctx, s));
+    RAD_ARCH_TRY(m.calib.begin(b, nm, g, ctx, s, m.mw.lat.x));
     m.engrams.resize(s.engram_layers.size());
     m.layers.resize((size_t)s.n_layer);
     for (int l = 0; l < (int)s.n_layer; ++l) RAD_ARCH_TRY(trunk_layer(b, m, l, &msrc[(size_t)l]));

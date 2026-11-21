@@ -3553,7 +3553,7 @@ to nearest and the converter says `no calibration for '<name>'`.
 
 Flags are YAML keys (`radiance` reads only a YAML file, TOOLS.md "The calibration mode"); `rad-yaml`
 writes one from command-line flags. The commands below are the ones run on the `mini` checkpoint
-(host, one rank, `libref`); the paths are the friend's.
+(host, `libref`; `mini` at one rank, `mini4` at four fake ranks with `RADIANCE_HOST_DEVICES=4`); the paths are the friend's.
 
 ```sh
 # 1. a bf16 container (tables for the Engram hash constants first). The experts stay bf16: the
@@ -3566,7 +3566,7 @@ rad-convert <ckpt> --add engram-tables.safetensors --recipe data/recipes/hy4-fla
 #    RADIANCE_CALIB_DIR / _TOKENS / _LAYERS from them; a RADIANCE_CALIB_DIR naming another
 #    directory is refused). The corpus's token count is read by the engine.
 mkdir grams
-rad-yaml --model hy4-bf16.rad --max-model-len 8192 --max-num-batched-tokens 8192 --max-num-seqs 4 \
+rad-yaml --model hy4-bf16.rad --tp 4 --max-model-len 8192 --max-num-batched-tokens 8192 --max-num-seqs 4 \
     --no-prefix-cache --calib-corpus corpus.jsonl --calib-dir grams [--calib-layers 0:14] > calib.yaml
 radiance --config calib.yaml
 #    ... radiance: calibration: rank 0 wrote N Hessian(s) of layers 0:42 after T rows to grams
@@ -3591,16 +3591,22 @@ Notes that are not in the commands:
 - **The corpus** has to look like the traffic the quantised model will serve (code-heavy prompts,
   for this deployment), at least a million tokens for the trunk (MOE-W4.md); score on a different
   slice. A document is a sequence: Engram history and positions restart at each.
-- **Ranks.** This build serves one rank (`--tp 1`). The recorder is rank-aware (a column-split input
-  is gathered to its whole width, one rank records each layer), and the experts' tap wants whole
-  experts per rank, so the multi-rank run is a WP7 question; until then a calibration of the real
-  checkpoint needs the weights on one rank (the disk tier, GUIDE.md section 4.3).
+- **Ranks.** Run at the rank count you will serve (`--tp 4`, whole experts a rank: calibration
+  forces them). The attention output's, the dense layer-0 down's and the shared down's inputs are
+  split by columns and gathered to the whole row before the Gram; `ffn_latent_out`'s input (each
+  rank holds the sum of its own experts) is reduced first; one rank (layer mod ranks) records each
+  layer. The experts' files are per rank (`gram.r<rank>...`, each rank its own experts' per-expert
+  Grams, the pooled ones summed by libquant). Verified on `mini4` at TP4 with fake host ranks
+  (`RADIANCE_HOST_DEVICES=4`, `--tp 4`) against TP1: trunk Grams agree to 2% relative Frobenius on
+  prompts without router near-ties (bf16 partial sums; a flipped expert pick moves a deeper layer's
+  Gram by more), and `rad-convert` with the gptq recipe finds every file. `--tp` 1, 2 and 4 are
+  the ranks the plugin serves.
 - **Quantised experts are not served yet** (WP10): calibrate the bf16 container, not
   `hy4-flash-w4nl64-rtn.recipe`'s, and the KL step 5 can only score a candidate this build serves
   (bf16 today). Trunk `gptq` lines in a recipe are refused at declare for the same reason; the
   Grams for them are already in `grams/` under the weight stems of the table above.
 - **Accuracy of the Grams.** On `mini`, the Grams equal `X^T X` of the plugin's own debug taps
-  (`RADIANCE_HY4_TAPS=1`, `RADIANCE_DUMP_BUF`) to 2e-8 (f32 accumulation), and `X^T X` of the
+  (`RADIANCE_HY4_TAPS=1`, `RADIANCE_DUMP_BUF`) at TP1 to 2e-8 (f32 accumulation), and `X^T X` of the
   transformers f32 activations to 0.3% to 1.6% relative Frobenius (bf16 rounding of the activations
   themselves; the layers' parity budget, PLAN 3.1).
 - **gpu-mini on a card** does not start yet: the Engram's E4M3 round trip has no device kernel

@@ -34,13 +34,16 @@
  * quantises and have no site. A site reads a buffer right after the op that fills it, before the
  * next layer reuses the shared plane; the hooks are in hyv4flash.cpp's step.
  *
- * TP: a site declares its local width; today one rank holds every input whole (K == k_local).
- * WP7 splits the attention output and the shared down input across ranks: those two sites then
- * take k_local = K / world and CalibFull gathers them. */
+ * TP: the attention output's input (heads a rank), the dense MLP's down input and the shared
+ * expert's are split by columns: those sites declare k_local = K / world and CalibFull gathers them
+ * to the whole row; one rank (layer % world) records each layer. The routed experts are whole a
+ * rank under calibration (Ffn::place) and each rank writes its own experts' files. */
 #ifndef HYV4FLASH_CALIB_H
 #define HYV4FLASH_CALIB_H
 
 #include <arch/rad_calib_full.h>
+
+#include <mutex>
 
 #include "hyv4flash_attn.h"
 #include "hyv4flash_engram.h"
@@ -54,7 +57,15 @@ namespace hyv4flash {
  * the trunk into one directory and the experts into another would leave the Grams a recipe needs
  * in two places. Returns RAD_OK when nothing is being recorded. Call before the first block's
  * probe (rad_arch.h's calib_dir() caches the first read). */
+inline int map_cli_to_env_once(const RadBuildCtx* ctx);
 inline int map_cli_to_env(const RadBuildCtx* ctx) {
+    /* Every rank's thread declares; the first sets the environment and the others wait for it, so
+     * no rank reads RADIANCE_CALIB_* (rad_arch.h caches the first read) before it is set. */
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
+    return map_cli_to_env_once(ctx);
+}
+inline int map_cli_to_env_once(const RadBuildCtx* ctx) {
     if (!ctx->calib_dir || !*ctx->calib_dir) return RAD_OK;
     const char* have = std::getenv("RADIANCE_CALIB_DIR");
     if (have && *have && std::strcmp(have, ctx->calib_dir) != 0) {
@@ -90,19 +101,34 @@ struct Calib {
     std::vector<Layer> layers;
     int head = -1;
     int64_t lat_w = 0;   /* kv_lora */
+    /* At more ranks each holds the routed sum of its own experts only (MoeFP8 no_reduce, the
+     * reduction runs behind latent_out): latent_out's whole input is the sum over ranks, so a
+     * copy of the plane is reduced here (exact) and tapped. */
+    rad_buf lat_src = 0, lat_sum = 0;
+    rad_op op_lat_copy = 0, op_lat_ar = 0;
 
     bool on() const { return cf.on; }
 
     /* From the build context; nothing unless --calib-dir. The widest input of any site sizes the
      * scratch and the widest split one (the attention output, the down projections) the gather. */
-    int begin(RadBuilder* b, Names& nm, const Geom& g, const RadBuildCtx* ctx, const Shape& s) {
+    int begin(RadBuilder* b, Names& nm, const Geom& g, const RadBuildCtx* ctx, const Shape& s,
+              rad_buf lat_x) {
         layers.assign((size_t)s.n_layer, Layer{});
         lat_w = s.kv_lora;
         int64_t split = std::max<int64_t>({ s.sparse.v_width(), s.sliding.v_width(), s.n_ff,
                                             s.n_ff_shared });
         int64_t wide = std::max<int64_t>({ s.n_embd, s.q_lora, s.kv_lora, split, s.latent,
                                            s.engram_heads * s.engram_head_dim });
-        return cf.begin(b, nm, g, ctx, s.n_layer, split * g.world, wide);
+        RAD_ARCH_TRY(cf.begin(b, nm, g, ctx, s.n_layer, split, wide));
+        if (cf.on && g.world > 1 && lat_x) {
+            lat_src = lat_x;
+            lat_sum = decl_b(b, nm.f("calib.latent_sum"), RAD_BF16, { g.max_tok, s.latent });
+            op_lat_copy = decl_copy(b, g.max_tok, s.latent, RAD_BF16, lat_src, lat_sum);
+            int rc = RAD_OK;
+            op_lat_ar = decl_all_reduce(b, g, s.latent, lat_sum, &rc);
+            if (!lat_sum || !op_lat_copy || rc != RAD_OK) return RAD_E_INVAL;
+        }
+        return RAD_OK;
     }
 
     /* The sites of layer l; `x` is the block-input plane the two norms write. The indexer is
@@ -112,10 +138,13 @@ struct Calib {
         if (!cf.records(l)) return RAD_OK;
         Layer& y = layers[(size_t)l];
         const std::string p = "blk." + std::to_string(l) + ".";
+        /* `k` is the whole input's width, `k_local` this rank's columns: the attention output, the
+         * dense MLP's and the shared expert's down projections are split by input columns at TP
+         * (CalibFull gathers them), every other input is whole on every rank. */
         auto add = [&](int* slot, const std::string& stem, const std::string& lin, rad_buf buf,
-                       int64_t k) {
+                       int64_t k, int64_t k_local = 0) {
             *slot = (int)cf.sites.size();
-            return cf.site(b, g, l, stem + ".input", lin, buf, k, k);
+            return cf.site(b, g, l, stem + ".input", lin, buf, k_local ? k_local : k, k);
         };
         auto wn = [&](std::initializer_list<const char*> names) {
             std::string r;
@@ -132,16 +161,17 @@ struct Calib {
         RAD_ARCH_TRY(add(&y.xa, p + "attn_q_a", xa, x, s.n_embd));
         RAD_ARCH_TRY(add(&y.qr, p + "attn_q_b", qb, w.qa, s.q_lora));
         RAD_ARCH_TRY(add(&y.kvb, p + "attn_kv_b", p + "attn_kv_b", w.latc, s.kv_lora));
-        RAD_ARCH_TRY(add(&y.ao, p + "attn_output", p + "attn_output", w.ag, at.a.v_width()));
+        RAD_ARCH_TRY(add(&y.ao, p + "attn_output", p + "attn_output", w.ag,
+                         at.a.v_width() * g.world, at.a.v_width()));
         if (!ffn.moe_layer) {
             RAD_ARCH_TRY(add(&y.xf, p + "ffn_gate_up", p + "ffn_gate_up", x, s.n_embd));
-            RAD_ARCH_TRY(add(&y.down, p + "ffn_down", p + "ffn_down", ffn.mlp.ff.x, s.n_ff));
+            RAD_ARCH_TRY(add(&y.down, p + "ffn_down", p + "ffn_down", ffn.mlp.ff.x, s.n_ff, s.n_ff_r));
         } else {
             RAD_ARCH_TRY(add(&y.xf, p + "ffn_latent_in",
                              wn({ "ffn_latent_in", "ffn_gate_up_shexp" }), x, s.n_embd));
             RAD_ARCH_TRY(add(&y.sdown, p + "ffn_down_shexp", p + "ffn_down_shexp",
-                             ffn.shared.ff.x, s.n_ff_shared));
-            RAD_ARCH_TRY(add(&y.lout, p + "ffn_latent_out", p + "ffn_latent_out", ffn.w.lat.x,
+                             ffn.shared.ff.x, s.n_ff_shared, s.n_ff_shared_r));
+            RAD_ARCH_TRY(add(&y.lout, p + "ffn_latent_out", p + "ffn_latent_out", lat_sum ? lat_sum : ffn.w.lat.x,
                              s.latent));
         }
         if (eg)
@@ -179,6 +209,10 @@ struct Calib {
         const Layer& y = layers[(size_t)l];
         tap(c, y.down, T);
         tap(c, y.sdown, T);
+        if (y.lout >= 0 && lat_sum) {
+            RAD_ISSUE_N(c, op_lat_copy, T, brows(lat_src, T), brows(lat_sum, T));
+            issue_all_reduce(c, op_lat_ar, lat_sum, T, cf.sites[(size_t)y.lout].K);
+        }
         tap(c, y.lout, T);
     }
     void after_engram(RadCtx* c, int l, int64_t T) { tap(c, layers[(size_t)l].eng, T); }

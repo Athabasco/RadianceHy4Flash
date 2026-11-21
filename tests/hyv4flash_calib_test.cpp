@@ -88,9 +88,10 @@ struct Declared {
     RadBuildCtx ctx = build_ctx();
     int rc = 0;
     /* `lo:hi` 0:0 records every layer. */
-    explicit Declared(const char* dir, int lo = 0, int hi = 0, long long tokens = 100) {
+    explicit Declared(const char* dir, int lo = 0, int hi = 0, long long tokens = 100, int world = 1,
+                      int rank = 0) {
         bf16_encs(&b);
-        ctx = build_ctx(0, 1);
+        ctx = build_ctx(rank, world);
         ctx.calib_dir = dir;
         ctx.calib_tokens = tokens;
         ctx.calib_layer_lo = lo;
@@ -196,6 +197,30 @@ TEST(every_linears_entry_is_a_declared_weight_of_the_sites_width_and_every_trunk
         if (!covered.count(stem)) fprintf(stderr, "linear %s has no calibration site\n", n.c_str());
         CHECK(covered.count(stem) == 1);
     }
+}
+
+/* At two ranks the attention output's, the dense down's and the shared down's inputs are split by
+ * columns (the others whole), one rank owns each layer, and the same files are named on every rank. */
+TEST(column_split_inputs_are_gathered_at_two_ranks) {
+    clean_env();
+    std::map<std::string, std::string> first;
+    for (int rank : { 0, 1 }) {
+        Declared d("/calib", 0, 0, 100, 2, rank);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        std::map<std::string, std::string> names = sites_of(d.model());
+        if (rank == 0) first = names;
+        CHECK(names == first);
+        for (const auto& s : d.model().calib.cf.sites) {
+            const bool split = s.stem.find("attn_output") != std::string::npos ||
+                               s.stem.find(".ffn_down.") != std::string::npos ||
+                               s.stem.find("ffn_down_shexp") != std::string::npos;
+            CHECK_EQ(s.k_local * (split ? 2 : 1), s.K);
+            CHECK_EQ(s.op_gather != 0, split);
+            const int layer = s.stem == "output.input" ? 0 : std::atoi(s.stem.c_str() + 4);
+            CHECK_EQ(s.owner, layer % 2 == rank);
+        }
+    }
+    clean_env();
 }
 
 /* --calib-layers LO:HI records those layers; the head's input only with the run that ends at the
