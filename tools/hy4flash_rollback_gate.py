@@ -7,6 +7,10 @@ RADIANCE_DEBUG_ORACLE_MODE so every rejection pattern of section 6.2 happens:
     random  right up to a hashed index        close   wrong exactly at the row that closes an indexer group of 4
     close2  as close, at the second such row  after   wrong at the row after a closing row (the closing row is accepted)
     miss    30 % wrong by hash (WP8's)
+and two modes with the DFly2 drafter instead of the oracle (WP13.3; not in the default list):
+    dfly            --num-speculative-tokens K: the drafter proposes
+    dfly-sabotage   the same with RADIANCE_HY4_DFLY_SABOTAGE=1 (every proposal the mask id: nearly every draft rejected)
+The oracle modes run with RADIANCE_HY4_DFLY=0, since prompt lookup alone (--spec-ngram) is refused beside a drafter.
 For each (prompt, mode) the speculative run must give, against the plain greedy run of the same prompt:
   * the generated ids and their logprobs byte-equal (production path, no taps), and with the debug taps on;
   * state probes equal on every committed position: the debug taps (RADIANCE_HY4_TAPS=1, read by the engine's buffer
@@ -36,6 +40,7 @@ PRESETS = {      # layer kinds and Engram layer indices (ids are one above): ref
     "gpu-mini": ([SP, SL, SP, SL], [1]),
 }
 MODES = ["right", "wrong", "random", "close", "close2", "after", "miss"]
+DFLY_MODES = ["dfly", "dfly-sabotage"]
 
 
 def prompt_text(ids):
@@ -326,8 +331,12 @@ def main():
         oracle = os.path.join(a.work, f"oracle-{tag0}.txt")
         open(oracle, "w").write(" ".join(map(str, g0)))
         for mode in modes:
-            extra = ["--spec-ngram", a.depth, "--debug-draft-oracle", oracle]
-            envm = dict(env_ring, RADIANCE_DEBUG_ORACLE_MODE=mode)
+            if mode in DFLY_MODES:
+                extra = ["--num-speculative-tokens", a.depth]
+                envm = dict(env_ring, **({"RADIANCE_HY4_DFLY_SABOTAGE": "1"} if mode == "dfly-sabotage" else {}))
+            else:
+                extra = ["--spec-ngram", a.depth, "--debug-draft-oracle", oracle]
+                envm = dict(env_ring, RADIANCE_DEBUG_ORACLE_MODE=mode, RADIANCE_HY4_DFLY="0")
             for taps in ([] if a.no_taps else [True]) + ([False] if mode in notap or a.no_taps else []):
                 r = Run(a, f"{tag0}-{mode}-{'tap' if taps else 'notap'}", extra, envm, taps)
                 try:
@@ -353,7 +362,9 @@ def main():
                         byname.setdefault(k[0] if k[0] not in ("MISSING", "BADSIZE") else k[0] + ":" + k[1], []).append(k[-1])
                     verdict(not bad, f"  probes: {len(ref_probe)} committed rows/groups compared, {len(bad)} differ"
                             + "".join(f"\n        {n}: first {sorted(v)[:6]}" for n, v in sorted(byname.items())))
-                if mode == "wrong" and st["rejected"] == 0:
+                if mode in DFLY_MODES and "'dfly2' proposes" not in r.srv.text():
+                    verdict(False, "  the DFly2 drafter was not served: the run is prompt lookup")
+                if mode in ("wrong", "dfly-sabotage") and st["rejected"] == 0:
                     verdict(False, "  nothing was rejected in mode wrong: the run proves nothing")
     print("coverage total:", json.dumps(total))
     if a.test_ring is not None:
