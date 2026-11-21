@@ -23312,6 +23312,70 @@ static void paged_perf(const Plugin& pl, int64_t Q, int64_t CTX, int iters) {
     dfree_all();
 }
 
+/* --perfkvsink [iters]: attn_kv_sink_h256 at Hy4-flash's prefill geometry, one sequence of M query
+ * rows after a cached prefix: sliding layers (window 512, prefix up to 511) at 64 heads (TP1) and
+ * 32 (TP2), sparse layers below the dense limit (window 0) at 32 and 16. FLOP counts the visible
+ * (row, key) pairs only, 4 * 256 a pair (Q.K and P.V). */
+static void kv_sink_perf(const Plugin& pl, int iters) {
+    if (iters <= 0) iters = 20;
+    const RadKernelInfo* r = find(pl, "attn_kv_sink_h256");
+    if (!r) { std::printf("--perfkvsink: attn_kv_sink_h256 absent\n"); return; }
+    struct G { const char* what; int64_t H, M, pre, window; };
+    const G gs[] = {
+        { "sliding TP1", 64, 1024, 511, 512 }, { "sliding TP1", 64, 512, 0, 512 },
+        { "sliding TP1", 64, 2048, 0, 512 },   { "sliding TP2", 32, 1024, 511, 512 },
+        { "sparse TP1", 32, 2048, 0, 0 },      { "sparse TP1", 32, 1024, 1024, 0 },
+        { "sparse TP1", 32, 512, 0, 0 },       { "sparse TP2", 16, 2048, 0, 0 },
+    };
+    std::printf("attn_kv_sink_h256, %d launches each (warm)\n", iters);
+    for (const G& g : gs) {
+        const int64_t D = 256, N = g.M + g.pre, H = g.H;
+        void* dq = dalloc((size_t)(g.M * H * D) * 2);
+        void* dk = dalloc((size_t)(N * H * D) * 2);
+        void* dv = dalloc((size_t)(N * H * D) * 2);
+        void* ds = dalloc((size_t)H * 4);
+        void* dout = dalloc((size_t)(g.M * H * D) * 2);
+        if (!dq || !dk || !dv || !ds || !dout) { std::printf("--perfkvsink: hipMalloc failed\n"); dfree_all(); return; }
+        {
+            std::vector<uint16_t> h((size_t)(N * H * D));
+            for (size_t i = 0; i < h.size(); ++i) h[i] = st_rand_bf16((uint32_t)i);
+            st_memcpy(dq, h.data(), (size_t)(g.M * H * D) * 2, hipMemcpyHostToDevice);
+            st_memcpy(dk, h.data(), h.size() * 2, hipMemcpyHostToDevice);
+            for (size_t i = 0; i < h.size(); ++i) h[i] = st_rand_bf16((uint32_t)(i * 3 + 1));
+            st_memcpy(dv, h.data(), h.size() * 2, hipMemcpyHostToDevice);
+            std::vector<float> sk((size_t)H, 0.5f);
+            st_memcpy(ds, sk.data(), sk.size() * 4, hipMemcpyHostToDevice);
+        }
+        std::vector<RadTensor> ts = { T(dq, RAD_BF16, { g.M, H, D }), T(dk, RAD_BF16, { N, H, D }),
+                                      T(dv, RAD_BF16, { N, H, D }), TI32({ 2 }, { 0, (int32_t)g.M }),
+                                      TI32({ 2 }, { 0, (int32_t)N }), T(ds, RAD_F32, { H }),
+                                      T(dout, RAD_BF16, { g.M, H, D }) };
+        std::vector<RadParam> ps = { PI("M", g.M), PI("N", N), PI("heads", H), PI("head_dim", D),
+                                     PI("window", g.window), PF("scale", 1.0 / 16.0), PS("dtype", "bf16") };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        const int rc = r->launch(&a, nullptr);
+        if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
+            std::printf("  %-12s rc %d\n", g.what, rc);
+            dfree_all();
+            continue;
+        }
+        double pairs = 0;
+        for (int64_t i = 0; i < g.M; ++i) {
+            const int64_t p = g.pre + i;
+            pairs += (double)(g.window > 0 ? std::min<int64_t>(p + 1, g.window) : p + 1);
+        }
+        const double us = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
+        std::printf("  %-12s heads %2lld  M %5lld  prefix %4lld  window %3lld  %8.3f ms  %6.1f TFLOP/s\n",
+                    g.what, (long long)H, (long long)g.M, (long long)g.pre, (long long)g.window,
+                    us / 1000.0, pairs * H * 4.0 * 256.0 / (us * 1e6));
+        dfree_all();
+    }
+}
+
 /* --perfattn M HEADS [iters]: one long non-causal sequence of M rows through the head-128 dense
  * attention at HEADS heads -- attn_dense, and attn_prefix_self without a prefix at bf16 and int8
  * scores -- with q, k and v as columns of one fused projection, as a DiT step issues them. */
@@ -26615,6 +26679,185 @@ static void sample_ngram_ban_case(const Plugin& pl) {
     ok(what, mismatches == 0 && banned_total > 0,
        "banned=" + std::to_string(banned_total) + " mismatch=" + std::to_string(mismatches) +
        (first.empty() ? "" : " " + first));
+}
+
+/* attn_kv_sink_h256 against libref's attn_kv_sink: ragged sequences, each m query rows after a
+ * cached prefix of `pre` keys (n = pre + m), at a window or none, q/k/v/out at padded row and head
+ * pitches with poisoned margins, and per-head sinks (`sink_big` puts one head's sink far above
+ * its scores, where the sink carries nearly all the mass). A second check: changing every key and
+ * value after a row's own position changes none of that row's output bytes (causality). */
+static void attn_kv_sink_check(const Plugin& pl, std::vector<int64_t> qlen, std::vector<int64_t> pre,
+                               int64_t heads, int64_t window, bool sink_big) {
+    const char* what = "attn_kv_sink_h256";
+    const auto* row = find(pl, what);
+    if (!row || !g_plugin) {
+        ok(what, false, "kernel missing");
+        return;
+    }
+    std::string path(g_plugin);
+    path = path.substr(0, path.find_last_of('/') + 1) + "libref.so";
+    void* ref = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!ref) {
+        ok(what, false, "oracle missing");
+        return;
+    }
+    auto count = (int (*)())dlsym(ref, "rad_kernel_count");
+    auto at = (const RadKernelInfo* (*)(int))dlsym(ref, "rad_kernel_at");
+    const RadKernelInfo* oracle = nullptr;
+    if (count && at)
+        for (int i = 0; i < count(); ++i)
+            if (!std::strcmp(at(i)->op, "attn_kv_sink")) oracle = at(i);
+    if (!oracle) {
+        ok(what, false, "oracle row missing");
+        dlclose(ref);
+        return;
+    }
+    const int64_t D = 256, S = (int64_t)qlen.size();
+    int64_t M = 0, N = 0;
+    for (int64_t s = 0; s < S; ++s) {
+        M += qlen[(size_t)s];
+        N += qlen[(size_t)s] + pre[(size_t)s];
+    }
+    std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("heads", heads), PI("head_dim", D),
+                                 PI("window", window), PF("scale", 1.0 / 16.0), PS("dtype", "bf16") };
+    /* q, k, v, cu_q, cu_k, sinks, out; pitches multiples of 8 elements (the kernel's 16 bytes) */
+    std::vector<RadTensor> host(7);
+    host[0] = T(nullptr, RAD_BF16, { M, heads, D });
+    host[0].stride[1] = D + 8;
+    host[0].stride[0] = heads * (D + 8) + 16;
+    host[1] = T(nullptr, RAD_BF16, { N, heads, D });
+    host[1].stride[1] = D + 16;
+    host[1].stride[0] = heads * (D + 16) + 8;
+    host[2] = T(nullptr, RAD_BF16, { N, heads, D });
+    host[3] = T(nullptr, RAD_I32, { S + 1 });
+    host[4] = T(nullptr, RAD_I32, { S + 1 });
+    host[5] = T(nullptr, RAD_F32, { heads });
+    host[6] = T(nullptr, RAD_BF16, { M, heads, D });
+    host[6].stride[1] = D + 8;
+    host[6].stride[0] = heads * (D + 8) + 8;
+    std::vector<std::vector<uint8_t>> bytes(7);
+    std::vector<void*> allocations(7, nullptr);
+    std::vector<RadTensor> device(7);
+    bool allocated = true;
+    for (int i = 0; i < 7 && allocated; ++i) {
+        RadTensor& t = host[(size_t)i];
+        const int64_t elements = t.shape[0] * t.stride[0];
+        bytes[(size_t)i].assign((size_t)elements * esz(t.dtype) + 256, 0xa5);
+        t.data = bytes[(size_t)i].data() + 128;
+        if (i <= 2)
+            for (int64_t e = 0; e < elements; ++e) {
+                /* q and k in [-2, 2], v in [-4, 4]: scores of a few units, a peaked softmax */
+                const float v = (float)((int)(st_mix32((uint32_t)(e * 7 + i * 7919)) % 2001) - 1000) /
+                                (i == 2 ? 250.0f : 500.0f);
+                ((uint16_t*)t.data)[e] = h_to_bf16(v);
+            }
+        if (i == 3 || i == 4) {
+            int c = 0;
+            for (int64_t s = 0; s <= S; ++s) {
+                ((int*)t.data)[s] = c;
+                if (s < S) c += (int)(qlen[(size_t)s] + (i == 4 ? pre[(size_t)s] : 0));
+            }
+        }
+        if (i == 5)
+            for (int64_t h = 0; h < heads; ++h)
+                ((float*)t.data)[h] = sink_big && h == 1 ? 30.0f : (float)((h % 7) - 3) * 1.5f;
+        allocations[(size_t)i] = dalloc(bytes[(size_t)i].size());
+        if (!allocations[(size_t)i]) {
+            allocated = false;
+            break;
+        }
+        st_memcpy(allocations[(size_t)i], bytes[(size_t)i].data(), bytes[(size_t)i].size(),
+                  hipMemcpyHostToDevice);
+        device[(size_t)i] = t;
+        device[(size_t)i].data = (char*)allocations[(size_t)i] + 128;
+    }
+    std::string shape;
+    for (int64_t s = 0; s < S; ++s)
+        shape += fmt("%s%lld+%lld", s ? "," : "", (long long)pre[(size_t)s], (long long)qlen[(size_t)s]);
+    std::string label = fmt("attn_kv_sink [%s] H=%lld window=%lld%s", shape.c_str(), (long long)heads,
+                            (long long)window, sink_big ? " big sink" : "");
+    if (!allocated) {
+        ok(label.c_str(), false, "allocation failed");
+        dlclose(ref);
+        return;
+    }
+    RadArgs args{};
+    args.t = host.data();
+    args.n_t = 7;
+    args.p = ps.data();
+    args.n_p = (int)ps.size();
+    args.world_size = 1;
+    const int rc = oracle->launch(&args, nullptr);
+    ok(fmt("%s host oracle", label.c_str()).c_str(), rc == RAD_OK);
+    if (rc == RAD_OK) {
+        run_case(row, device, ps);
+        std::vector<uint8_t> got(bytes[6].size());
+        st_memcpy(got.data(), allocations[6], got.size(), hipMemcpyDeviceToHost);
+        std::vector<bool> written(got.size(), false);
+        bool matches = true, guards = true;
+        float max_error = 0, max_rel = 0;
+        const auto& t = host[6];
+        for (int64_t r = 0; r < M; ++r)
+            for (int64_t h = 0; h < heads; ++h) {
+                double num = 0, den = 0;
+                for (int64_t d = 0; d < D; ++d) {
+                    const long off = r * t.stride[0] + h * t.stride[1] + d;
+                    const float want = h_bf16(((uint16_t*)t.data)[off]),
+                                actual = h_bf16(((uint16_t*)(got.data() + 128))[off]);
+                    const float error = std::fabs(actual - want);
+                    max_error = std::max(max_error, error);
+                    num += (double)error * error;
+                    den += (double)want * want;
+                    matches = matches && std::isfinite(actual) &&
+                              error <= 0.002f + 0.008f * std::fabs(want);
+                    written[128 + off * 2] = written[129 + off * 2] = true;
+                }
+                if (den > 0) max_rel = std::max(max_rel, (float)std::sqrt(num / den));
+            }
+        for (size_t j = 0; j < got.size(); ++j)
+            if (!written[j]) guards = guards && got[j] == 0xa5;
+        ok(fmt("%s max error %.4g, row rel %.3g", label.c_str(), max_error, max_rel).c_str(),
+           matches && max_rel <= 5e-3f);
+        ok(fmt("%s pitched rows and guards", label.c_str()).c_str(), guards);
+
+        /* causality: every key and value at or past a sequence's last row's own position is
+         * already its own; scramble each sequence's keys after its first row's position instead
+         * and that first row must not move */
+        std::vector<uint8_t> kmod = bytes[1], vmod = bytes[2];
+        int64_t kofs = 0;
+        for (int64_t s = 0; s < S; ++s) {
+            const int64_t n = qlen[(size_t)s] + pre[(size_t)s];
+            for (int64_t j = pre[(size_t)s] + 1; j < n; ++j)
+                for (int64_t h = 0; h < heads; ++h)
+                    for (int64_t d = 0; d < D; ++d) {
+                        uint16_t* kp = (uint16_t*)(kmod.data() + 128) + (kofs + j) * host[1].stride[0] +
+                                       h * host[1].stride[1] + d;
+                        uint16_t* vp = (uint16_t*)(vmod.data() + 128) + (kofs + j) * host[2].stride[0] +
+                                       h * host[2].stride[1] + d;
+                        *kp = h_to_bf16(h_bf16(*kp) * -3.0f + 1.0f);
+                        *vp = h_to_bf16(h_bf16(*vp) * 5.0f - 2.0f);
+                    }
+            kofs += n;
+        }
+        st_memcpy(allocations[1], kmod.data(), kmod.size(), hipMemcpyHostToDevice);
+        st_memcpy(allocations[2], vmod.data(), vmod.size(), hipMemcpyHostToDevice);
+        run_case(row, device, ps);
+        std::vector<uint8_t> got2(got.size());
+        st_memcpy(got2.data(), allocations[6], got2.size(), hipMemcpyDeviceToHost);
+        bool causal = true;
+        int64_t r0 = 0;
+        for (int64_t s = 0; s < S; ++s) {
+            for (int64_t h = 0; h < heads; ++h)
+                for (int64_t d = 0; d < D; ++d) {
+                    const long off = (r0 * t.stride[0] + h * t.stride[1] + d) * 2 + 128;
+                    causal = causal && got[(size_t)off] == got2[(size_t)off] &&
+                             got[(size_t)off + 1] == got2[(size_t)off + 1];
+                }
+            r0 += qlen[(size_t)s];
+        }
+        ok(fmt("%s later keys leave a row's bytes", label.c_str()).c_str(), causal);
+    }
+    dlclose(ref);
 }
 
 /* sam_attn, against a host port of deepencoder.py's attention (get_rel_pos + window_partition).
@@ -33194,6 +33437,21 @@ static void device_phase(const Plugin& pl) {
     attn_usel_case(pl, 300, 1500);
     attn_gq_fold_case(pl, 3, true, true, 0, true);
     attn_gq_fold_case(pl, 24, true, true, 0, true);
+    if (sel("attn_kv_sink_h256")) {
+        /* Hy4-flash's prefill rows: sliding layers (64 heads, window 512 counting the own token)
+         * around the window's edge and as a chunk after a cached prefix; sparse layers below the
+         * dense limit (32 heads, window 0) with a deep prefix; ragged batches; a dominating sink. */
+        attn_kv_sink_check(pl, { 1 }, { 0 }, 64, 512, false);
+        attn_kv_sink_check(pl, { 511 }, { 0 }, 64, 512, false);
+        attn_kv_sink_check(pl, { 512 }, { 0 }, 64, 512, false);
+        attn_kv_sink_check(pl, { 513 }, { 0 }, 64, 512, true);
+        attn_kv_sink_check(pl, { 1024 }, { 511 }, 64, 512, false);
+        attn_kv_sink_check(pl, { 100, 1, 64 }, { 37, 511, 1 }, 32, 512, true);
+        attn_kv_sink_check(pl, { 2048 }, { 0 }, 32, 0, false);
+        attn_kv_sink_check(pl, { 300 }, { 1748 }, 32, 0, true);
+        attn_kv_sink_check(pl, { 1, 16, 130 }, { 2047, 0, 900 }, 32, 0, false);
+        attn_kv_sink_check(pl, { 16, 1 }, { 2047, 2047 }, 16, 512, false);
+    }
     if (sel("attn_vit_h72_bf16")) {
         const RadKernelInfo* r = find(pl, "attn_vit_h72_bf16");
         if (!r) ok("attn_vit_h72_bf16", false, "row absent");
@@ -36343,6 +36601,7 @@ static void usage(void) {
                 "                       q_len 1 ending a CTX-token context, the gated merge): the\n"
                 "                       decode kernel a row against the tiled form. R4D_USEL_SEL and\n"
                 "                       R4D_USEL_SEQU name dumps of a real chunk's qsa_sel / qsa_sequ.\n"
+                "  --perfkvsink [iters]: attn_kv_sink_h256 at Hy4-flash's prefill geometries\n"
                 "  --perfattn M HEADS [iters]:  the head-128 dense attention over one M-row\n"
                 "                       sequence: attn_dense and attn_prefix_self without a prefix at\n"
                 "                       bf16 and int8 scores, bf16 and fp8 P.V, and quant_cols_fp8\n"
@@ -36444,6 +36703,7 @@ int main(int argc, char** argv) {
     int video_it = 0;
     int conv_it = 0;
     long long attn_m = 0, attn_h = 0;
+    int kvs_it = 0;
     int attn_it = 5;
     long long pg_q = 0, pg_ctx = 0;
     long long us_t = 0, us_ctx = 0;
@@ -36708,6 +36968,9 @@ int main(int argc, char** argv) {
             us_t = std::strtoll(argv[++i], nullptr, 0);
             us_ctx = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != '-') us_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfkvsink")) {
+            kvs_it = 20;
+            if (i + 1 < argc && argv[i + 1][0] != '-') kvs_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfattn")) {
             if (i + 2 >= argc) { usage(); return 2; }
             attn_m = std::strtoll(argv[++i], nullptr, 0);
@@ -36768,6 +37031,15 @@ int main(int argc, char** argv) {
         paged_perf(pl, pg_q, pg_ctx, pg_it);
 #else
         skip("paged attention timing", "built without HIP");
+#endif
+        return 0;
+    }
+    if (kvs_it > 0) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        kv_sink_perf(pl, kvs_it);
+#else
+        skip("attn_kv_sink timing", "built without HIP");
 #endif
         return 0;
     }
