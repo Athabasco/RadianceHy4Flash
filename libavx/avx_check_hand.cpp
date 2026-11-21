@@ -1433,12 +1433,24 @@ constexpr float kW5nl[32] = { 0.8125f, 2.5f, 4.0f, 5.5f, 7.5f, 9.0f, 11.0f, 12.0
                               -0.8125f, -2.5f, -4.0f, -5.5f, -7.5f, -9.0f, -11.0f, -12.0f,
                               -14.0f, -16.0f, -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -30.0f };
 
+/* A 64-entry table in W6NL's shape: 32 E4M3-exact magnitudes (1 + m/8 times 2^(e-1)), then their
+ * negatives. */
+struct W6Tab {
+    float v[64];
+    constexpr W6Tab() : v() {
+        for (int i = 0; i < 32; ++i) { v[i] = (1.0f + (float)(i % 8) / 8.0f) * (float)(1 << (i / 8)) * 0.5f; v[32 + i] = -v[i]; }
+    }
+};
+constexpr W6Tab kW6nlT{};
+constexpr const float* kW6nl = kW6nlT.v;
+
 struct Form { const char* dtype; int bits; int64_t group; uint32_t sdt; bool level; };
 constexpr Form kForms[] = {
     { "w4nla8h",   4, 128, RAD_BF16,   false },
     { "w4nl64a8h", 4, 64,  RAD_F8E4M3, true },
     { "w4nl32a8h", 4, 32,  RAD_F8E4M3, true },
     { "w5nl64a8h", 5, 64,  RAD_F8E4M3, true },
+    { "w6nl64a8h", 6, 64,  RAD_F8E4M3, true },
 };
 
 /* The encoding libquant writes for the form: codes, scale, its fixed level, then the table. */
@@ -1447,7 +1459,7 @@ RadEncoding encoding(const Form& f) {
     rad_enc_clear(&e);
     rad_enc_copy_str(e.scheme, "affine");
     rad_enc_copy_str(e.transform, "fwht128");
-    rad_enc_add_plane(&e, "codes", f.bits == 5 ? RAD_U5 : RAD_U4, 1, 1);
+    rad_enc_add_plane(&e, "codes", f.bits == 6 ? RAD_U6 : f.bits == 5 ? RAD_U5 : RAD_U4, 1, 1);
     rad_enc_add_plane(&e, "scale", f.sdt, 1, f.group);
     if (f.level) rad_enc_add_plane(&e, "scale.1", RAD_F32, 0, 0);
     rad_enc_add_table(&e, "table", RAD_F32, 1, (int64_t)1 << f.bits);
@@ -1492,7 +1504,8 @@ Planes draw(const Form& f, const RadEncoding& e, int64_t n, int64_t k, uint64_t 
             rad_store_f32(w.p[is].data() + r * rad_enc_row_bytes(f.sdt, sc), f.sdt, c, v);
         }
     if (il >= 0) rad_store_f32(w.p[il].data(), RAD_F32, 0, 0x1p-13f);
-    std::memcpy(w.p[it].data(), f.bits == 5 ? kW5nl : kW4nl, sizeof(float) << f.bits);
+    std::memcpy(w.p[it].data(), f.bits == 6 ? kW6nl : f.bits == 5 ? kW5nl : kW4nl,
+                sizeof(float) << f.bits);
     return w;
 }
 
@@ -1888,6 +1901,7 @@ int hook_refusals(const Check& ck) {
     static const R kR[] = {
         { 1, "w4nl32a8h", 3, true,  false },   /* scale per 64 named as per 32 */
         { 3, "w4nl64a8h", 2, false, false },   /* five-bit codes named four-bit */
+        { 4, "w5nl64a8h", 2, false, false },   /* six-bit codes named five-bit */
         { 1, "fp8a8",     2, false, false },   /* no codebook */
         { 1, "w4nl64a8h", 2, false, true },    /* unrotated */
         { 1, "w4nl64a8h", 4, false, false },   /* sorted_tok's position */
@@ -1951,7 +1965,7 @@ int codebook_cases(const Check& ck, int* run) {
           160, false },
     };
     int fails = 0;
-    for (int fm = 0; fm < 4; ++fm)
+    for (int fm = 0; fm < 5; ++fm)
         for (cb::Case c : kCases) {
             c.form = fm;
             const char* op = c.ncls == 4 ? "moe_gemm_q_mod4" : "moe_gemm_q";
