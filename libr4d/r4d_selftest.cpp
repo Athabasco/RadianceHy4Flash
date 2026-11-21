@@ -19938,6 +19938,314 @@ static void mla_paged_check(const Plugin& pl, std::vector<int64_t> qlen, std::ve
     dlclose(ref);
 }
 
+/* mla_attn_paged_sink / mla_attn_sel_sink (Hy4-flash) against libref, and their byte promises:
+ * verify rows equal the single-row decode at each position, the paged form at window 0 equals the
+ * selection form over the same pages, the launch forms (16 or 32 heads a workgroup, element-wise
+ * key load) agree bit for bit. Pitched q / q_rope / out with poisoned margins; an unmapped page;
+ * sinks from -1000 to 1000. */
+struct SinkOps {
+    std::vector<RadTensor> host;
+    std::vector<std::vector<uint8_t>> bytes;
+    std::vector<RadParam> ps;
+    int out = 0;
+};
+/* Host operands of one launch. Paged: sequences (qlen, ctx), window. Selection (`sel`): the paged
+ * tables expanded to one row each with length p + 1 (`full`), or, past `sel_keep` blocks, a
+ * subset of each row's blocks as an indexer leaves it (kept blocks in order, the partial page
+ * last). */
+static SinkOps sink_ops(bool sel, int64_t heads, const std::vector<int64_t>& qlen,
+                        const std::vector<int64_t>& ctx, int64_t window, int64_t bs,
+                        int64_t sel_keep = 0, uint32_t seed = 1) {
+    SinkOps o;
+    const int64_t L = 512, R = 64, S = (int64_t)qlen.size();
+    int64_t M = 0, bmax = 1, pages = 0;
+    for (int64_t s = 0; s < S; ++s) {
+        M += qlen[(size_t)s];
+        bmax = std::max(bmax, (ctx[(size_t)s] + bs - 1) / bs);
+        pages += (ctx[(size_t)s] + bs - 1) / bs;
+    }
+    pages = std::max<int64_t>(pages, 1);
+    /* the paged tables: scrambled pages, the second block of the deepest sequence unmapped */
+    std::vector<int32_t> table((size_t)(S * bmax), -1);
+    {
+        int next = 0;
+        for (int64_t s = 0; s < S; ++s)
+            for (int64_t b = 0; b < (ctx[(size_t)s] + bs - 1) / bs; ++b) {
+                int v = (int)((next++ * 5 + 3) % pages);
+                if (s == S - 1 && b == 1 && ctx[(size_t)s] > 2 * bs) v = -1;
+                table[(size_t)(s * bmax + b)] = v;
+            }
+    }
+    const float sink_cycle[] = { 0.3f, 25.f, -25.f, 2.f, 90.f, -1.f, 1000.f, -1000.f };
+    o.ps = { PI("M", M), PI("heads", heads), PI("latent_dim", L), PI("rope_dim", R) };
+    if (sel) o.ps.push_back(PI("blocks", bmax));
+    else o.ps.push_back(PI("window", window));
+    o.ps.push_back(PI("block_size", bs));
+    o.ps.push_back(PF("scale", 1 / 16.0));
+    o.ps.push_back(PS("dtype", "bf16"));
+    const int n = sel ? 7 : 8;
+    o.out = n - 1;
+    o.host.assign((size_t)n, RadTensor{});
+    o.bytes.assign((size_t)n, {});
+    auto& q = o.host[0];
+    q = T(nullptr, RAD_BF16, { M, heads, L });
+    q.stride[1] = L + 3;
+    q.stride[0] = heads * (L + 3) + 11;
+    auto& qr = o.host[1];
+    qr = T(nullptr, RAD_BF16, { M, heads, R });
+    qr.stride[1] = 192;
+    qr.stride[0] = heads * 192 + 4;
+    o.host[2] = T(nullptr, RAD_BF16, { pages, 1, bs, L + R });
+    if (sel) {
+        o.host[3] = T(nullptr, RAD_I32, { M, bmax });
+        o.host[4] = T(nullptr, RAD_I32, { M });
+    } else {
+        o.host[3] = T(nullptr, RAD_I32, { S, bmax });
+        o.host[3].stride[0] = bmax + 2;
+        o.host[4] = T(nullptr, RAD_I32, { S });
+        o.host[5] = T(nullptr, RAD_I32, { S + 1 });
+    }
+    o.host[(size_t)n - 2] = T(nullptr, RAD_F32, { heads });
+    auto& out = o.host[(size_t)n - 1];
+    out = T(nullptr, RAD_BF16, { M, heads, L });
+    out.stride[1] = L + 5;
+    out.stride[0] = heads * (L + 5) + 7;
+    for (int i = 0; i < n; ++i) {
+        RadTensor& t = o.host[(size_t)i];
+        const int64_t elements = t.shape[0] * t.stride[0];
+        o.bytes[(size_t)i].assign((size_t)elements * esz(t.dtype) + 256, 0xa5);
+        t.data = o.bytes[(size_t)i].data() + 128;
+        if (i <= 2)
+            for (int64_t e = 0; e < elements; ++e) {
+                const float v = (float)((int)(st_mix32((uint32_t)(e * 7 + i * 7919 + seed * 104729)) %
+                                              2001) - 1000) / 1000.0f;
+                ((uint16_t*)t.data)[e] = h_to_bf16(i == 2 ? v : 0.6f * v);
+            }
+    }
+    for (int64_t h = 0; h < heads; ++h)
+        ((float*)o.host[(size_t)n - 2].data)[h] = sink_cycle[h % 8] + 0.01f * (float)h;
+    if (sel) {
+        int32_t* bt = (int32_t*)o.host[3].data;
+        int32_t* len = (int32_t*)o.host[4].data;
+        int64_t r = 0;
+        for (int64_t s = 0; s < S; ++s)
+            for (int64_t i = 0; i < qlen[(size_t)s]; ++i, ++r) {
+                const int64_t p = ctx[(size_t)s] - qlen[(size_t)s] + i, nb = (p + 1 + bs - 1) / bs;
+                const int32_t* src = &table[(size_t)(s * bmax)];
+                int64_t k = 0;
+                if (!sel_keep || nb <= sel_keep) {
+                    for (int64_t b = 0; b < nb; ++b) bt[r * bmax + k++] = src[b];
+                    len[r] = (int32_t)(p + 1);
+                } else {
+                    /* sel_keep - 1 of the complete blocks (a hashed choice), then the last */
+                    const int64_t full = (p + 1) / bs;
+                    std::vector<int64_t> pick;
+                    for (int64_t b = 0; b < full; ++b) pick.push_back(b);
+                    std::sort(pick.begin(), pick.end(), [&](int64_t a, int64_t b2) {
+                        return st_mix32((uint32_t)(a * 31 + r)) < st_mix32((uint32_t)(b2 * 31 + r));
+                    });
+                    pick.resize((size_t)(sel_keep - 1));
+                    std::sort(pick.begin(), pick.end());
+                    for (int64_t b : pick) bt[r * bmax + k++] = src[b];
+                    const int64_t tail = (p + 1) % bs;
+                    if (tail) bt[r * bmax + k++] = src[full];
+                    len[r] = (int32_t)((tail ? k - 1 : k) * bs + tail);
+                }
+                for (; k < bmax; ++k) bt[r * bmax + k] = -1;
+            }
+    } else {
+        for (int64_t s = 0; s < S; ++s)
+            for (int64_t b = 0; b < bmax; ++b)
+                ((int32_t*)o.host[3].data)[s * o.host[3].stride[0] + b] = table[(size_t)(s * bmax + b)];
+        for (int64_t s = 0; s < S; ++s) ((int32_t*)o.host[4].data)[s] = (int32_t)ctx[(size_t)s];
+        int32_t c = 0;
+        for (int64_t s = 0; s <= S; ++s) {
+            ((int32_t*)o.host[5].data)[s] = c;
+            if (s < S) c += (int32_t)qlen[(size_t)s];
+        }
+    }
+    return o;
+}
+/* The output bytes (margins included) of one device launch of `row` at pin form `form`. */
+static bool sink_device(const Plugin& pl, const RadKernelInfo* row, SinkOps& o, int form,
+                        std::vector<uint8_t>& got) {
+    auto* pin = (void (*)(int))dlsym(pl.h, "r4d_mla_sink_pin_form");
+    std::vector<void*> mem(o.host.size(), nullptr);
+    std::vector<RadTensor> dev(o.host.size());
+    for (size_t i = 0; i < o.host.size(); ++i) {
+        mem[i] = dalloc(o.bytes[i].size());
+        if (!mem[i]) return false;
+        st_memcpy(mem[i], o.bytes[i].data(), o.bytes[i].size(), hipMemcpyHostToDevice);
+        dev[i] = o.host[i];
+        dev[i].data = (char*)mem[i] + 128;
+    }
+    RadArgs a{};
+    a.t = dev.data();
+    a.n_t = (int)dev.size();
+    a.p = o.ps.data();
+    a.n_p = (int)o.ps.size();
+    a.world_size = 1;
+    const int64_t need = row->scratch ? row->scratch(&a) : 0;
+    if (need < 0) return false;
+    if (need > 0) {
+        a.scratch = dalloc((size_t)need);
+        a.scratch_bytes = need;
+    }
+    if (pin) pin(form);
+    const int rc = row->launch(&a, nullptr);
+    if (pin) pin(0);
+    const hipError_t he = (hipError_t)st_stream_sync(nullptr);
+    if (rc != RAD_OK || he != hipSuccess) return false;
+    got.resize(o.bytes[(size_t)o.out].size());
+    st_memcpy(got.data(), mem[(size_t)o.out], got.size(), hipMemcpyDeviceToHost);
+    return true;
+}
+static const RadKernelInfo* sink_oracle(void*& ref, const char* op) {
+    std::string path(g_plugin);
+    path = path.substr(0, path.find_last_of('/') + 1) + "libref.so";
+    ref = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!ref) return nullptr;
+    auto count = (int (*)())dlsym(ref, "rad_kernel_count");
+    auto at = (const RadKernelInfo* (*)(int))dlsym(ref, "rad_kernel_at");
+    if (count && at)
+        for (int i = 0; i < count(); ++i)
+            if (!std::strcmp(at(i)->op, op)) return at(i);
+    return nullptr;
+}
+/* One case against libref: every element within 0.002 + 0.008 |want|, margins untouched. */
+static void mla_sink_check(const Plugin& pl, bool sel, int64_t heads, std::vector<int64_t> qlen,
+                           std::vector<int64_t> ctx, int64_t window, int64_t bs,
+                           int64_t sel_keep = 0) {
+    const char* what = sel ? "mla_attn_sel_sink_bf16" : "mla_attn_paged_sink_bf16";
+    const auto* row = find(pl, what);
+    if (!row || !g_plugin) {
+        ok(what, false, "kernel missing");
+        return;
+    }
+    void* ref = nullptr;
+    const RadKernelInfo* oracle = sink_oracle(ref, sel ? "mla_attn_sel_sink" : "mla_attn_paged_sink");
+    if (!oracle) {
+        ok(what, false, "oracle missing");
+        if (ref) dlclose(ref);
+        return;
+    }
+    SinkOps o = sink_ops(sel, heads, qlen, ctx, window, bs, sel_keep);
+    std::string label = fmt("%s H=%lld bs=%lld%s%s ctx", sel ? "sel_sink" : "paged_sink",
+                            (long long)heads, (long long)bs,
+                            sel ? "" : fmt(" w=%lld", (long long)window).c_str(),
+                            sel_keep ? fmt(" keep=%lld", (long long)sel_keep).c_str() : "");
+    for (size_t s = 0; s < ctx.size(); ++s)
+        label += fmt(" %lld/%lld", (long long)qlen[s], (long long)ctx[s]);
+    std::vector<uint8_t> got;
+    if (!sink_device(pl, row, o, 0, got)) {
+        ok(label.c_str(), false, "device launch failed");
+        dlclose(ref);
+        return;
+    }
+    RadArgs args{};
+    args.t = o.host.data();
+    args.n_t = (int)o.host.size();
+    args.p = o.ps.data();
+    args.n_p = (int)o.ps.size();
+    args.world_size = 1;
+    const int rc = oracle->launch(&args, nullptr);
+    ok(fmt("%s host oracle", label.c_str()).c_str(), rc == RAD_OK);
+    if (rc == RAD_OK) {
+        const auto& t = o.host[(size_t)o.out];
+        std::vector<bool> written(got.size(), false);
+        bool matches = true, guards = true;
+        float max_error = 0;
+        for (int64_t r = 0; r < t.shape[0]; ++r)
+            for (int64_t h = 0; h < heads; ++h)
+                for (int64_t d = 0; d < 512; ++d) {
+                    const long off = r * t.stride[0] + h * t.stride[1] + d;
+                    const float want = h_bf16(((uint16_t*)t.data)[off]),
+                                actual = h_bf16(((uint16_t*)(got.data() + 128))[off]);
+                    const float error = std::fabs(actual - want);
+                    max_error = std::max(max_error, error);
+                    matches = matches && std::isfinite(actual) &&
+                              error <= 0.002f + 0.008f * std::fabs(want);
+                    written[128 + off * 2] = written[129 + off * 2] = true;
+                }
+        for (size_t j = 0; j < got.size(); ++j)
+            if (!written[j]) guards = guards && got[j] == 0xa5;
+        ok(fmt("%s max error %.6g", label.c_str(), max_error).c_str(), matches);
+        ok(fmt("%s pitched rows and guards", label.c_str()).c_str(), guards);
+    }
+    dlclose(ref);
+}
+/* The byte promises on the card. The rows of each sequence against one-row launches at their
+ * positions; at window 0 the paged form against the selection form over the same pages; forms
+ * 1..3 against the rule (form 0). */
+static void mla_sink_bytes(const Plugin& pl, int64_t heads, std::vector<int64_t> qlen,
+                           std::vector<int64_t> ctx, int64_t window, int64_t bs) {
+    const auto* paged = find(pl, "mla_attn_paged_sink_bf16");
+    const auto* selr = find(pl, "mla_attn_sel_sink_bf16");
+    if (!paged || !selr) {
+        ok("mla_sink bytes", false, "kernel missing");
+        return;
+    }
+    std::string label = fmt("sink bytes H=%lld w=%lld bs=%lld ctx", (long long)heads,
+                            (long long)window, (long long)bs);
+    for (size_t s = 0; s < ctx.size(); ++s)
+        label += fmt(" %lld/%lld", (long long)qlen[s], (long long)ctx[s]);
+    SinkOps all = sink_ops(false, heads, qlen, ctx, window, bs);
+    std::vector<uint8_t> base;
+    if (!sink_device(pl, paged, all, 0, base)) {
+        ok(label.c_str(), false, "device launch failed");
+        return;
+    }
+    const auto& ot = all.host[(size_t)all.out];
+    auto row_bytes = [&](const std::vector<uint8_t>& b, const RadTensor& t, int64_t r) {
+        std::vector<uint16_t> v;
+        for (int64_t h = 0; h < heads; ++h)
+            for (int64_t d = 0; d < 512; ++d)
+                v.push_back(((const uint16_t*)(b.data() + 128))[r * t.stride[0] + h * t.stride[1] + d]);
+        return v;
+    };
+    /* verify rows: a one-row launch with the same table and the row's own q, at its position */
+    bool same = true;
+    int64_t r = 0;
+    for (size_t s = 0; s < qlen.size(); ++s)
+        for (int64_t i = 0; i < qlen[s]; ++i, ++r) {
+            SinkOps one = sink_ops(false, heads, { 1 }, { ctx[s] }, window, bs);
+            /* the whole launch's cache */
+            one.bytes[2] = all.bytes[2];
+            one.host[2] = all.host[2];
+            one.host[2].data = one.bytes[2].data() + 128;
+            /* the table, q and q_rope of row r */
+            const RadTensor& bt = all.host[3];
+            for (int64_t b = 0; b < one.host[3].shape[1]; ++b)
+                ((int32_t*)one.host[3].data)[b] = ((int32_t*)bt.data)[(int64_t)s * bt.stride[0] + b];
+            ((int32_t*)one.host[4].data)[0] = (int32_t)(ctx[s] - qlen[s] + i + 1);
+            for (int k = 0; k < 2; ++k) {
+                const RadTensor &src = all.host[(size_t)k], &dst = one.host[(size_t)k];
+                for (int64_t h = 0; h < heads; ++h)
+                    for (int64_t d = 0; d < src.shape[2]; ++d)
+                        ((uint16_t*)dst.data)[h * dst.stride[1] + d] =
+                            ((uint16_t*)src.data)[r * src.stride[0] + h * src.stride[1] + d];
+            }
+            std::vector<uint8_t> g;
+            if (!sink_device(pl, paged, one, 0, g) ||
+                row_bytes(g, one.host[(size_t)one.out], 0) != row_bytes(base, ot, r))
+                same = false;
+        }
+    ok(fmt("%s verify rows == decode rows", label.c_str()).c_str(), same);
+    for (int form : { 1, 2, 3 }) {
+        std::vector<uint8_t> g;
+        const bool ran = sink_device(pl, paged, all, form, g);
+        ok(fmt("%s form %d == rule", label.c_str(), form).c_str(), ran && g == base);
+    }
+    if (!window) {
+        SinkOps s = sink_ops(true, heads, qlen, ctx, 0, bs);
+        std::vector<uint8_t> g;
+        bool eq = sink_device(pl, selr, s, 0, g);
+        for (int64_t rr = 0; eq && rr < ot.shape[0]; ++rr)
+            eq = row_bytes(g, s.host[(size_t)s.out], rr) == row_bytes(base, ot, rr);
+        ok(fmt("%s paged == sel", label.c_str()).c_str(), eq);
+    }
+}
+
 /* An environment variable set (or, with a null value, cleared) for one scope and restored after
  * it: the MLA launcher reads its counting switch at every call. */
 struct ScopedEnv {
@@ -36305,6 +36613,38 @@ static void device_phase(const Plugin& pl) {
                 mla_paged_check(pl, { 33, 5 }, { 33, 900 }, heads, gated);
                 mla_paged_check(pl, { 130 }, { 130 }, heads, gated);
             }
+    }
+    if (sel("mla_attn_paged_sink_bf16")) {
+        /* Hy4-flash: sliding layers at 64 heads (TP1) and 32 (TP2), the sparse ones' dense form
+         * (window 0) at 32 down to 8; decode, a verify of up to 8 rows, contexts at the window's
+         * edge and past 2048, block sizes 4 and 16. */
+        for (int64_t heads : { 64, 32 })
+            for (int64_t bs : { 4, 16 }) {
+                mla_sink_check(pl, false, heads, { 1 }, { 1 }, 512, bs);
+                mla_sink_check(pl, false, heads, { 1, 1, 1 }, { 511, 512, 513 }, 512, bs);
+                mla_sink_check(pl, false, heads, { 8, 4 }, { 520, 2100 }, 512, bs);
+                mla_sink_check(pl, false, heads, { 2, 1 }, { 4097, 600 }, 512, bs);
+            }
+        for (int64_t heads : { 32, 16, 8 }) {
+            mla_sink_check(pl, false, heads, { 1, 3 }, { 17, 513 }, 0, 4);
+            mla_sink_check(pl, false, heads, { 8 }, { 2100 }, 0, 4);
+        }
+        mla_sink_check(pl, false, 64, { 20 }, { 600 }, 512, 4); /* past 16 rows: unsplit */
+        mla_sink_check(pl, false, 32, { 100 }, { 300 }, 0, 4);
+        mla_sink_bytes(pl, 64, { 8, 1 }, { 530, 2100 }, 512, 4);
+        mla_sink_bytes(pl, 32, { 1, 1, 1 }, { 511, 512, 513 }, 512, 16);
+        mla_sink_bytes(pl, 32, { 5, 1 }, { 2049, 600 }, 0, 4);
+        mla_sink_bytes(pl, 16, { 3 }, { 513 }, 0, 4);
+    }
+    if (sel("mla_attn_sel_sink_bf16")) {
+        /* The indexer's selection: full selections below 2048 keys, a 2048-key subset (512 blocks
+         * of 4) past it. */
+        for (int64_t heads : { 32, 16, 8 }) {
+            mla_sink_check(pl, true, heads, { 1, 2 }, { 1, 513 }, 0, 4);
+            mla_sink_check(pl, true, heads, { 4, 1 }, { 3000, 4100 }, 0, 4, 512);
+        }
+        mla_sink_check(pl, true, 64, { 8 }, { 2500 }, 0, 4, 512);
+        mla_sink_check(pl, true, 32, { 80 }, { 2200 }, 0, 4, 512); /* unsplit */
     }
     if (sel("mla_attn_rows_bf16")) {
         /* A rank's run of rows with all 64 heads (GLM's prefill split by rows), against the matrix
