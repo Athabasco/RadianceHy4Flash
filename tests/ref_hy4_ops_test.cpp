@@ -956,6 +956,22 @@ TEST(engram_ids_carry_the_window_across_steps_in_both_layouts_and_through_cache_
     CHECK_EQ(f.state.iat(2), (int64_t)eg_tok[8]); CHECK_EQ(f.state.iat(3), (int64_t)eg_tok[9]);
 }
 
+/* The engine hands a CONV group's state as [slots, n_head_kv * head_dim, W], [slots, 1, W] for the
+ * plugin's one id a slot: the same window as [slots, W]. */
+TEST(engram_ids_reads_the_state_as_the_engine_hands_a_conv_group) {
+    EngramCase a(6), b(6);
+    b.state = T(RAD_I32, {3, 1, 2});
+    st_int(RAD_I32, b.state.t.data, 2, 77); st_int(RAD_I32, b.state.t.data, 3, 88);     // slot 1
+    st_int(RAD_I32, a.state.t.data, 0, 77); st_int(RAD_I32, a.state.t.data, 1, 88);
+    for (EngramCase* c : { &a, &b }) { c->tok.n(eg_tok + 6, 6); c->pos.n(eg_pos + 6, 6); }
+    T slot(RAD_I32, {1}); slot.n({1});
+    REQUIRE_EQ(run_ids(a), (int)RAD_OK);
+    REQUIRE_EQ(run_ids(b, nullptr, &slot), (int)RAD_OK);
+    for (int64_t i = 0; i < 60; ++i) CHECK_EQ(b.ids.iat(i), a.ids.iat(i));
+    CHECK_EQ(b.state.iat(2), a.state.iat(0)); CHECK_EQ(b.state.iat(3), a.state.iat(1));
+    CHECK_EQ(b.state.iat(0), 0); CHECK_EQ(b.state.iat(1), 0);                             // slot 0 untouched
+}
+
 TEST(engram_ids_refuses_what_it_cannot_hash) {
     EngramCase c;
     A a; a.t(c.tok).t(c.state).t(c.cu).t(c.pos).t(c.map).t(c.mult).t(c.vsz).t(c.off).tnull().tnull().t(c.ids).t(c.mask)

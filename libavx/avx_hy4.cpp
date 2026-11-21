@@ -752,7 +752,7 @@ AVX_KERNEL(engram_ids) {
         return RAD_E_SHAPE;
     const int64_t M = numel(&tok), n_seq = cu.shape[0] - 1;
     if (numel(&pos) < M || ids.rank != 2 || ids.shape[0] < M || ids.shape[1] != heads ||
-        numel(&mask) < M || st.rank != 2 || st.shape[1] < ctx)
+        numel(&mask) < M || st.rank < 2 || st.shape[st.rank - 1] < ctx)
         return RAD_E_SHAPE;
     std::vector<int64_t> vtab((size_t)heads), otab((size_t)heads), mtab((size_t)ngram);
     for (int64_t h = 0; h < heads; ++h) {
@@ -761,7 +761,8 @@ AVX_KERNEL(engram_ids) {
         if (vtab[(size_t)h] <= 0 || otab[(size_t)h] < 0) return RAD_E_SHAPE;
     }
     for (int64_t k = 0; k < ngram; ++k) mtab[(size_t)k] = ldi(&mult, offlin(&mult, k));
-    const int64_t W = st.shape[1];
+    /* The CONV group's state: [slots, W], or [slots, 1, W] as the engine hands it. */
+    const int64_t W = st.shape[st.rank - 1];
     for (int64_t s = 0; s < n_seq; ++s) {
         const int64_t o = nacc ? ldi(nacc, offlin(nacc, s)) - 1 : 0;
         const int64_t b0 = cuv(&cu, s), b1 = cuv(&cu, s + 1);

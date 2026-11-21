@@ -289,7 +289,8 @@ extern "C" int r4d_rad_engram_ids(const RadArgs* a, RadStream s) {
     if (tok->rank < 1 || M < 1 || M > INT32_MAX / 64 || !r4d_contig(tok) || !r4d_contig(cu) ||
         cu->rank != 1 || cu->shape[0] < 2 || r4d_numel(pos) < M || r4d_numel(map) < msize ||
         r4d_numel(mult) < ngram || r4d_numel(vsz) < heads || r4d_numel(off) < heads ||
-        r4d_numel(mask) < M || st->rank != 2 || st->shape[1] < ctx || st->stride[1] != 1 ||
+        r4d_numel(mask) < M || st->rank < 2 || st->rank > 3 || (st->rank == 3 && st->shape[1] != 1) ||
+        st->shape[st->rank - 1] < ctx || st->stride[st->rank - 1] != 1 ||
         ids->rank != 2 || ids->shape[0] < M || ids->shape[1] != heads || ids->stride[1] != 1)
         return R4D_NO(RAD_E_SHAPE);
     if (!r4d_contig(pos) || !r4d_contig(map) || !r4d_contig(mult) || !r4d_contig(vsz) ||
@@ -315,7 +316,8 @@ extern "C" int r4d_rad_engram_ids(const RadArgs* a, RadStream s) {
     p.image = (int32_t)image;
     p.video = (int32_t)video;
     p.n_seq = (int32_t)(cu->shape[0] - 1);
-    p.W = (int32_t)st->shape[1];
+    /* [slots, W], or [slots, 1, W] as the engine hands a CONV group's state. */
+    p.W = (int32_t)st->shape[st->rank - 1];
     p.sp = (uint64_t)st->stride[0];
     p.ip = (uint64_t)ids->stride[0];
     const uint32_t blocks = (uint32_t)((M * heads + 255) / 256);

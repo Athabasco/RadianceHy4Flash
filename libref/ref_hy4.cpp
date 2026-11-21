@@ -644,11 +644,12 @@ int ref_engram_ids(const RadArgs* a, RadStream) {
         return RAD_E_SHAPE;
     const int64_t M = numel(&tok), n_seq = cu.shape[0] - 1;
     if (numel(&pos) < M || ids.rank != 2 || ids.shape[0] < M || ids.shape[1] != heads ||
-        numel(&mask) < M || st.rank != 2 || st.shape[1] < ctx)
+        numel(&mask) < M || st.rank < 2 || st.shape[st.rank - 1] < ctx)
         return RAD_E_SHAPE;
     for (int64_t h = 0; h < heads; ++h)
         if (ld_idx(&vsz, h) <= 0 || ld_idx(&off, h) < 0) return RAD_E_SHAPE;
-    const int64_t W = st.shape[1];
+    /* The CONV group's state is [slots, W] or, as the engine hands it, [slots, 1, W]. */
+    const int64_t W = st.shape[st.rank - 1];
     for (int64_t s = 0; s < n_seq; ++s) {
         const int64_t o = nacc ? ld_idx(nacc, s) - 1 : 0;
         const int64_t b0 = cu_at(&cu, s), b1 = cu_at(&cu, s + 1);
