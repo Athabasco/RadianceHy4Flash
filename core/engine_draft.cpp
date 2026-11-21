@@ -1155,9 +1155,16 @@ int Engine::block_depth_decide() {
     if (n <= 0 || steps <= 0) return RAD_OK;
     RadEvent ev = depth_ev_[0];
     const auto t0 = std::chrono::steady_clock::now();
-    int q = rad_event_query(ev);
+    /* A step whose drafting rows are all greedy has no law to read: every row verifies `lawless`
+     * and the walk's states are not waited for (the wait would hold the next step's issue behind
+     * this step's trunk pass and both draft passes). */
+    bool any_law = false;
+    for (int i = 0; i < n; ++i) any_law |= couple_draw_stage_[(size_t)i].mode == 1;
+    int q = any_law ? rad_event_query(ev) : 1;
     if (q < 0) return q;
-    if (q == 0) {
+    if (!any_law) {
+        ++depth_stats_.late;
+    } else if (q == 0) {
         /* The trunk's whole forward pass may be in front: block for the ids (copied ahead of
          * both drafter passes), then poll the few hundred microseconds of the passes, which
          * answers within a microsecond where an interrupt takes tens. */
@@ -1183,7 +1190,7 @@ int Engine::block_depth_decide() {
     } else {
         ++depth_stats_.late;
     }
-    RAD_TRY(rad_event_sync(ev));
+    if (any_law) RAD_TRY(rad_event_sync(ev));
     depth_stats_.wait_us +=
         std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
     /* Each row's statistics in block order, up to the first position with no law: a law that is
