@@ -1302,7 +1302,11 @@ int Engine::step_loop() {
     std::vector<uint64_t> cancel;
     /* Not in KL mode: its scored rows are copied out of the logits buffer after collection, and a
      * pass issued ahead would overwrite them. */
-    pipelining_ = !cfg_.kld() && !cfg_.calib() && !embedding_ &&
+    /* Nor under the buffer probe (RADIANCE_DUMP_BUF at -vv): it reads after the step is
+     * collected, and a pass issued ahead would already have rewritten what it shows. */
+    const char* probe = std::getenv("RADIANCE_DUMP_BUF");
+    const bool probing = (int)log_level() >= (int)Log::Trace && probe && *probe;
+    pipelining_ = !cfg_.kld() && !cfg_.calib() && !embedding_ && !probing &&
                   (serial_drafting() || block_drafting() || cfg_.n_spec <= 0);
     early_ids_ = !cfg_.kld() && !embedding_;
     /* A tree's acceptance moves K and V on the card behind the step issued ahead. The KL mode
