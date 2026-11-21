@@ -34620,6 +34620,131 @@ static void hy4_mla_kv_split_case(const Plugin& pl) {
     }
 }
 
+/* mla_row_norm_rope_store: Hy4-flash's latent cache row in one launch, held to the three rows it
+ * replaces (rmsnorm over the row's first 512 columns, rope over its last 64, kv_store of its
+ * halves) on column-slice operands of one buffer, byte for byte on the row and on the cache: plain
+ * and imrope positions, an f32 and a bf16 gain, padding slots, the block sizes of the sparse and the
+ * sliding group. The chained form (`chain` 1 and no engine record) is run too. */
+static void hy4_mla_row_front_case(const Plugin& pl) {
+    if (!sel("mla_row_norm_rope_store_bf16")) return;
+    const RadKernelInfo* fu = find(pl, "mla_row_norm_rope_store_bf16");
+    const RadKernelInfo* rn = find(pl, "rmsnorm_bf16");
+    const RadKernelInfo* rp = find(pl, "rope_bf16");
+    const RadKernelInfo* ks = find(pl, "kv_store_bf16");
+    if (!fu || !rn || !rp || !ks) { ok("mla_row_norm_rope_store_bf16", false, "row absent"); return; }
+    const int64_t L = 512, R = 64, P = L + R, half = P / 2;
+    struct C { int64_t M, bs, blocks; bool imrope, f32gain, pad, chain; };
+    const C cs[] = { { 1, 64, 4, false, true, false, false }, { 1, 64, 4, false, true, false, true },
+                     { 6, 64, 4, true, true, false, true },   { 17, 16, 8, false, false, true, false },
+                     { 64, 64, 6, true, true, true, true },   { 3, 16, 4, true, false, false, false },
+                     { 130, 64, 4, false, true, true, false } };
+    for (const C& c : cs) {
+        const std::string what = fmt("mla_row_norm_rope_store is byte-identical to its three rows: M %lld "
+                                     "block %lld%s%s%s%s", (long long)c.M, (long long)c.bs,
+                                     c.imrope ? ", imrope" : "", c.f32gain ? "" : ", bf16 gain",
+                                     c.pad ? ", padding slots" : "", c.chain ? ", chained form" : "");
+        Hy4Rng rng((uint32_t)(c.M * 31 + c.bs + c.imrope));
+        std::vector<uint16_t> row((size_t)(c.M * P));
+        for (uint16_t& v : row) v = h_to_bf16(rng.n() * 3.0f);
+        std::vector<float> gain((size_t)L);
+        for (float& g : gain) g = 0.5f + 0.5f * (rng.u() + 1.0f);
+        std::vector<uint16_t> gain16((size_t)L);
+        for (size_t i = 0; i < gain16.size(); ++i) gain16[i] = h_to_bf16(gain[i]);
+        std::vector<int32_t> pos((size_t)(c.M * (c.imrope ? 3 : 1))), slot((size_t)c.M);
+        for (int64_t i = 0; i < c.M; ++i) {
+            pos[(size_t)i] = (int32_t)(900 + 37 * i + rng.r(5));
+            if (c.imrope) {
+                pos[(size_t)(c.M + i)] = (int32_t)(rng.r(40));
+                pos[(size_t)(2 * c.M + i)] = (int32_t)(rng.r(40));
+            }
+            slot[(size_t)i] = c.pad && i % 5 == 3 ? -1 : (int32_t)((i * 7 + 2) % (c.blocks * c.bs));
+        }
+        /* distinct slots: two tokens on one slot would race in both forms */
+        { std::vector<char> used((size_t)(c.blocks * c.bs), 0);
+          for (int64_t i = 0; i < c.M; ++i) {
+              int32_t& v = slot[(size_t)i];
+              if (v < 0) continue;
+              while (used[(size_t)v]) v = (int32_t)((v + 1) % (c.blocks * c.bs));
+              used[(size_t)v] = 1;
+          } }
+        const int64_t cache_n = c.blocks * c.bs * P;
+        std::vector<uint16_t> cache((size_t)cache_n);
+        for (uint16_t& v : cache) v = h_to_bf16(rng.u());
+        void *d_row[2], *d_cache[2];
+        void* d_gain = dalloc(gain.size() * (c.f32gain ? 4 : 2));
+        void* d_pos = dalloc(pos.size() * 4);
+        void* d_slot = dalloc(slot.size() * 4);
+        bool alloc_ok = d_gain && d_pos && d_slot;
+        for (int k = 0; k < 2; ++k) {
+            d_row[k] = dalloc(row.size() * 2);
+            d_cache[k] = dalloc(cache.size() * 2);
+            alloc_ok = alloc_ok && d_row[k] && d_cache[k];
+        }
+        if (!alloc_ok) { ok(what.c_str(), false, "allocation"); continue; }
+        if (c.f32gain) st_memcpy(d_gain, gain.data(), gain.size() * 4, hipMemcpyHostToDevice);
+        else           st_memcpy(d_gain, gain16.data(), gain16.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_pos, pos.data(), pos.size() * 4, hipMemcpyHostToDevice);
+        st_memcpy(d_slot, slot.data(), slot.size() * 4, hipMemcpyHostToDevice);
+        for (int k = 0; k < 2; ++k) {
+            st_memcpy(d_row[k], row.data(), row.size() * 2, hipMemcpyHostToDevice);
+            st_memcpy(d_cache[k], cache.data(), cache.size() * 2, hipMemcpyHostToDevice);
+        }
+        const RadTensor gt = T(d_gain, c.f32gain ? RAD_F32 : RAD_BF16, { L });
+        const RadTensor pt = c.imrope ? T(d_pos, RAD_I32, { 3, c.M }) : T(d_pos, RAD_I32, { c.M });
+        const RadTensor st = T(d_slot, RAD_I32, { c.M });
+        auto cache_t = [&](void* d) { return T(d, RAD_BF16, { c.blocks, 1, c.bs, P }); };
+        /* The fused launch. */
+        std::vector<RadTensor> ft = { T(d_row[0], RAD_BF16, { c.M, P }), gt, pt, st, cache_t(d_cache[0]) };
+        std::vector<RadParam> fp = { PI("M", c.M), PI("latent", L), PI("rope_dim", R), PF("eps", 1e-6),
+                                     PF("theta", 10000.0), PF("scale", 1.0),
+                                     PS("mode", c.imrope ? "imrope_gptj" : "gptj"),
+                                     PI("block_size", c.bs), PS("dtype", "bf16") };
+        if (c.imrope) fp.push_back(PS("sections", "11 11 10"));
+        if (c.chain) fp.push_back(PI("chain", 1));
+        const int r1 = ij_run_row(fu, ft, fp);
+        /* The chain on slices of one buffer: the norm over the first L columns (rows at pitch P), the
+         * rope over the last R, the store of the two halves. */
+        auto slice = [&](void* d, int64_t col, int64_t width) {
+            RadTensor t = T((char*)d + col * 2, RAD_BF16, { c.M, width });
+            t.stride[0] = P;
+            return t;
+        };
+        std::vector<RadTensor> nt = { slice(d_row[1], 0, L), gt, slice(d_row[1], 0, L) };
+        std::vector<RadParam> np = { PI("M", c.M), PI("n", L), PF("eps", 1e-6), PS("dtype", "bf16") };
+        int r2 = ij_run_row(rn, nt, np);
+        std::vector<RadTensor> rt = { slice(d_row[1], L, R), pt };
+        std::vector<RadParam> rpp = { PI("M", c.M), PI("head_dim", R), PI("n_head", 1), PI("n_head_kv", 0),
+                                      PF("theta", 10000.0), PF("scale", 1.0),
+                                      PS("mode", c.imrope ? "imrope_gptj" : "gptj"), PI("rotary_dim", R) };
+        if (c.imrope) rpp.push_back(PS("sections", "11 11 10"));
+        if (r2 == RAD_OK) r2 = ij_run_row(rp, rt, rpp);
+        std::vector<RadTensor> kt = { slice(d_row[1], 0, half), slice(d_row[1], half, half), st,
+                                      cache_t(d_cache[1]) };
+        std::vector<RadParam> kp = { PI("M", c.M), PI("head_dim", half), PI("n_head_kv", 1),
+                                     PI("block_size", c.bs), PS("kv_dtype", "bf16") };
+        if (r2 == RAD_OK) r2 = ij_run_row(ks, kt, kp);
+        if (r1 != RAD_OK || r2 != RAD_OK) {
+            ok(what.c_str(), false, fmt("rc %d / chain %d", r1, r2));
+            continue;
+        }
+        std::vector<uint16_t> r_f(row.size()), r_c(row.size()), c_f(cache.size()), c_c(cache.size());
+        st_memcpy(r_f.data(), d_row[0], row.size() * 2, hipMemcpyDeviceToHost);
+        st_memcpy(r_c.data(), d_row[1], row.size() * 2, hipMemcpyDeviceToHost);
+        st_memcpy(c_f.data(), d_cache[0], cache.size() * 2, hipMemcpyDeviceToHost);
+        st_memcpy(c_c.data(), d_cache[1], cache.size() * 2, hipMemcpyDeviceToHost);
+        int64_t bad_row = 0, bad_cache = 0;
+        for (size_t i = 0; i < r_f.size(); ++i) bad_row += r_f[i] != r_c[i];
+        for (size_t i = 0; i < c_f.size(); ++i) bad_cache += c_f[i] != c_c[i];
+        /* The row must have changed (the chain ran) and the cache must hold something new. */
+        bool moved = false, stored = false;
+        for (size_t i = 0; i < r_c.size(); ++i) moved |= r_c[i] != row[i];
+        for (size_t i = 0; i < c_c.size(); ++i) stored |= c_c[i] != cache[i];
+        ok(what.c_str(), bad_row == 0 && bad_cache == 0 && moved && stored,
+           fmt("%lld row and %lld cache values differ%s%s", (long long)bad_row, (long long)bad_cache,
+               moved ? "" : ", the chain left the row alone", stored ? "" : ", nothing was stored"));
+    }
+}
+
 /* engram_ids: prefill and decode forms, a document start inside the chunk, ids at and past the
  * map, pad / image / video tokens, a slot permutation with a dropped slot, i32 and i64 ids, and the
  * window after the step. Everything is an integer, so everything is exact. */
@@ -34871,6 +34996,7 @@ static void device_phase(const Plugin& pl) {
     hy4_misc_case(pl);
     hy4_mla_project_kv_case(pl);
     hy4_mla_kv_split_case(pl);
+    hy4_mla_row_front_case(pl);
     hy4_engram_ids_case(pl);
     hy4_dfly_sel_case(pl);
     hy4_engram_norm_case(pl);

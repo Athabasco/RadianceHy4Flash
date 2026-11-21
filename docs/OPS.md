@@ -3757,6 +3757,7 @@ refuses the graph rather than resolving a similar op.
 | `mla_expand_gate` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `dtype` | `x`, `w`w, `g` → `y` |
 | `mla_attn_paged_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `block_size` `window` `scale`:f64 `dtype` `stable`/opt | `q`, `q_rope`, `kv`, `block_table`, `seqused`, `cu_seqlens`, `sinks`w → `out` |
 | `mla_attn_sel_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `blocks` `block_size` `scale`:f64 `dtype` `stable`/opt | `q`, `q_rope`, `kv`, `bt`, `length`, `sinks`w → `out` |
+| `mla_row_norm_rope_store` | `M`(range) `latent` `rope_dim` `eps`:f64 `theta`:f64 `scale`:f64/opt `mode`/opt `sections`/opt `block_size` `dtype` | `row`:inout, `w`w, `positions`, `slot_mapping`, `kv_cache`:inout |
 | `mla_kv_split` | `M`(range) `heads` `k_dim` `v_dim` `rope_dim` `dtype` | `kvb`, `k_rope` → `k`, `v` |
 | `attn_kv_sink` | `M`(range) `N` `heads` `head_dim` `window` `scale`:f64 `dtype` | `q`, `k`, `v`, `cu_q`, `cu_k`, `sinks`w → `out` |
 | `gate_mul` | `M`(range) `n` `dtype` | `a`, `g` → `y` |
@@ -3846,6 +3847,18 @@ bf16 before the product, as the pair stores and reads it. libref and libavx run 
 (their `mla_project_kv` expand, then their `gate_mul` in place); libr4d's fused row is held to its
 own pair byte for byte (rad-kbench's fusion oracle, `r4d_fuse.cpp`). A graph whose libraries lack
 the op issues the pair (`arch/hyv4flash`, `rad_op_declared`).
+
+`mla_row_norm_rope_store` (device-only) is Hy4-flash's latent cache row `[latent | rotary key]`,
+`latent + rope_dim` columns a token, in one launch: `rmsnorm` over the first `latent` columns in place
+(`w` of `latent` entries, `eps`), `rope` over the last `rope_dim` (one head, `mode` `gptj`, or
+`imrope_gptj` with `sections` and `[3, M]` positions, `theta`, `scale`), then `kv_store` of the row as
+one KV head of `(latent + rope_dim) / 2`, its first half the key slot and the rest the value slot, into
+`kv_cache` `[blocks, 1, block_size, latent + rope_dim]` at `slot_mapping`. The row is left as the
+chain leaves it. Byte-identical to the three ops (the same bodies run in the same order, one workgroup
+of 256 threads a token; the norm's sum is the 256-lane partition at every width). It publishes no
+`replaces` hook: the chain's operands are column slices of one buffer, which a hook cannot wire.
+r4d_selftest runs it against the three rows on column-slice operands. `arch/hyv4flash` issues it in
+front of the paged store (not the streamed one, nor with the debug taps on) when the op is declared.
 
 ### `mla_attn_paged_sink`, `mla_attn_sel_sink`, `attn_kv_sink`
 

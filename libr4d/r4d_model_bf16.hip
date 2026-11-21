@@ -792,6 +792,42 @@ __global__ __launch_bounds__(kThreads) void r4dchain_kv_store(R4D_KVS_PARAMS) {
 }
 #undef R4D_KVS_PARAMS
 
+// ---------------------------------------------------------------------------- mla_row_norm_rope_store
+// Hy4-flash's latent cache row, [latent | rotary key] of L + R columns a token: the norm of the first
+// L, the rotary of the last R (one head, gptj pairs, plain or imrope positions) and the store of the
+// row as one KV head of (L + R) / 2 (its first half the key slot, the rest the value slot), in one
+// workgroup a token. The three bodies are the standalone kernels' own (rmsnorm_body at n = L in place,
+// rope_body at one head of R, kv_store_body), called in order with a barrier between: every
+// column goes through the same expressions in the same order, so the row and the cache slot are the
+// chain's bytes. The norm's sum is the 256-lane partition whatever the width (r4d_common.h), which
+// is why this block's 256 threads fold what the standalone launch's 1024 or 512 do.
+struct MlaRowFront {
+    uint16_t* row;            // [M][pitch], L + R columns used
+    const void* gain;         // L, f32 or bf16 (WF32)
+    const int32_t* pos;
+    const int32_t* slot;
+    uint16_t* kv;
+    uint32_t L, R, pitch, block_size, n_blocks, plane;
+    float eps, theta, rscale;
+    int mode, gptj, s0, s1, s2, n_sec;
+    int pad_;                 // no tail padding: a kernel's by-value struct is audited byte for byte
+};
+static_assert(sizeof(MlaRowFront) == 104, "MlaRowFront has padding");
+template <bool WF32, class CH>
+__global__ __launch_bounds__(kThreads) void mla_row_front_kernel(MlaRowFront p) {
+    if (CH::on) r4d_chain_wait();
+    rmsnorm_body<WF32, kThreads>(p.row, p.gain, p.row, p.L, p.eps, 0.0f, 1.0f, p.pitch, p.pitch,
+                                 gridDim.x);
+    __syncthreads();
+    rope_body(p.row + p.L, p.pos, p.R, 1u, p.R, p.R / 2, (int)p.R, p.gptj, p.theta, p.rscale,
+              p.pitch, p.mode, p.s0, p.s1, p.s2, p.n_sec, p.plane, RadYarn{}, RadLlama3{});
+    __syncthreads();
+    const uint32_t half = (p.L + p.R) / 2;
+    kv_store_body(p.row, p.row + half, p.slot, p.kv, half, 1u, p.block_size, p.n_blocks, p.pitch,
+                  p.pitch);
+    if (CH::on) r4d_chain_done();
+}
+
 // The same scatter into an E4M3 cache: the write side of the fp8kv attention family and its
 // `k_descale` / `v_descale` operands.
 //
@@ -2680,6 +2716,82 @@ extern "C" int r4d_rad_kv_store(const RadArgs* a, RadStream s) {
                          (int)g.n_blocks, (int)g.k_ld, (int)g.v_ld, (long)(uintptr_t)s,
                          r4d_geti_or(a, "chain", 0) != 0 && g.T <= 64) == 0 ? RAD_OK
                                                                            : RAD_E_DEVICE;
+}
+
+/* mla_row_norm_rope_store: operands row [M, L + R] (inout, the rows at one pitch), w (L), positions,
+ * slot_mapping, kv_cache [blocks, 1, block_size, L + R]. The chain it replaces is rmsnorm over the row's
+ * first L columns, rope (gptj or imrope_gptj) over its last R, kv_store of the row's halves
+ * (docs/OPS.md); there is no `replaces` hook, since the chain's operands are column slices of one
+ * buffer, which a hook's wiring cannot name. r4d_selftest compares it with the three rows. */
+extern "C" int r4d_rad_mla_row_norm_rope_store(const RadArgs* a, RadStream s) {
+    const RadTensor* row = r4d_opt(a, 0);
+    const RadTensor* w   = r4d_opt(a, 1);
+    const RadTensor* pos = r4d_opt(a, 2);
+    const RadTensor* sm  = r4d_opt(a, 3);
+    const RadTensor* kv  = r4d_opt(a, 4);
+    if (!row || !w || !pos || !sm || !kv) return R4D_NO(RAD_E_INVAL);
+    R4D_NEED(dt_bf16(row));
+    R4D_NEED(dt_i32(pos));
+    R4D_NEED(dt_i32(sm));
+    R4D_NEED(dt_bf16(kv));
+    if (w->dtype != RAD_F32 && w->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(w) || !r4d_contig(sm) || !r4d_contig(kv)) return R4D_NO(RAD_E_STRIDE);
+    if (pos->rank == 2 ? pos->stride[1] != 1 : pos->stride[0] != 1) return R4D_NO(RAD_E_STRIDE);
+
+    const long long L = r4d_geti_or(a, "latent", 0), R = r4d_geti_or(a, "rope_dim", 0),
+                    bs = r4d_geti_or(a, "block_size", 0);
+    if (L < 8 || R < 2 || (R & 1) || ((L + R) & 1) || bs < 1 || r4d_numel(w) < L)
+        return R4D_NO(RAD_E_SHAPE);
+    const char* mode = r4d_gets(a, "mode");
+    int gptj = 1, mc = 0;
+    if (!mode) return R4D_NO(RAD_E_SCHEMA);
+    if (!std::strcmp(mode, "gptj")) mc = 0;
+    else if (!std::strcmp(mode, "imrope_gptj")) mc = 3;
+    else return R4D_NO(RAD_E_UNSUPPORTED);
+    int sec[3] = { 0, 0, 0 }, n_sec = 0;
+    for (const char* v = r4d_gets(a, "sections"); v && *v;) {
+        char* e = nullptr;
+        const long x = std::strtol(v, &e, 10);
+        if (e == v) break;
+        if (x <= 0 || n_sec >= 3) return R4D_NO(RAD_E_SHAPE);
+        sec[n_sec++] = (int)x;
+        v = e;
+    }
+    long long M = 0;
+    const long long pitch = r4d_rows_pitch(row, L + R, &M);
+    if (pitch < 0) return R4D_NO(RAD_E_STRIDE);
+    const long long T = r4d_numel(sm);
+    if (T < 1 || M < T || T > 65535) return R4D_NO(RAD_E_SHAPE);
+    const bool multi = pos->rank >= 2;
+    const long long Mp = multi ? pos->shape[1] : r4d_numel(pos);
+    if (Mp < T) return R4D_NO(RAD_E_SHAPE);
+    int plane = 0;
+    if (multi) {
+        if (mc != 3 || n_sec != 3 || pos->shape[0] < 3) return R4D_NO(RAD_E_SHAPE);
+        plane = (int)(pos->stride[0] >= pos->shape[1] ? pos->stride[0] : pos->shape[1]);
+    }
+    if (kv->rank != 4 || kv->shape[1] != 1 || kv->shape[2] != bs || kv->shape[3] != L + R)
+        return R4D_NO(RAD_E_SHAPE);
+    const double theta = r4d_getf(a, "theta", 10000.0), eps = r4d_getf(a, "eps", 1e-6),
+                 scale = r4d_getf(a, "scale", 1.0);
+    if (!(theta > 0.0) || !(eps >= 0.0) || !(scale > 0.0)) return R4D_NO(RAD_E_INVAL);
+    if (!r4d_aligned(row->data, 2)) return R4D_NO(RAD_E_ALIGN);
+
+    MlaRowFront p{};
+    p.row = (uint16_t*)row->data; p.gain = w->data; p.pos = (const int32_t*)pos->data;
+    p.slot = (const int32_t*)sm->data; p.kv = (uint16_t*)kv->data;
+    p.L = (uint32_t)L; p.R = (uint32_t)R; p.pitch = (uint32_t)pitch;
+    p.block_size = (uint32_t)bs; p.n_blocks = (uint32_t)kv->shape[0]; p.plane = (uint32_t)plane;
+    p.eps = (float)eps; p.theta = (float)theta; p.rscale = (float)scale;
+    p.mode = mc; p.gptj = gptj; p.s0 = sec[0]; p.s1 = sec[1]; p.s2 = sec[2]; p.n_sec = n_sec;
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && T <= 64;
+#define R4D_MRF(WF_, CH_)                                                                          \
+    R4D_EMIT(s, (mla_row_front_kernel<WF_, CH_>), dim3((uint32_t)T), dim3(kThreads), 0, p)
+    const bool wf = w->dtype == RAD_F32;
+    return (wf ? (ch ? R4D_MRF(true, r4dchain) : R4D_MRF(true, R4dUnchained))
+               : (ch ? R4D_MRF(false, r4dchain) : R4D_MRF(false, R4dUnchained)))
+                   == RAD_OK ? RAD_OK : RAD_E_DEVICE;
+#undef R4D_MRF
 }
 
 /* The E4M3 store. `k_scale` and `v_scale` are the attention side's descales (one per sequence and

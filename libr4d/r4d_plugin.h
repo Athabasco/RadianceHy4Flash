@@ -503,6 +503,7 @@ int r4d_rad_gate_mul(const RadArgs*, RadStream);
 int r4d_rad_mla_project_kv(const RadArgs*, RadStream);
 int r4d_rad_mla_expand_gate(const RadArgs*, RadStream);
 int r4d_rad_mla_kv_split(const RadArgs*, RadStream);
+int r4d_rad_mla_row_norm_rope_store(const RadArgs*, RadStream);
 int r4d_rad_dfly_sel(const RadArgs*, RadStream);
 int r4d_rad_engram_ids(const RadArgs*, RadStream);
 int r4d_rad_engram_norm(const RadArgs*, RadStream);

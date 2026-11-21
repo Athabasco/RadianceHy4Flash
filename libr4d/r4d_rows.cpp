@@ -686,6 +686,17 @@ static const RadParamSpec pMlaExpandGate[] = {
 static const RadOperandSpec oMlaExpandGate[] = {
     {"x", RAD_OPD_IN, 0}, {"w", RAD_OPD_WEIGHT, 0}, {"g", RAD_OPD_IN, 0}, {"y", RAD_OPD_OUT, 0},
 };
+/* mla_row_norm_rope_store: Hy4-flash's latent cache row, [latent | rotary key]: rmsnorm of the first
+ * `latent` columns, rope (gptj, or imrope_gptj with `sections`) of the last `rope_dim`, and kv_store of
+ * the row as one KV head of (latent + rope_dim) / 2 (libr4d only; no `replaces` hook). */
+static const RadParamSpec pMlaRowFront[] = {
+    P_INT("M"), P_INT("latent"), P_INT("rope_dim"), P_F64("eps"), P_F64("theta"), P_F64O("scale"),
+    P_STRO("mode"), P_STRO("sections"), P_INT("block_size"), P_STR("dtype"),
+};
+static const RadOperandSpec oMlaRowFront[] = {
+    {"row", RAD_OPD_INOUT, 0}, {"w", RAD_OPD_WEIGHT, 0}, {"positions", RAD_OPD_IN, 0},
+    {"slot_mapping", RAD_OPD_IN, 0}, {"kv_cache", RAD_OPD_INOUT, 0},
+};
 static const RadParamSpec pMlaKvSplit[] = {
     P_INT("M"), P_INT("heads"), P_INT("k_dim"), P_INT("v_dim"), P_INT("rope_dim"), P_STR("dtype"),
 };
@@ -3833,6 +3844,12 @@ static const RadOpSchema kSchemas[] = {
            "mla_project_kv's expand followed by gate_mul in one launch: y = round(f32(round(sum_j "
            "x[m,h,j] * w[h*(k_dim+v_dim) + k_dim + c][j])) * sigmoid(f32(g[m, h*v_dim + c]))). "
            "Byte-identical to the two ops it replaces."),
+    SCHEMA("mla_row_norm_rope_store", pMlaRowFront, oMlaRowFront,
+           "Hy4-flash's latent cache row [latent | rotary key] in one launch: rmsnorm over the first "
+           "`latent` columns, rope (gptj, or imrope_gptj with `sections`) over the last `rope_dim`, "
+           "kv_store of the row as one KV head of (latent + rope_dim) / 2 (its first half the key slot, "
+           "the rest the value slot). Byte-identical to the three ops it replaces, on the row and on "
+           "the cache."),
     SCHEMA("mla_kv_split", pMlaKvSplit, oMlaKvSplit,
            "kvb [N, heads*(k_dim+v_dim)] and k_rope [N, rope_dim] -> k [N, heads, k_dim+rope_dim] (the rope "
            "part shared by every head) and v [N, heads, v_dim]. A copy."),
@@ -5318,6 +5335,10 @@ static const RadConstraint cMlaProjectKv[] = {
 static const RadConstraint cMlaExpandGate[] = {
     C_GE("M", 1), C_LE("M", 65535), C_GE("heads", 1), C_LE("heads", 64), C_EQ("k_dim", 192),
     C_EQ("v_dim", 256), C_EQ("latent_dim", 512), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cMlaRowFront[] = {
+    C_GE("M", 1), C_LE("M", 65535), C_GE("latent", 8), C_GE("rope_dim", 2), C_GE("block_size", 1),
+    C_IN("dtype", "bf16"),
 };
 static const RadConstraint cMlaKvSplit[] = {
     C_GE("M", 1), C_GE("heads", 1), C_GE("k_dim", 1), C_GE("v_dim", 1), C_GE("rope_dim", 1),
@@ -8707,6 +8728,13 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaExpandGate), ROW(tMlaKv), nullptr,
   nullptr, nullptr, r4d_rad_mla_expand_gate, nullptr, nullptr, nullptr,
   r4d_shape_mla_expand_gate, nullptr, r4d_fuse_mla_expand_gate },
+{ "mla_row_norm_rope_store_bf16", "mla_row_norm_rope_store", "attn",
+  "the latent cache row's norm, rotary and paged store, one workgroup a token",
+  "latent and rope_dim even, M 1..65535, a bf16 cache of one head; plain or imrope positions",
+  "bf16 row and cache, f32 or bf16 gain, i32 positions and slots",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaRowFront), NOTUNE,
+  nullptr, nullptr, r4d_rad_mla_row_norm_rope_store, nullptr, nullptr, nullptr,
+  nullptr },
 { "mla_kv_split_bf16", "mla_kv_split", "attn", "kv_b output split into k and v heads, a copy",
   "any heads and widths; 16-byte accesses when the widths and pitches are multiples of 8",
   "bf16",
@@ -11851,7 +11879,7 @@ extern "C" int rad_kernel_chain(int i) {
         "moe_scatter_i32", "moe_scatter_inv_i32", "swiglu_clamped_bf16",
         "engram_ids_i32", "engram_norm_bf16", "engram_gate_bf16", "embed_lookup_q_bf16",
         "quant_act_fp8_grp", "dequant_fp8_bf16", "logits_gemm_bf16", "logits_gemm_bf16_cols",
-        "dfly_sel_i32", "gemm_bf16_nt_bias_tiled",
+        "dfly_sel_i32", "gemm_bf16_nt_bias_tiled", "mla_row_norm_rope_store_bf16",
         /* ...and the small rows of DFly2's draft pass (a launch-bound pass: 33 % idle): its index
          * and fill rows, the f32 narrowing, the layer scale and the draft cache's row scatter */
         "ar_gather_2rank", "iota", "fill_bf16", "fill_f32", "fill_i32", "cast_f32_bf16", "mul_weight_bf16",
