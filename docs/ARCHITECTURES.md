@@ -3738,7 +3738,9 @@ Engram rows, the seven prompts, 9230 positions; mean / median KL in nats, top-1)
 
 TP2 against TP1 of the same container (median KL, top-1): bf16 2.6e-4 / 0.96, `i8` 1.1e-3 / 0.92,
 `w6nl64-rtn` 2.4e-3 / 0.90, `iqr-gptq` 1.9e-2 / 0.77 -- the IQR container moves about eight times
-more between the ranks than the other forms, which is not explained yet (WP8 report).
+more between the ranks than the other forms. Its routed experts alone (the u4 trellis gate_up and the
+`w6nl64` down, GPTQ, sliced at TP2) give 8.0e-3 median KL at TP1 and at TP2, so the extra movement
+comes from the trunk's trellis linears; not explained yet.
 The host (libavx, TP1) gives the same for the forms it reads: `w4nl64-rtn` 5.3e-2 / 2.4e-2, 0.75;
 `i8` 2.2e-2 / 1.9e-3, 0.90. The IQR trellis has no host kernel.
 
