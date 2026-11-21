@@ -145,6 +145,32 @@ int count_issued(const RadBuilder& b, const RadCtx& c, const char* op) {
 
 }  // namespace
 
+/* WP16.0c / WP16.1a: the whole-on-every-rank paged groups are declared replicated at every world
+ * (the host tier keeps each once a slot), the per-rank state groups are not, and the plugin asks
+ * for chained launches. */
+TEST(the_replicated_kv_groups_and_the_chain_request) {
+    for (int world : { 1, 2 }) {
+        for (int rank = 0; rank < world; ++rank) {
+            Declared d(bf16_encs, world, rank);
+            REQUIRE_EQ(d.rc, RAD_OK);
+            for (const char* n : { "kv_latent_sparse", "kv_latent_sliding", "kv_index_keys" }) {
+                const RecKV* k = kv_named(d.b, n);
+                REQUIRE(k != nullptr);
+                CHECK(k->replicated);
+            }
+            for (const char* n : { "kv_index_tail", "kv_engram_tokens" }) {
+                const RecKV* k = kv_named(d.b, n);
+                REQUIRE(k != nullptr);
+                CHECK(!k->replicated);
+            }
+        }
+    }
+    Declared d;
+    RadArchProbe p{};
+    CHECK_OK(hyv4flash::probe(d.mk.meta(), &p));
+    CHECK_EQ(p.chain_pays, (int)RAD_CHAIN_ALWAYS);
+}
+
 /* Every layer kind's ops, once each where the plan says so: the connections, both MLA forms on
  * both layer kinds (the sparse ones with the selection form), the indexer on the sparse layers, the
  * dense MLP and the latent MoE, the Engram in front of layer 1, the head. */

@@ -825,6 +825,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     HY4_NEED(m.op_norm && m.op_gather && m.op_head, "rmsnorm / gather_rows / logits_gemm");
     RAD_ARCH_TRY(m.calib.output(b, g, s, m.final_hidden));
 
+    /* Every rank computes the whole latent rows (kv_a, its norm and rope are replicated; only the
+     * heads split) and pools the whole indexer keys, so the host tier keeps each paged group once
+     * a slot (WP16.0c). The sliding window's latent is the same rows. The indexer's raw-key tail
+     * (LINEAR) and the Engram history (CONV) travel in the checkpoint store and stay per rank. */
+    if (m.kv_sparse) RAD_ARCH_TRY(rad_kv_group_replicated(b, m.kv_sparse));
+    if (m.kv_sliding) RAD_ARCH_TRY(rad_kv_group_replicated(b, m.kv_sliding));
+    if (m.kv_index) RAD_ARCH_TRY(rad_kv_group_replicated(b, m.kv_index));
+
     /* A container carries what the model can serve, so the drafter and the tower are declared
      * wherever the checkpoint has them and the caller left room (rad-convert's --max-spec 0
      * leaves the drafter out). Neither is served by this build. */
@@ -949,10 +957,20 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
     m.calib.after_step(c, T);
 }
+
+/* Chained launches, with a drafter and without: the decode step is launch-bound and the rows that
+ * have a chained form (GEMM, norm, rope, kv_store, add, silu_mul, MoE, gather) chain; the others
+ * keep their barrier. Bit-identical: the same kernels launched with the barrier bit (WP16.1a). */
+static int probe(const RadModelMeta* meta, RadArchProbe* out) {
+    if (!meta || !out) return RAD_E_INVAL;
+    out->chain_pays = RAD_CHAIN_ALWAYS;
+    return RAD_OK;
+}
 } // namespace hyv4flash
 
 #ifndef RAD_ARCH_NO_EXPORTS
 /* The model's state is indexed by slot (rad_build_slot). */
+RAD_ARCH_PROBE(hyv4flash)
 RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(hyv4flash, "hyv4flash", "", "0.2.0",
                 "Tencent Hy4-flash: the text trunk at 1, 2 or 4 ranks (bf16), the weight manifest and "
