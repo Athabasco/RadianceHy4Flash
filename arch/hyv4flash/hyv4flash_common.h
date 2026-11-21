@@ -298,6 +298,12 @@ inline bool fused_quant_on() {
     return !(e && *e && std::strcmp(e, "0") == 0);
 }
 
+/* The chained 128-group rotated int8 quantisers (Geom::chain_q8). Off: RADIANCE_HY4_CHAIN_Q8=0. */
+inline bool chain_q8_on() {
+    const char* e = std::getenv("RADIANCE_HY4_CHAIN_Q8");
+    return !(e && *e && std::strcmp(e, "0") == 0);
+}
+
 /* MoeFP8's fused selection and sort (Config::router_fuse). Off: RADIANCE_HY4_ROUTER_FUSE=0. */
 inline bool router_fuse_on() {
     const char* e = std::getenv("RADIANCE_HY4_ROUTER_FUSE");

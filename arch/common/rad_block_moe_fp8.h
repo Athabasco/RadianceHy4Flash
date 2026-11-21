@@ -1276,7 +1276,14 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         gin_q = w.hr.cq();
         gin_s = w.hr.cs();
         gin_g = w.hr.cg();
-        if (!hr_in)
+        if (!hr_in && g.chain_q8)   /* the chained row (Geom::chain_q8) */
+            op_hq = rw(b, RAD_OP(b, a8 ? "had_quant_act_i8g" : "had_quant_act_fp8",
+                          RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n", g.n_embd),
+                                     RAD_INT("group", gin_g), RAD_STR("dtype", g.dtype),
+                                     RAD_INT("chained", 1)),
+                          RAD_NOWEIGHTS),
+                      {w.h.x}, {gin_q, gin_s});
+        else if (!hr_in)
             op_hq = rw(b, RAD_OP(b, a8 ? "had_quant_act_i8g" : "had_quant_act_fp8",
                           RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n", g.n_embd),
                                      RAD_INT("group", gin_g), RAD_STR("dtype", g.dtype)),

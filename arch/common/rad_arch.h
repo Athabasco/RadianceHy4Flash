@@ -816,6 +816,11 @@ struct Geom {
      * w_bf16 is. */
     bool    w_i8h = false;
     int64_t w_i8_group = 128;
+    /* Ask for the chained form of the 128-group rotated quantisers (had_quant_act_i8g's and
+     * had_quant_act_fp8's `chained` 1, libr4d's *_chained rows) where the blocks declare them. Off by
+     * default: chained between two plain GEMMs it measured slower (Flash-Next); an architecture
+     * whose GEMMs around them all chain sets it (Hy4-flash). The bytes are the same either way. */
+    bool    chain_q8 = false;
 
     int64_t q_dim()   const { return n_head * head_dim; }
     int64_t kv_dim()  const { return n_head_kv * head_dim; }

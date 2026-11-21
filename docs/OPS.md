@@ -703,7 +703,7 @@ and is optional.
 | op | params | operands |
 |---|---|---|
 | `quant_act_fp8` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
-| `had_quant_act_fp8` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
+| `had_quant_act_fp8` | `M` `n` `group` `dtype` `chained`/opt | `x` → `q`, `scale` |
 | `quant_cols_fp8` | `M` `n` `dtype` | `x` → `y`, `scale` |
 | `rmsnorm_quant_fp8` | `M` `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gated_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
@@ -731,9 +731,9 @@ for it. `residual` present is the `fused_add_rms_norm` form.
 
 | op | params | operands |
 |---|---|---|
-| `had_quant_act_i8g` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
+| `had_quant_act_i8g` | `M` `n` `group` `dtype` `chained`/opt | `x` → `q`, `scale` |
 | `gated_had_quant_i8g` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
-| `rmsnorm_had_quant_i8g` | `M` `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
+| `rmsnorm_had_quant_i8g` | `M` `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt `chained`/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gate_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate`, `x` → `q`, `scale`, `out_bf16`? |
 | `gate_had_quant_i8g` | `M` `n` `group` `dtype` `act`:str/opt | `gate`, `x` → `q`, `scale`, `out_bf16`? |
 | `rmsnorm_quant_i8` | `M` `n` `eps`:f64 `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
@@ -752,6 +752,12 @@ one launch for a norm read by three projections (q, k and v), and none between t
 the down projection. `out_bf16` receives the unrotated value, for a bf16 consumer. `n` is a
 multiple of `group`. A rotated code read as a plain one, or the reverse, gives a model that runs
 and is wrong, so these are separate ops.
+
+`chained` 1 on `had_quant_act_i8g`, `had_quant_act_fp8` and `rmsnorm_had_quant_i8g` asks for the
+chained form of the 128-group kernel (libr4d's `*_chained` rows, the same bytes): an architecture
+whose GEMMs around these quantisers all chain sets it (Hy4-flash); without it the rows stay plain,
+since one chained quantiser between two plain GEMMs measured slower (Flash-Next). The host
+libraries ignore it.
 
 `gate_had_quant_i8g` is `gate_quant_fp8`'s product (the gate in its own operand: a gated
 attention's gate is a column slice of the `[q|gate]` projection) with `had_quant_act_i8g`'s

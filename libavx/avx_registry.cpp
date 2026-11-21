@@ -315,6 +315,9 @@ static const RadParamSpec pCast[] = { P_INT("M"), P_INT("n"), P_STR("from"), P_S
 /* ---- quantisation and rotation ------------------------------------------------------------ */
 static const RadParamSpec pQuant[]      = { P_INT("M"), P_INT("n"), P_INT("group"),
                                             P_STR("dtype") };
+/* had_quant_act_i8g's and had_quant_act_fp8's (libref's spelling): `chained` is a device library's row choice, ignored here. */
+static const RadParamSpec pHadQuantI8g[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"),
+                                            P_INTO("chained") };
 /* gram_accum's: `upper` 1 accumulates only k2 >= k1, the half a reader of a symmetric H needs. */
 static const RadParamSpec pGram[]       = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"),
                                             P_INTO("upper") };
@@ -1293,10 +1296,10 @@ static const RadOpSchema kSchemas[] = {
   "symmetric int8, one f32 scale per `group` contiguous elements, row-major." },
 { "quant_act_fp8", ARR(pQuant), ARR(oQuantFp8), "symmetric block-scaled E4M3 quantiser." },
 { "quant_cols_fp8", ARR(pQuantCols), ARR(oQuantCols), "E4M3 with one scale per column." },
-{ "had_quant_act_fp8", ARR(pQuant), ARR(oQuantFp8),
+{ "had_quant_act_fp8", ARR(pHadQuantI8g), ARR(oQuantFp8),
   "width-128 Hadamard, then quant_act_fp8's symmetric E4M3 per group. No normalisation: the "
   "1/128 is the rotated expert weight's stored scale (docs/OPS.md)." },
-{ "had_quant_act_i8g", ARR(pQuant), ARR(oQuantFp8),
+{ "had_quant_act_i8g", ARR(pHadQuantI8g), ARR(oQuantFp8),
   "width-`group` Hadamard, then quant_act_i8g's symmetric int8 per group. No normalisation: the "
   "1/group is the i8a8h weight's stored scale (docs/OPS.md)." },
 { "gram_accum", ARR(pGram), ARR(oGram),

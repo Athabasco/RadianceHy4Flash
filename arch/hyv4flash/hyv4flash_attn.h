@@ -208,10 +208,15 @@ struct Attn {
             qcodes.s8 = pr->s8;
             qcodes.g8 = fn.g8;
             qcodes.q8_fed = qcodes.q8_rot = true;
-            op_qa_norm = mk(b, "rmsnorm_had_quant_i8g",
-                            { RAD_RANGE("M", 1, T), RAD_INT("n", s.q_lora), RAD_F64("eps", s.eps),
-                              RAD_INT("group", fn.g8), RAD_STR("dtype", "bf16") },
-                            { qa_gain }, { w.qa_raw }, { qcodes.q8, qcodes.s8, w.qa });
+            op_qa_norm = g.chain_q8
+                ? mk(b, "rmsnorm_had_quant_i8g",
+                     { RAD_RANGE("M", 1, T), RAD_INT("n", s.q_lora), RAD_F64("eps", s.eps),
+                       RAD_INT("group", fn.g8), RAD_STR("dtype", "bf16"), RAD_INT("chained", 1) },
+                     { qa_gain }, { w.qa_raw }, { qcodes.q8, qcodes.s8, w.qa })
+                : mk(b, "rmsnorm_had_quant_i8g",
+                     { RAD_RANGE("M", 1, T), RAD_INT("n", s.q_lora), RAD_F64("eps", s.eps),
+                       RAD_INT("group", fn.g8), RAD_STR("dtype", "bf16") },
+                     { qa_gain }, { w.qa_raw }, { qcodes.q8, qcodes.s8, w.qa });
             /* Unserved after all: the plain norm out of place, and q_nope's own quantiser. */
             if (!op_qa_norm) qfuse = false;
         }
