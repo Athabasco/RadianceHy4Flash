@@ -458,7 +458,7 @@ static const RadParamSpec pQsaScore[] = { P_INT("M"), P_INT("n"), P_INT("heads")
 static const RadOperandSpec oQsaScore[] = { OPD("q"), OPD("bk"), OPD("bt"), OPD("cu"), OPD("nc"),
                                             OUT("score") };
 static const RadParamSpec pQsaSelect[] = { P_INT("M"), P_INT("blocks"), P_INT("topk"),
-                                           P_INT("ratio"), P_INT("seqs"), P_INTO("signed") };
+                                           P_INT("ratio"), P_INT("seqs"), P_INTO("signed"), P_INTO("own") };
 static const RadOperandSpec oQsaSelect[] = { OPD("score"), OPD("bt"), OPD("nc"), OPD("pos"),
                                              OPD("cu"), OUT("sel"), OUT("nsel"), OUT("seqused") };
 static const RadParamSpec pQsaTailStore[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("ring"),

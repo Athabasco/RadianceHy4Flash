@@ -812,6 +812,8 @@ int main(int argc, char** argv) {
             const uint64_t seed = 0x9e3779b97f4a7c15ull + (uint64_t)lvl;
             if (!row_gather_case(lib, at, calls, seed, ck.verbose, false)) rc = 1;
             if (!row_gather_case(lib, at, calls, seed, ck.verbose, true)) rc = 1;
+            /* Engram's tables carry a scale a row, which the decode finds by the output row. */
+            if (!row_gather_case(lib, at, calls, seed, ck.verbose, false, true)) rc = 1;
             /* And in TMPDIR, usually tmpfs: since Linux 6.6 tmpfs does direct reads but reports
              * no alignment (like btrfs), so the gather uses the block size. Only the read differs
              * there, so it runs once. */

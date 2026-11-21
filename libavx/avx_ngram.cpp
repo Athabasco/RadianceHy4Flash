@@ -609,7 +609,7 @@ std::atomic<uint64_t> g_rows_read{0};
  * read, every unpublished claim is released (word back to EMPTY) so no thread waits on it. */
 int read_and_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
                      const SpanRead* reads, size_t total, long long n, long long ne,
-                     avx::RowDecode decode, const uint16_t* lut, uint16_t* out, long long x_ld) {
+                     avx::RowDecode decode, const avx::DecodeTab* lut, uint16_t* out, long long x_ld) {
     const long long A      = tf.align;
     const long long stride = ((n + A - 1) / A + 1) * A;
     for (size_t b = 0; b < total;) {
@@ -672,7 +672,7 @@ struct UrgentReads {
 };
 
 int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowGather& q,
-                    avx::RowDecode decode, const uint16_t* lut) {
+                    avx::RowDecode decode, const avx::DecodeTab* lut) {
     Gather& g = gather_state();
     const uint64_t me = owner_tag();
     if (!me) return RAD_E_UNSUPPORTED;
@@ -804,7 +804,7 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
  * starting at row `first`, read this thread's claims, wait for rows other threads are reading, then
  * decode from the cache. A row whose slot is taken over during the decode is read again directly. */
 int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowGather& q,
-                long long first, avx::RowDecode decode, const uint16_t* lut) {
+                long long first, avx::RowDecode decode, const avx::DecodeTab* lut) {
     /* A decode step's rows are read on demand; a prefill chunk's tens of thousands, whose future is
      * known, go through the claims and the read-ahead queue. */
     if (q.M <= kOnDemandMaxRows) return gather_ondemand(tf, rc, rr, q, decode, lut);
@@ -1249,9 +1249,11 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
 
     /* bf16 value of every E4M3 code at this call's scale, built with the ABI's converters (so it
      * matches libref); the decode is a table lookup. */
-    uint16_t lut[256];
+    avx::DecodeTab tab;
     for (int b = 0; b < 256; ++b)
-        lut[b] = rad_f32_to_bf16(rad_fp8e4m3_to_f32((uint8_t)b) * q.scale);
+        tab.lut[b] = rad_f32_to_bf16(rad_fp8e4m3_to_f32((uint8_t)b) * q.scale);
+    tab.per_row = q.row_scale;
+    const avx::DecodeTab* lut = &tab;
 
     /* File-backed tables go through the shared cache; others are read from memory. The caller
      * has already refused ids past the table, which matters once they become file offsets. */
@@ -1304,7 +1306,8 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
  * shipped format). E4M3 carries its own exponent, a row's dynamic range is only ~2.3x, and the
  * error is flat across scales from 2^-13 to 2^-10, so a per-row scale would buy a few percent of
  * error for 1.25% more bytes. (INT8 in the same byte would do much better; that is a different
- * format.)
+ * format.) Engram's tables (Hy4-flash) are the one place a scale a row is the model's own format:
+ * `block` 1 x * and a `[rows, 1]` plane, accepted below and decoded through avx::RowScale.
  *
  * The table is stored as is, so it can be read in place from the container's mapping (a relayout
  * would copy 51 GB). This hook only validates; any other quantisation is refused. The one other
@@ -1331,14 +1334,16 @@ extern "C" int avx_layout_ngram(const RadParam* p, int n_p, int operand, const R
         return RAD_E_UNSUPPORTED;
     }
     const RadEncPlane* sc = rad_enc_plane(enc, "scale");
+    /* One scale for the table (`block` 0 x 0), or one a row (`block` 1 x *, Engram's tables). */
+    const bool per_row = sc && sc->block[0] == 1 && sc->block[1] == 0;
     if (!rad_enc_is(enc, "affine") || enc->n_planes != 2 || enc->transform[0] ||
-        enc->plane[0].dtype != RAD_F8E4M3 || !sc || sc->dtype != RAD_BF16 || sc->block[0] != 0 ||
-        sc->block[1] != 0)
+        enc->plane[0].dtype != RAD_F8E4M3 || !sc || sc->dtype != RAD_BF16 ||
+        (!per_row && (sc->block[0] != 0 || sc->block[1] != 0)))
         return RAD_E_DTYPE;
     if (n != 1 || !pl || !sel) return RAD_E_SHAPE;
     const char* want = operand == EQ_WTE ? "codes" : "scale";
     if (std::strncmp(enc->plane[sel[0]].role, want, RAD_ENC_STR) != 0) return RAD_E_SHAPE;
-    const long long r = operand == EQ_WTE ? rows : 1, c = operand == EQ_WTE ? dim : 1;
+    const long long r = operand == EQ_WTE || per_row ? rows : 1, c = operand == EQ_WTE ? dim : 1;
     if (pl[0].rank != 2 || pl[0].shape[0] != r || pl[0].shape[1] != c) return RAD_E_SHAPE;
     return RAD_E_UNSUPPORTED;
 }

@@ -3,7 +3,7 @@
 The conventional op vocabulary in hand-written x86 SIMD, dispatched at run time by CPU feature.
 
 libavx is a kernel plugin beside `libref` and `libr4d`. libref is the only other host
-implementation, and it is a slow reference. libavx implements all 161 of libref's ops with the
+implementation, and it is a slow reference. libavx implements all 174 of libref's ops with the
 same schemas and the same answers to a tolerance, the image generator's included (below).
 
     cmake -S libavx -B build-avx -DCMAKE_PREFIX_PATH=<radiance prefix> && cmake --build build-avx -j4
@@ -30,6 +30,12 @@ The rows come through `avx_ngram.cpp`, compiled baseline so the process has one 
 - an O_DIRECT read through io_uring for each miss, with the ranks dividing a call's misses rather
   than duplicating them;
 - a reader thread that fetches the next prefill chunk's rows while the current one runs.
+
+Engram's tables (Hy4-flash) carry one bf16 scale a row instead of one for the table: the scale plane
+(`block = 1 x *`, 2 bytes a row) stays resident, and the decode finds a row's scale from the row's
+output address (`(dst - out) / x_ld`, `avx_rows.h`: `RowScale`), so the cache and the reads are the
+same for both forms. A scale of one entry keeps its old meaning, `n_vocab` entries are per row, any
+other count is `RAD_E_SHAPE`; rows outside the shard decode to zero either way.
 
 The level's kernel decodes the rows: at AVX-512 the call's 256-entry bf16 table sits in eight
 registers and four `vpermt2w` look up 32 codes; below it, one code at a time. The row's layout hook

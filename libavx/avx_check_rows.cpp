@@ -212,9 +212,11 @@ static RowTable* row_table(const std::string& dir, bool bf16, int64_t V, int64_t
 }
 
 bool row_gather_case(const Lib& lib, const std::string& dir, int64_t calls, uint64_t seed,
-                     bool verbose, bool bf16) {
+                     bool verbose, bool bf16, bool per_row) {
     const RadKernelInfo* r = lib.row("embed_lookup_q");
-    const char* what = bf16 ? "embed_lookup_q from a file, bf16 table" : "embed_lookup_q from a file";
+    const char* what = bf16 ? "embed_lookup_q from a file, bf16 table"
+                            : (per_row ? "embed_lookup_q from a file, a scale a row"
+                                       : "embed_lookup_q from a file");
     if (!r || !r->launch) {
         std::printf("  %s: no row\n", what);
         return false;
@@ -262,6 +264,12 @@ bool row_gather_case(const Lib& lib, const std::string& dir, int64_t calls, uint
         }
     uint16_t lut[256];
     for (int b = 0; b < 256; ++b) lut[b] = rad_f32_to_bf16(rad_fp8e4m3_to_f32((uint8_t)b) * scale);
+    /* Engram's table: one bf16 scale a row, resident beside the file-backed codes. */
+    std::vector<uint16_t> row_scale;
+    if (per_row) {
+        row_scale.resize((size_t)V);
+        for (auto& v : row_scale) v = rad_f32_to_bf16(0.05f + (float)(rnd() % 1000) / 500.0f);
+    }
 
     auto tensor = [](void* p, uint32_t dt, std::initializer_list<int64_t> shape) {
         RadTensor t{};
@@ -284,7 +292,9 @@ bool row_gather_case(const Lib& lib, const std::string& dir, int64_t calls, uint
         std::vector<RadTensor> ts = {
             tensor(nullptr, RAD_I32, {M}),
             tensor(const_cast<uint8_t*>(tab), bf16 ? RAD_BF16 : RAD_F8E4M3, {V, n}),
-            tensor(bf16 ? nullptr : &sc, RAD_BF16, {1}), tensor(out.data(), RAD_BF16, {M, n}),
+            per_row ? tensor(row_scale.data(), RAD_BF16, {V})
+                    : tensor(bf16 ? nullptr : &sc, RAD_BF16, {1}),
+            tensor(out.data(), RAD_BF16, {M, n}),
             tensor(nullptr, RAD_I32, {M}) };
         RadParam ps[3] = {};
         ps[0].key = "M";       ps[0].kind = RAD_P_INT; ps[0].ival = M;
@@ -310,6 +320,9 @@ bool row_gather_case(const Lib& lib, const std::string& dir, int64_t calls, uint
                 for (int64_t i = 0; i < n; ++i) {
                     uint16_t want = 0;
                     if (id >= 0 && bf16) std::memcpy(&want, tab + ((int64_t)id * n + i) * 2, 2);
+                    else if (id >= 0 && per_row)
+                        want = rad_f32_to_bf16(rad_fp8e4m3_to_f32(tab[(int64_t)id * n + i]) *
+                                               rad_bf16_to_f32(row_scale[(size_t)id]));
                     else if (id >= 0)    want = lut[tab[(int64_t)id * n + i]];
                     if (out[(size_t)(m * n + i)] != want) { ++bad[rk]; break; }
                 }
