@@ -243,7 +243,9 @@ static const RadOperandSpec oMlaAttnSelSink[] = { OPD("q"), OPD("q_rope"), OPD("
 static const RadParamSpec pMlaKvSplit[] = { P_INT("M"), P_INT("heads"), P_INT("k_dim"),
     P_INT("v_dim"), P_INT("rope_dim"), P_STR("dtype") };
 static const RadOperandSpec oMlaKvSplit[] = { OPD("kvb"), OPD("k_rope"), OUT("k"), OUT("v") };
-static const RadParamSpec pAttnKvSink[] = { P_INT("M"), P_INT("N"), P_INT("heads"),
+/* N is a capacity (RAD_PROLE_CAPACITY): the kernel runs by the k / v and cu operands' extents, so a
+ * sizing declare at a smaller step may name fewer keys. */
+static const RadParamSpec pAttnKvSink[] = { P_INT("M"), P_CAP("N"), P_INT("heads"),
     P_INT("head_dim"), P_INT("window"), P_F64("scale"), P_STR("dtype") };
 static const RadOperandSpec oAttnKvSink[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_q"),
     OPD("cu_k"), WGT("sinks"), OUT("out") };

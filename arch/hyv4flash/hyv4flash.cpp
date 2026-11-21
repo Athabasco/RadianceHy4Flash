@@ -115,6 +115,13 @@ struct Model {
     int arm = kArmBf16;   /* the routed arms' activation codes (Ffn::arm) */
 };
 static std::unique_ptr<Model> models[MAX_SLOTS];
+/* Where a sizing declare goes (RadBuildCtx::shape_probe): the engine declares again at smaller step
+ * sizes to size the activation arena's levels, lends the memory above a level to the expert slab
+ * while steps stay that small, and arms the prefill stager above the largest level. Such a declare
+ * must leave the state step() reads alone, so it fills this model instead (nemotronh's and
+ * glm5next's probe_model); the engine runs one per (level, rank) in parallel threads. The friend's
+ * plugin measured the loan at 10.6 -> 24 tok/s decode on the real model at TP2 (tiered experts). */
+static thread_local std::unique_ptr<Model> probe_model;
 
 /* ------------------------------------------------------------------ the config */
 static int64_t top(const RadModelMeta* m, const char* key, int64_t dflt) {
@@ -803,14 +810,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return RAD_E_INVAL;
     if (ctx->kv_dtype != RAD_DT_INVALID && ctx->kv_dtype != RAD_BF16)
         return refuse("the latent and indexer caches are bf16; run with --kv-cache-dtype bf16");
-    auto& slot = models[rad_build_slot(ctx)];
+    const bool sizing = ctx->shape_probe != 0;
+    /* A calibration run records into host squares and files from its declare's sites; a sizing
+     * declare of it would pin those again. Its levels are dropped (the engine notes it and lends
+     * nothing): a calibration run is not served for speed. */
+    if (sizing && ctx->calib_dir && *ctx->calib_dir) return RAD_E_UNSUPPORTED;
+    auto& slot = sizing ? probe_model : models[rad_build_slot(ctx)];
     slot = std::make_unique<Model>();
     Model& m = *slot;
     m.nm = Names(ctx->scope);
     Names& nm = m.nm;
     Shape& s = m.s;
     Geom& g = m.g;
-    RAD_ARCH_TRY(map_cli_to_env(ctx));   /* before the first block reads RADIANCE_CALIB_* */
+    if (!sizing) RAD_ARCH_TRY(map_cli_to_env(ctx));   /* before the first block reads RADIANCE_CALIB_* */
     RAD_ARCH_TRY(read_shape(s, meta));
     RAD_ARCH_TRY(split_ranks(s, ctx->world_size ? ctx->world_size : 1, ctx->rank));
     s.calib_lo = ctx->calib_layer_lo;
@@ -995,7 +1007,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         for (auto& f : m.df.defer) RAD_ARCH_TRY(f());
         m.df.defer.clear();
     }
-    if (dfly && !m.df.served && ctx->rank == 0)
+    if (dfly && !m.df.served && ctx->rank == 0 && !sizing)
         fprintf(stderr, "radiance: hyv4flash: DFly2 is declared and not served: %s; speculation "
                         "falls back to prompt lookup\n", m.df.why.c_str());
     if (vit_weights) {
@@ -1193,6 +1205,9 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     out->draft_depth_fixed = top(meta, "dfly_num_hidden_layers", 0) > 0 ? 1 : 0;
     out->chain_pays = RAD_CHAIN_ALWAYS;
     out->kv_stream_ok = 1;
+    /* declare() honours RadBuildCtx::shape_probe (probe_model above): the core sizes the arena's
+     * levels, lends their tops to the expert slab and arms the prefill stager. */
+    out->shape_probe_ok = 1;
     return RAD_OK;
 }
 
