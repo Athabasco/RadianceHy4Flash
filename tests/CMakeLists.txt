@@ -957,10 +957,12 @@ add_test(NAME oot_plugins
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/oot_plugins.sh
                  ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR} ${CMAKE_BINARY_DIR}/oot "${RAD_OOT_COMPILER}" "${RAD_OOT_TARGETS}"
                  "${RAD_HIP_VOPD_REPEATABLE}" "${CMAKE_CXX_COMPILER}" "${CMAKE_BUILD_TYPE}")
+# TIMEOUT 7200: a cold rebuild of the 51 plugins plus the kbench replay took 59 min on the 48-thread build host while it was busy (measured, hy4-close);
+# 3600 s left no margin.
 # RESOURCE_LOCK kbench_memory: its replay holds operands in host memory as the kbench entries do.
 set_tests_properties(oot_plugins PROPERTIES
   LABELS "oot"
-  TIMEOUT 3600
+  TIMEOUT 7200
   RESOURCE_LOCK kbench_memory
   ENVIRONMENT "CMAKE_GENERATOR=${CMAKE_GENERATOR};${RAD_TEST_OMP_ENV};${RAD_OOT_ENV}")
 

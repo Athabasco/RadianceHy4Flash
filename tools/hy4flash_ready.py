@@ -19,7 +19,7 @@ Never downloads weights, never touches a card unless --gpu (then under flock gpu
 Logs of every step go to --work (default <build>/ready), the table is also written there as ready.json.
 Do not write "ready" into quant.md from this script's output alone: read the OPEN lines.
 """
-import argparse, concurrent.futures as cf, threading, glob, json, os, re, shutil, struct, subprocess, sys, time, urllib.request
+import argparse, random, concurrent.futures as cf, threading, glob, json, os, re, shutil, struct, subprocess, sys, time, urllib.request
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -603,7 +603,7 @@ def a9(c):
 # What "runs and is not garbage" means per format (PLAN 4.4 A8: top-1 >= 80 % at 8 bits, reported for 4 bits): the KL of the quantised
 # container's logits against the bf16 container with the same Engram rows (radiance's own --kld-record, same kernels and TP), as
 # (max mean KL in nats, min top-1 agreement). The bounds are about 3x the means WP8/WP10 measured on gpu-mini on the cards
-# (w4 0.054 / 0.75, w5 0.027 / 0.84, w6 0.018 / 0.88, i8 0.022 / 0.90, iqr-gptq 0.064 / 0.75) and 10 points of top-1 under them:
+# (w4 0.054 / 0.75, w4nl64-gptq 0.048 / 0.77, w5 0.027 / 0.84, w6 0.018 / 0.88, i8 0.022 / 0.90, iqr-gptq 0.064 / 0.75) and 10 points of top-1 under them:
 # regression bounds on random weights, not accuracy claims -- the friend's real-weight KL is the measurement that matters.
 A8_FORMATS = ["w4nl64-rtn", "w5nl64-rtn", "w6nl64-rtn", "i8"]
 A8_BOUNDS = {"w4nl64-rtn": (0.16, 0.60), "w5nl64-rtn": (0.09, 0.70), "w6nl64-rtn": (0.06, 0.75), "i8": (0.07, 0.80),
@@ -645,11 +645,36 @@ def prep_preset(c, preset):
     return r
 
 
-def a8_convert(c, P, name, recipe):
+def a8_convert(c, P, name, recipe, calib=None):
     out = f"{P['w']}/{name}.rad"
     rc, text = run([c.convert, P["ck"], "--add", f"{P['w']}/tables.safetensors", "-o", out, "--max-ctx", P["max_ctx"], "--max-tok", P["chunk"],
-                    "--recipe", recipe], f"{P['w']}/{name}.convert.log", dict(P["env"], CALIB=f"{P['w']}/no-grams"), 1800)
+                    "--recipe", recipe], f"{P['w']}/{name}.convert.log", dict(P["env"], CALIB=calib or f"{P['w']}/no-grams"), 1800)
     return out if rc == 0 else None
+
+
+def a8_calibrate(c, P, bf):
+    """WP9 flow on the cards (docs/ARCHITECTURES.md, "Calibrating Hy4-flash"): 6 x 1024 random-token documents (not the scored prompts)
+    through the bf16 gpu-mini container at TP1, then tools/calib_st2gram.py. Returns the Gram directory, or None."""
+    g = f"{P['w']}/grams"
+    shutil.rmtree(g, ignore_errors=True)
+    os.makedirs(g)
+    V = json.load(open(f"{P['ck']}/config.json"))["text_config"]["vocab_size"]
+    rng = random.Random(0)
+    with open(f"{P['w']}/calib.jsonl", "w") as f:
+        for _ in range(6):
+            f.write(json.dumps({"prompt": "<t0>" + "".join(f"<t{rng.randrange(V)}>" for _ in range(1023))}) + "\n")
+    env = dict(P["env"], RADIANCE_KERNELS=SERVING_KERNELS)
+    for k in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "RADIANCE_HOST_DEVICES", "RADIANCE_HOST_VRAM_MIB"):
+        env.pop(k, None)
+    yml = subprocess.run([f"{c.build}/bin/rad-yaml", "--model", bf, "--tp", "1", "--max-model-len", str(P["max_ctx"]), "--max-num-batched-tokens", str(P["chunk"]),
+                          "--max-num-seqs", "1", "--no-prefix-cache", "--kernels", "libr4d,libavx", "--calib-corpus", f"{P['w']}/calib.jsonl",
+                          "--calib-dir", g], stdout=subprocess.PIPE, text=True, env=dict(os.environ, **env)).stdout
+    open(f"{P['w']}/calib.yaml", "w").write(yml)
+    rc, out = run(["flock", GPU_LOCK, f"{c.build}/bin/radiance", "--config", f"{P['w']}/calib.yaml"], f"{P['w']}/calib.log", env, 1800)
+    if rc:
+        return None
+    run([sys.executable, f"{SRC}/tools/calib_st2gram.py", g], f"{P['w']}/st2gram.log", env)
+    return g
 
 
 def a8_radiance(c, P, rad, tp, gpu, extra, log):
@@ -700,15 +725,24 @@ def a8_preset_runs(c, preset, gpu, tps, label):
             continue
         refs[tp] = ref
     med1 = {}
-    for name in A8_FORMATS + (["iqr-gptq"] if gpu else []):
+    grams = None
+    if gpu:
+        grams = a8_calibrate(c, P, bf)
+        if grams:
+            say("A8", "PASS", f"{label}: calibration run on the cards (6 x 1024 tokens, TP1): {len(glob.glob(f'{grams}/*.safetensors'))} trunk site files, "
+                              f"{len(glob.glob(f'{grams}/gram.r*.bin'))} RADGRAM2 files (the expert Grams)")
+        else:
+            say("A8", "FAIL", f"{label}: the calibration run on the cards failed ({P['w']}/calib.log)")
+    kl_mean = {}
+    for name in A8_FORMATS + (["w4nl64-gptq"] if grams else []) + (["iqr-gptq"] if gpu else []):
         if name == "iqr-gptq":
             rad = c.iqr_rad
             if not rad or not os.path.exists(rad):
                 say("A8", "OPEN", f"{label} iqr-gptq: its container takes ~95 min of GPTQ on the host (WP8); none given (--iqr-container, default "
-                                  f"work/iqrtp/iqr128.rad)")
+                                  f"work/close/iqr-fresh.rad)")
                 continue
         else:
-            rad = a8_convert(c, P, name, os.path.join(SRC, f"data/recipes/hy4-flash-{name}.recipe"))
+            rad = a8_convert(c, P, name, os.path.join(SRC, f"data/recipes/hy4-flash-{name}.recipe"), grams if name.endswith("-gptq") else None)
             if not rad:
                 say("A8", "FAIL", f"{label} {name}: does not convert ({P['w']}/{name}.convert.log)")
                 continue
@@ -726,6 +760,11 @@ def a8_preset_runs(c, preset, gpu, tps, label):
             ok, txt = a8_judge(c, name, label, tp, r)
             if tp == 1:
                 med1[name] = r["median"]
+            kl_mean[(name, tp)] = r["mean"]
+            if name == "w4nl64-gptq" and ("w4nl64-rtn", tp) in kl_mean:
+                rtn = kl_mean[("w4nl64-rtn", tp)]
+                ok = ok and r["mean"] <= rtn * 1.05      # same grid as the rtn recipe, only the rounding differs: GPTQ must not be worse
+                txt += f"; w4nl64-rtn's is {rtn:.3g} (GPTQ must be <= 1.05x)"
             if name == "iqr-gptq" and tp > 1 and ok and r["median"] > IQR_TP2_FACTOR * med1.get(name, 1e9):
                 say("A8", "OPEN", f"{txt}; its median is {r['median'] / med1[name]:.1f}x its TP1's ({med1[name]:.3g}): the trunk trellis's TP2 "
                                   f"deviation (WP8; branch hy4-iqrtp), not a format bound")
@@ -750,14 +789,11 @@ def a8(c):
     # The formats' widths: the recipes' 128-wide groups (i8) and the 64-wide codebook blocks do not fit `mini`'s widths (q_lora 64, ff 128
     # on 2 ranks...): `mini4q` is mini4 at widths the forms take at TP1, TP2 and TP4 (ARCHITECTURES.md, "Quantised Hy4-flash").
     a8_preset_runs(c, "mini4q", False, (1, 2, 4), "mini4q host (libref)")
-    say("A8", "OPEN", "w4nl64-gptq: needs the friend's Grams; the A7 run converts it against a mini4 calibration (a Gram for every expert "
-                      "projection) and its served KL on real weights is the friend's measurement")
     if not c.gpu:
-        say("A8", "OPEN", "the same on the cards (gpu-mini) for the expert forms, the int8 trunk and the IQR trellis: run with --gpu")
+        say("A8", "OPEN", "w4nl64-gptq's served KL, and the same on the cards (gpu-mini) for the expert forms, the int8 trunk and the IQR trellis: "
+                          "run with --gpu (A7 converts the gptq recipe against a mini4 calibration; real-weight KL is the friend's measurement)")
         return
     a8_preset_runs(c, "gpu-mini", True, (1, 2), "gpu-mini cards (libr4d,libavx)")
-    say("A8", "OPEN", "the IQR container is the one convert that takes 95 min (GPTQ at 40 threads); its card numbers come from the cached "
-                      "container, not a fresh convert in this run")
 
 
 def a10(c):
@@ -832,7 +868,7 @@ def a11(c):
                 # (1) serial rerun under the CPU-budget scale: parallel runs flake (BASELINE_TESTS.md); the card tests (kbench*, *_card) are
                 # masked from the cards by the host environment of the parallel run, so they rerun under gpu.lock with the cards visible
                 cards = [t for t in failed if re.match(r"^(kbench.*|.*_card)$", t)]
-                slow = [t for t in failed if t == "oot_plugins"]       # ctest's own TIMEOUT 3600 s is shorter than a cold rebuild of 51 plugins here
+                slow = [t for t in failed if t == "oot_plugins"]       # the build's ctest TIMEOUT may be the old 3600 s; a cold rebuild of 51 plugins + the kbench replay measured ~59 min here (the repo's TIMEOUT is now 7200)
                 rest = [t for t in failed if t not in cards and t not in slow]
                 still = []
                 for t in slow:
@@ -904,8 +940,10 @@ def main():
     ap.add_argument("--only", help="comma list, e.g. A1,A9")
     ap.add_argument("--gpu", action="store_true", help="also run the card items (A5), under flock gpu.lock")
     ap.add_argument("--full-suite", nargs="*", metavar="BUILD", help="run the whole ctest of these build directories (A11)")
-    ap.add_argument("--iqr-container", default=os.path.join(SRC, "..", "..", "work/iqrtp/iqr128.rad"),
-                    help="a gpu-mini container converted with hy4-flash-iqr-gptq.recipe (its GPTQ takes ~95 min on the host), for A8 on the cards")
+    ap.add_argument("--iqr-container", default=os.path.join(SRC, "..", "..", "work/close/iqr-fresh.rad"),
+                    help="a gpu-mini container converted with the current hy4-flash-iqr-gptq.recipe (tcq_rows=128 for gate_up), for A8 on the cards. "
+                         "Its GPTQ takes ~95 min on the host, so it is made once: CALIB=<grams of a gpu-mini calibration> rad-convert <gpu-mini ckpt> --add tables.safetensors "
+                         "--recipe data/recipes/hy4-flash-iqr-gptq.recipe -o iqr-fresh.rad --max-ctx 3008 --max-tok 3000")
     ap.add_argument("--offline", action="store_true", help="do not fetch the release structure")
     a = ap.parse_args()
     c = Ctx()
