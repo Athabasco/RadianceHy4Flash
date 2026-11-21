@@ -59,6 +59,10 @@ struct IndexWire {
         work = (T + s.ix_pool - 1) / s.ix_pool + g.max_seqs;
         blocks = (g.max_ctx + s.ix_pool - 1) / s.ix_pool + 1;
         ring = s.ix_pool + g.max_spec;
+        /* RADIANCE_HY4_TEST_RING=<delta> (a test, WP13.0): a ring smaller or larger by delta rows,
+         * to show the rollback gate's probes can fail. Never set in service. */
+        if (const char* e = std::getenv("RADIANCE_HY4_TEST_RING"); e && *e)
+            ring = std::max<int64_t>(1, ring + std::strtoll(e, nullptr, 10));
         tk = decl_b(b, nm.f("ix.token_keys"), RAD_BF16, { T, D });
         stage = decl_b(b, nm.f("ix.stage"), RAD_BF16, { work * s.ix_pool, D });
         page = decl_b(b, nm.f("ix.page"), RAD_I32, { work });

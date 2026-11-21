@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <numeric>
 #include <string>
 
@@ -230,6 +231,12 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
      * sends; kDebugMiss of the drafts are corrupted. The text must stay the plain run's whatever is
      * accepted. */
     debug_oracle_.clear();
+    debug_oracle_mode_ = 0;
+    if (const char* m = std::getenv("RADIANCE_DEBUG_ORACLE_MODE"); m && *m) {
+        static const char* const kModes[] = { "miss", "right", "wrong", "random", "close", "close2", "after" };
+        for (int i = 0; i < 7; ++i)
+            if (!std::strcmp(m, kModes[i])) debug_oracle_mode_ = i;
+    }
     if (const char* f = cfg.debug_draft_oracle.c_str(); *f && cfg.n_spec > 0) {
         if (FILE* fp = std::fopen(f, "r")) {
             std::string text;
@@ -1087,12 +1094,42 @@ int Scheduler::draft_ngram(SchedReq& s, int depth, int* match) const {
          * where a hash of (n, position) falls under the miss rate. */
         const int64_t n = seq.nb;
         int d = 0;
+        /* RADIANCE_DEBUG_ORACLE_MODE (a rollback test, WP13.0): where the first wrong draft sits.
+         * Every draft from there on is wrong too, so the rows from it are rejected. Unset or
+         * `miss`: each draft wrong at kDebugMiss, by hash. `right`: none. `wrong`: the first.
+         * `random`: a hash picks the index (depth: all right). `close` / `close2`: the first /
+         * second draft whose row (position size + d) is the last of an indexer group of 4, i.e.
+         * the row that closes it is rejected. `after`: the first draft whose row follows a
+         * closing row (the closing row is accepted). Position size - 1 is row 0. */
+        int first_wrong = -1;
+        const int mode = debug_oracle_mode_;
+        if (mode != 0) {
+            first_wrong = depth;
+            auto mix = [&](uint64_t x) {
+                x = (x + 1) * 0x9E3779B97F4A7C15ull;
+                x ^= x >> 31; x *= 0xbf58476d1ce4e5b9ull; x ^= x >> 29;
+                return x;
+            };
+            if (mode == 2) first_wrong = 0;
+            else if (mode == 3) first_wrong = (int)(mix((uint64_t)n) % (uint64_t)(depth + 1));
+            else if (mode >= 4) {
+                int seen = 0;
+                const int want = mode == 5 ? 1 : 0;
+                for (int e = 0; e < depth; ++e) {
+                    const int64_t pe = seq.size() + e;
+                    if (mode == 6 ? (pe % 4 == 0) : (pe % 4 == 3)) {
+                        if (seen++ == want || mode == 6) { first_wrong = e; break; }
+                    }
+                }
+            }
+        }
         for (; d < depth && n + d < (int64_t)debug_oracle_.size(); ++d) {
             uint64_t h = (uint64_t)(n * RAD_SCHED_MAX_SPEC + d + 1) * 0x9E3779B97F4A7C15ull;
             h ^= h >> 31;
             h *= 0xbf58476d1ce4e5b9ull;
             h ^= h >> 29;
-            const bool miss = (double)(h >> 11) * 0x1.0p-53 < kDebugMiss;
+            const bool miss = first_wrong >= 0 ? d >= first_wrong
+                                               : (double)(h >> 11) * 0x1.0p-53 < kDebugMiss;
             const int32_t t = debug_oracle_[(size_t)(n + d)];
             s.draft[d] = miss ? (int32_t)((t + 1) % (int32_t)prog_->meta.n_vocab) : t;
         }

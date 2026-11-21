@@ -702,6 +702,8 @@ private:
      * any model. A test harness; empty when not given. */
     std::vector<int32_t>    debug_oracle_;
     static constexpr double kDebugMiss = 0.3;
+    /* RADIANCE_DEBUG_ORACLE_MODE: 0 miss (the hash), 1 right, 2 wrong, 3 random, 4 close, 5 close2, 6 after. */
+    int debug_oracle_mode_ = 0;
 
     mutable std::mutex mu_;
 
