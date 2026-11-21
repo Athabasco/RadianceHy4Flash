@@ -48,6 +48,10 @@ struct Fixture {
             { "num_experts_per_tok", 2 }, { "moe_intermediate_size", FE },
             { "routed_expert_hidden_size", LAT }, { "index_n_heads", IXH },
             { "index_head_dim", IXD }, { "compressed_indexer_compress_ratio", POOL },
+            { "compressed_indexer_group_topk", 4 }, { "routed_scaling_factor", 3.998 },
+            { "swiglu_limit", 10.0 }, { "norm_topk_prob", true }, { "hc_eps", 1e-6 },
+            { "hc_magnitude", 2.0 }, { "engram_pad_id", 2 }, { "engram_lookup_table_size", MAP },
+            { "engram_fp8_embedding", true },
             { "use_mla", true }, { "gated_mla", true }, { "learnable_sink", true },
             { "sandwich_norm", true }, { "enable_ihc", true }, { "use_dsa", true },
             { "use_compressed_indexer", true }, { "attention_bias", false },
@@ -261,9 +265,24 @@ TEST(every_checkpoint_tensor_is_read_and_kept_as_the_release_holds_it) {
     CHECK(plain(f, "blk.0.index_pool_gate.weight") ==
           at(l0 + "self_attn.compressed_indexer.key_gate_projection.weight"));
     CHECK(plain(f, "blk.0.index_ape") == at(l0 + "self_attn.compressed_indexer.intra_group_ape"));
-    /* The sliding layer has the wider head count and no indexer. */
-    CHECK_EQ(plain(f, "blk.1.attn_q_b.weight").size(), (size_t)SWA_HEADS * (NOPE + ROPE) * QL * 2);
-    CHECK(f.find("blk.1.index_query.weight") == nullptr);
+    /* q_b is served as two linears over its rows, each head's nope rows and its rope rows (the
+     * absorbed attention reads the nope part through kv_b, the rotary the rope part); the sliding
+     * layer has the wider head count and no indexer. index_query is split the same way. */
+    auto head_rows = [](const std::string& w, int heads, int per, int off, int n, int cols) {
+        std::string out;
+        const size_t row = (size_t)cols * 2;
+        for (int h = 0; h < heads; ++h)
+            out += w.substr(((size_t)h * per + off) * row, (size_t)n * row);
+        return out;
+    };
+    const std::string qb1 = at(l1 + "self_attn.q_b_proj.weight");
+    CHECK(plain(f, "blk.1.attn_q_nope.weight") == head_rows(qb1, SWA_HEADS, NOPE + ROPE, 0, NOPE, QL));
+    CHECK(plain(f, "blk.1.attn_q_rope.weight") == head_rows(qb1, SWA_HEADS, NOPE + ROPE, NOPE, ROPE, QL));
+    CHECK(f.find("blk.1.attn_q_b.weight") == nullptr);
+    const std::string iq = at(l0 + "self_attn.compressed_indexer.query_projection.weight");
+    CHECK(plain(f, "blk.0.index_query_nope.weight") == head_rows(iq, IXH, IXD, 0, IXD - ROPE, QL));
+    CHECK(plain(f, "blk.0.index_query_rope.weight") == head_rows(iq, IXH, IXD, IXD - ROPE, ROPE, QL));
+    CHECK(f.find("blk.1.index_query_nope.weight") == nullptr);
     /* gate and up are fused, gate rows first, in the dense layer and in the shared expert. */
     CHECK(plain(f, "blk.0.ffn_gate_up.weight") ==
           at(l0 + "mlp.gate_proj.weight") + at(l0 + "mlp.up_proj.weight"));
@@ -275,8 +294,10 @@ TEST(every_checkpoint_tensor_is_read_and_kept_as_the_release_holds_it) {
     /* The latent's in and out are the checkpoint's "down" and "up", by direction in width. */
     CHECK(plain(f, "blk.1.ffn_latent_in.weight") == at(l1 + "mlp.routed_expert_down_proj.weight"));
     CHECK(plain(f, "blk.1.ffn_latent_out.weight") == at(l1 + "mlp.routed_expert_up_proj.weight"));
-    CHECK(plain(f, "blk.1.ffn_gate_inp.correction") ==
-          at(l1 + "mlp.gate.e_score_correction_bias"));
+    /* The router is MoeFP8's GlmRouter's, in f32 (the reference scores in f32). */
+    CHECK(plain(f, "blk.1.glm_router.correction") == at(l1 + "mlp.gate.e_score_correction_bias"));
+    CHECK(plain(f, "blk.1.glm_router.weight") == at(l1 + "mlp.gate.weight"));
+    CHECK(f.find("blk.1.ffn_gate_inp.weight") == nullptr);
     /* Each expert is its dim-0 slice of the two stacked tensors. */
     const std::string& gu = at(l1 + "mlp.experts.gate_up_proj");
     const std::string& dn = at(l1 + "mlp.experts.down_proj");

@@ -14,7 +14,7 @@ plugin claims.
 | `arch/hyv3_bf16` | `hyv3` | *(empty)* | Tencent Hy-Memory-30B-A3B BF16 safetensors; BF16, W4 or W8A8 weights by recipe; TP1/2, BF16 KV |
 | `arch/hyv3_fp8` | `hyv3` | `fp8` | Tencent Hy-Memory-30B-A3B-FP8's descriptor: the same graph, one dense layer then sigmoid-routed MoE; its per-tensor E4M3 linears are a form this build does not serve; TP1/2, bf16 or int8 KV |
 | `arch/hyv3_gguf` | `hyv3` | `gguf_ftype_15` | llama.cpp Hy-Memory Q4_K_M GGUF, dequantized and recipe-converted to native Radiance weights; TP1/2 |
-| `arch/hyv4flash` | `hyv4flash` | *(empty)* | Tencent Hy4-flash from its bf16 checkpoint, **conversion only**: the weight manifest and the checkpoint name map, so `rad-convert` quantises the release by a recipe (`data/recipes/hy4-flash-bf16.recipe`, `hy4-flash-w4nl64-rtn.recipe`); it declares no graph and a container does not serve yet ([what is declared](#hyv4flash-tencent-hy4-flash)) |
+| `arch/hyv4flash` | `hyv4flash` | *(empty)* | Tencent Hy4-flash from its bf16 checkpoint: the text trunk at one rank on bf16 weights (the Engram table also as the bf16 recipe's E4M3 rows), the weight manifest and the checkpoint name map, so `rad-convert` quantises the release by a recipe (`data/recipes/hy4-flash-bf16.recipe`, `hy4-flash-w4nl64-rtn.recipe`); more ranks, quantised experts and trunk linears, DFly2 and pictures are not served yet ([the graph](#hyv4flash-tencent-hy4-flash)) |
 | `arch/flint` | `flint` | *(empty)* | Recursive Flint (39.8B-A2.5B): 2 dense layers then 47 sigmoid-routed MoE layers (256 experts top-6, ungated 1024-wide shared expert), GQA 32/4 at head_dim 128 with QK RMSNorm, a learned per-head sink on every layer, RoPE on the 35 sliding layers (window 513) and NoPE on the 14 full layers; two KV groups (full and window), TP1/2 (expert parallel); BF16 or int8 KV. Weights by recipe: an IQ8R trunk with rotated int8 experts (`data/recipes/flint-iq8r.recipe`), or u4 attention, int4 experts and plain int8 dense/shared/head (`data/recipes/flint-bf16-q4.recipe`); `docs/FLINT.md` |
 | `arch/qwen35_w8a8` | `qwen35` | `w8a8_fwht128` | `qwen35_fp8` with an int8 trunk: i8 weights with a bf16 scale per 128 of K, rotated by a 128-wide Hadamard, against int8 activations under the same rotation: IQ8R and IQR-V4 (`data/recipes/q38-27b-iq8r.recipe`, `q38-27b-iq4r-s-v4.recipe`) |
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
@@ -3271,11 +3271,10 @@ geometry  a point's [x | sin | cos] at 8 octaves (51 values, f32, point_fourier)
 # `hyv4flash`: Tencent Hy4-flash
 
 `model_type: hy_v4_flash`, `HYV4FlashForConditionalGeneration` (HF `tencent/Hy4-flash`, 220B
-parameters in 148 bf16 shards, 440 GB). `arch/hyv4flash` declares the release's weights and maps
-them to its checkpoint tensors, and declares **no op**: it is what `rad-convert` needs to write a
-container, and `rad_arch_step` fails by name. The reference is transformers'
-`modeling_hy_v4_flash.py` (pull request 50903 at the time of writing; the 5.23.0 release has `hy_v4`
-only), which does not load the drafter.
+parameters in 148 bf16 shards, 440 GB). `arch/hyv4flash` declares the release's weights, maps
+them to its checkpoint tensors and serves the text trunk at one rank on bf16 weights (below, "The
+graph"). The reference is transformers' `modeling_hy_v4_flash.py` (pull request 50903 at c2ec8505;
+the 5.23.0 release has `hy_v4` only), which does not load the drafter.
 
 ```
 42 layers over hc_mult 4 streams of 3072, vocab 120832 (lm_head not tied), rms_norm_eps 1e-5
@@ -3328,13 +3327,15 @@ the drafter's `dfly.blk.<i>`, the tower `v.`.
 | `hc_head.{fn,base,scale}` | `model.hc_head.hc_head_{fn,base,scale}` | f32 |
 | `blk.l.hc_attn.*`, `blk.l.hc_ffn.*` | `hc_attn_layer.hc_pre.hc_*`, `hc_mlp_layer.hc_pre.hc_*` | f32 |
 | `attn_norm`, `ffn_norm` | `input_layernorm`, `post_attention_layernorm` | |
-| `attn_q_a`, `attn_q_a_norm`, `attn_q_b` | `self_attn.q_a_proj`, `q_a_layernorm`, `q_b_proj` | |
-| `attn_kv_a`, `attn_kv_a_norm`, `attn_kv_b` | `kv_a_proj_with_mqa`, `kv_a_layernorm`, `kv_b_proj` | |
+| `attn_q_a`, `attn_q_a_norm` | `self_attn.q_a_proj`, `q_a_layernorm` | |
+| `attn_q_nope`, `attn_q_rope` | `q_b_proj`, each head's 192 leading rows / its 64 trailing ones | two linears over one tensor's rows |
+| `attn_kv_a`, `attn_kv_a_norm`, `attn_kv_b` | `kv_a_proj_with_mqa`, `kv_a_layernorm`, `kv_b_proj` | `attn_kv_b` plain bf16 only |
 | `attn_gate`, `attn_output`, `attn_post_norm`, `attn_sinks` | `linear_gate`, `o_proj`, `post_proj_norm`, `learnable_sink_param` | |
-| `index_query`, `index_head`, `index_key`, `index_key_norm` | `compressed_indexer.query_projection`, `head_weight_projection`, `token_key_projection`, `token_key_norm` | sparse layers |
+| `index_query_nope`, `index_query_rope` | `compressed_indexer.query_projection`, each head's 64 leading rows / its 64 trailing ones | sparse layers |
+| `index_head`, `index_key`, `index_key_norm` | `head_weight_projection`, `token_key_projection`, `token_key_norm` | sparse layers |
 | `index_pool_value`, `index_pool_gate`, `index_pool_norm`, `index_ape` | `key_value_projection`, `key_gate_projection`, `key_norm`, `intra_group_ape` | f32 |
 | `ffn_gate_up`, `ffn_down`, `ffn_post_norm` | `mlp.gate_proj` + `up_proj`, `down_proj`, `post_fc2_norm` | layer 0 |
-| `ffn_gate_inp.weight`, `ffn_gate_inp.correction` | `mlp.gate.weight`, `mlp.gate.e_score_correction_bias` | |
+| `glm_router.weight`, `glm_router.correction` | `mlp.gate.weight`, `mlp.gate.e_score_correction_bias` | f32; MoeFP8's router (GlmRouter) |
 | `ffn_latent_in`, `ffn_latent_out` | `mlp.routed_expert_down_proj`, `mlp.routed_expert_up_proj` | |
 | `ffn_gate_up_exps.<e>`, `ffn_down_exps.<e>` | slice `e` of `mlp.experts.gate_up_proj` [512, 3072, 1536] and `down_proj` [512, 1536, 1536] | one movement unit an expert |
 | `ffn_gate_up_shexp`, `ffn_down_shexp`, `ffn_post_norm` | `mlp.shared_experts.gate_proj` + `up_proj`, `down_proj`, `mlp.combine_output_norm` | |
@@ -3343,7 +3344,7 @@ the drafter's `dfly.blk.<i>`, the tower `v.`.
 | `engram_key.{weight,bias}` [4 * 3072, 1536] | `key_projs.0..3`, joined | one GEMM for the four streams |
 | `engram_key_norm`, `engram_query_norm`, `engram_branch_scale` [4 * 3072] | `norm_key.0..3`, `norm_query.0..3`, `unified_per_hc_scales.0..3` | |
 | `engram_value.{weight,bias}`, `engram_value_gain` | `value_proj`, `unified_pre_gamma` | |
-| `engram_mult`, `engram_vocab_sizes`, `engram_offsets` | `engram.<l>.hash_multipliers`, `head_vocab_sizes`, `head_offsets` of `rad-convert --add` | optional, i64 |
+| `engram_mult`, `engram_vocab_sizes`, `engram_offsets` | `engram.<l>.hash_multipliers`, `head_vocab_sizes`, `head_offsets` of `rad-convert --add` | i64; optional at convert, a step without them fails by name |
 
 Traps:
 
@@ -3374,6 +3375,62 @@ Traps:
   recalls. The recipes of record leave them alone.
 - **`engram_fp8_embedding` aside, the release is plain bf16** with no `quantization_config`; Tencent's
   `Hy4-flash-FP8` is another repository, which this plugin has not been run on.
+
+## The graph
+
+One step, as `arch/hyv4flash` issues it (PLAN §1.2; the blocks are `hyv4flash_attn.h`,
+`hyv4flash_indexer.h`, `hyv4flash_moe.h`, `hyv4flash_engram.h`, `hyv4flash_common.h`):
+
+```
+embed_lookup -> copied into every stream (cast a stream)
+per layer
+  [Engram] engram_ids (the layer's own CONV history), embed_lookup_q over the ids, for a bf16 table
+           the E4M3 round trip (quant_act_fp8 one group a row, dequant), engram_norm,
+           gemm_nt_bias key and value, engram_gate into the streams
+  ihc_pre (hc_attn), rmsnorm (attn_norm)
+  q_a, rmsnorm, q_nope / q_rope; kv_a, rmsnorm on the latent, rope (gptj) on q_rope and the key,
+  kv_store of the row [latent | key] as one KV head of (512 + 64) / 2; attn_gate
+  [sparse] index_key, rmsnorm, qsa_work, idx_pool_gated into the indexer cache, qsa_tail_store;
+           selecting: index_query_nope / _rope, rope, index_head, idx_score, qsa_select(own 1)
+  absorbed:     mla_project_kv absorb, mla_attn_paged_sink (window) or mla_attn_sel_sink, expand
+  non-absorbed: the latent copied, gemm_nt kv_b, mla_kv_split, the query assembled, attn_kv_sink
+  gate_mul, attn_output, rmsnorm (attn_post_norm), ihc_post
+  ihc_pre (hc_ffn), rmsnorm (ffn_norm)
+  layer 0: ffn_gate_up, silu_mul, ffn_down; else ffn_latent_in, MoeFP8 (GlmRouter over x, the
+           bf16 experts' clamped SwiGLU), ffn_latent_out, the shared expert, add
+  rmsnorm (ffn_post_norm), ihc_post
+ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
+```
+
+- **Which attention.** Decode and verify rows are absorbed. A step whose prefill sequences all start
+  at position 0 (one row at 0 each, read from `RadBatch::positions_h`) runs those rows non-absorbed;
+  a chunk with a cached prefix is absorbed (no op serves the read of cached rows back into a
+  contiguous key block). The sparse layers attend through the indexer's selection for every row
+  once the step's longest context passes `compressed_indexer_group_topk * ratio` (2048; HF's
+  `candidate_topk`), densely below it, where the selection would take every closed group.
+  `RADIANCE_HY4_PREFILL=absorbed` sends every row down the absorbed path.
+- **The caches.** The sliding layers' latent rows in a `RAD_KV_WINDOW` group (block 16, window
+  `sliding_window` = 512 keys with the own one), the sparse layers' in a full group of block 4, so
+  a page is an indexer group and `qsa_select`'s table is the attention's; the indexer's pooled keys
+  in a full group of block 4 (one key a page); its raw-key tail a linear state of `4 + n_spec` rows;
+  each Engram layer's token history a CONV state of two ids.
+- **The Engram norms' eps** is `finfo(dtype).eps` in the reference (DECISIONS U1):
+  `RADIANCE_HY4_ENGRAM_EPS=bf16` (0.0078125, the default), `f32` (1.19e-7, the harness's parity
+  mode) or a number.
+- **Debug taps.** `RADIANCE_HY4_TAPS=1` declares a PERSIST `dbg.<key>.<l>` buffer and a copy for each
+  key of the harness's tap contract (`resid`, `resid_mid`, `stream_in`, `attn_hc_x`,
+  `attn_hc_post`, `attn_out`, `mlp_out`, `engram_out`, `engram_hash_ids`, `router_*`, `moe_*`,
+  `index_token_keys`, `index_group_keys`, `index_sel`, `index_nsel`, `attn_*`, `ffn_*`, `embed`,
+  `hc_head_out`, `final_hidden`), read through `RADIANCE_DUMP_BUF` / `RADIANCE_DUMP_DIR`. The engine
+  issues no step ahead while that probe runs, so each step's dump shows that step.
+- **Not served, refused by name**: more than one rank (WP7); a quantised kv_b, embedding, lm_head,
+  trunk linear or f32 parameter at declare; quantised routed experts at the step (a container in
+  `hy4-flash-w4nl64-rtn.recipe`'s form converts, and its layers declare their experts as the
+  manifest does); pictures and the drafter.
+
+Tests: `hyv4flash_arch_test` (the declared graph of the `mini` geometry, each step kind lint clean,
+the taps, the refusals) and, against transformers, the harness of the plugin's work directory
+(`ref/run_rad.py --preset mini`).
 
 ## Converting
 
