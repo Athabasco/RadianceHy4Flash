@@ -115,7 +115,7 @@ struct Engram {
         const char* ep = nm.ckpt("model.layers.%d.engram_layer", l);
         RAD_ARCH_TRY(rad_bind_layer_kv(b, l, hist));
 
-        /* The table: E4M3 rows and a bf16 scale a row (a recipe), or bf16 as shipped. A vocabulary
+        /* The table: E4M3 rows and a bf16 or f32 scale a row (a recipe), or bf16 as shipped. A vocabulary
          * table, though not the token one: a few rows a token, far too large for a card. */
         const char* tn = nm.f("blk.%d.engram_table.weight", l);
         RAD_ARCH_TRY(map_copy(b, tn, nm.ckpt("%s.multi_head_embedding.embedding.weight", ep)));
@@ -128,19 +128,20 @@ struct Engram {
         } else {
             const RadEncPlane* sc = rad_enc_plane(&te, "scale");
             if (!(te.n_planes == 2 && te.plane[0].dtype == RAD_F8E4M3 && sc &&
-                  sc->dtype == RAD_BF16 && sc->block[0] == 1)) {
+                  (sc->dtype == RAD_BF16 || sc->dtype == RAD_F32) && sc->block[0] == 1)) {
                 char en[256];
                 rad_enc_format(&te, en, sizeof en);
                 fprintf(stderr, "radiance: hyv4flash: '%s' is %s; the Engram table is served "
-                                "bf16 or as E4M3 rows under a bf16 scale a row "
-                                "(fp8_e4m3*bf16[1x*], data/recipes/hy4-flash-bf16.recipe)\n",
+                                "bf16 or as E4M3 rows under a bf16 or f32 scale a row "
+                                "(fp8_e4m3*bf16[1x*], data/recipes/hy4-flash-bf16.recipe; "
+                                "fp8_e4m3*f32[1x*], hy4-flash-bf16-f32.recipe)\n",
                         tn, en);
                 return RAD_E_UNSUPPORTED;
             }
             table = decl_view(b, tn, nullptr, "codes", RAD_F8E4M3, { rows, HD }, RAD_ACCESS_VOCAB,
                               RAD_SHARD_NONE, grp);
             table_scale = decl_view(b, nm.f("blk.%d.engram_table.scale", l), tn, "scale",
-                                    RAD_BF16, { rows, 1 }, RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp);
+                                    sc->dtype, { rows, 1 }, RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp);
             if (!table_scale) return RAD_E_INVAL;
         }
         if (!table) return RAD_E_INVAL;

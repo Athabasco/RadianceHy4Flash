@@ -719,6 +719,31 @@ TEST(quantised_trunk_linears_quantise_their_own_input) {
     steps_clean_at(d.b, 0, 1);
 }
 
+/* The Engram table as E4M3 rows under a bf16 or an f32 scale a row (hy4-flash-bf16.recipe,
+ * hy4-flash-bf16-f32.recipe): the scale view at the stored dtype, no runtime round trip. */
+TEST(the_engram_table_takes_a_bf16_or_an_f32_row_scale) {
+    auto bf = [](RadBuilder* b) {
+        bf16_encs(b);
+        b->encs.insert(b->encs.begin(), { { "engram_table", rad_enc_affine(RAD_F8E4M3, RAD_BF16, 1, 0) },
+                                          { "engram_mult", rad_enc_plain(RAD_I64) } });
+    };
+    auto f32 = [](RadBuilder* b) {
+        bf16_encs(b);
+        b->encs.insert(b->encs.begin(), { { "engram_table", rad_enc_affine(RAD_F8E4M3, RAD_F32, 1, 0) },
+                                          { "engram_mult", rad_enc_plain(RAD_I64) } });
+    };
+    for (auto encs : { +bf, +f32 }) {
+        Declared d(encs);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        const RecWeight* sc = find_w(d.b, "blk.1.engram_table.scale");
+        REQUIRE(sc != nullptr);
+        CHECK_EQ(sc->d.dtype, encs == +f32 ? (uint32_t)RAD_F32 : (uint32_t)RAD_BF16);
+        CHECK_EQ(count_op(d.b, "dequant"), 0);
+        every_weight_read(d.b);
+        steps_clean_at(d.b, 0, 1);
+    }
+}
+
 /* Quantised experts at two and four ranks are a slice of every expert's width (PLAN §1.5, 768 /
  * 384 at the real size; 256 / 128 here at a 512-wide expert): every rank declares all eight
  * experts, gate_up split by rows in its two parts and down by columns, the routed arm reduced

@@ -1307,7 +1307,8 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
  * error is flat across scales from 2^-13 to 2^-10, so a per-row scale would buy a few percent of
  * error for 1.25% more bytes. (INT8 in the same byte would do much better; that is a different
  * format.) Engram's tables (Hy4-flash) are the one place a scale a row is the model's own format:
- * `block` 1 x * and a `[rows, 1]` plane, accepted below and decoded through avx::RowScale.
+ * `block` 1 x * and a `[rows, 1]` plane, bf16 or f32 (the f32 form keeps the reference's own
+ * scale, amax / 448 unrounded), accepted below and decoded through avx::RowScale.
  *
  * The table is stored as is, so it can be read in place from the container's mapping (a relayout
  * would copy 51 GB). This hook only validates; any other quantisation is refused. The one other
@@ -1337,7 +1338,8 @@ extern "C" int avx_layout_ngram(const RadParam* p, int n_p, int operand, const R
     /* One scale for the table (`block` 0 x 0), or one a row (`block` 1 x *, Engram's tables). */
     const bool per_row = sc && sc->block[0] == 1 && sc->block[1] == 0;
     if (!rad_enc_is(enc, "affine") || enc->n_planes != 2 || enc->transform[0] ||
-        enc->plane[0].dtype != RAD_F8E4M3 || !sc || sc->dtype != RAD_BF16 ||
+        enc->plane[0].dtype != RAD_F8E4M3 || !sc ||
+        !(sc->dtype == RAD_BF16 || (per_row && sc->dtype == RAD_F32)) ||
         (!per_row && (sc->block[0] != 0 || sc->block[1] != 0)))
         return RAD_E_DTYPE;
     if (n != 1 || !pl || !sel) return RAD_E_SHAPE;

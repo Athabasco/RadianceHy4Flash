@@ -4,6 +4,7 @@
 #include "tiny_model.h"
 #include "format/radfile.h"
 #include "text/tokenizer.h"
+#include "rad_plugin.h"
 
 #include <cstdlib>
 #include <fstream>
@@ -366,6 +367,48 @@ TEST(the_bf16_recipe_stores_the_engram_table_as_e4m3_rows) {
     CHECK_EQ(f.plane(*e, 1).bytes, (uint64_t)EROWS * 2);
     /* Every other weight is the checkpoint's. */
     CHECK(plain(f, "blk.1.ffn_gate_up_exps.0.weight").size() == (size_t)2 * FE * LAT * 2);
+}
+
+/* hy4-flash-bf16-f32.recipe: the transformers port's f32 round trip exactly, an f32 scale
+ * amax / 448 a row and codes e4m3(x / scale) (a division), every code and scale of the table. */
+TEST(the_f32_engram_recipe_is_the_ports_round_trip_exactly) {
+    const Fixture& fx = fixture();
+    REQUIRE(fx.ok);
+    std::string log;
+    const std::string out = fx.dir / "e32.rad";
+    REQUIRE_EQ(fx.convert(out, { "--recipe", RAD_E2E_RECIPES "/hy4-flash-bf16-f32.recipe" }, &log),
+               0);
+    RadFile f;
+    REQUIRE_EQ(f.open(out.c_str()), RAD_OK);
+    const RadFileEntry* e = f.find("blk.1.engram_table.weight");
+    REQUIRE(e != nullptr);
+    REQUIRE_EQ(e->n_planes, (uint32_t)2);
+    const RadEncoding& enc = f.encoding(*e);
+    CHECK_EQ(enc.plane[0].dtype, (uint32_t)RAD_F8E4M3);
+    CHECK_EQ(enc.plane[1].dtype, (uint32_t)RAD_F32);
+    REQUIRE_EQ(f.plane(*e, 1).bytes, (uint64_t)EROWS * 4);
+    const uint8_t* codes = (const uint8_t*)f.data(f.plane(*e, 0));
+    const float* scales = (const float*)f.data(f.plane(*e, 1));
+    const auto it = fx.src.find("model.layers.1.engram_layer.multi_head_embedding.embedding.weight");
+    REQUIRE(it != fx.src.end());
+    const uint16_t* x = (const uint16_t*)it->second.data();
+    int bad_codes = 0, bad_scales = 0;
+    for (int r = 0; r < EROWS; ++r) {
+        float v[EHD], amax = 0.0f;
+        for (int c = 0; c < EHD; ++c) {
+            const uint32_t u = (uint32_t)x[r * EHD + c] << 16;
+            std::memcpy(&v[c], &u, 4);
+            amax = std::max(amax, std::fabs(v[c]));
+        }
+        const float sc = std::max(amax, 1e-12f) / 448.0f;
+        bad_scales += scales[r] != sc;
+        for (int c = 0; c < EHD; ++c) {
+            const float q = std::min(std::max(v[c] / sc, -448.0f), 448.0f);
+            bad_codes += codes[r * EHD + c] != rad_f32_to_fp8e4m3(q);
+        }
+    }
+    CHECK_EQ(bad_scales, 0);
+    CHECK_EQ(bad_codes, 0);
 }
 
 TEST(the_w4nl64_recipe_stores_every_routed_expert_as_four_bit_codes) {
