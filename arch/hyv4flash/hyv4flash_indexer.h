@@ -86,7 +86,7 @@ struct Indexer {
     rad_op op_key_norm = 0, op_work = 0, op_pool = 0, op_tail = 0;
     rad_op op_q_rope = 0, op_qn_copy = 0, op_qr_copy = 0, op_score = 0, op_select = 0;
     rad_op op_tap_zero = 0, op_tap_pool = 0, op_tap_ident = 0, op_tap_select = 0, op_tap_nsel0 = 0;
-    Tap t_token_keys{}, t_group_keys{}, t_sel{}, t_nsel{};
+    Tap t_token_keys{}, t_group_keys{}, t_sel{}, t_nsel{}, t_score{};
 
     /* `index` is the indexer cache group, declared by the caller right before this (block 4,
      * claimed by idx_pool_gated); `tail` the raw-key ring, `attention` the sparse latent group. */
@@ -236,6 +236,9 @@ struct Indexer {
             RAD_ARCH_TRY(t_sel.declare(b, nm, T, "index_sel", l, RAD_I32, s.ix_group_topk,
                                        w.sel_ids));
             RAD_ARCH_TRY(t_nsel.declare(b, nm, T, "index_nsel", l, RAD_I32, 1, w.nsel));
+            /* The scores the selection read, a row's groups by index (WP4: the selection is
+             * checked against its own scores, the scores against HF's). */
+            RAD_ARCH_TRY(t_score.declare(b, nm, T, "index_score", l, RAD_F32, w.blocks, w.score));
             op_tap_nsel0 = mk(b, "fill",
                               { RAD_RANGE("M", 1, T), RAD_INT("n", 1), RAD_STR("dtype", "i32") },
                               {}, {}, { t_nsel.buf });
@@ -315,6 +318,7 @@ struct Indexer {
                         brows(w.len, T));
             t_sel.step(c, brows(w.sel_ids, T), T);
             t_nsel.step(c, brows(w.nsel, T), T);
+            t_score.step(c, brows(w.score, T), T);
         }
         return true;
     }

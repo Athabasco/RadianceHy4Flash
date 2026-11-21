@@ -270,7 +270,7 @@ TEST(the_debug_taps_are_persistent_buffers_and_lint_clean) {
     for (const char* n : { "dbg.resid.0", "dbg.resid_mid.2", "dbg.attn_hc_x.1", "dbg.attn_hc_post.0",
                            "dbg.attn_out.1", "dbg.mlp_out.0", "dbg.engram_out.1",
                            "dbg.router_topk_idx.1", "dbg.index_token_keys.0",
-                           "dbg.index_group_keys.2", "dbg.index_sel.0", "dbg.index_nsel.2",
+                           "dbg.index_group_keys.2", "dbg.index_sel.0", "dbg.index_nsel.2", "dbg.index_score.0",
                            "dbg.embed", "dbg.final_hidden" }) {
         const RecBuf* t = find_b(d.b, n);
         CHECK(t != nullptr);

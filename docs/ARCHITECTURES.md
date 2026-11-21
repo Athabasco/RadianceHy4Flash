@@ -3405,7 +3405,10 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
 - **Which attention.** Decode and verify rows are absorbed. A step whose prefill sequences all start
   at position 0 (one row at 0 each, read from `RadBatch::positions_h`) runs those rows non-absorbed;
   a chunk with a cached prefix is absorbed (no op serves the read of cached rows back into a
-  contiguous key block). The sparse layers attend through the indexer's selection for every row
+  contiguous key block). That is a speed choice, not a numerical one: both paths write the same
+  cache rows, and the chunked-prefill harness runs (chunk 16 on `mini`, `mini6`) are within the
+  same tolerance of HF as the one-shot ones. A paged gather of the cached latent rows belongs to
+  the non-absorbed prefill kernel's tuning (WP16), if profiling shows the expansion pays there. The sparse layers attend through the indexer's selection for every row
   once the step's longest context passes `compressed_indexer_group_topk * ratio` (2048; HF's
   `candidate_topk`), densely below it, where the selection would take every closed group.
   `RADIANCE_HY4_PREFILL=absorbed` sends every row down the absorbed path.
@@ -3421,8 +3424,30 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   key of the harness's tap contract (`resid`, `resid_mid`, `stream_in`, `attn_hc_x`,
   `attn_hc_post`, `attn_out`, `mlp_out`, `engram_out`, `engram_hash_ids`, `router_*`, `moe_*`,
   `index_token_keys`, `index_group_keys`, `index_sel`, `index_nsel`, `attn_*`, `ffn_*`, `embed`,
-  `hc_head_out`, `final_hidden`), read through `RADIANCE_DUMP_BUF` / `RADIANCE_DUMP_DIR`. The engine
-  issues no step ahead while that probe runs, so each step's dump shows that step.
+  `hc_head_out`, `final_hidden`, and `index_score`, the scores the selection read), read through
+  `RADIANCE_DUMP_BUF` / `RADIANCE_DUMP_DIR`. The engine issues no step ahead while that probe runs,
+  so each step's dump shows that step.
+- **Host parity** (harness `ref/run_rad.py`, `notes/wp4.md`). The reference is HF in f32,
+  *conditioned* on radiance's discrete decisions: on random weights the indexer's scores tie
+  exactly (relu gives 0) and the router has near-ties, so HF runs again with radiance's selection
+  and routing substituted, after checking that each decision is the top-k of radiance's own scores
+  (the `index_score` and `router_logits` taps) and those scores are within tolerance of HF's. A
+  tensor's relative L2 to that reference may be 2x what HF's own bf16 run (same decisions) has,
+  logits mean KL 2e-3. Measured on `mini` and `mini6`, libref and libavx, one-shot, chunked
+  prefill, prefill + 32 decode steps and decode from BOS (all green):
+
+  | | libref | libavx |
+  |---|---|---|
+  | relL2 / HF bf16's, median (max) | 0.84 (1.49) | 0.84 (1.54) |
+  | largest relL2, any tensor (`mini6` layer 5) | 3.9e-2 | 4.1e-2 |
+  | logits mean KL, worst prompt | 6.3e-4 | 6.1e-4 |
+  | decision rows differing from HF's free choice (exact ties) | 395 / 8646 (287) | 395 / 8646 (292) |
+
+  libavx against libref directly: relL2 at most 0.93 (median 0.05) of HF bf16's distance and
+  logits KL at most 1.8e-4 until their decisions first differ (a near-tie both sides break by
+  their own scores); past that point the two runs are compared with HF only. The rotary tables in
+  bf16 (PLAN D5) would move a tensor by 5e-4 to 1.3e-3, a twentieth of the bf16 trunk's noise: the
+  f32 tables stay.
 - **Not served, refused by name**: a world other than 1, 2 or 4, or one the heads, the dense and
   shared widths or the vocabulary do not divide; a quantised kv_b, embedding, lm_head, trunk linear
   or f32 parameter at declare; quantised routed experts at the step at one rank (a container in
