@@ -14,7 +14,7 @@ plugin claims.
 | `arch/hyv3_bf16` | `hyv3` | *(empty)* | Tencent Hy-Memory-30B-A3B BF16 safetensors; BF16, W4 or W8A8 weights by recipe; TP1/2, BF16 KV |
 | `arch/hyv3_fp8` | `hyv3` | `fp8` | Tencent Hy-Memory-30B-A3B-FP8's descriptor: the same graph, one dense layer then sigmoid-routed MoE; its per-tensor E4M3 linears are a form this build does not serve; TP1/2, bf16 or int8 KV |
 | `arch/hyv3_gguf` | `hyv3` | `gguf_ftype_15` | llama.cpp Hy-Memory Q4_K_M GGUF, dequantized and recipe-converted to native Radiance weights; TP1/2 |
-| `arch/hyv4flash` | `hyv4flash` | *(empty)* | Tencent Hy4-flash from its bf16 checkpoint: the text trunk at one rank on bf16 weights (the Engram table also as the bf16 recipe's E4M3 rows), the weight manifest and the checkpoint name map, so `rad-convert` quantises the release by a recipe (`data/recipes/hy4-flash-bf16.recipe`, `hy4-flash-w4nl64-rtn.recipe`); more ranks, quantised experts and trunk linears, DFly2 and pictures are not served yet ([the graph](#hyv4flash-tencent-hy4-flash)) |
+| `arch/hyv4flash` | `hyv4flash` | *(empty)* | Tencent Hy4-flash from its bf16 checkpoint: the text trunk at one, two or four ranks (TP1/2/4, whole heads a rank, whole experts a rank) on bf16 weights (the Engram table also as the bf16 recipe's E4M3 rows), the weight manifest and the checkpoint name map, so `rad-convert` quantises the release by a recipe (`data/recipes/hy4-flash-bf16.recipe`, `hy4-flash-w4nl64-rtn.recipe`); quantised experts and trunk linears, DFly2 and pictures are not served yet ([the graph](#hyv4flash-tencent-hy4-flash)) |
 | `arch/flint` | `flint` | *(empty)* | Recursive Flint (39.8B-A2.5B): 2 dense layers then 47 sigmoid-routed MoE layers (256 experts top-6, ungated 1024-wide shared expert), GQA 32/4 at head_dim 128 with QK RMSNorm, a learned per-head sink on every layer, RoPE on the 35 sliding layers (window 513) and NoPE on the 14 full layers; two KV groups (full and window), TP1/2 (expert parallel); BF16 or int8 KV. Weights by recipe: an IQ8R trunk with rotated int8 experts (`data/recipes/flint-iq8r.recipe`), or u4 attention, int4 experts and plain int8 dense/shared/head (`data/recipes/flint-bf16-q4.recipe`); `docs/FLINT.md` |
 | `arch/qwen35_w8a8` | `qwen35` | `w8a8_fwht128` | `qwen35_fp8` with an int8 trunk: i8 weights with a bf16 scale per 128 of K, rotated by a 128-wide Hadamard, against int8 activations under the same rotation: IQ8R and IQR-V4 (`data/recipes/q38-27b-iq8r.recipe`, `q38-27b-iq4r-s-v4.recipe`) |
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
@@ -3272,8 +3272,8 @@ geometry  a point's [x | sin | cos] at 8 octaves (51 values, f32, point_fourier)
 
 `model_type: hy_v4_flash`, `HYV4FlashForConditionalGeneration` (HF `tencent/Hy4-flash`, 220B
 parameters in 148 bf16 shards, 440 GB). `arch/hyv4flash` declares the release's weights, maps
-them to its checkpoint tensors and serves the text trunk at one rank on bf16 weights (below, "The
-graph"). The reference is transformers' `modeling_hy_v4_flash.py` (pull request 50903 at c2ec8505;
+them to its checkpoint tensors and serves the text trunk at one, two or four ranks on bf16 weights
+(below, "The graph" and "Tensor parallelism"). The reference is transformers' `modeling_hy_v4_flash.py` (pull request 50903 at c2ec8505;
 the 5.23.0 release has `hy_v4` only), which does not load the drafter.
 
 ```
@@ -3423,14 +3423,43 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   `index_token_keys`, `index_group_keys`, `index_sel`, `index_nsel`, `attn_*`, `ffn_*`, `embed`,
   `hc_head_out`, `final_hidden`), read through `RADIANCE_DUMP_BUF` / `RADIANCE_DUMP_DIR`. The engine
   issues no step ahead while that probe runs, so each step's dump shows that step.
-- **Not served, refused by name**: more than one rank (WP7); a quantised kv_b, embedding, lm_head,
-  trunk linear or f32 parameter at declare; quantised routed experts at the step (a container in
+- **Not served, refused by name**: a world other than 1, 2 or 4, or one the heads, the dense and
+  shared widths or the vocabulary do not divide; a quantised kv_b, embedding, lm_head, trunk linear
+  or f32 parameter at declare; quantised routed experts at the step at one rank (a container in
   `hy4-flash-w4nl64-rtn.recipe`'s form converts, and its layers declare their experts as the
-  manifest does); pictures and the drafter.
+  manifest does) and at declare at more ranks; a library without an exact all-reduce at more
+  ranks; pictures and the drafter.
+
+### Tensor parallelism
+
+`--tp 2` or `--tp 4` (PLAN §1.5):
+
+| part | split | real model at TP2 / TP4 |
+|---|---|---|
+| `attn_q_nope`, `attn_q_rope`, `attn_kv_b`, `attn_gate`, `attn_sinks` | rows, whole heads a rank, contiguous | sparse 16 / 8, sliding 32 / 16 heads |
+| `attn_output` | columns (the rank's heads), all-reduce behind it | |
+| layer 0 `ffn_gate_up` / `ffn_down` | rows of each half / columns | 6912 / 3456 |
+| shared expert `ffn_gate_up_shexp` / `ffn_down_shexp` | the same | 768 / 384 |
+| routed experts, bf16 (and every calibration run) | whole experts a rank, `expert_base = rank * E / world` | 256 / 128 experts |
+| `output.weight` (lm_head) | rows by vocabulary, logits `[rows, n_vocab / world]` | 60416 / 30208 |
+| streams, iHC, every norm, `token_embd`, Engram, indexer, router, `q_a`, `kv_a`, `ffn_latent_in/out`, the caches | replicated | |
+
+Two all-reduces a layer, both exact bf16 (`exact 1`, whatever `--tp-wire` allows: the sandwich norm
+behind each and the calibration read the sum): behind `attn_output`, before `attn_post_norm`, and
+behind the feed-forward's sum (the dense MLP's, or the routed arm through the replicated
+`ffn_latent_out` plus the shared expert's slice, one reduction for both, `MoeFP8` with
+`no_reduce`), before `ffn_post_norm`. The latent caches are the same on every rank (MLA has one
+latent for all heads). The slice of every expert's width that quantised serving will use (768 / 384,
+whole 128-column groups, `Ffn::place`) is computed but not served: quantised experts are WP10, and
+MoeFP8 serves a bf16 expert only whole. At more than one rank the taps of a rank's partial values
+(`attn_gate_logits`, `moe_experts_out`, `moe_routed_out`, `moe_shared_out`) are left out and
+`attn_o_proj` is tapped behind its reduction.
 
 Tests: `hyv4flash_arch_test` (the declared graph of the `mini` geometry, each step kind lint clean,
-the taps, the refusals) and, against transformers, the harness of the plugin's work directory
-(`ref/run_rad.py --preset mini`).
+the taps, the refusals; at two and four ranks every weight covered exactly once, each rank's heads,
+experts and vocabulary, two exact reductions a layer, every step kind lint clean on every rank)
+and, against transformers, the harness of the plugin's work directory (`ref/run_rad.py --preset
+mini`, `--tp 2` on fake host ranks; `--preset mini4`, twice mini's heads and experts, at `--tp 4`).
 
 ## Converting
 
