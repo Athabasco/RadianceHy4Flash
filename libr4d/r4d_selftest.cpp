@@ -18491,6 +18491,122 @@ static void qsa_perf(const Plugin& pl, int64_t ctx, int64_t M, int iters) {
         (double)M * live * 8.0);
 }
 
+
+static float ix_rf(uint32_t seed, uint32_t i);
+/* --perfidx CTX [M] [iters]: Hy4-flash's indexer query side at a real context, per mode, 16 heads,
+ * 128 wide, one sequence of CTX / 4 groups and M query rows (M = 1 a decode step): exact
+ * (idx_score, bf16 keys), fp8 (dsa_query + dsa_score_fp8_h16) and int8 (dsa_query_i8 +
+ * dsa_score_i8_h16), then qsa_select (topk 511, the same in all three). Whole-step microseconds of
+ * each launch, warmed. The pooling (a group every 4 tokens) is not in these numbers. */
+static void idx_perf(const Plugin& pl, int64_t ctx, int64_t M, int iters) {
+    if (iters <= 0) iters = 200;
+    const int64_t H = 16, n = 128, ratio = 4, topk = 511;
+    const int64_t live = ctx / ratio, nb = live + 2, pages = live + 1;
+    if (live < 1 || M < 1) { std::printf("--perfidx: ctx or M out of range\n"); return; }
+    std::printf("hy4 indexer at ctx=%lld (%lld groups), M=%lld, %d launches\n", (long long)ctx,
+                (long long)live, (long long)M, iters);
+    std::vector<uint8_t> q8((size_t)(M * H * n)), kh8((size_t)(pages * 136), 0);
+    std::vector<uint16_t> qb((size_t)(M * H * n)), kb((size_t)(pages * n)), gb((size_t)(M * H));
+    for (size_t i = 0; i < q8.size(); ++i) q8[i] = (uint8_t)(int8_t)((int)((i * 37 + 11) % 255) - 127);
+    for (size_t i = 0; i < qb.size(); ++i) qb[i] = h_to_bf16(ix_rf(7, (uint32_t)i));
+    for (size_t i = 0; i < kb.size(); ++i) kb[i] = h_to_bf16(ix_rf(8, (uint32_t)i));
+    for (size_t i = 0; i < gb.size(); ++i) gb[i] = h_to_bf16(ix_rf(9, (uint32_t)i));
+    for (int64_t p = 0; p < pages; ++p) {
+        for (int64_t d = 0; d < n; ++d)
+            kh8[(size_t)(p * 136 + d)] = (uint8_t)(int8_t)((int)((p * 29 + d * 7) % 255) - 127);
+        const float sc = 0.01f;
+        std::memcpy(&kh8[(size_t)(p * 136 + 128)], &sc, 4);
+    }
+    std::vector<float> qsh((size_t)(M * H), 0.02f), gh((size_t)(M * H));
+    for (size_t i = 0; i < gh.size(); ++i) gh[i] = (float)((int)((i * 53) % 201) - 100) / 100.0f;
+    std::vector<int32_t> bth((size_t)nb, -1), nch(1, (int32_t)live), cuh = { 0, (int32_t)M },
+                                               posh((size_t)M);
+    for (int64_t b = 0; b <= live; ++b) bth[(size_t)b] = (int32_t)((b * 7919 + 13) % pages);
+    for (int64_t m = 0; m < M; ++m) posh[(size_t)m] = (int32_t)(ctx - M + m);
+    void *d_q8 = dalloc(q8.size()), *d_qb = dalloc(qb.size() * 2), *d_kb = dalloc(kb.size() * 2),
+         *d_gb = dalloc(gb.size() * 2), *d_qs = dalloc(qsh.size() * 4), *d_g = dalloc(gh.size() * 4),
+         *d_k8 = dalloc(kh8.size()), *d_bt = dalloc(bth.size() * 4), *d_nc = dalloc(4),
+         *d_cu = dalloc(8), *d_po = dalloc(posh.size() * 4),
+         *d_sc = dalloc((size_t)(M * nb) * 4), *d_se = dalloc((size_t)(M * (topk + 1)) * 4),
+         *d_ns = dalloc((size_t)M * 4), *d_su = dalloc((size_t)M * 4),
+         *d_qc = dalloc(q8.size()), *d_qq = dalloc(qsh.size() * 4);
+    if (!d_q8 || !d_qb || !d_kb || !d_gb || !d_qs || !d_g || !d_k8 || !d_bt || !d_nc || !d_cu ||
+        !d_po || !d_sc || !d_se || !d_ns || !d_su || !d_qc || !d_qq) {
+        std::printf("  alloc failed\n");
+        return;
+    }
+    st_memcpy(d_q8, q8.data(), q8.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_qb, qb.data(), qb.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_kb, kb.data(), kb.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_gb, gb.data(), gb.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_qs, qsh.data(), qsh.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_g, gh.data(), gh.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_k8, kh8.data(), kh8.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_bt, bth.data(), bth.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_nc, nch.data(), 4, hipMemcpyHostToDevice);
+    st_memcpy(d_cu, cuh.data(), 8, hipMemcpyHostToDevice);
+    st_memcpy(d_po, posh.data(), posh.size() * 4, hipMemcpyHostToDevice);
+    auto run = [&](const char* row, std::vector<RadTensor> ts, std::vector<RadParam> ps) {
+        const RadKernelInfo* r = find(pl, row);
+        if (!r) return -1.0;
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        if (r->launch(&a, nullptr) != RAD_OK || st_stream_sync(nullptr) != hipSuccess) return -1.0;
+        hipEvent_t w0, w1;
+        st_ev_create(&w0); st_ev_create(&w1);
+        st_ev_record(w0, nullptr);
+        float wms = 0.0f;
+        for (int guard = 0; guard < 100000 && wms < 300.0f; ++guard) {
+            for (int i = 0; i < 32; ++i) r->launch(&a, nullptr);
+            st_ev_record(w1, nullptr);
+            st_ev_sync(w1);
+            st_ev_elapsed(&wms, w0, w1);
+        }
+        st_ev_destroy(w0); st_ev_destroy(w1);
+        return st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
+    };
+    RadTensor sc = T(d_sc, RAD_F32, { M, nb });
+    sc.shape[1] = live + 1;
+    const double t_exact =
+        run("idx_score_bf16",
+            { T(d_qb, RAD_BF16, { M, H, n }), T(d_gb, RAD_BF16, { M, H }),
+              T(d_kb, RAD_BF16, { pages, 1, 4, n / 4 }), T(d_bt, RAD_I32, { 1, nb }),
+              T(d_cu, RAD_I32, { 2 }), T(d_nc, RAD_I32, { 1 }), sc },
+            { PI("M", M), PI("n", n), PI("heads", H), PI("blocks", nb), PI("seqs", 1),
+              PS("dtype", "bf16") });
+    auto quant = [&](const char* qrow, const char* srow, uint32_t qt, const char* dt) {
+        const double tq = run(qrow, { T(d_qb, RAD_BF16, { M * H, n }), T(d_qc, qt, { M * H, n }),
+                                      T(d_qq, RAD_F32, { M * H, 1 }) },
+                              { PI("M", M * H), PI("n", n), PS("dtype", "bf16") });
+        RadTensor sc2 = sc;
+        const double ts = run(srow,
+                              { T(d_q8, qt, { M * H, n }), T(d_qs, RAD_F32, { M * H, 1 }),
+                                T(d_g, RAD_F32, { M, H }), T(d_k8, RAD_U8, { pages, 1, 4, 34 }),
+                                RadTensor{}, T(d_bt, RAD_I32, { 1, nb }), T(d_cu, RAD_I32, { 2 }),
+                                T(d_nc, RAD_I32, { 1 }), sc2, RadTensor{} },
+                              { PI("M", M), PI("n", n), PI("heads", H), PI("blocks", nb),
+                                PI("seqs", 1), PS("dtype", dt) });
+        return std::make_pair(tq, ts);
+    };
+    const auto f8 = quant("dsa_query_fp8", "dsa_score_fp8_h16", RAD_F8E4M3, "fp8_e4m3");
+    const auto i8 = quant("dsa_query_i8", "dsa_score_i8_h16", RAD_I8, "int8");
+    const double t_sel =
+        run("qsa_select_i32",
+            { sc, T(d_bt, RAD_I32, { 1, nb }), T(d_nc, RAD_I32, { 1 }), T(d_po, RAD_I32, { M }),
+              T(d_cu, RAD_I32, { 2 }), T(d_se, RAD_I32, { M, topk + 1 }), T(d_ns, RAD_I32, { M }),
+              T(d_su, RAD_I32, { M }) },
+            { PI("M", M), PI("blocks", nb), PI("topk", topk), PI("ratio", ratio), PI("seqs", 1),
+              PI("signed", 1), PI("own", 1) });
+    std::printf("  exact  idx_score                      %9.2f us\n", t_exact);
+    std::printf("  fp8    dsa_query %8.2f + dsa_score %9.2f = %9.2f us\n", f8.first, f8.second,
+                f8.first + f8.second);
+    std::printf("  int8   dsa_query %8.2f + dsa_score %9.2f = %9.2f us\n", i8.first, i8.second,
+                i8.first + i8.second);
+    std::printf("  qsa_select (topk %lld, the same in all)  %9.2f us\n", (long long)topk, t_sel);
+}
+
 /* ------------------------------------------------------------- GLM's DSA indexer, timed at length
  *
  * dsa_score scores every complete block of a row's sequence and qsa_select ranks them, so both
@@ -38395,7 +38511,7 @@ int main(int argc, char** argv) {
     long long perf_pb1 = 0;
     long long sop_m = 0, sop_k = 0;
     int sop_it = 2000;
-    long long qsa_ctx = 0, qsa_m = 4, dsa_ctx = 0, dsa_m = 6;
+    long long qsa_ctx = 0, qsa_m = 4, dsa_ctx = 0, dsa_m = 6, idx_ctx = 0, idx_m = 1;
     int dsa_it = 100;
     long long mla_m = 0, mla_blocks = 0, mla_heads = 0;
     int mla_it = 20;
@@ -38535,6 +38651,11 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { usage(); return 2; }
             dsa_ctx = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) dsa_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) dsa_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfidx")) {
+            if (i + 1 >= argc) { usage(); return 2; }
+            idx_ctx = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) idx_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) dsa_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfqsa")) {
             /* The indexer at a real context length (the only decode op that grows with it). */
@@ -38932,6 +39053,16 @@ int main(int argc, char** argv) {
         dfree_all();
 #else
         skip("MLA attention timing", "built without HIP");
+#endif
+        return 0;
+    }
+    if (idx_ctx) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        idx_perf(pl, idx_ctx, idx_m, dsa_it);
+        dfree_all();
+#else
+        skip("hy4 indexer timing", "built without HIP");
 #endif
         return 0;
     }
