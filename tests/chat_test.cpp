@@ -529,8 +529,8 @@ TEST(every_shipped_template_renders_as_reference_jinja_does) {
                                 "reference render " + first_difference(ref, got));
         }
     }
-    /* Five templates, every case each one renders. */
-    CHECK(compared >= 74);
+    /* Six templates, every case each one renders. */
+    CHECK(compared >= 101);
 }
 
 /* ------------------------------------------------------------------ reading the reply back */

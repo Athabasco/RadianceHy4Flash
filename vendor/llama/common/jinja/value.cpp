@@ -765,6 +765,42 @@ const func_builtins & value_string_t::get_builtins() const {
             std::string suffix = args.get_pos(1)->as_string().str();
             return mk_val<value_bool>(string_endswith(str, suffix));
         }},
+        /* str.format with positional fields: "{}" (auto-numbered), "{0}", and "{{" / "}}" for
+         * the braces. Names, attribute access and format specs are refused by name, not guessed
+         * at. Hy4's template builds every special token with it ('<｜hy_start{}｜>'.format(HYTK)). */
+        {"format", [](const func_args & args) -> value {
+            value val_input = args.get_pos(0);
+            if (!is_val<value_string>(val_input)) {
+                throw raised_exception("format() first argument must be a string");
+            }
+            const std::string fmt = val_input->as_string().str();
+            const size_t n_args = args.count() - 1;
+            std::string out;
+            size_t next_auto = 0;
+            for (size_t i = 0; i < fmt.size(); ++i) {
+                const char c = fmt[i];
+                if (c == '{' && i + 1 < fmt.size() && fmt[i + 1] == '{') { out += '{'; ++i; continue; }
+                if (c == '}' && i + 1 < fmt.size() && fmt[i + 1] == '}') { out += '}'; ++i; continue; }
+                if (c == '}') throw raised_exception("format(): single '}' encountered in the string");
+                if (c != '{') { out += c; continue; }
+                const size_t close = fmt.find('}', i + 1);
+                if (close == std::string::npos)
+                    throw raised_exception("format(): expected '}' before end of string");
+                const std::string field = fmt.substr(i + 1, close - i - 1);
+                size_t idx;
+                if (field.empty()) {
+                    idx = next_auto++;
+                } else if (field.find_first_not_of("0123456789") == std::string::npos) {
+                    idx = static_cast<size_t>(std::stoull(field));
+                } else {
+                    throw not_implemented_exception("format(): only positional fields are implemented, got '{" + field + "}'");
+                }
+                if (idx >= n_args) throw raised_exception("format(): replacement index " + std::to_string(idx) + " out of range for positional args");
+                out += args.get_pos(idx + 1)->as_string().str();
+                i = close;
+            }
+            return mk_val<value_string>(out);
+        }},
         {"split", [](const func_args & args) -> value {
             args.ensure_count(1, 3);
             value val_input = args.get_pos(0);
