@@ -13,7 +13,12 @@ gate) and M = 6 (a verify of 1 + 5 drafts). Rebuild (host only, libref answers):
   rad-kbench --fixture raw_extra.rkb --kernels libref --rerecord extra.rkb
   python3 data/kernels_hy4.py merge gpumini.rkb hy4_mla_sink.rkb extra.rkb data/kernels_hy4.rkb
 
-hy4_mla_sink.rkb is WP6b's (notes/wp6b-mkfix.py, rerecorded). Check a card with
+hy4_mla_sink.rkb is WP6b's (notes/wp6b-mkfix.py, rerecorded). The vision rows (WP15):
+
+  rad-kbench -m gpu-mini-vis.rad --kernels libref --max-ctx 4096 --max-tok 1024 --mm-max-patches 4096 --record vis.rkb
+  python3 data/kernels_hy4.py vis data/kernels_hy4.rkb vis.rkb data/kernels_hy4.rkb
+
+Check a card with
   rad-kbench --fixture data/kernels_hy4.rkb --kernels libr4d:libref [--bench]
 """
 import copy, struct, sys
@@ -170,5 +175,31 @@ def merge(*paths):
     head = dict(load(paths[0]), source='hy4-flash: gpu-mini graph + real geometry / TP shards (WP8)', cases=cases)
     save(head, out); print(len(cases), 'cases ->', out)
 
+# WP15: the vision rows, from a recording of the gpu-mini-vis container with --mm-max-patches (the tower
+# at the real head width 72, its merger, the newline lookup, the media rows' scatter, and the trunk's
+# and the indexer's M-RoPE forms).
+VIS = ('grid_embed_sf', 'conv2d_unfold', 'attn_dense', 'layernorm', 'gemm_nt_bias', 'scatter_rows')
+def vis_case(c):
+    if c['op'] in VIS: return True
+    if c['op'] == 'embed_lookup': return par(c, 'n_vocab') == 1          # the newline row
+    if c['op'] in ('rope', 'idx_pool_gated'):
+        return any(p[0] == 'mode' and p[4] == 'imrope_gptj' for p in c['params'])
+    return False
+
+def vis(base, rec, out):
+    """base fixture + the vision cases of `rec` (rad-kbench -m gpu-mini-vis.rad --mm-max-patches 4096
+    --kernels libref --record rec), each distinct point once."""
+    fx, r = load(base), load(rec)
+    have = {(c['op'], repr(c['params']), repr([(o['role'], o['dtype'], o['shape']) for o in c['opd']]))
+            for c in fx['cases']}
+    add = []
+    for c in r['cases']:
+        if not vis_case(c) or not any(o.get('have_ref') for o in c['opd']): continue
+        k = (c['op'], repr(c['params']), repr([(o['role'], o['dtype'], o['shape']) for o in c['opd']]))
+        if k in have: continue
+        have.add(k); add.append(c)
+    fx = dict(fx, source=fx['source'] + ' + vision (WP15, gpu-mini-vis)', cases=fx['cases'] + add)
+    save(fx, out); print(len(add), 'vision cases added ->', out, len(fx['cases']), 'in all')
+
 if __name__ == '__main__':
-    {'raw': raw, 'merge': merge}[sys.argv[1]](*sys.argv[2:])
+    {'raw': raw, 'merge': merge, 'vis': vis}[sys.argv[1]](*sys.argv[2:])
