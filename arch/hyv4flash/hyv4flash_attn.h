@@ -99,7 +99,7 @@ struct Attn {
     rad_op op_qa_norm = 0, op_kv_norm = 0, op_q_rope = 0, op_k_rope = 0, op_store = 0;
     rad_op op_absorb = 0, op_paged = 0, op_sel = 0, op_expand = 0;
     rad_op op_lat_copy = 0, op_kvb = 0, op_split = 0, op_qn_copy = 0, op_qr_copy = 0, op_dense = 0, op_rebase = 0;
-    rad_op op_gate = 0, op_post_norm = 0;
+    rad_op op_gate = 0, op_post_norm = 0, op_ar = 0;
     Tap t_in_norm{}, t_q_resid{}, t_kv_latent{}, t_gate{}, t_o_proj{}, t_out{};
 
     /* `ap` is the checkpoint's `model.layers.<l>.self_attn`. `group` is the layer's latent KV
@@ -111,7 +111,8 @@ struct Attn {
         g = geom;
         layer = l;
         sliding = is_sliding;
-        a = sliding ? s.sliding : s.sparse;
+        a = s.local(sliding);   /* this rank's heads */
+        const AttnGeom& whole = sliding ? s.sliding : s.sparse;
         w = wire;
         xa = in;
         ya = outb;
@@ -138,14 +139,15 @@ struct Attn {
         HY4_NEED(op_qa_norm, "rmsnorm");
 
         /* q_b's rows are head-major, a head's nope rows then its rope rows: one row map a part,
-         * a piece a head, eight pieces a map (successive ROWS maps extend one name). */
+         * a piece a head, eight pieces a map (successive ROWS maps extend one name). The maps
+         * name every head; a rank reads its heads' rows of the result (RAD_SHARD_ROW). */
         const char* qsrc = nm.ckpt("%s.q_b_proj.weight", ap);
         auto part = [&](const char* name, int64_t off, int64_t width) -> int {
-            for (int64_t h0 = 0; h0 < H; h0 += 8) {
+            for (int64_t h0 = 0; h0 < whole.heads; h0 += 8) {
                 RadNameMap m = map_base(name, RAD_MAP_ROWS);
-                for (int64_t h = h0; h < std::min<int64_t>(h0 + 8, H); ++h) {
+                for (int64_t h = h0; h < std::min<int64_t>(h0 + 8, whole.heads); ++h) {
                     m.src[m.n_src] = qsrc;
-                    m.src_index[m.n_src] = (int)(h * a.qk() + off);
+                    m.src_index[m.n_src] = (int)(h * whole.qk() + off);
                     m.src_rows[m.n_src] = width;
                     ++m.n_src;
                 }
@@ -157,9 +159,9 @@ struct Attn {
         RAD_ARCH_TRY(part(nm.f("blk.%d.attn_q_rope.weight", l), N, R));
         q_nope.mapped = q_rope.mapped = true;
         RAD_ARCH_TRY(q_nope.declare(b, nm, g, nm.f("blk.%d.attn_q_nope", l), H * N, s.q_lora,
-                                    RAD_SHARD_NONE, grp, { qsrc }, act(w.qa), w.q_nope));
+                                    RAD_SHARD_ROW, grp, { qsrc }, act(w.qa), w.q_nope));
         RAD_ARCH_TRY(q_rope.declare(b, nm, g, nm.f("blk.%d.attn_q_rope", l), H * R, s.q_lora,
-                                    RAD_SHARD_NONE, grp, { qsrc }, act(w.qa), w.q_rope));
+                                    RAD_SHARD_ROW, grp, { qsrc }, act(w.qa), w.q_rope));
 
         /* kv_a's rows are the latent then the shared rotary key (`kv_a_proj_with_mqa`). */
         RAD_ARCH_TRY(kv_a.declare(b, nm, g, nm.f("blk.%d.attn_kv_a", l), L + R, s.n_embd,
@@ -200,20 +202,26 @@ struct Attn {
                             "(DECISIONS U2). Convert it without a recipe rule.\n", bn, en);
             return RAD_E_UNSUPPORTED;
         }
-        kv_b = decl_w(b, bn, RAD_BF16, { a.kv_width(), L }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
+        /* A head's key rows then its value rows, head after head: a rank's heads are a
+         * contiguous run of rows, as are its sinks. */
+        kv_b = decl_w(b, bn, RAD_BF16, { a.kv_width(), L }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW,
                       grp);
         sinks = decl_f32(b, nm.f("blk.%d.attn_sinks.weight", l),
-                         nm.ckpt("%s.learnable_sink_param", ap), { H }, grp);
+                         nm.ckpt("%s.learnable_sink_param", ap), { H }, grp, RAD_ACCESS_PER_TOKEN,
+                         RAD_SHARD_ROW);
         if (!kv_b || !sinks) return RAD_E_INVAL;
 
         RAD_ARCH_TRY(gate.declare(b, nm, g, nm.f("blk.%d.attn_gate", l), a.v_width(), s.n_embd,
-                                  RAD_SHARD_NONE, grp, { nm.ckpt("%s.linear_gate.weight", ap) },
+                                  RAD_SHARD_ROW, grp, { nm.ckpt("%s.linear_gate.weight", ap) },
                                   act(xa), w.gate));
 
         RAD_ARCH_TRY(t_in_norm.declare(b, nm, T, "attn_in_norm", l, RAD_BF16, s.n_embd, xa));
         RAD_ARCH_TRY(t_q_resid.declare(b, nm, T, "attn_q_resid", l, RAD_BF16, s.q_lora, w.qa));
         RAD_ARCH_TRY(t_kv_latent.declare(b, nm, T, "attn_kv_latent", l, RAD_BF16, L, w.row));
-        RAD_ARCH_TRY(t_gate.declare(b, nm, T, "attn_gate_logits", l, RAD_BF16, a.v_width(), w.gate));
+        /* The gate's logits are the rank's heads only: tapped at one rank. */
+        if (s.world == 1)
+            RAD_ARCH_TRY(t_gate.declare(b, nm, T, "attn_gate_logits", l, RAD_BF16, a.v_width(),
+                                        w.gate));
         return RAD_OK;
     }
 
@@ -284,9 +292,14 @@ struct Attn {
                      { RAD_RANGE("M", 1, T), RAD_INT("n", a.v_width()), RAD_STR("dtype", "bf16") },
                      {}, { w.ao, w.gate }, { w.ag });
         HY4_NEED(op_gate, "gate_mul");
+        /* o_proj reads the rank's heads (its columns) into a partial sum, reduced before the
+         * sandwich norm. */
         RAD_ARCH_TRY(out.declare(b, nm, g, nm.f("blk.%d.attn_output", l), s.n_embd, a.v_width(),
-                                 RAD_SHARD_NONE, grp, { nm.ckpt("%s.o_proj.weight", ap) },
+                                 RAD_SHARD_COL, grp, { nm.ckpt("%s.o_proj.weight", ap) },
                                  act(w.ag), w.o));
+        int rc = RAD_OK;
+        op_ar = decl_all_reduce(b, g, s.n_embd, w.o, &rc);
+        RAD_ARCH_TRY(rc);
         post_gain = decl_f32(b, nm.f("blk.%d.attn_post_norm.weight", l),
                              nm.ckpt("%s.post_proj_norm.weight", ap), { s.n_embd }, grp);
         if (!post_gain) return RAD_E_INVAL;
@@ -395,6 +408,7 @@ struct Attn {
         if (p.nonabs && !selecting && p.P > 0) dense(c, batch, p);
         RAD_ISSUE_N(c, op_gate, T, brows(w.ao, T), brows(w.gate, T), brows(w.ag, T));
         out.step(c, act(w.ag), w.o, T);
+        issue_all_reduce(c, op_ar, w.o, T, s.n_embd);
         t_o_proj.step(c, brows(w.o, T), T);
         RAD_ISSUE_N(c, op_post_norm, T, brows(w.o, T), RAD_W(post_gain), brows(ya, T));
         t_out.step(c, brows(ya, T), T);

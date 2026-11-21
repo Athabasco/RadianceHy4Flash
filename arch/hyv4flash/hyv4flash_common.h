@@ -54,6 +54,19 @@ struct Shape {
     /* DFly2 and the tower */
     int64_t dfly_layers = 0;
     int64_t v_layers = 0, v_embd = 0, v_ff = 0, v_patch = 0, v_chan = 0, v_merge = 0, v_pos = 0;
+
+    /* This rank's share (PLAN §1.5, set by split_ranks; at one rank the whole). The attention's
+     * heads are whole and contiguous a rank (q_nope, q_rope, kv_b, attn_gate and the sinks by
+     * rows, attn_output by columns); the dense MLP and the shared expert split their width evenly;
+     * the routed experts are either whole a rank (`experts_whole`: experts [expert_base,
+     * expert_base + n_expert_r), for bf16 experts and calibration) or a slice of every expert's
+     * width (n_ff_exp_r, the quantised serving form). Everything else is replicated. The geometry
+     * above stays the model's: the drafter and the tower are declared whole. */
+    int world = 1, rank = 0;
+    AttnGeom sparse_r{}, sliding_r{};
+    int64_t n_ff_r = 0, n_ff_shared_r = 0, n_expert_r = 0, expert_base = 0, n_ff_exp_r = 0;
+    bool experts_whole = true;
+    const AttnGeom& local(bool sliding_layer) const { return sliding_layer ? sliding_r : sparse_r; }
 };
 
 inline int refuse(const char* what) {
@@ -85,7 +98,7 @@ inline rad_op mk(RadBuilder* b, const char* name, std::initializer_list<RadParam
  * stores it so. A recipe that quantised one is refused by name: nothing here reads its codes. */
 inline rad_weight decl_f32(RadBuilder* b, const char* name, const char* src,
                            std::initializer_list<int64_t> shape, RadWeightGroup grp,
-                           int access = RAD_ACCESS_PER_TOKEN) {
+                           int access = RAD_ACCESS_PER_TOKEN, int shard = RAD_SHARD_NONE) {
     if (map_copy(b, name, src) != RAD_OK) return 0;
     RadEncoding e{};
     if (weight_enc(b, name, &e) && !(rad_enc_is(&e, "plain") && e.n_planes == 1)) {
@@ -96,7 +109,31 @@ inline rad_weight decl_f32(RadBuilder* b, const char* name, const char* src,
                         "without a recipe rule.\n", name, en);
         return 0;
     }
-    return decl_w(b, name, RAD_F32, shape, access, RAD_SHARD_NONE, grp);
+    return decl_w(b, name, RAD_F32, shape, access, shard, grp);
+}
+
+/* The all-reduce of a rank's partial [rows, n] in place, before a norm that needs the full sum:
+ * exact bf16 (summed in f32 in rank order, rounded once), whatever wire the deployment allows,
+ * because the norm behind it and the calibration read the sum. 0 at one rank. At more ranks a
+ * library that serves no exact reduction is a refusal (PLAN §1.5), returned in `*rc`. */
+inline rad_op decl_all_reduce(RadBuilder* b, const Geom& g, int64_t n, rad_buf x, int* rc) {
+    *rc = RAD_OK;
+    if (g.world <= 1) return 0;
+    const rad_op h = mk(b, "all_reduce",
+                        { RAD_INT("world_size", g.world), RAD_RANGE("numel", n, g.max_tok * n),
+                          RAD_STR("dtype", "bf16"), RAD_INT("exact", 1),
+                          RAD_INT("min_bytes", g.wire_min_bytes) },
+                        {}, { x }, { x });
+    if (!h) {
+        fprintf(stderr, "radiance: hyv4flash: no loaded library serves an exact bf16 all_reduce "
+                        "over %d ranks; the tensor-parallel graph needs one before each sandwich "
+                        "norm\n", g.world);
+        *rc = RAD_E_UNSUPPORTED;
+    }
+    return h;
+}
+inline void issue_all_reduce(RadCtx* c, rad_op op, rad_buf x, int64_t rows, int64_t n) {
+    if (op && rows > 0) RAD_ISSUE_N(c, op, rows * n, brows(x, rows), RAD_NONE);
 }
 
 /* A plain bf16 weight that an op other than a linear reads (kv_b, the Engram table's bf16 form). */

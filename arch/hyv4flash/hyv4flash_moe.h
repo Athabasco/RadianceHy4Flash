@@ -22,7 +22,9 @@
 
 namespace hyv4flash {
 
-/* A gated MLP over `x`: gate and up fused (gate rows first), SiLU, down. */
+/* A gated MLP over `x`: gate and up fused (gate rows first), SiLU, down. `ff_w` is this rank's
+ * share of the width: gate_up's rows of each half (RAD_SHARD_ROW over two row parts), down's
+ * columns (RAD_SHARD_COL); its output is the rank's partial sum. */
 struct GatedMlp {
     LinearFP8 gate_up{}, down{};
     GateQuantFP8 act{};
@@ -36,12 +38,12 @@ struct GatedMlp {
         ActFP8 in{};
         in.x = x;
         const auto grp = grp_layer(l);
-        RAD_ARCH_TRY(gate_up.declare(b, nm, g, gu_name, 2 * ff_w, s.n_embd, RAD_SHARD_NONE, grp,
+        RAD_ARCH_TRY(gate_up.declare(b, nm, g, gu_name, 2 * ff_w, s.n_embd, RAD_SHARD_ROW, grp,
                                      { nm.ckpt("%s.gate_proj.weight", mp),
                                        nm.ckpt("%s.up_proj.weight", mp) },
                                      in, gu, 0, { ff_w, ff_w }));
         RAD_ARCH_TRY(act.declare(b, g, gu, ff, ff_w, "silu"));
-        RAD_ARCH_TRY(down.declare(b, nm, g, dn_name, s.n_embd, ff_w, RAD_SHARD_NONE, grp,
+        RAD_ARCH_TRY(down.declare(b, nm, g, dn_name, s.n_embd, ff_w, RAD_SHARD_COL, grp,
                                   { nm.ckpt("%s.down_proj.weight", mp) }, ff, y));
         return RAD_OK;
     }
@@ -63,21 +65,23 @@ struct MoeWire {
     rad_buf sout = 0;      /* [T, n] */
     MoeFP8::Wire moe{};
     int declare(RadBuilder* b, Names& nm, const Shape& s, const Geom& g) {
-        const int64_t T = g.max_tok, k = s.top_k, F = s.n_ff_exp, L = s.latent;
+        /* The rank's experts and width (whole experts: n_expert_r of the full width; sliced: all
+         * of them, n_ff_exp_r wide); the router scores all of them. */
+        const int64_t T = g.max_tok, k = s.top_k, F = s.n_ff_exp_r, L = s.latent;
         auto bf = [&](const char* n, std::initializer_list<int64_t> shape) {
             return decl_b(b, nm.f("%s", n), RAD_BF16, shape);
         };
         lat.x = bf("moe.latent", { T, L });
         routed = bf("moe.routed", { T, s.n_embd });
-        sgu = bf("moe.shared_gate_up", { T, 2 * s.n_ff_shared });
-        sff = bf("moe.shared_ff", { T, s.n_ff_shared });
+        sgu = bf("moe.shared_gate_up", { T, 2 * s.n_ff_shared_r });
+        sff = bf("moe.shared_ff", { T, s.n_ff_shared_r });
         sout = bf("moe.shared_out", { T, s.n_embd });
         auto& w = moe;
         w.logits = decl_b(b, nm.f("moe.router_logits"), RAD_F32, { T, s.n_expert });
         w.ids = decl_b(b, nm.f("moe.expert_ids"), RAD_I32, { T, k });
         w.ew = decl_b(b, nm.f("moe.expert_weights"), RAD_F32, { T, k });
-        w.eoff = decl_b(b, nm.f("moe.expert_offsets"), RAD_I32, { s.n_expert + 1 });
-        w.ecnt = decl_b(b, nm.f("moe.expert_counts"), RAD_I32, { s.n_expert });
+        w.eoff = decl_b(b, nm.f("moe.expert_offsets"), RAD_I32, { s.n_expert_r + 1 });
+        w.ecnt = decl_b(b, nm.f("moe.expert_counts"), RAD_I32, { s.n_expert_r });
         w.sorted = decl_b(b, nm.f("moe.expert_sorted"), RAD_I32, { T * k });
         w.egu = bf("moe.expert_gate_up", { T * k, 2 * F });
         w.eff.x = bf("moe.expert_ff", { T * k, F });
@@ -93,6 +97,7 @@ struct Ffn {
     bool moe_layer = false;
     Geom g{};
     int layer = 0;
+    int64_t n_embd = 0;
     rad_buf xf = 0, yf = 0;
     /* dense */
     GatedMlp mlp{};
@@ -102,7 +107,7 @@ struct Ffn {
     LinearFP8 lat_in{}, lat_out{};
     MoeFP8 moe{};
     GatedMlp shared{};
-    rad_op op_join = 0;
+    rad_op op_join = 0, op_ar = 0;
     bool routed_served = true;
     rad_weight post_gain = 0;
     rad_op op_post_norm = 0;
@@ -127,6 +132,8 @@ struct Ffn {
         c.router_k = s.n_embd;
         c.no_reduce = 1;
         c.calib = calib_dir() != nullptr ? 1 : 0;
+        /* The first expert this rank maps (whole experts; the probe reads its format). */
+        c.probed_expert = (int64_t)s.rank * (s.n_expert / s.world);
         src->norm = nullptr;          /* the input is the latent, prepared here */
         src->router = nm.ckpt("%s.gate.weight", mp);
         src->router_bias = nm.ckpt("%s.gate.e_score_correction_bias", mp);
@@ -135,6 +142,46 @@ struct Ffn {
         src->experts_down = nm.ckpt("%s.experts.down_proj", mp);
         RAD_ARCH_TRY(MoeFP8::probe(b, nm, l, *src, &c));
         return RAD_OK;
+    }
+
+    /* The routed experts' placement over the ranks (PLAN §1.5), after the probe: whole experts a
+     * rank for bf16 experts (MoeFP8 serves a plain expert whole) and for a calibration run (a
+     * Hessian spans an expert's whole K: the friend's TP4 run, 128 of 512 a rank), else a slice
+     * of every expert's width in whole 128-column groups (the quantised serving form, 768 / 384 at
+     * TP2 / TP4). Every MoE layer has the same experts, so the placement is the model's.
+     * `whole`: the caller's choice by the probed format and the calibration switch. */
+    static int place(Shape& s, bool whole) {
+        s.n_expert_r = s.n_expert;
+        s.expert_base = 0;
+        s.n_ff_exp_r = s.n_ff_exp;
+        s.experts_whole = true;
+        if (s.world <= 1) return RAD_OK;
+        if (whole) {
+            if (s.n_expert % s.world) {
+                fprintf(stderr, "radiance: hyv4flash: %lld routed experts do not split whole over "
+                                "%d ranks\n", (long long)s.n_expert, s.world);
+                return RAD_E_UNSUPPORTED;
+            }
+            s.n_expert_r = s.n_expert / s.world;
+            s.expert_base = (int64_t)s.rank * s.n_expert_r;
+            return RAD_OK;
+        }
+        if (s.n_ff_exp % ((int64_t)RAD_FP8_BLOCK * s.world)) {
+            fprintf(stderr, "radiance: hyv4flash: the routed experts' %lld columns do not split "
+                            "over %d ranks in whole %d-column groups\n",
+                    (long long)s.n_ff_exp, s.world, RAD_FP8_BLOCK);
+            return RAD_E_UNSUPPORTED;
+        }
+        s.n_ff_exp_r = s.n_ff_exp / s.world;
+        s.experts_whole = false;
+        return RAD_OK;
+    }
+    /* A layer's routed-arm configuration for the placement. */
+    static void apply(const Shape& s, MoeFP8::Config& c) {
+        c.n_expert = s.n_expert_r;
+        c.n_expert_all = s.n_expert;
+        c.expert_base = s.expert_base;
+        c.n_ff_exp = s.n_ff_exp_r;
     }
 
     /* Whether this build serves a layer's routed arm: plain bf16 experts. A quantised one (the
@@ -150,6 +197,7 @@ struct Ffn {
                 const std::function<int(int)>& experts) {
         g = geom;
         layer = l;
+        n_embd = s.n_embd;
         moe_layer = s.is_moe[(size_t)l] != 0;
         xf = x;
         yf = y;
@@ -166,7 +214,7 @@ struct Ffn {
         if (!moe_layer) {
             mo = dense_out;
             RAD_ARCH_TRY(mlp.declare(b, nm, g, s, l, nm.f("blk.%d.ffn_gate_up", l),
-                                     nm.f("blk.%d.ffn_down", l), mp, s.n_ff, xf, mo, dense_gu,
+                                     nm.f("blk.%d.ffn_down", l), mp, s.n_ff_r, xf, mo, dense_gu,
                                      dense_ff));
             sum = mo;
             post_src = nm.ckpt("%s.post_fc2_norm.weight", mp);
@@ -182,7 +230,7 @@ struct Ffn {
             Geom ge = g;
             ge.n_embd = s.latent;
             ge.n_ff_all = s.n_ff_exp;
-            ge.n_ff = s.n_ff_exp;
+            ge.n_ff = s.n_ff_exp_r;
             MoeFP8::Wire mw = w.moe;
             mw.h = w.lat;
             mw.route = xf;
@@ -207,7 +255,7 @@ struct Ffn {
                                          w.routed));
             RAD_ARCH_TRY(shared.declare(b, nm, g, s, l, nm.f("blk.%d.ffn_gate_up_shexp", l),
                                         nm.f("blk.%d.ffn_down_shexp", l),
-                                        nm.ckpt("%s.shared_experts", mp), s.n_ff_shared, xf,
+                                        nm.ckpt("%s.shared_experts", mp), s.n_ff_shared_r, xf,
                                         w.sout, w.sgu, w.sff));
             op_join = mk(b, "add",
                          { RAD_RANGE("M", 1, T), RAD_INT("n", s.n_embd), RAD_STR("dtype", "bf16") },
@@ -222,12 +270,23 @@ struct Ffn {
             RAD_ARCH_TRY(t_w.declare(b, nm, T, "router_topk_w", l, RAD_F32, s.top_k, w.moe.ew));
             RAD_ARCH_TRY(t_routed_in.declare(b, nm, T, "moe_routed_in", l, RAD_BF16, s.latent,
                                              w.lat.x));
-            RAD_ARCH_TRY(t_experts_out.declare(b, nm, T, "moe_experts_out", l, RAD_BF16, s.latent,
-                                               w.lat.x));
-            RAD_ARCH_TRY(t_routed_out.declare(b, nm, T, "moe_routed_out", l, RAD_BF16, s.n_embd,
-                                              w.routed));
-            RAD_ARCH_TRY(t_shared.declare(b, nm, T, "moe_shared_out", l, RAD_BF16, s.n_embd,
-                                          w.sout));
+            /* The arms' outputs are a rank's partial sums: tapped at one rank. */
+            if (s.world == 1) {
+                RAD_ARCH_TRY(t_experts_out.declare(b, nm, T, "moe_experts_out", l, RAD_BF16,
+                                                   s.latent, w.lat.x));
+                RAD_ARCH_TRY(t_routed_out.declare(b, nm, T, "moe_routed_out", l, RAD_BF16,
+                                                  s.n_embd, w.routed));
+                RAD_ARCH_TRY(t_shared.declare(b, nm, T, "moe_shared_out", l, RAD_BF16, s.n_embd,
+                                              w.sout));
+            }
+        }
+        /* One reduction a block, before the sandwich norm: the dense MLP's partial, or the routed
+         * arm's (the rank's experts, widened by the replicated latent_out) plus the shared
+         * expert's slice (MoeFP8 runs with no_reduce). */
+        {
+            int rc = RAD_OK;
+            op_ar = decl_all_reduce(b, g, s.n_embd, sum, &rc);
+            RAD_ARCH_TRY(rc);
         }
         /* One role, one declared name: the dense layer's sandwich norm is the layer's
          * (`post_fc2_norm`), a MoE layer's the block's (`combine_output_norm`). */
@@ -270,6 +329,7 @@ struct Ffn {
             RAD_ISSUE_N(c, op_join, T, brows(w.routed, T), brows(w.sout, T), brows(w.routed, T));
             sum = w.routed;
         }
+        issue_all_reduce(c, op_ar, sum, T, n_embd);
         RAD_ISSUE_N(c, op_post_norm, T, brows(sum, T), RAD_W(post_gain), brows(yf, T));
         t_out.step(c, brows(yf, T), T);
         return true;

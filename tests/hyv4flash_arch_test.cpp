@@ -1,5 +1,6 @@
 /* Hy4-flash's declared graph and step (arch/hyv4flash), without a GPU or checkpoint: the harness's
- * `mini` geometry (ref/minicfg.py, the convert test's fixture), one rank, bf16. */
+ * `mini` geometry (ref/minicfg.py, the convert test's fixture) at one and two ranks, and its
+ * `mini4` twin (twice the heads and experts) at one, two and four ranks, bf16. */
 #define RAD_ARCH_NO_EXPORTS 1
 #include "arch_fakes.h"
 #include "rad_plugin.h"
@@ -12,8 +13,9 @@ using namespace rad_fake;
 namespace {
 
 /* The `mini` preset as rad-convert records its config: 3 layers (sparse, sliding, sparse; layer 0
- * dense, 1-2 latent MoE), two streams, an Engram in front of layer 1, dense limit 16. */
-MetaKV mini_meta() {
+ * dense, 1-2 latent MoE), two streams, an Engram in front of layer 1, dense limit 16. `wide` is
+ * `mini4`: 4 sparse and 8 sliding heads and 8 experts, so four ranks hold whole heads. */
+MetaKV mini_meta(bool wide = false) {
     RadModelMeta m{};
     m.arch_id = "hyv4flash";
     m.name = "test-hy4-mini";
@@ -59,6 +61,12 @@ MetaKV mini_meta() {
         { "video_token_id", "120124" },
     };
     for (const auto& p : kv) k.set(p[0], p[1]);
+    if (wide) {
+        k.m.n_head = k.m.n_head_kv = 4;
+        k.m.n_expert = 8;
+        k.set("num_attention_heads", "4").set("swa_num_attention_heads", "8");
+        k.set("n_routed_experts", "8");
+    }
     return k;
 }
 
@@ -71,13 +79,15 @@ void bf16_encs(RadBuilder* b) {
 }
 
 struct Declared {
-    MetaKV mk = mini_meta();
+    MetaKV mk;
     RadBuilder b;
     RadBuildCtx ctx = build_ctx();
     int rc = 0;
-    explicit Declared(void (*encs)(RadBuilder*) = bf16_encs, int world = 1) {
+    explicit Declared(void (*encs)(RadBuilder*) = bf16_encs, int world = 1, int rank = 0,
+                      bool wide = false)
+        : mk(mini_meta(wide)) {
         encs(&b);
-        ctx = build_ctx(0, world);
+        ctx = build_ctx(rank, world);
         rc = stderr_of_rc([&] { return hyv4flash::declare(&b, mk.meta(), &ctx); });
     }
 };
@@ -279,10 +289,9 @@ TEST(the_debug_taps_are_persistent_buffers_and_lint_clean) {
     }
 }
 
-/* What this build does not serve is refused by name: at declare more ranks, a quantised kv_b and a
- * recipe over a parameter the model applies in f32; at the step a quantised expert. */
+/* What this build does not serve is refused by name: at declare a quantised kv_b and a recipe over
+ * a parameter the model applies in f32; at the step a quantised expert. */
 TEST(unserved_forms_are_refused_at_declare) {
-    CHECK_EQ(Declared(bf16_encs, 2).rc, RAD_E_UNSUPPORTED);
     auto kvb = [](RadBuilder* b) {
         bf16_encs(b);
         b->encs.insert(b->encs.begin(), { "attn_kv_b", rad_enc_affine(RAD_I8, RAD_BF16, 1, 128) });
@@ -311,6 +320,228 @@ TEST(unserved_forms_are_refused_at_declare) {
         b->encs.insert(b->encs.begin(), { "hc_attn.fn", rad_enc_affine(RAD_I8, RAD_BF16, 1, 128) });
     };
     CHECK(Declared(hc).rc < 0);
+}
+
+/* ------------------------------------------------------------------ tensor parallelism (PLAN §1.5) */
+namespace {
+
+/* What a weight's name says it is: an attention part split by whole heads, a width split, the
+ * vocabulary-split head, a routed expert (whole on one rank), or replicated. */
+enum Part { kReplicated, kRows, kCols, kExpert };
+Part part_of(const std::string& n) {
+    auto has = [&](const char* x) { return n.find(x) != std::string::npos; };
+    if (has("_exps.")) return kExpert;
+    if (n.rfind("dfly.", 0) == 0 || n.rfind("v.", 0) == 0) return kReplicated;   /* not served */
+    for (const char* r : { ".attn_q_nope.", ".attn_q_rope.", ".attn_kv_b.", ".attn_gate.",
+                           ".attn_sinks.", ".ffn_gate_up.", ".ffn_gate_up_shexp." })
+        if (has(r)) return kRows;
+    if (n == "output.weight") return kRows;
+    for (const char* c : { ".attn_output.", ".ffn_down.", ".ffn_down_shexp." })
+        if (has(c)) return kCols;
+    return kReplicated;
+}
+
+rad_buf buf_named(const RadBuilder& b, const char* n) {
+    for (size_t i = 0; i < b.bufs.size(); ++i)
+        if (b.bufs[i].name == n) return (rad_buf)(i + 1);
+    return 0;
+}
+
+void steps_clean_at(RadBuilder& b, int rank, int world) {
+    struct Case { std::vector<int> dq, pq; int32_t ctx; };
+    const Case cases[] = { { { 1, 1, 1 }, {}, 0 }, { {}, { 12 }, 0 }, { {}, { 40 }, 0 },
+                           { { 1 }, { 10 }, 0 }, { {}, { 16 }, 16 } };
+    for (const Case& cs : cases) {
+        auto k = kit(b, cs.dq, cs.pq, cs.ctx);
+        k->b.positions_h = k->pos.data();
+        auto v = run_passes(b, hyv4flash::step, { k.get() }, rank, world);
+        for (auto& c : v)
+            if (!c->step_fail.empty()) fprintf(stderr, "rank %d/%d: %s\n", rank, world,
+                                               c->step_fail.c_str());
+        CHECK_PASSES(b, v);
+    }
+}
+
+}  // namespace
+
+/* Every weight of the one-rank graph is covered exactly once by the ranks of two and four: a head
+ * or width split is an even share along its split dimension on every rank (each stacked half of
+ * a fused gate_up on its own), a routed expert is whole on exactly one rank (bf16 experts,
+ * `expert_base = rank * E / world`), and everything else (iHC, norms, q_a, kv_a, the indexer,
+ * the router, the latent pair, the Engram, the embedding) is the whole weight on every rank. */
+TEST(the_ranks_cover_every_weight_exactly_once) {
+    for (bool wide : { false, true }) {
+        Declared one(bf16_encs, 1, 0, wide);
+        REQUIRE_EQ(one.rc, RAD_OK);
+        std::map<std::string, const RecWeight*> whole;
+        for (const auto& w : one.b.weights) whole[w.name] = &w;
+        for (int world : { 2, 4 }) {
+            if (!wide && world == 4) continue;   /* mini's 2 sparse heads: refused, below */
+            std::vector<std::unique_ptr<Declared>> ranks;
+            std::map<std::string, int> seen;
+            for (int r = 0; r < world; ++r) {
+                ranks.push_back(std::make_unique<Declared>(bf16_encs, world, r, wide));
+                REQUIRE_EQ(ranks.back()->rc, RAD_OK);
+                for (const auto& w : ranks.back()->b.weights) {
+                    ++seen[w.name];
+                    auto it = whole.find(w.name);
+                    REQUIRE(it != whole.end());
+                    const RadWeightDecl& o = it->second->d;
+                    const Part pt = part_of(w.name);
+                    CHECK_EQ(w.d.rank, o.rank);
+                    CHECK(!w.span_set);   /* every split here is even */
+                    const int split = pt == kRows ? 0 : pt == kCols ? 1 : -1;
+                    CHECK_EQ(w.d.shard, pt == kRows ? (int)RAD_SHARD_ROW
+                                        : pt == kCols ? (int)RAD_SHARD_COL
+                                                      : (int)RAD_SHARD_NONE);
+                    for (uint32_t k = 0; k < o.rank; ++k) {
+                        const int64_t want = (int)k == split ? o.shape[k] / world : o.shape[k];
+                        if (w.d.shape[k] != want)
+                            fprintf(stderr, "%s dim %u: %lld, want %lld (world %d)\n",
+                                    w.name.c_str(), k, (long long)w.d.shape[k], (long long)want,
+                                    world);
+                        CHECK_EQ(w.d.shape[k], want);
+                    }
+                    /* A fused gate_up splits each half (an expert is whole: no parts). */
+                    if (pt == kExpert) continue;
+                    CHECK_EQ(w.d.n_row_parts, o.n_row_parts);
+                    for (int q = 0; q < o.n_row_parts; ++q)
+                        CHECK_EQ(w.d.row_parts[q], o.row_parts[q] / (pt == kRows ? world : 1));
+                }
+            }
+            for (const auto& [name, w] : whole) {
+                const int want = part_of(name) == kExpert ? 1 : world;
+                if (seen[name] != want)
+                    fprintf(stderr, "%s on %d of %d ranks, want %d\n", name.c_str(), seen[name],
+                            world, want);
+                CHECK_EQ(seen[name], want);
+            }
+            /* Experts [r E / W, (r + 1) E / W) on rank r. */
+            const int E = wide ? 8 : 4;
+            for (int r = 0; r < world; ++r)
+                for (int e = 0; e < E; ++e) {
+                    char n[64];
+                    std::snprintf(n, sizeof n, "blk.2.ffn_down_exps.%d.weight", e);
+                    CHECK_EQ(find_w(ranks[(size_t)r]->b, n) != nullptr, e / (E / world) == r);
+                }
+        }
+    }
+}
+
+/* A rank's graph: its heads in every attention op, two exact all-reduces a layer (behind o_proj and
+ * behind the feed-forward's sum, each before its sandwich norm, in place), its experts in the
+ * routed arm, its vocabulary in the head and the logits buffer; every step kind lint clean on every
+ * rank. */
+TEST(each_rank_declares_its_share_and_reduces_twice_a_layer) {
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            Declared d(bf16_encs, world, rank, true);
+            REQUIRE_EQ(d.rc, RAD_OK);
+            RadBuilder& b = d.b;
+            const int Hs = 4 / world, Hw = 8 / world, E = 8 / world;
+            for (const char* op : { "mla_attn_paged_sink", "mla_project_kv", "attn_kv_sink",
+                                    "mla_kv_split" })
+                for (int i = 0; i < count_op(b, op); ++i) {
+                    const int64_t h = pint(find_op(b, op, i), "heads");
+                    CHECK(h == Hs || h == Hw);
+                }
+            CHECK_EQ(pint(find_op(b, "mla_attn_paged_sink", 0), "heads"), Hs);   /* layer 0 sparse */
+            CHECK_EQ(pint(find_op(b, "mla_attn_paged_sink", 1), "heads"), Hw);   /* layer 1 sliding */
+            CHECK_EQ(pint(find_op(b, "mla_attn_sel_sink", 0), "heads"), Hs);
+            CHECK_EQ(pint(find_op(b, "gate_mul", 1), "n"), Hw * 32);
+            /* Replicated: the cache row, the indexer, the router over every expert. */
+            CHECK_EQ(kv_named(b, "kv_latent_sparse")->d.head_dim, 20);
+            CHECK_EQ(pint(find_op(b, "idx_score"), "heads"), 2);
+            CHECK_EQ(pint(find_op(b, "router_sigmoid_topk"), "n_expert"), 8);
+            int based = 0;
+            for (const auto& o : b.ops)
+                if (param(&o, "expert_base")) {
+                    ++based;
+                    CHECK_EQ(pint(&o, "expert_base"), rank * E);
+                }
+            CHECK(based >= 2);
+            int mg = 0;
+            for (const auto& o : b.ops)
+                if (o.op == "moe_gemm") {
+                    ++mg;
+                    CHECK_EQ(pint(&o, "n_expert"), E);
+                }
+            CHECK_EQ(mg, 4);
+            CHECK_EQ(pint(find_op(b, "logits_gemm"), "n_vocab"), 320 / world);
+            CHECK_EQ(find_b(b, "logits")->d.shape[1], 320 / world);
+
+            const int nar = count_op(b, "all_reduce");
+            CHECK_EQ(nar, world == 1 ? 0 : 6);
+            for (int i = 0; i < nar; ++i) {
+                const RecOp* ar = find_op(b, "all_reduce", i);
+                CHECK_EQ(pint(ar, "exact"), 1);
+                CHECK_EQ(pint(ar, "world_size"), world);
+                CHECK_EQ(pstr(ar, "dtype"), std::string("bf16"));
+                REQUIRE_EQ(ar->reads.size(), (size_t)1);
+                CHECK(ar->writes == ar->reads);
+                /* Its buffer is what the next rmsnorm reads: o_proj's output or the block's sum. */
+                const rad_buf x = ar->reads[0];
+                bool normed = false;
+                for (const auto& o : b.ops)
+                    if (o.op == "rmsnorm" && in(o.reads, x)) normed = true;
+                CHECK(normed);
+            }
+            if (world > 1) {
+                const rad_buf o = buf_named(b, "sparse.o_proj"), sum = buf_named(b, "moe.routed"),
+                              dense = buf_named(b, "dense_out");
+                int on_o = 0, on_sum = 0, on_dense = 0;
+                for (int i = 0; i < nar; ++i) {
+                    const rad_buf x = find_op(b, "all_reduce", i)->reads[0];
+                    on_o += x == o;
+                    on_sum += x == sum;
+                    on_dense += x == dense;
+                }
+                CHECK_EQ(on_o, 2);       /* the two sparse layers */
+                CHECK_EQ(on_sum, 2);     /* the two MoE layers */
+                CHECK_EQ(on_dense, 1);   /* layer 0 */
+            }
+            steps_clean_at(b, rank, world);
+        }
+}
+
+/* The taps the harness compares are the replicated values at every world; a rank's partial sums
+ * (the gate logits of its heads, the arms' outputs) are tapped at one rank only, o_proj after its
+ * reduction. */
+TEST(taps_at_more_ranks_are_the_replicated_values) {
+    setenv("RADIANCE_HY4_TAPS", "1", 1);
+    Declared d(bf16_encs, 2, 1);
+    unsetenv("RADIANCE_HY4_TAPS");
+    REQUIRE_EQ(d.rc, RAD_OK);
+    for (const char* n : { "dbg.resid.0", "dbg.attn_out.1", "dbg.mlp_out.2", "dbg.attn_o_proj.0",
+                           "dbg.router_topk_idx.1", "dbg.index_sel.0", "dbg.engram_out.1" })
+        CHECK(find_b(d.b, n) != nullptr);
+    for (const char* n : { "dbg.attn_gate_logits.0", "dbg.moe_experts_out.1",
+                           "dbg.moe_routed_out.1", "dbg.moe_shared_out.2" })
+        CHECK(find_b(d.b, n) == nullptr);
+    steps_clean_at(d.b, 1, 2);
+}
+
+/* What does not split is refused by name at declare: a world other than 1, 2 or 4, heads that are
+ * not whole a rank (mini's two sparse heads over four), quantised experts at more ranks (not served,
+ * WP10), and a library without an exact all-reduce. */
+TEST(tensor_parallel_refusals) {
+    CHECK_EQ(Declared(bf16_encs, 3, 0, true).rc, RAD_E_UNSUPPORTED);
+    CHECK_EQ(Declared(bf16_encs, 8, 0, true).rc, RAD_E_UNSUPPORTED);
+    CHECK_EQ(Declared(bf16_encs, 4, 0, false).rc, RAD_E_UNSUPPORTED);
+    auto experts = [](RadBuilder* b) {
+        bf16_encs(b);
+        RadEncoding i8 = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+        rad_enc_copy_str(i8.transform, "fwht128");
+        b->encs[0].second = i8;
+        b->encs[1].second = i8;
+    };
+    CHECK_EQ(Declared(experts, 2).rc, RAD_E_UNSUPPORTED);
+    auto no_ar = [](RadBuilder* b) {
+        bf16_encs(b);
+        b->refuse.insert("all_reduce");
+    };
+    CHECK_EQ(Declared(no_ar, 2).rc, RAD_E_UNSUPPORTED);
+    CHECK_EQ(Declared(no_ar, 1).rc, RAD_OK);   /* one rank reduces nothing */
 }
 
 RAD_TEST_MAIN()

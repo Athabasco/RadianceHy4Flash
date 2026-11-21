@@ -1,6 +1,6 @@
 /* hyv4flash -- Tencent Hy4-flash (`model_type: hy_v4_flash`, HYV4FlashForConditionalGeneration)
- * from its bf16 checkpoint: the text trunk's serving graph at one rank, and the weight manifest and
- * checkpoint name map rad-convert needs. docs/ARCHITECTURES.md describes the model and its traps.
+ * from its bf16 checkpoint: the text trunk's serving graph at 1, 2 or 4 ranks, and the weight
+ * manifest and checkpoint name map rad-convert needs. docs/ARCHITECTURES.md describes the model and its traps.
  *
  *   42 layers over four hyper-connection streams (iHC: a read gate and a write gate a block, no
  *     mixing matrix), hidden 3072, vocab 120832, embedding and lm_head separate
@@ -24,8 +24,10 @@
  * feed-forward connection, the feed-forward (hyv4flash_moe.h), ihc_post; at the end the head's
  * collapse (ihc_pre over hc_head), the final norm and the lm_head into the declared logits.
  *
- * Served: one rank, the text trunk, bf16 weights (the Engram table also as E4M3 rows, the
- * bf16 recipe). Refused by name: more ranks (WP7), a quantised trunk linear or expert (WP10), a
+ * Served: one, two or four ranks (PLAN §1.5: whole heads a rank, the dense and shared widths
+ * split, whole experts a rank, the lm_head by vocabulary, two exact all-reduces a layer, the rest
+ * replicated; split_ranks, Ffn::place), the text trunk, bf16 weights (the Engram table also as E4M3
+ * rows, the bf16 recipe). Refused by name: other worlds, a quantised trunk linear or expert (WP10), a
  * quantised kv_b (DECISIONS U2) or f32 parameter, pictures (WP15). DFly2 and the tower are declared
  * as the checkpoint holds them and not served (WP13, WP15).
  *
@@ -562,14 +564,15 @@ static int buffers(RadBuilder* b, Model& m) {
         (s.is_sliding[(size_t)l] ? any_sliding : any_sparse) = true;
         (s.is_moe[(size_t)l] ? any_moe : any_dense) = true;
     }
-    if (any_sparse) RAD_ARCH_TRY(m.aw_sparse.declare(b, nm, s, s.sparse, T, g.max_seqs, "sparse"));
+    if (any_sparse)
+        RAD_ARCH_TRY(m.aw_sparse.declare(b, nm, s, s.sparse_r, T, g.max_seqs, "sparse"));
     if (any_sliding)
-        RAD_ARCH_TRY(m.aw_sliding.declare(b, nm, s, s.sliding, T, g.max_seqs, "sliding"));
+        RAD_ARCH_TRY(m.aw_sliding.declare(b, nm, s, s.sliding_r, T, g.max_seqs, "sliding"));
     if (any_sparse) RAD_ARCH_TRY(m.iw.declare(b, nm, s, g));
     if (any_moe) RAD_ARCH_TRY(m.mw.declare(b, nm, s, g));
     if (any_dense) {
-        m.dense_gu = bf("dense_gate_up", { T, 2 * s.n_ff });
-        m.dense_ff = bf("dense_ff", { T, s.n_ff });
+        m.dense_gu = bf("dense_gate_up", { T, 2 * s.n_ff_r });
+        m.dense_ff = bf("dense_ff", { T, s.n_ff_r });
         m.dense_out = bf("dense_out", { T, E });
         if (!m.dense_gu || !m.dense_ff || !m.dense_out) return RAD_E_INVAL;
     }
@@ -613,7 +616,7 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
      * groups before the first pool. */
     rad_kvgroup& kv = lay.sliding ? m.kv_sliding : m.kv_sparse;
     const bool first_kv = !kv;
-    const AttnGeom& a = lay.sliding ? s.sliding : s.sparse;
+    const AttnGeom& a = s.local(lay.sliding);
     if (!kv) kv = latent_group(b, nm, lay.sliding, s.window, s.kv_lora + a.qk_rope);
     if (!kv) return RAD_E_INVAL;
     const int64_t block = lay.sliding ? (int64_t)RAD_KV_BLOCK : s.ix_pool;
@@ -674,13 +677,52 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
     return RAD_OK;
 }
 
+/* This rank's share of the model (PLAN §1.5, Shape's comment): whole heads a rank on both
+ * attention kinds, the dense MLP's and the shared expert's widths evenly. 1, 2 or 4 ranks. The
+ * routed experts' placement follows their format (Ffn::place). */
+static int split_ranks(Shape& s, int world, int rank) {
+    s.world = world;
+    s.rank = rank;
+    if (world != 1 && world != 2 && world != 4) {
+        fprintf(stderr, "radiance: hyv4flash: --tp %d; the head and width splits are built for 1, "
+                        "2 or 4 ranks\n", world);
+        return RAD_E_UNSUPPORTED;
+    }
+    s.sparse_r = s.sparse;
+    s.sliding_r = s.sliding;
+    s.n_ff_r = s.n_ff;
+    s.n_ff_shared_r = s.n_ff_shared;
+    s.n_expert_r = s.n_expert;
+    s.n_ff_exp_r = s.n_ff_exp;
+    bool any_sparse = false, any_sliding = false, any_moe = false, any_dense = false;
+    for (int64_t l = 0; l < s.n_layer; ++l) {
+        (s.is_sliding[(size_t)l] ? any_sliding : any_sparse) = true;
+        (s.is_moe[(size_t)l] ? any_moe : any_dense) = true;
+    }
+    const struct { bool on; const char* what; int64_t n; } parts[] = {
+        { any_sparse, "the sparse layers' attention heads", s.sparse.heads },
+        { any_sliding, "the sliding layers' attention heads", s.sliding.heads },
+        { any_dense, "the dense MLP's intermediate_size", s.n_ff },
+        { any_moe, "the shared expert's width", s.n_ff_shared },
+        { true, "the vocabulary (lm_head)", s.n_vocab },
+    };
+    for (const auto& p : parts)
+        if (p.on && p.n % world) {
+            fprintf(stderr, "radiance: hyv4flash: %s (%lld) do not split evenly over %d ranks\n",
+                    p.what, (long long)p.n, world);
+            return RAD_E_UNSUPPORTED;
+        }
+    s.sparse_r.heads = s.sparse.heads / world;
+    s.sliding_r.heads = s.sliding.heads / world;
+    s.n_ff_r = s.n_ff / world;
+    s.n_ff_shared_r = s.n_ff_shared / world;
+    return RAD_OK;
+}
+
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS ||
         rad_build_slot(ctx) >= MAX_SLOTS)
         return RAD_E_INVAL;
-    if (ctx->world_size > 1)
-        return refuse("this build serves one rank; the tensor-parallel split (heads, experts, "
-                      "the vocabulary) is WP7");
     if (ctx->kv_dtype != RAD_DT_INVALID && ctx->kv_dtype != RAD_BF16)
         return refuse("the latent and indexer caches are bf16; run with --kv-cache-dtype bf16");
     auto& slot = models[rad_build_slot(ctx)];
@@ -691,6 +733,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     Shape& s = m.s;
     Geom& g = m.g;
     RAD_ARCH_TRY(read_shape(s, meta));
+    RAD_ARCH_TRY(split_ranks(s, ctx->world_size ? ctx->world_size : 1, ctx->rank));
     RAD_ARCH_TRY(geom_from(g, meta, ctx, "bf16", RAD_BF16));
     /* Every linear of this build reads the bf16 plane (a quantised one is refused by its
      * LinearFP8): no activation codes are declared. */
@@ -710,9 +753,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     for (const char* n : { token, headn })
         if (!is_plain_bf16(b, n))
             return refuse("a quantised embedding or lm_head is not served yet (WP10)");
+    /* The embedding is replicated (no reduction behind the lookup); the head is split by
+     * vocabulary, each rank's logits [rows, n_vocab / world] (Geom::n_vocab, vocab_off). */
     m.token = decl_w(b, token, RAD_BF16, { s.n_vocab, s.n_embd }, RAD_ACCESS_VOCAB, RAD_SHARD_NONE,
                      grp_model());
-    m.head = decl_w(b, headn, RAD_BF16, { s.n_vocab, s.n_embd }, RAD_ACCESS_VOCAB, RAD_SHARD_NONE,
+    m.head = decl_w(b, headn, RAD_BF16, { g.n_vocab, s.n_embd }, RAD_ACCESS_VOCAB, RAD_SHARD_ROW,
                     grp_model());
     m.final_gain = decl_f32(b, nm.f("output_norm.weight"), "model.norm.weight", { s.n_embd },
                             grp_model());
@@ -721,8 +766,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* The routed arms' format, before any buffer (MoeFP8::probe maps each probed expert). */
     std::vector<MoeFP8::Src> msrc((size_t)s.n_layer);
+    bool any_quant = false, calib = false;
     for (int l = 0; l < (int)s.n_layer; ++l)
-        if (s.is_moe[(size_t)l]) RAD_ARCH_TRY(Ffn::probe(b, nm, s, l, &msrc[(size_t)l]));
+        if (s.is_moe[(size_t)l]) {
+            RAD_ARCH_TRY(Ffn::probe(b, nm, s, l, &msrc[(size_t)l]));
+            any_quant = any_quant || !Ffn::served(msrc[(size_t)l]);
+            calib = calib || msrc[(size_t)l].cfg.calib;
+        }
+    /* Quantised experts are declared whole for rad-convert and refused at the step (Ffn::served);
+     * at more ranks that would load every expert on every rank first, so it is refused here. */
+    if (any_quant && s.world > 1)
+        return refuse("quantised routed experts are not served yet (WP10); at more than one rank "
+                      "they would be declared whole on every rank");
+    RAD_ARCH_TRY(Ffn::place(s, calib || !any_quant));
+    for (int l = 0; l < (int)s.n_layer; ++l)
+        if (s.is_moe[(size_t)l] && Ffn::served(msrc[(size_t)l]))
+            Ffn::apply(s, msrc[(size_t)l].cfg);
 
     RAD_ARCH_TRY(buffers(b, m));
     const int64_t T = g.max_tok, E = s.n_embd;
@@ -764,7 +823,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                        RAD_STR("dtype", "bf16") },
                      {}, { m.final_hidden }, { m.logit_input });
     m.op_head = mk(b, "logits_gemm",
-                   { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", s.n_vocab),
+                   { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
                      RAD_INT("n_embd", E), RAD_STR("dtype", "bf16") },
                    { m.head }, { m.logit_input }, { m.logits });
     HY4_NEED(m.op_norm && m.op_gather && m.op_head, "rmsnorm / gather_rows / logits_gemm");
@@ -786,12 +845,16 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     rad_note(b,
              "Hy4-flash (hyv4flash): %lld layers over %lld streams, %lld sparse + %lld sliding "
              "MLA (window %lld, dense to %lld keys), %lld latent MoE of %lld experts top-%lld, "
-             "%zu Engram tables (eps %g), DFly2 %s, vision %s; TP1, bf16%s",
+             "%zu Engram tables (eps %g), DFly2 %s, vision %s; TP%d (rank %d: %lld/%lld sparse "
+             "and %lld/%lld sliding heads, experts %s), bf16%s",
              (long long)s.n_layer, (long long)s.hc, (long long)n_sparse,
              (long long)(s.n_layer - n_sparse), (long long)s.window, (long long)s.dense_limit,
              (long long)n_moe, (long long)s.n_expert, (long long)s.top_k, s.engram_layers.size(),
              s.engram_layers.empty() ? 0.0 : engram_eps(),
              dfly ? "declared (not served)" : "left out", vit ? "declared (not served)" : "left out",
+             s.world, s.rank, (long long)s.sparse_r.heads, (long long)s.sparse.heads,
+             (long long)s.sliding_r.heads, (long long)s.sliding.heads,
+             s.world == 1 ? "all" : s.experts_whole ? "whole per rank" : "sliced per rank",
              taps_on() ? ", debug taps" : "");
     return RAD_OK;
 }
@@ -887,7 +950,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
 /* The model's state is indexed by slot (rad_build_slot). */
 RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(hyv4flash, "hyv4flash", "", "0.2.0",
-                "Tencent Hy4-flash: the text trunk at one rank (bf16), the weight manifest and "
+                "Tencent Hy4-flash: the text trunk at 1, 2 or 4 ranks (bf16), the weight manifest and "
                 "checkpoint name map")
 RAD_ARCH_CHAT_FORMAT(hyv4flash)
 #endif
