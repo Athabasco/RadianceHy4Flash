@@ -264,6 +264,8 @@ TEST(the_mini_graph_declares_every_layer_kind) {
     CHECK(find_w(b, "blk.0.index_query_nope.weight") != nullptr);
     CHECK(find_w(b, "blk.1.index_query_nope.weight") == nullptr);
     CHECK(find_w(b, "blk.1.engram_mult") != nullptr);
+    /* The Engram table is model-level, so --ngram-placement keeps it off the cards. */
+    CHECK_EQ(find_w(b, "blk.1.engram_table.weight")->d.group.layer, -1);
     /* q_b's rows per head: nope then rope, a piece a head. */
     const RecMap* qn = find_map(b, "blk.1.attn_q_nope.weight");
     REQUIRE(qn != nullptr);
@@ -1063,6 +1065,8 @@ TEST(the_engram_table_takes_a_bf16_or_an_f32_row_scale) {
         const RecWeight* sc = find_w(d.b, "blk.1.engram_table.scale");
         REQUIRE(sc != nullptr);
         CHECK_EQ(sc->d.dtype, encs == +f32 ? (uint32_t)RAD_F32 : (uint32_t)RAD_BF16);
+        CHECK_EQ(find_w(d.b, "blk.1.engram_table.weight")->d.group.layer, -1);
+        CHECK_EQ(sc->d.group.layer, -1);
         CHECK_EQ(count_op(d.b, "dequant"), 0);
         every_weight_read(d.b);
         steps_clean_at(d.b, 0, 1);

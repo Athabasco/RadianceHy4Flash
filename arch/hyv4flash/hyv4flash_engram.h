@@ -116,7 +116,9 @@ struct Engram {
         RAD_ARCH_TRY(rad_bind_layer_kv(b, l, hist));
 
         /* The table: E4M3 rows and a bf16 or f32 scale a row (a recipe), or bf16 as shipped. A vocabulary
-         * table, though not the token one: a few rows a token, far too large for a card. */
+         * table, though not the token one: a few rows a token, far too large for a card. Model-level
+         * (grp_model), as rad_block_ple.h declares its tables: the planner takes an embed_lookup_q table
+         * off the cards (--ngram-placement) only when it is a model-level weight. */
         const char* tn = nm.f("blk.%d.engram_table.weight", l);
         RAD_ARCH_TRY(map_copy(b, tn, nm.ckpt("%s.multi_head_embedding.embedding.weight", ep)));
         RadEncoding te{};
@@ -124,7 +126,7 @@ struct Engram {
         table_bf16 = !known || (rad_enc_is(&te, "plain") && te.n_planes == 1 &&
                                 te.plane[0].dtype == RAD_BF16);
         if (table_bf16) {
-            table = decl_w(b, tn, RAD_BF16, { rows, HD }, RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp);
+            table = decl_w(b, tn, RAD_BF16, { rows, HD }, RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
         } else {
             const RadEncPlane* sc = rad_enc_plane(&te, "scale");
             if (!(te.n_planes == 2 && te.plane[0].dtype == RAD_F8E4M3 && sc &&
@@ -139,9 +141,9 @@ struct Engram {
                 return RAD_E_UNSUPPORTED;
             }
             table = decl_view(b, tn, nullptr, "codes", RAD_F8E4M3, { rows, HD }, RAD_ACCESS_VOCAB,
-                              RAD_SHARD_NONE, grp);
+                              RAD_SHARD_NONE, grp_model());
             table_scale = decl_view(b, nm.f("blk.%d.engram_table.scale", l), tn, "scale",
-                                    sc->dtype, { rows, 1 }, RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp);
+                                    sc->dtype, { rows, 1 }, RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
             if (!table_scale) return RAD_E_INVAL;
         }
         if (!table) return RAD_E_INVAL;
