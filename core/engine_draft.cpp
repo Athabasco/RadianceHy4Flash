@@ -111,8 +111,10 @@ int Engine::step_state_init() {
             RAD_MEM_HOST_PINNED));
         if (!couple_draw_stage_ || !couple_readback_) return RAD_E_NOMEM;
         if (drafter_.kind == RAD_DRAFT_BLOCK)
-            RAD_INFO("DFlash coupled LIVE: %d position(s), x~Q along the candidate walk, maximal "
-                     "coupling at the verify; fixed-seed tokens are NOT preserved", drafter_.depth);
+            RAD_INFO("block drafter '%s' coupled LIVE: %d position(s), x~Q at each (DFlash2 along "
+                     "its candidate walk, DFly2 along its chain), maximal coupling at the verify; "
+                     "fixed-seed tokens are NOT preserved",
+                     drafter_.name ? drafter_.name : "?", drafter_.depth);
         else
             RAD_INFO("MTP coupled LIVE: %d linear round(s), x~Q from the draft shortlist, "
                      "maximal coupling at the verify; fixed-seed tokens are NOT preserved",

@@ -1019,9 +1019,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              s.engram_layers.empty() ? 0.0 : engram_eps(),
              !dfly         ? "left out"
              : m.df.served ? nm.f("served (depth %lld, block %lld, %lld layer(s) over trunk layers "
-                                  "%s, greedy proposals, %s)",
+                                  "%s, %s, %s)",
                                   (long long)m.df.depth, (long long)m.df.block,
                                   (long long)m.df.layers, dfly_layers_str(m.df).c_str(),
+                                  m.df.coupled
+                                      ? "coupled proposals (x~Q, Q the T1 softmax of each chain "
+                                        "step's top 8, mtp_couple_propose a step)"
+                                      : "greedy proposals",
                                   m.df.n_quant ? nm.f("%d of its linears int8", m.df.n_quant)
                                                : "bf16 linears")
                            : "declared (not served)",

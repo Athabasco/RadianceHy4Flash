@@ -1307,6 +1307,92 @@ TEST(an_engine_step_with_dfly2_is_lint_clean_and_the_query_pass_touches_no_trunk
     }
 }
 
+/* WP13.8 (kernels/dfly2.md §8.2): under --draft-coupling the chain declares the planes the engine
+ * binds by name (`mtp_couple_draws` [seqs, draw], `mtp_couple_state` [depth, seqs, state]) and one
+ * mtp_couple_propose a step (round k + 1 of max_rounds = depth, the WHOLE vocabulary at TP, over the
+ * merged shortlist with its values widened to f32), issued after the step's top-8 (and merge) and
+ * before the proposal is copied out; lint clean. Uncoupled, none of it. Sabotaged and coupled, the
+ * shortlist's ids are replaced (iota) before the draw instead of the proposals after it. */
+TEST(dfly2_coupled_draws_each_chain_step_from_its_shortlist_law) {
+    for (int world : { 1, 2 })
+        for (int depth : { 5, 2 }) {
+            DeclDfly plain(depth, dfly_meta(), world, 0);
+            REQUIRE_EQ(plain.rc, RAD_OK);
+            CHECK_EQ(count_op(plain.b, "mtp_couple_propose"), 0);
+            CHECK(find_b(plain.b, "mtp_couple_state") == nullptr);
+            MetaKV mk = dfly_meta();
+            RadBuilder b;
+            bf16_encs(&b);
+            RadBuildCtx ctx = spec_ctx(0, world, depth);
+            ctx.draft_coupling = 1;
+            int rc = 0;
+            const std::string err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
+            if (rc != RAD_OK) fputs(err.c_str(), stderr);
+            REQUIRE_EQ(rc, RAD_OK);
+            const auto& df = hyv4flash::models[0]->df;
+            REQUIRE(df.served && df.coupled);
+            const RecBuf* dr = find_b(b, "mtp_couple_draws");
+            const RecBuf* st = find_b(b, "mtp_couple_state");
+            REQUIRE(dr != nullptr && st != nullptr);
+            CHECK_EQ(st->d.rank, 3u);
+            CHECK_EQ(st->d.shape[0], depth);
+            CHECK_EQ(st->d.shape[2], (int64_t)RAD_MTP_COUPLE_STATE_WORDS);
+            CHECK_EQ(dr->d.shape[1], (int64_t)RAD_MTP_COUPLE_DRAW_WORDS);
+            CHECK_EQ(st->d.shape[1], dr->d.shape[0]);
+            CHECK_EQ(st->d.kind, (int)RAD_BUF_PERSIST);
+            CHECK_EQ(count_op(b, "mtp_couple_propose"), depth);
+            for (int k = 0; k < depth; ++k) {
+                const auto& o = b.op_of(df.steps[(size_t)k].op_couple);
+                CHECK_EQ(pint(o, "round"), k + 1);
+                CHECK_EQ(pint(o, "max_rounds"), depth);
+                CHECK_EQ(pint(o, "n_vocab"), 320);
+            }
+            /* the engine's query pass: 2 sequences */
+            const int64_t block = depth + 1;
+            auto trunk = kit(b, std::vector<int>(2, (int)block), {});
+            trunk->b.positions_h = trunk->pos.data();
+            auto ctxp = context_pass(b, *trunk);
+            Query qp(b, 2, block, depth);
+            auto ps = run_passes(b, hyv4flash::step, { trunk.get(), ctxp.get(), qp.k.get() });
+            for (const auto& c : ps) {
+                if (!c->step_fail.empty()) fprintf(stderr, "%s\n", c->step_fail.c_str());
+                CHECK(c->step_fail.empty());
+            }
+            CHECK_LINT(b, ps[0].get(), ps[1].get(), ps[2].get());
+            const auto& is = ps[2]->issues;
+            for (int k = 0; k < depth; ++k) {
+                const auto& S = df.steps[(size_t)k];
+                size_t at_top = SIZE_MAX, at_c = SIZE_MAX, at_tok = SIZE_MAX, at_merge = SIZE_MAX;
+                for (size_t i = 0; i < is.size(); ++i) {
+                    if (is[i].op == S.op_topk) at_top = i;
+                    if (is[i].op == S.op_merge && S.op_merge) at_merge = i;
+                    if (is[i].op == S.op_couple) at_c = i;
+                    if (is[i].op == S.op_tok) at_tok = i;
+                }
+                REQUIRE(at_top != SIZE_MAX && at_c != SIZE_MAX && at_tok != SIZE_MAX);
+                CHECK(at_top < at_c && at_c < at_tok);
+                if (world > 1) { REQUIRE(at_merge != SIZE_MAX); CHECK(at_merge < at_c); }
+                CHECK_EQ(is[at_c].n, 2);
+            }
+        }
+    /* sabotaged: the ids before the draw, no fill of the proposals after it */
+    setenv("RADIANCE_HY4_DFLY_SABOTAGE", "1", 1);
+    {
+        MetaKV mk = dfly_meta();
+        RadBuilder b;
+        bf16_encs(&b);
+        RadBuildCtx ctx = spec_ctx(0, 1, 5);
+        ctx.draft_coupling = 1;
+        int rc = 0;
+        (void)stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
+        REQUIRE_EQ(rc, RAD_OK);
+        const auto& df = hyv4flash::models[0]->df;
+        CHECK(df.op_sabotage == 0);
+        for (const auto& S : df.steps) CHECK(S.op_csab != 0);
+    }
+    unsetenv("RADIANCE_HY4_DFLY_SABOTAGE");
+}
+
 /* WP13.9: the drafter's linears stored quantised (IQ8R, rotated int8, ...) are read as the trunk's
  * are (Lin): each its own input quantised into the rank's code pair, then gemm_nt_q; this rank's
  * slice at TP; every other tensor as before. A form no Lin reads, or a quantised kv_b / embedding,

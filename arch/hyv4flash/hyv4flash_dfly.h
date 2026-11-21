@@ -38,7 +38,10 @@
  * IQ8R, rotated forms; WP13.9, sliced at TP like the bf16 ones; kv_b and the embedding stay bf16),
  * depth 1..5, greedy
  * proposals (exact at every temperature under the engine's verify; vLLM's `probabilistic` draft
- * sampling is not modelled, coupling is WP13.8), no local window (dfly_context_local_window > 0 is
+ * sampling is not modelled) or, under --draft-coupling on (WP13.8), coupled ones: each chain step
+ * samples x_k ~ Q_k = softmax of its merged top-8 logits with mtp_couple_propose (round k + 1) and
+ * stores Q_k in `mtp_couple_state`, which the coupled / traversal verify and the adaptive prefix
+ * read (a greedy request keeps the argmax); no local window (dfly_context_local_window > 0 is
  * refused), the confidence head declared and not read. Anything else declares the manifest only,
  * says why, and leaves speculation to prompt lookup. RADIANCE_HY4_DFLY=0 does the same on purpose
  * (prompt lookup alone, as --spec-ngram needs); RADIANCE_HY4_DFLY_SABOTAGE=1 (tests only) replaces
@@ -47,6 +50,7 @@
 #define HYV4FLASH_DFLY_H
 
 #include "hyv4flash_indexer.h"
+#include "rad_spechub.h"
 
 #include <functional>
 #include <map>
@@ -67,6 +71,10 @@ struct Dfly {
     bool want = false;              /* the drafter's weights are declared (manifest) */
     bool served = false;            /* ... and its passes are built */
     bool sabotage = false;
+    /* --draft-coupling on (kernels/dfly2.md §8.2): each chain step samples its proposal from the
+     * law of its top-8 shortlist (mtp_couple_propose, round k + 1) and stores that law for the
+     * coupled verify. */
+    bool coupled = false;
     /* RADIANCE_HY4_DFLY_TEST_BREAK (tests only, kernels/dfly2.md §6.4): `store_late` stores the
      * draft rows after the attention, `nsel_keep` leaves the selection snapshot uncleared on a
      * step that does not select. Each must be caught by the parity check; neither changes text. */
@@ -122,6 +130,10 @@ struct Dfly {
             }
         };
         if (e && !std::strcmp(e, "0")) no("RADIANCE_HY4_DFLY=0");
+        coupled = ctx->draft_coupling != 0;
+        if (coupled && b && !rad_op_declared(b, "mtp_couple_propose"))
+            no("--draft-coupling on: no loaded kernel library serves mtp_couple_propose (the "
+               "spechub kernels)");
         if (b && !rad_op_declared(b, "dfly_sel"))
             no("no loaded kernel library serves dfly_sel (libref, libavx and libr4d do)");
         if (depth > 5)
@@ -255,6 +267,9 @@ struct Dfly {
         rad_op op_rowk = 0, op_zk = 0, op_pe = 0, op_hn = 0, op_en = 0,
                op_silu = 0, op_add = 0, op_head = 0, op_lcast = 0, op_topk = 0,
                op_tok = 0, op_prev = 0, op_gcp = 0, op_ucp = 0;
+        /* --draft-coupling: the shortlist's values at f32, the sampled proposal (and, sabotaged, the
+         * shortlist's ids replaced first) */
+        rad_op op_vcast = 0, op_couple = 0, op_csab = 0;
         rad_op op_gather = 0, op_merge = 0;   /* TP: the vocabulary shards' merge; 0 at one rank */
         Tap t_corr{}, t_logits{}, t_idx{}, t_val{};
     };
@@ -271,6 +286,9 @@ struct Dfly {
     rad_buf zk = 0, pe = 0, ccat = 0, cg = 0, cup = 0, cgu = 0, cff = 0, cd = 0, zc = 0, logits = 0, lbf = 0,
             cidx = 0, cval = 0, prev = 0, tokens = 0;
     rad_buf pairs = 0, gath = 0;   /* TP: this rank's top-R as (id, value) pairs, every rank's */
+    /* --draft-coupling: the f32 shortlist values the law is built from, and the planes the engine
+     * binds by name (one draw a drafting row, one state a (chain step, row)) */
+    rad_buf cvalf = 0, couple_draws = 0, couple_state = 0;
     rad_op op_ar_o = 0, op_ar_y = 0;   /* TP: the layers' two reductions; 0 at one rank */
     rad_buf ident = 0;   /* taps: [max_seqs, P] the identity table */
     int64_t ident_w = 0;
@@ -431,6 +449,16 @@ struct Dfly {
         cidx = i32("cand_idx", { S, R });
         cval = bf("cand_val", { S, R });
         prev = i32("prev", { S });
+        if (coupled) {
+            /* The engine finds the two planes by these names (core/engine_draft.cpp) and stages
+             * the draws in the query pass's sequence order, which is the chain's row order. */
+            cvalf = decl_b(b, nm.f("dfly.cand_val_f32"), RAD_F32, { S, R });
+            couple_draws = decl_b(b, nm.f("mtp_couple_draws"), RAD_U32,
+                                  { S, (int64_t)RAD_MTP_COUPLE_DRAW_WORDS }, RAD_BUF_PERSIST);
+            couple_state = decl_b(b, nm.f("mtp_couple_state"), RAD_U32,
+                                  { depth, S, (int64_t)RAD_MTP_COUPLE_STATE_WORDS }, RAD_BUF_PERSIST);
+            if (!cvalf || !couple_draws || !couple_state) return RAD_E_INVAL;
+        }
         if (s.world > 1) {
             pairs = decl_b(b, nm.f("dfly.cand_pairs"), RAD_F32, { S, R, 2 });
             gath = decl_b(b, nm.f("dfly.cand_gathered"), RAD_F32, { S, s.world * R, 2 });
@@ -751,6 +779,34 @@ struct Dfly {
             }
             RAD_ARCH_TRY(st.t_idx.declare(b, nm, S, "dfly.cand_idx", ki, RAD_I32, R, cidx));
             RAD_ARCH_TRY(st.t_val.declare(b, nm, S, "dfly.cand_val", ki, RAD_BF16, R, cval));
+            if (coupled) {
+                /* Q_k = the FP64 softmax (temperature 1) of the eight best logits, bf16-rounded as
+                 * the greedy chain ranks them and widened exactly; x_k ~ Q_k into column 0 and Q_k
+                 * into state row (k, sequence). The shortlist is the merged global one at TP, the
+                 * draw the one the engine staged on every rank, so x_k is the same on every rank.
+                 * A greedy request (draw mode 0) keeps the argmax: greedy text is unchanged. */
+                if (sabotage) {
+                    /* Tests: eight distinct ids next to the mask id (never the model's choice in
+                     * general), so the coupled states are valid laws over tokens the target
+                     * rejects. */
+                    const int64_t base = std::min<int64_t>((int64_t)mask, s.n_vocab - R);
+                    st.op_csab = mk(b, "iota",
+                                    { RAD_RANGE("M", 1, S * R), RAD_INT("start", base),
+                                      RAD_INT("step", 1), RAD_INT("period", R) },
+                                    {}, {}, { cidx });
+                    HY4_NEED(st.op_csab, "iota (period)");
+                }
+                st.op_vcast = mk(b, "cast",
+                                 { RAD_RANGE("M", 1, S), RAD_INT("n", R), RAD_STR("from", "bf16"),
+                                   RAD_STR("to", "f32") },
+                                 {}, { cval }, { cvalf });
+                st.op_couple = mk(b, "mtp_couple_propose",
+                                  { RAD_RANGE("M", 1, S), RAD_INT("n_vocab", s.n_vocab),
+                                    RAD_INT("round", k + 1), RAD_INT("max_rounds", depth) },
+                                  {}, { cidx, cvalf, couple_draws }, { cidx, couple_state });
+                HY4_NEED(st.op_vcast, "cast (bf16 -> f32)");
+                HY4_NEED(st.op_couple, "mtp_couple_propose");
+            }
             st.op_tok = decl_copy(b, S, 1, RAD_I32, cidx, tokens);
             st.op_prev = decl_copy(b, S, 1, RAD_I32, cidx, prev);
             HY4_NEED(st.op_rowk, "iota");
@@ -762,7 +818,7 @@ struct Dfly {
             HY4_NEED(st.op_lcast && st.op_tok && st.op_prev && st.op_gcp && st.op_ucp, "cast");
             HY4_NEED(st.op_topk, "row_topk (bf16)");
         }
-        if (sabotage) {
+        if (sabotage && !coupled) {
             op_sabotage = mk(b, "fill",
                              { RAD_RANGE("M", 1, S), RAD_INT("n", depth), RAD_STR("dtype", "i32"),
                                RAD_F64("value", (double)mask) },
@@ -979,6 +1035,13 @@ struct Dfly {
             }
             st.t_idx.step(c, brows(cidx, n), n);
             st.t_val.step(c, brows(cval, n), n);
+            if (st.op_couple) {
+                if (st.op_csab) RAD_ISSUE_N(c, st.op_csab, n * R, bcol_at(cidx, 0, R, 0, R, n));
+                RAD_ISSUE_N(c, st.op_vcast, n, brows(cval, n), brows(cvalf, n));
+                RAD_ISSUE_N(c, st.op_couple, n, brows(cidx, n), brows(cvalf, n),
+                            praw(batch->seq_ids, RAD_I32, batch->n_seq),
+                            brows(couple_draws, n), RAD_B(couple_state));
+            }
             RAD_ISSUE_N(c, st.op_tok, n, bcol(cidx, 0, 1, n), bcol(tokens, k, 1, n));
             RAD_ISSUE_N(c, st.op_prev, n, bcol(cidx, 0, 1, n), brows(prev, n));
         }
