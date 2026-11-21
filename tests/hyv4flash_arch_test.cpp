@@ -181,8 +181,8 @@ TEST(the_mini_graph_declares_every_layer_kind) {
     CHECK_EQ(count_op(b, "ihc_pre"), 7);                /* 2 a layer and the head's collapse */
     CHECK_EQ(count_op(b, "ihc_post"), 6);
     CHECK_EQ(count_op(b, "mla_project_kv"), 6);         /* absorb and expand a layer */
-    CHECK_EQ(count_op(b, "mla_attn_paged_sink"), 3);
-    CHECK_EQ(count_op(b, "mla_attn_sel_sink"), 2);      /* the sparse layers */
+    CHECK_EQ(count_op(b, "mla_attn_paged_sink"), 6);    /* decode-class (stable) and prefill */
+    CHECK_EQ(count_op(b, "mla_attn_sel_sink"), 4);      /* the sparse layers, both instances */
     CHECK_EQ(count_op(b, "attn_kv_sink"), 3);
     CHECK_EQ(count_op(b, "mla_kv_split"), 3);
     CHECK_EQ(count_op(b, "gate_mul"), 3);
@@ -205,7 +205,7 @@ TEST(the_mini_graph_declares_every_layer_kind) {
     CHECK(find_b(b, "dbg.resid.0") == nullptr);         /* no taps unless asked */
 
     /* The sink attention's geometry: a sliding layer's window, the scale 1/sqrt(nope + rope). */
-    const RecOp* sw = find_op(b, "mla_attn_paged_sink", 1);
+    const RecOp* sw = find_op(b, "mla_attn_paged_sink", 2);
     CHECK_EQ(pint(sw, "heads"), 4);
     CHECK_EQ(pint(sw, "window"), 8);
     CHECK_EQ(pint(sw, "block_size"), 16);
@@ -213,6 +213,11 @@ TEST(the_mini_graph_declares_every_layer_kind) {
     const RecOp* sp = find_op(b, "mla_attn_paged_sink", 0);
     CHECK_EQ(pint(sp, "window"), 0);
     CHECK_EQ(pint(sp, "block_size"), 4);
+    /* WP16 3.4.1: the decode-class instance stable, the prefill one fast */
+    CHECK_EQ(pint(sp, "stable"), 1);
+    CHECK_EQ(pint(find_op(b, "mla_attn_paged_sink", 1), "stable"), 0);
+    CHECK_EQ(pint(find_op(b, "mla_attn_sel_sink", 0), "stable"), 1);
+    CHECK_EQ(pint(find_op(b, "mla_attn_sel_sink", 1), "stable"), 0);
     const RecOp* sel = find_op(b, "qsa_select");
     CHECK_EQ(pint(sel, "topk"), 3);
     CHECK_EQ(pint(sel, "own"), 1);
@@ -279,6 +284,7 @@ TEST(every_step_kind_is_lint_clean) {
         { "fresh prefill", {}, { 12 }, 0, true },
         { "fresh prefill, long", {}, { 40 }, 0, true },
         { "mixed", { 1 }, { 10 }, 0, true },
+        { "mixed, prefix", { 1, 1 }, { 4 }, 8, true },
         { "prefix chunk", {}, { 16 }, 16, true },
         { "no host positions", {}, { 12 }, 0, false },
     };
@@ -302,6 +308,12 @@ TEST(every_step_kind_is_lint_clean) {
         } else if (!std::strcmp(cs.what, "decode")) {
             CHECK_EQ(dense, 0);
             CHECK_EQ(sel, 2);         /* contexts of 40 and more pass the limit of 16 */
+            CHECK_EQ(count_issued(b, c, "mla_attn_paged_sink"), 1);   /* the stable one only */
+        } else if (!std::strcmp(cs.what, "mixed, prefix")) {
+            /* both instances (WP16 3.4.1): decode rows stable, the absorbed prefill rows fast */
+            CHECK_EQ(dense, 0);
+            CHECK_EQ(sel, 4);
+            CHECK_EQ(count_issued(b, c, "mla_attn_paged_sink"), 2);
         } else if (!std::strcmp(cs.what, "prefix chunk") ||
                    !std::strcmp(cs.what, "no host positions")) {
             CHECK_EQ(dense, 0);       /* a cached prefix (or none known) is absorbed */
@@ -788,7 +800,7 @@ TEST(each_rank_declares_its_share_and_reduces_twice_a_layer) {
                     CHECK(h == Hs || h == Hw);
                 }
             CHECK_EQ(pint(find_op(b, "mla_attn_paged_sink", 0), "heads"), Hs);   /* layer 0 sparse */
-            CHECK_EQ(pint(find_op(b, "mla_attn_paged_sink", 1), "heads"), Hw);   /* layer 1 sliding */
+            CHECK_EQ(pint(find_op(b, "mla_attn_paged_sink", 2), "heads"), Hw);   /* layer 1 sliding */
             CHECK_EQ(pint(find_op(b, "mla_attn_sel_sink", 0), "heads"), Hs);
             CHECK_EQ(pint(find_op(b, "gate_mul", 1), "n"), Hw * 32);
             /* Replicated: the cache row, the indexer, the router over every expert. */

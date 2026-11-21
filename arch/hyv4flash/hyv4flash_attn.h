@@ -12,7 +12,9 @@
  *                 over the indexer's table), the latent expanded through kv_b's value rows
  *   non-absorbed  the step's latent rows through kv_b (a GEMM), split into per-head keys and
  *                 values (mla_kv_split), dense attention with the sink (attn_kv_sink)
- * Decode and verify rows are absorbed. A step whose prefill sequences all start at position 0
+ * Decode and verify rows are absorbed, through an instance of the latent attention declared with
+ * `stable 1` (a row's bytes independent of the step's other rows and streams: verify == decode at
+ * any stream count, WP16 perf.md 3.4.1); the absorbed prefill rows use a second, `stable 0`. A step whose prefill sequences all start at position 0
  * (nothing of them cached) runs those rows non-absorbed, unless the sparse layers select (context
  * past the dense limit), which is absorbed for every row. RADIANCE_HY4_PREFILL=absorbed sends every
  * row down the absorbed path. A prefill row with a cached prefix is absorbed too: gathering the
@@ -109,7 +111,10 @@ struct Attn {
     rad_weight qa_gain = 0, kv_gain = 0, post_gain = 0, kv_b = 0, sinks = 0;
     rad_op op_qa_norm = 0, op_kv_norm = 0, op_q_rope = 0, op_k_rope = 0, op_store = 0;
     rad_op op_store_stream = 0, op_resolve = 0;   /* a streamed sparse group (--kv-resident) */
-    rad_op op_absorb = 0, op_paged = 0, op_sel = 0, op_expand = 0;
+    /* The latent attention twice (WP16 perf.md 3.4.1): decode-class rows (decode and verify,
+     * [0, DT)) with `stable 1`, whose bytes do not depend on the step's other rows or streams, and
+     * prefill rows ([DT, T)) with `stable 0`, the fast form. */
+    rad_op op_absorb = 0, op_paged = 0, op_paged_pf = 0, op_sel = 0, op_sel_pf = 0, op_expand = 0;
     rad_op op_lat_copy = 0, op_kvb = 0, op_split = 0, op_qn_copy = 0, op_qr_copy = 0, op_dense = 0, op_rebase = 0;
     rad_op op_gate = 0, op_post_norm = 0, op_ar = 0;
     rad_op op_expand_gate = 0;   /* the expansion with the gate folded in, where a library has it */
@@ -272,12 +277,21 @@ struct Attn {
                       { kv_b }, { in_ }, { out_ });
         };
         op_absorb = proj("absorb", w.q_nope, w.q_lat);
-        op_paged = mk(b, "mla_attn_paged_sink",
-                      { RAD_RANGE("M", 1, T), RAD_INT("heads", H), RAD_INT("latent_dim", L),
+        /* The prefill sequences' bounds rebased to 0: the absorbed prefill instance's and the
+         * non-absorbed attention's. */
+        op_rebase = mk(b, "sub_i32", { RAD_RANGE("M", 1, g.max_seqs + 1) }, {}, {}, { w.cu_p });
+        /* Decode-class rows: one a stream and its speculation rows. */
+        const int64_t DTmax = std::max<int64_t>(1, std::min<int64_t>(T, g.max_logit_rows));
+        auto paged_op = [&](int64_t rows, int stable, std::initializer_list<rad_buf> in) {
+            return mk(b, "mla_attn_paged_sink",
+                      { RAD_RANGE("M", 1, rows), RAD_INT("heads", H), RAD_INT("latent_dim", L),
                         RAD_INT("rope_dim", R), RAD_INT("block_size", bs),
                         RAD_INT("window", window), RAD_F64("scale", scale),
-                        RAD_STR("dtype", "bf16") },
-                      { sinks }, { w.q_lat, w.q_rope }, { w.lat });
+                        RAD_STR("dtype", "bf16"), RAD_INT("stable", stable) },
+                      { sinks }, in, { w.lat });
+        };
+        op_paged = paged_op(DTmax, 1, { w.q_lat, w.q_rope });
+        op_paged_pf = paged_op(T, 0, { w.q_lat, w.q_rope, w.cu_p });
         op_expand = proj("expand", w.lat, w.ao);
         HY4_NEED(op_absorb && op_expand, "mla_project_kv");
         /* mla_expand_gate is the expansion followed by gate_mul, byte for byte (libr4d in one
@@ -294,15 +308,19 @@ struct Attn {
                                 { kv_b }, { w.lat, w.gate }, { w.ag });
             if (op_expand_gate && !rad_op_resolved(b, op_expand_gate)) op_expand_gate = 0;
         }
-        HY4_NEED(op_paged, "mla_attn_paged_sink");
+        HY4_NEED(op_paged && op_paged_pf, "mla_attn_paged_sink");
         if (!sliding) {
-            op_sel = mk(b, "mla_attn_sel_sink",
-                        { RAD_RANGE("M", 1, T), RAD_INT("heads", H), RAD_INT("latent_dim", L),
-                          RAD_INT("rope_dim", R), RAD_INT("blocks", s.ix_group_topk),
-                          RAD_INT("block_size", bs), RAD_F64("scale", scale),
-                          RAD_STR("dtype", "bf16") },
-                        { sinks }, { w.q_lat, w.q_rope, sel, len }, { w.lat });
-            HY4_NEED(op_sel, "mla_attn_sel_sink");
+            auto sel_op = [&](int64_t rows, int stable) {
+                return mk(b, "mla_attn_sel_sink",
+                          { RAD_RANGE("M", 1, rows), RAD_INT("heads", H), RAD_INT("latent_dim", L),
+                            RAD_INT("rope_dim", R), RAD_INT("blocks", s.ix_group_topk),
+                            RAD_INT("block_size", bs), RAD_F64("scale", scale),
+                            RAD_STR("dtype", "bf16"), RAD_INT("stable", stable) },
+                          { sinks }, { w.q_lat, w.q_rope, sel, len }, { w.lat });
+            };
+            op_sel = sel_op(DTmax, 1);
+            op_sel_pf = sel_op(T, 0);
+            HY4_NEED(op_sel && op_sel_pf, "mla_attn_sel_sink");
             /* Issued after the layer's selection and before mla_attn_sel_sink reads `sel`;
              * `nsel` is qsa_select's entry count, the table's pitch the attention's `blocks`. */
             op_resolve = kv_resolve_declare(b, g, kv, sel, nsel, s.ix_group_topk);
@@ -320,7 +338,6 @@ struct Attn {
                       {}, { w.kvb, w.row }, { w.k, w.v });
         op_qn_copy = decl_copy(b, T, H * N, RAD_BF16, w.q_nope, w.q_full);
         op_qr_copy = decl_copy(b, T, H * R, RAD_BF16, w.q_rope, w.q_full);
-        op_rebase = mk(b, "sub_i32", { RAD_RANGE("M", 1, g.max_seqs + 1) }, {}, {}, { w.cu_p });
         op_dense = mk(b, "attn_kv_sink",
                       { RAD_RANGE("M", 1, T), RAD_INT("N", T), RAD_INT("heads", H),
                         RAD_INT("head_dim", a.qk()), RAD_INT("window", window),
@@ -411,14 +428,43 @@ struct Attn {
         return true;
     }
 
-    /* The absorbed attention over sequences [0, S) (rows [0, rows)) of the paged cache. */
-    void paged(RadCtx* c, const RadBatch* batch, int64_t S, int64_t rows) const {
-        if (S <= 0 || rows <= 0) return;
+    /* The absorbed attention over the paged cache: the decode sequences [0, D) (rows [0, DT))
+     * with the stable instance, then, when `prefill`, the prefill sequences [D, S) (rows
+     * [DT, T)) with the fast one over their bounds rebased to 0. */
+    void paged(RadCtx* c, const RadBatch* batch, const StepPlan& p, bool prefill) const {
         const auto* kb = kv_batch(batch, kv);
-        RAD_ISSUE_N(c, op_paged, rows, brows(w.q_lat, rows), brows(w.q_rope, rows),
-                    kv_cache(kv, layer), praw2(kb->block_table, RAD_I32, S, kb->block_table_pitch),
-                    praw(kb->seqused, RAD_I32, S), praw(batch->cu_seqlens, RAD_I32, S + 1),
-                    RAD_W(sinks), brows(w.lat, rows));
+        const int64_t pitch = kb->block_table_pitch, D = p.D, DT = p.DT, L = s.kv_lora,
+                      R = a.qk_rope, H = a.heads;
+        if (D > 0 && DT > 0)
+            RAD_ISSUE_N(c, op_paged, DT, brows(w.q_lat, DT), brows(w.q_rope, DT),
+                        kv_cache(kv, layer), praw2(kb->block_table, RAD_I32, D, pitch),
+                        praw(kb->seqused, RAD_I32, D), praw(batch->cu_seqlens, RAD_I32, D + 1),
+                        RAD_W(sinks), brows(w.lat, DT));
+        const int64_t M = p.T - DT;
+        if (!prefill || p.P <= 0 || M <= 0) return;
+        const int32_t* cu = batch->cu_seqlens + D;
+        RAD_ISSUE_N(c, op_rebase, p.P + 1, praw(cu, RAD_I32, p.P + 1), praw(cu, RAD_I32, 1),
+                    brows(w.cu_p, p.P + 1));
+        RAD_ISSUE_N(c, op_paged_pf, M, brow_slice(w.q_lat, DT, M, H * L),
+                    brow_slice(w.q_rope, DT, M, H * R), kv_cache(kv, layer),
+                    praw2(kb->block_table + D * pitch, RAD_I32, p.P, pitch),
+                    praw(kb->seqused + D, RAD_I32, p.P), brows(w.cu_p, p.P + 1), RAD_W(sinks),
+                    brow_slice(w.lat, DT, M, H * L));
+    }
+
+    /* The selection form: decode-class rows [0, DT) stable, prefill rows [DT, T) fast. */
+    void selected(RadCtx* c, const StepPlan& p, rad_buf sel, rad_buf len) const {
+        const int64_t DT = p.DT, M = p.T - DT, L = s.kv_lora, R = a.qk_rope, H = a.heads,
+                      K = s.ix_group_topk;
+        if (DT > 0)
+            RAD_ISSUE_N(c, op_sel, DT, brows(w.q_lat, DT), brows(w.q_rope, DT),
+                        kv_cache(kv, layer), brows(sel, DT), brows(len, DT), RAD_W(sinks),
+                        brows(w.lat, DT));
+        if (M > 0)
+            RAD_ISSUE_N(c, op_sel_pf, M, brow_slice(w.q_lat, DT, M, H * L),
+                        brow_slice(w.q_rope, DT, M, H * R), kv_cache(kv, layer),
+                        brow_slice(sel, DT, M, K), brow_slice(len, DT, M, 1), RAD_W(sinks),
+                        brow_slice(w.lat, DT, M, H * L));
     }
 
     /* The non-absorbed attention over the prefill rows [DT, T), every key this step's. */
@@ -474,7 +520,6 @@ struct Attn {
         };
         const bool selecting = !sliding && p.select;
         const int64_t abs_rows = selecting ? T : p.nonabs ? p.DT : T;
-        const int64_t abs_seqs = p.nonabs && !selecting ? p.D : p.S;
         if (abs_rows > 0) {
             RAD_ISSUE_N(c, op_absorb, abs_rows, brows(w.q_nope, abs_rows), RAD_W(kv_b),
                         brows(w.q_lat, abs_rows));
@@ -490,11 +535,9 @@ struct Attn {
                 kv_resolve_issue(c, op_resolve, S, brows(sel, T), brows(nsel, T), kv, layer, T);
             }
             if (selecting)
-                RAD_ISSUE_N(c, op_sel, T, brows(w.q_lat, T), brows(w.q_rope, T),
-                            kv_cache(kv, layer), brows(sel, T), brows(len, T), RAD_W(sinks),
-                            brows(w.lat, T));
+                selected(c, p, sel, len);
             else
-                paged(c, batch, abs_seqs, abs_rows);
+                paged(c, batch, p, !p.nonabs);
             if (op_expand_gate)
                 RAD_ISSUE_N(c, op_expand_gate, abs_rows, brows(w.lat, abs_rows), RAD_W(kv_b),
                             brows(w.gate, abs_rows), brows(w.ag, abs_rows));
