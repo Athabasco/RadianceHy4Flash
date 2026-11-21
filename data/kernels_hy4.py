@@ -33,6 +33,13 @@ ihc_post at n = 3072 M = 16, from a recording of the graph with the junction dec
 (The last rerecord matters: rad-kbench draws a weight by position, dtype and extents, so a case
 recorded alone can draw different bytes inside the whole fixture.)
 
+The DFly2 draft pass (WP13.7), recorded with the drafter declared and appended (no whole-fixture rerecord: the
+appended cases replay against their recording as they are, and a rerecord would rewrite the junction rows' answers):
+
+  rad-kbench -m gpu-mini.rad --kernels libref --max-ctx 4096 --max-tok 1024 --num-speculative-tokens 5 \
+      --op dfly_sel --op row_topk --op mla_attn_sel_sink --record dfly.rkb
+  python3 data/kernels_hy4.py dfly data/kernels_hy4.rkb dfly.rkb data/kernels_hy4.rkb
+
 Check a card with
   rad-kbench --fixture data/kernels_hy4.rkb --kernels libr4d:libref [--bench]
 """
@@ -270,5 +277,24 @@ def vis(base, rec, out):
     fx = dict(fx, source=fx['source'] + ' + vision (WP15, gpu-mini-vis)', cases=fx['cases'] + add)
     save(fx, out); print(len(add), 'vision cases added ->', out, len(fx['cases']), 'in all')
 
+# WP13.7: the DFly2 draft pass's own points, from a recording of the gpu-mini container with the drafter
+# declared (rad-kbench --num-speculative-tokens 5): dfly_sel (blocks 514 over 512 recalled pages), the chain's
+# row_topk over the vocabulary, and the draft attention at the table width 514.
+def dfly_case(c):
+    if c['op'] in ('dfly_sel', 'row_topk'): return True
+    return c['op'] == 'mla_attn_sel_sink' and par(c, 'blocks') == 514
+
+def dfly(base, rec, out):
+    """base fixture + the draft pass's cases of `rec`, each distinct point once."""
+    fx, r = load(base), load(rec)
+    key = lambda c: (c['op'], repr(c['params']), repr([(o['role'], o['dtype'], o['shape']) for o in c['opd']]))
+    have = {key(c) for c in fx['cases']}
+    add = []
+    for c in r['cases']:
+        if not dfly_case(c) or not any(o.get('have_ref') for o in c['opd']) or key(c) in have: continue
+        have.add(key(c)); add.append(c)
+    fx = dict(fx, source=fx['source'] + ' + DFly2 draft pass (WP13.7)', cases=fx['cases'] + add)
+    save(fx, out); print(len(add), 'draft cases added ->', out, len(fx['cases']), 'in all')
+
 if __name__ == '__main__':
-    {'raw': raw, 'merge': merge, 'vis': vis, 'wp163': wp163, 'junction': junction, 'append': append}[sys.argv[1]](*sys.argv[2:])
+    {'raw': raw, 'merge': merge, 'vis': vis, 'wp163': wp163, 'junction': junction, 'append': append, 'dfly': dfly}[sys.argv[1]](*sys.argv[2:])
