@@ -3,8 +3,12 @@
 #include "rad_test.h"
 #include "tiny_model.h"
 #include "format/radfile.h"
+#include "text/tokenizer.h"
 
+#include <cstdlib>
+#include <fstream>
 #include <map>
+#include <sstream>
 
 using namespace rad;
 
@@ -396,6 +400,45 @@ TEST(the_hash_constants_come_from_an_added_file) {
     CHECK(plain(f, "blk.1.engram_mult") == bytes(ts[0]));
     CHECK(plain(f, "blk.1.engram_vocab_sizes") == bytes(ts[1]));
     CHECK(plain(f, "blk.1.engram_offsets") == bytes(ts[2]));
+}
+
+/* The release's tokenizer and chat template are baked, with the special tokens the template and the
+ * reply format name. The release's files are 9 MB, so they are read from the directory
+ * RAD_TEST_HY4_TOKENIZER_DIR names (tokenizer.json, chat_template.jinja) and the case is skipped
+ * without it. */
+TEST(the_release_tokenizer_and_chat_template_are_baked) {
+    const char* dir = std::getenv("RAD_TEST_HY4_TOKENIZER_DIR");
+    if (!dir || !*dir) SKIP("set RAD_TEST_HY4_TOKENIZER_DIR to a directory with the release's tokenizer.json and chat_template.jinja");
+    const Fixture& fx = fixture();
+    REQUIRE(fx.ok);
+    const std::string tj = std::string(dir) + "/tokenizer.json", ct = std::string(dir) + "/chat_template.jinja";
+    std::string log;
+    const std::string out = fx.dir / "tok.rad";
+    REQUIRE_EQ(fx.convert(out, { "--tokenizer", tj, "--chat-template", ct }, &log), 0);
+    RadFile f;
+    REQUIRE_EQ(f.open(out.c_str()), RAD_OK);
+    VocabBuild vb;
+    REQUIRE_EQ(vocab_deserialize(f.base(), (uint64_t)f.size(), f.vocab().h, vb), RAD_OK);
+    std::ifstream in(ct, std::ios::binary);
+    std::ostringstream want;
+    want << in.rdbuf();
+    std::string tmpl = want.str();
+    while (!tmpl.empty() && (tmpl.back() == '\n' || tmpl.back() == ' ')) tmpl.pop_back();
+    CHECK_EQ(vb.chat_template, tmpl);
+    CHECK_EQ((int)vb.tokens.size(), 120832);
+    /* The ids the template and the reply format rely on, spelled with the release's suffix. */
+    const std::map<int, std::string> expect{
+        { 120000, "<｜hy_start:opensource｜>" },   { 120001, "<｜hy_middle:opensource｜>" },
+        { 120025, "<｜hy_end:opensource｜>" },     { 120029, "<think:opensource>" },
+        { 120030, "</think:opensource>" },         { 120033, "<tool_call:opensource>" },
+        { 120034, "</tool_call:opensource>" },     { 120035, "<tool_calls:opensource>" },
+        { 120036, "</tool_calls:opensource>" },    { 120037, "<tool_response:opensource>" },
+        { 120039, "<｜reasoning_mode:opensource｜>" }, { 120040, "<arg_key:opensource>" },
+        { 120041, "</arg_key:opensource>" },       { 120042, "<arg_value:opensource>" },
+        { 120043, "</arg_value:opensource>" } };
+    for (const auto& [id, text] : expect) CHECK_EQ(vb.tokens.at((size_t)id), text);
+    CHECK_EQ(vb.bos, 120000);
+    CHECK_EQ(vb.eos, 120025);
 }
 
 RAD_TEST_MAIN()

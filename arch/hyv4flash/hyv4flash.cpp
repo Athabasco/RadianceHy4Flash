@@ -31,6 +31,8 @@
  * the convert test runs on a model of a few kilobytes. */
 #include <arch/rad_arch.h>
 
+#include "chat.h"
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -753,4 +755,5 @@ static void step(RadCtx* c, const RadBatch*) {
 RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(hyv4flash, "hyv4flash", "", "0.1.0",
                 "Tencent Hy4-flash: the weight manifest and checkpoint name map (conversion only)")
+RAD_ARCH_CHAT_FORMAT(hyv4flash)
 #endif

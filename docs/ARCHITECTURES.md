@@ -3395,6 +3395,19 @@ The sizes are `rad-convert --plan-only`'s over the release's 1964 tensors (43699
 safetensors headers and config, without the 440 GB of data. No Hy4-flash weight has been through a
 quantiser yet, so neither recipe has an error report or a quality number.
 
+Chat: `rad-convert` bakes the release's `tokenizer.json` (120832 tokens, bos 120000, eos 120025 =
+`<｜hy_end:opensource｜>`) and `chat_template.jinja` from the checkpoint directory. Every marker has
+the suffix `:opensource`. The template takes `reasoning_effort` `no_think` or `high` (default `high`)
+and throws on anything else, `max` and `None` included; it has no `enable_thinking`, so the server
+maps thinking off onto `no_think` (GUIDE.md, `reasoning-effort`). The generation prompt ends in
+`<think:opensource>` for `high` and `<think:opensource></think:opensource>` for `no_think`. The plugin
+exports `rad_arch_chat_format` (`arch/hyv4flash/chat.h`): a reply is
+`[<think>REASONING</think>]CONTENT[<tool_calls><tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>...</tool_calls>]`,
+every tag with the `:opensource` suffix, no newlines, a non-string argument as JSON; the grammar is
+lazy on `<tool_calls:opensource>`. Tests: `hyv4flash_chat_test`, the `hy4flash` rows of `chat_test`
+(golden renders by transformers, `tests/mkchatgolden.py`) and, with `RAD_TEST_HY4_TOKENIZER_DIR`
+set to a directory holding the release's two files, `hyv4flash_convert_test`.
+
 `--max-spec 0` leaves the drafter out; the tower is declared whenever the config has one. The
 checkpoint is larger than most disks hold twice, and `--defer` / `--in-place` convert it a piece at
 a time (TOOLS.md).

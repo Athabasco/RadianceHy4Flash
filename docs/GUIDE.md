@@ -2367,11 +2367,18 @@ models:
     reasoning-effort: medium
 ```
 
-At startup the template is probed with `low`, `medium`, `high`, `xhigh` and `max`, and the ones it
+At startup the template is probed with `low`, `medium`, `high`, `xhigh`, `max` and `no_think`, and the ones it
 takes are logged and published on `/server_info` as `capabilities.reasoning_efforts` (with the
 server's own `none` and `minimal`; `null` when the template takes any word). A request outside the set
 gets a 400 with `param: "reasoning_effort"`, `code: "unsupported_value"` and the set in
 `error.supported`.
+
+A template that takes `no_think` (Hy4-flash's takes `no_think` and `high` and nothing else, and has no
+`enable_thinking`) gets every way of turning thinking off as `reasoning_effort: no_think`: `none`,
+`minimal`, `no_think` itself, `enable_thinking: false` (top level or in `chat_template_kwargs`),
+`thinking.type: disabled`, `reasoning.enabled: false`. Thinking off wins over a level named beside it,
+including the deployment's `reasoning-effort`. `low`, `medium`, `xhigh` and `max` get the 400 above
+naming `high` and `no_think`; `reasoning-effort-map: {low: no_think, max: high}` translates them instead.
 
 **`reasoning-effort-map: FROM=TO,...`** rewrites a request's effort before the template sees it, for
 clients that send OpenAI's levels. Qwen3.8 has no `high`, so:
