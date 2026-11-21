@@ -51,6 +51,8 @@ struct StepPlan {
 /* The planes of one attention geometry, shared by its layers. */
 struct AttnWire {
     rad_buf qa = 0;       /* [T, q_lora] q_a's output, normed in place (HF's q_resid) */
+    rad_buf qa_raw = 0;   /* [T, q_lora] q_a's output in front of a fused norm (Attn::qfuse); declared
+                             by the first layer that fuses */
     rad_buf q_nope = 0;   /* [T, H*nope] */
     rad_buf q_rope = 0;   /* [T, H*R] rotated in place */
     rad_buf row = 0;      /* [T, L + R] the cache row */
@@ -110,6 +112,12 @@ struct Attn {
     Lin q_a{}, q_nope{}, q_rope{}, kv_a{}, gate{}, out{};
     rad_weight qa_gain = 0, kv_gain = 0, post_gain = 0, kv_b = 0, sinks = 0;
     rad_op op_qa_norm = 0, op_kv_norm = 0, op_q_rope = 0, op_k_rope = 0, op_store = 0;
+    /* The q residual's norm writes q_nope's and q_rope's rotated int8 codes in its pass
+     * (rmsnorm_had_quant_i8g, fused_quant_on): q_a then writes `qa_raw`, the norm `qa` and the
+     * codes `qcodes`. */
+    bool qfuse = false;
+    ActFP8 qcodes{};
+    rad_buf qa_out = 0;   /* q_a's output: w.qa (normed in place) or, behind the fused norm, qa_raw */
     rad_op op_store_stream = 0, op_resolve = 0;   /* a streamed sparse group (--kv-resident) */
     rad_op op_row_front = 0;   /* the cache row's norm, rotary and store in one launch (WP16.5) */
     /* The latent attention twice (WP16 perf.md 3.4.1): decode-class rows (decode and verify,
@@ -124,7 +132,7 @@ struct Attn {
     /* `ap` is the checkpoint's `model.layers.<l>.self_attn`. `group` is the layer's latent KV
      * group, declared by the caller right before this (its block size is this layer's ops'). */
     int declare(RadBuilder* b, Names& nm, const Shape& shape, const Geom& geom, int l,
-                bool is_sliding, const AttnWire& wire, rad_buf in, rad_buf outb, rad_kvgroup group,
+                bool is_sliding, AttnWire& wire, rad_buf in, rad_buf outb, rad_kvgroup group,
                 int64_t block, const char* ap, bool first_of_group) {
         s = shape;
         g = geom;
@@ -148,18 +156,10 @@ struct Attn {
         };
         RAD_ARCH_TRY(rad_bind_layer_kv(b, l, kv));
 
-        RAD_ARCH_TRY(q_a.declare(b, nm, g, nm.f("blk.%d.attn_q_a", l), s.q_lora, s.n_embd,
-                                 RAD_SHARD_NONE, grp, { nm.ckpt("%s.q_a_proj.weight", ap) },
-                                 act(xa), w.qa));
-        qa_gain = decl_f32(b, nm.f("blk.%d.attn_q_a_norm.weight", l),
-                           nm.ckpt("%s.q_a_layernorm.weight", ap), { s.q_lora }, grp);
-        if (!qa_gain) return RAD_E_INVAL;
-        op_qa_norm = decl_rmsnorm(b, T, s.q_lora, s.eps, qa_gain, w.qa, w.qa);
-        HY4_NEED(op_qa_norm, "rmsnorm");
-
         /* q_b's rows are head-major, a head's nope rows then its rope rows: one row map a part,
          * a piece a head, eight pieces a map (successive ROWS maps extend one name). The maps
-         * name every head; a rank reads its heads' rows of the result (RAD_SHARD_ROW). */
+         * name every head; a rank reads its heads' rows of the result (RAD_SHARD_ROW). Mapped
+         * first: the q residual's norm takes its form from them. */
         const char* qsrc = nm.ckpt("%s.q_b_proj.weight", ap);
         auto part = [&](const char* name, int64_t off, int64_t width) -> int {
             for (int64_t h0 = 0; h0 < whole.heads; h0 += 8) {
@@ -177,12 +177,57 @@ struct Attn {
         RAD_ARCH_TRY(part(nm.f("blk.%d.attn_q_nope.weight", l), 0, N));
         RAD_ARCH_TRY(part(nm.f("blk.%d.attn_q_rope.weight", l), N, R));
         q_nope.mapped = q_rope.mapped = true;
+
+        /* The int8 inputs (Lin::feed): q_a, kv_a and the gate read the attention norm's output,
+         * q_nope and q_rope the normed q residual; each group quantises once. Where both q_b
+         * parts are rotated int8 of one form and libr4d serves it, the residual's norm writes
+         * their codes itself (rmsnorm_had_quant_i8g), byte-identical to the norm followed by
+         * had_quant_act_i8g. */
+        const CodeForm fn = code_form(b, nm.f("blk.%d.attn_q_nope.weight", l));
+        qfuse = fused_quant_on() && fn.rot && fn.same(code_form(b, nm.f("blk.%d.attn_q_rope.weight", l))) &&
+                s.q_lora % fn.g8 == 0 && rad_op_declared(b, "rmsnorm_had_quant_i8g");
+        if (qfuse && !wire.qa_raw) {
+            wire.qa_raw = decl_b(b, nm.f("%s.q_a_raw", sliding ? "sliding" : "sparse"), RAD_BF16,
+                                 { T, s.q_lora });
+            if (!wire.qa_raw) return RAD_E_INVAL;
+        }
+        w.qa_raw = qfuse ? wire.qa_raw : 0;
+        qa_out = qfuse ? w.qa_raw : w.qa;
+        q_a.lead = "attn_in";
+        RAD_ARCH_TRY(q_a.declare(b, nm, g, nm.f("blk.%d.attn_q_a", l), s.q_lora, s.n_embd,
+                                 RAD_SHARD_NONE, grp, { nm.ckpt("%s.q_a_proj.weight", ap) },
+                                 act(xa), qa_out));
+        qa_gain = decl_f32(b, nm.f("blk.%d.attn_q_a_norm.weight", l),
+                           nm.ckpt("%s.q_a_layernorm.weight", ap), { s.q_lora }, grp);
+        if (!qa_gain) return RAD_E_INVAL;
+        if (qfuse) {
+            Codes* cs = codes_of(b);
+            const Codes::Pair* pr = cs ? cs->get(s.q_lora, fn.g8, "q_res") : nullptr;
+            if (!pr) return RAD_E_INVAL;
+            qcodes.q8 = pr->q8;
+            qcodes.s8 = pr->s8;
+            qcodes.g8 = fn.g8;
+            qcodes.q8_fed = qcodes.q8_rot = true;
+            op_qa_norm = mk(b, "rmsnorm_had_quant_i8g",
+                            { RAD_RANGE("M", 1, T), RAD_INT("n", s.q_lora), RAD_F64("eps", s.eps),
+                              RAD_INT("group", fn.g8), RAD_STR("dtype", "bf16") },
+                            { qa_gain }, { w.qa_raw }, { qcodes.q8, qcodes.s8, w.qa });
+            /* Unserved after all: the plain norm out of place, and q_nope's own quantiser. */
+            if (!op_qa_norm) qfuse = false;
+        }
+        if (!qfuse) op_qa_norm = decl_rmsnorm(b, T, s.q_lora, s.eps, qa_gain, qa_out, w.qa);
+        HY4_NEED(op_qa_norm, "rmsnorm");
+        if (qfuse) q_nope.fed_codes = q_rope.fed_codes = &qcodes;
+        q_nope.lead = "q_res";
+        q_rope.feed = &q_nope;
         RAD_ARCH_TRY(q_nope.declare(b, nm, g, nm.f("blk.%d.attn_q_nope", l), H * N, s.q_lora,
                                     RAD_SHARD_ROW, grp, { qsrc }, act(w.qa), w.q_nope));
         RAD_ARCH_TRY(q_rope.declare(b, nm, g, nm.f("blk.%d.attn_q_rope", l), H * R, s.q_lora,
                                     RAD_SHARD_ROW, grp, { qsrc }, act(w.qa), w.q_rope));
+        q_nope.fed_codes = q_rope.fed_codes = nullptr;   /* `qcodes` moves with the layer */
 
         /* kv_a's rows are the latent then the shared rotary key (`kv_a_proj_with_mqa`). */
+        kv_a.feed = &q_a;
         RAD_ARCH_TRY(kv_a.declare(b, nm, g, nm.f("blk.%d.attn_kv_a", l), L + R, s.n_embd,
                                   RAD_SHARD_NONE, grp,
                                   { nm.ckpt("%s.kv_a_proj_with_mqa.weight", ap) }, act(xa), w.row));
@@ -261,6 +306,7 @@ struct Attn {
                          RAD_SHARD_ROW);
         if (!kv_b || !sinks) return RAD_E_INVAL;
 
+        gate.feed = &q_a;
         RAD_ARCH_TRY(gate.declare(b, nm, g, nm.f("blk.%d.attn_gate", l), a.v_width(), s.n_embd,
                                   RAD_SHARD_ROW, grp, { nm.ckpt("%s.linear_gate.weight", ap) },
                                   act(xa), w.gate));
@@ -409,8 +455,12 @@ struct Attn {
         };
         const RadOperand pos = praw(batch->positions, RAD_I32, T);
         t_in_norm.step(c, brows(xa, T), T);
-        q_a.step(c, act(xa), w.qa, T);
-        RAD_ISSUE_N(c, op_qa_norm, T, brows(w.qa, T), RAD_W(qa_gain), brows(w.qa, T));
+        q_a.step(c, act(xa), qa_out, T);
+        if (qfuse)
+            RAD_ISSUE_N(c, op_qa_norm, T, brows(qa_out, T), RAD_NONE, RAD_W(qa_gain),
+                        brows(qcodes.q8, T), brows(qcodes.s8, T), brows(w.qa, T));
+        else
+            RAD_ISSUE_N(c, op_qa_norm, T, brows(qa_out, T), RAD_W(qa_gain), brows(w.qa, T));
         t_q_resid.step(c, brows(w.qa, T), T);
         q_nope.step(c, act(w.qa), w.q_nope, T);
         q_rope.step(c, act(w.qa), w.q_rope, T);

@@ -1036,61 +1036,128 @@ TEST(quantised_routed_experts_are_served_clamped) {
     }
 }
 
-/* Trunk linears a recipe made int8 (rotated or not) or the u5 trellis read int8 codes each writes
- * itself from its input's bf16 plane into the rank's one scratch pair; the others stay bf16 GEMMs,
- * and an int8 lm_head is read by logits_gemm at its codes' dtype. */
-TEST(quantised_trunk_linears_quantise_their_own_input) {
-    auto encs = [](RadBuilder* b) {
-        bf16_encs(b);
-        b->encs.insert(b->encs.begin(), { { "attn_output", rad_enc_plain(RAD_BF16) },
-                                          { "attn_q_a.", enc_trellis(RAD_U5, true) },
-                                          { "attn_gate.", enc_i8(true) },
-                                          { "ffn_gate_up_shexp", enc_i8(true) },
-                                          { "ffn_down_shexp", enc_i8(true) },
-                                          { "ffn_gate_up.", enc_i8(true) },
-                                          { "ffn_down.", enc_i8(false) },
-                                          { "ffn_latent_in", enc_i8(true) },
-                                          { "ffn_latent_out", enc_i8(true) },
-                                          { "output.weight", enc_i8(false) } });
+/* Trunk linears a recipe made int8 (rotated or not) or the u5 trellis read int8 codes from their
+ * input's bf16 plane; the others stay bf16 GEMMs, and an int8 lm_head is read by logits_gemm at its
+ * codes' dtype. Linears of one input and one code form share one quantiser (Lin::feed: q_a with
+ * the gate, the latent with the shared expert's gate_up; the u5 trellis and the rotated int8 read
+ * the same had_quant_act_i8g codes), and where the library serves it the shared expert's gate writes
+ * its down projection's codes itself (gated_had_quant_i8g). Without the device rows (a CPU
+ * engine), or with RADIANCE_HY4_SHARE_CODES=0 / RADIANCE_HY4_FUSED_QUANT=0, each quantises its own. */
+void int8_trunk_encs(RadBuilder* b) {
+    bf16_encs(b);
+    b->encs.insert(b->encs.begin(), { { "attn_output", rad_enc_plain(RAD_BF16) },
+                                      { "attn_q_a.", enc_trellis(RAD_U5, true) },
+                                      { "attn_gate.", enc_i8(true) },
+                                      { "ffn_gate_up_shexp", enc_i8(true) },
+                                      { "ffn_down_shexp", enc_i8(true) },
+                                      { "ffn_gate_up.", enc_i8(true) },
+                                      { "ffn_down.", enc_i8(false) },
+                                      { "ffn_latent_in", enc_i8(true) },
+                                      { "ffn_latent_out", enc_i8(true) },
+                                      { "output.weight", enc_i8(false) } });
+}
+/* The same on a CPU engine: no device-only fused rows. */
+void int8_trunk_encs_host(RadBuilder* b) {
+    int8_trunk_encs(b);
+    for (const char* op : { "gated_had_quant_i8g", "rmsnorm_had_quant_i8g", "router_sigmoid_topk_scatter" })
+        b->undeclared.insert(op);
+}
+
+TEST(quantised_trunk_linears_share_one_quantiser_an_input) {
+    struct Run { const char* what; bool host, share, fuse; int had, gated; };
+    /* 15 rotated GEMMs: q_a and gate (3 layers each), the dense gate_up, the shared pair and the
+     * latent pair (2 MoE layers each). Their quantisers: q_a (3, the gate fed), the dense gate_up
+     * (1), the latent (2, the shared gate_up fed), the latent_out (2) and, unless the gate writes
+     * them, the shared down's (2). */
+    const Run runs[] = {
+        { "device", false, true, true, 3 + 1 + 2 + 2, 2 },
+        { "host", true, true, true, 3 + 1 + 2 + 2 + 2, 0 },
+        { "no fusion", false, true, false, 3 + 1 + 2 + 2 + 2, 0 },
+        { "no sharing", false, false, false, 15, 0 },
     };
-    Declared d(encs);
-    REQUIRE_EQ(d.rc, RAD_OK);
-    const RadBuilder& b = d.b;
-    /* A pair a width: the 128-wide inputs and the dense down's 256. */
-    for (const char* n : { "trunk_codes.128.128.q8", "trunk_codes.256.128.q8" }) {
-        const RecBuf* q8 = find_b(b, n);
-        REQUIRE(q8 != nullptr);
-        CHECK_EQ(q8->d.dtype, RAD_I8);
+    for (const Run& r : runs) {
+        fprintf(stderr, "run %s\n", r.what);
+        if (!r.share) setenv("RADIANCE_HY4_SHARE_CODES", "0", 1);
+        if (!r.fuse) setenv("RADIANCE_HY4_FUSED_QUANT", "0", 1);
+        Declared d(r.host ? int8_trunk_encs_host : int8_trunk_encs);
+        unsetenv("RADIANCE_HY4_SHARE_CODES");
+        unsetenv("RADIANCE_HY4_FUSED_QUANT");
+        REQUIRE_EQ(d.rc, RAD_OK);
+        const RadBuilder& b = d.b;
+        /* A pair a width (the 128-wide inputs and the dense down's 256), and a pair of its own for
+         * each shared input and for the gate's codes. */
+        for (const char* n : { "trunk_codes.128.128.q8", "trunk_codes.256.128.q8" }) {
+            const RecBuf* q8 = find_b(b, n);
+            REQUIRE(q8 != nullptr);
+            CHECK_EQ(q8->d.dtype, RAD_I8);
+        }
+        CHECK(find_b(b, "trunk_codes.64.128.q8") == nullptr);
+        CHECK_EQ(find_b(b, "trunk_codes.attn_in.128.128.q8") != nullptr, r.share);
+        CHECK_EQ(find_b(b, "trunk_codes.ffn_in.128.128.q8") != nullptr, r.share);
+        CHECK_EQ(find_b(b, "trunk_codes.gated.128.128.q8") != nullptr, r.gated > 0);
+        int i8h = 0, i8 = 0;
+        for (const auto& o : b.ops)
+            if (o.op == "gemm_nt_q") (pstr(&o, "dtype") == "i8a8h" ? i8h : i8) += 1;
+        CHECK_EQ(i8h, 3 + 3 + 1 + 2 * 2 + 2 * 2);
+        CHECK_EQ(i8, 1);
+        CHECK_EQ(count_op(b, "had_quant_act_i8g"), r.had);
+        CHECK_EQ(count_op(b, "gated_had_quant_i8g"), r.gated);
+        CHECK_EQ(count_op(b, "quant_act_i8g"), 1);
+        /* The routers' selection and sort in one launch where a library serves it (MoeFP8's
+         * router_fuse), the pair beside it for wider passes. */
+        CHECK_EQ(count_op(b, "router_sigmoid_topk_scatter"), r.host ? 0 : 2);
+        CHECK_EQ(count_op(b, "router_sigmoid_topk"), 2);
+        /* Left bf16: q_nope / q_rope, kv_a, attn_output, the indexer. */
+        CHECK(count_op(b, "gemm_nt") > 0);
+        const RecWeight* head = find_w(b, "output.weight");
+        REQUIRE(head != nullptr);
+        CHECK_EQ(head->d.dtype, RAD_I8);
+        every_weight_read(d.b);
+        /* Every fed GEMM's codes are written before it in each step kind. */
+        steps_clean_at(d.b, 0, 1);
     }
-    CHECK(find_b(b, "trunk_codes.64.128.q8") == nullptr);
-    int i8h = 0, i8 = 0;
-    for (const auto& o : b.ops)
-        if (o.op == "gemm_nt_q") (pstr(&o, "dtype") == "i8a8h" ? i8h : i8) += 1;
-    /* q_a and gate (3 layers each), the dense gate_up, the shared pair and the latent pair (2
-     * MoE layers each): rotated; the dense down: plain. */
-    CHECK_EQ(i8h, 3 + 3 + 1 + 2 * 2 + 2 * 2);
-    CHECK_EQ(i8, 1);
-    CHECK_EQ(count_op(b, "had_quant_act_i8g") >= i8h, true);
-    CHECK_EQ(count_op(b, "quant_act_i8g"), 1);
-    /* Left bf16: q_nope / q_rope, kv_a, attn_output, the indexer (their K or rows do not take
-     * int8 at mini's widths, or no recipe touched them). */
-    CHECK(count_op(b, "gemm_nt") > 0);
-    const RecWeight* head = find_w(b, "output.weight");
-    REQUIRE(head != nullptr);
-    CHECK_EQ(head->d.dtype, RAD_I8);
-    every_weight_read(d.b);
-    steps_clean_at(d.b, 0, 1);
+}
+
+/* q_nope and q_rope rotated int8 of one form at a q_lora of whole 128 groups: the q residual's norm
+ * writes their codes in its pass (rmsnorm_had_quant_i8g) from q_a's raw output, so neither has a
+ * quantiser; on a CPU engine q_nope quantises the normed residual once and q_rope reads its codes. */
+void q_b_i8_encs(RadBuilder* b) {
+    bf16_encs(b);
+    b->encs.insert(b->encs.begin(), { { "attn_q_nope", enc_i8(true) }, { "attn_q_rope", enc_i8(true) } });
+}
+void q_b_i8_encs_host(RadBuilder* b) {
+    q_b_i8_encs(b);
+    b->undeclared.insert("rmsnorm_had_quant_i8g");
+}
+TEST(the_q_residuals_norm_writes_q_bs_rotated_codes) {
+    for (int host = 0; host < 2; ++host) {
+        MetaKV mk = mini_meta();
+        mk.set("q_lora_rank", "128");
+        RadBuilder b;
+        (host ? q_b_i8_encs_host : q_b_i8_encs)(&b);
+        RadBuildCtx ctx = build_ctx();
+        REQUIRE_EQ(hyv4flash::declare(&b, mk.meta(), &ctx), RAD_OK);
+        CHECK_EQ(count_op(b, "rmsnorm_had_quant_i8g"), host ? 0 : 3);
+        CHECK_EQ(count_op(b, "had_quant_act_i8g"), host ? 3 : 0);
+        CHECK_EQ(find_b(b, "sparse.q_a_raw") != nullptr, !host);
+        CHECK_EQ(find_b(b, "sliding.q_a_raw") != nullptr, !host);
+        int i8h = 0;
+        for (const auto& o : b.ops) i8h += o.op == "gemm_nt_q" && pstr(&o, "dtype") == "i8a8h";
+        CHECK_EQ(i8h, 6);
+        every_weight_read(b);
+        steps_clean_at(b, 0, 1);
+    }
 }
 
 /* A sizing declare (RadBuildCtx::shape_probe) at a smaller step declares the same ops and buffers,
  * every buffer at most as tall and no other extent changed, and leaves the served model alone:
  * the real declare's steps still issue its own handles. The probe says so (shape_probe_ok). */
 TEST(a_sizing_declare_matches_the_real_one_and_leaves_its_model_alone) {
-    {
-        Declared d;
+    for (int i8 = 0; i8 < 2; ++i8) {
+        Declared d(i8 ? int8_trunk_encs : bf16_encs);
         REQUIRE_EQ(d.rc, RAD_OK);
         RadBuilder pb;
-        bf16_encs(&pb);
+        (i8 ? int8_trunk_encs : bf16_encs)(&pb);
         RadBuildCtx pc = build_ctx();
         pc.max_tok = 64;
         pc.shape_probe = 1;
