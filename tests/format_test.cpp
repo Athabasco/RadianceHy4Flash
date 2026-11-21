@@ -1222,6 +1222,39 @@ TEST(an_in_place_extension_that_fails_leaves_the_container_as_it_was) {
     CHECK(slurp(b.path) == before);
 }
 
+/* ------------------------------------------------------------------ skeleton (rad-convert --skeleton) */
+/* A container whose planes were never written: finish() refuses it, unless the caller asked for a skeleton (allow_unwritten_planes), then the
+ * file is complete in structure at its full length and its data are holes, which a sparse file stores for free. */
+TEST(a_skeleton_leaves_its_planes_as_holes_and_otherwise_an_unwritten_plane_refuses) {
+    auto build = [&](const char* stem, bool holes, bool seal, std::string* path) {
+        *path = radtest::tmp_path(stem);
+        RadWriter w;
+        CHECK_OK(w.begin(path->c_str()));
+        w.set_arch("radtest");
+        w.set_model_name("skeleton-test");
+        const RadWriter::Weight x = mkw("blk.0.attn_qkv.weight", plain_bf16(), 4096, 1024, 0, -1, 0);
+        CHECK(w.add_weight(x) >= 0);          /* reserved, never written: 8 MiB of codes */
+        if (seal) CHECK_OK(w.seal());
+        if (holes) w.allow_unwritten_planes();
+        return w.finish();
+    };
+    std::string p1, p2;
+    CHECK(build("skel-refused", false, true, &p1) < 0);
+    CHECK_OK(build("skel-ok", true, true, &p2));
+    RadFile f;
+    REQUIRE(f.open(p2.c_str()) >= 0);
+    const RadFileEntry* e = f.find("blk.0.attn_qkv.weight");
+    REQUIRE(e != nullptr);
+    struct stat st {};
+    REQUIRE(::stat(p2.c_str(), &st) == 0);
+    CHECK(st.st_size >= (off_t)(4096 * 1024 * 2));       /* the data's length is there ... */
+    CHECK(st.st_blocks * 512 < (off_t)(4096 * 1024));    /* ... and its blocks are not */
+    const RadFilePlane& pl = f.plane(*e, 0);
+    CHECK((int64_t)pl.bytes == 4096 * 1024 * 2);
+    std::string p3;
+    CHECK(build("skel-unsealed", true, false, &p3) < 0);
+}
+
 /* ------------------------------------------------------------------ refusals */
 TEST(truncated_file_is_refused_not_crashed) {
     Built b = write_model("trunc");

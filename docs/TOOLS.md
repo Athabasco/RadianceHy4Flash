@@ -151,6 +151,9 @@ rad-convert [options] <input> -o <model.rad>
       --defer GLOB     leave the matching weights out, for a later --in-place run to add
       --gpus LIST      the cards (HIP device numbers, comma separated) quantisers may run on;
                        large weights then run two at a time. The bytes are the host's
+      --skeleton       write the structure of the container (header, tables, vocab, template) with every
+                       weight's planes left as holes: a sparse file of the real size that declares but holds
+                       no weights, and reads none of the checkpoint's data (declare checks at real geometry)
       --plan-only      declare, plan every weight's encoding, print the plan, and stop
       --report N       the worst N quantisation errors to print (default 20)
   -v, --verbose

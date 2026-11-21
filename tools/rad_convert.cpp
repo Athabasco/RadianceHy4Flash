@@ -406,6 +406,11 @@ void usage() {
         "                       may run on, and large weights then run two at a time. A\n"
         "                       quantiser writes the same bytes on a card as on the host; with\n"
         "                       no quantiser plugin that has a device path, refused\n"
+        "      --skeleton       write the container's structure (header, tables, vocab, chat\n"
+        "                       template) with every weight's planes left as holes: a sparse file\n"
+        "                       of the real size that declares but holds no weights. For checking\n"
+        "                       a real-size model's declare, selection and buffers without its\n"
+        "                       data; the checkpoint's tensor data are never read\n"
         "      --plan-only      declare, plan every weight's encoding, print the plan, and stop\n"
         "                       before writing anything\n"
         "      --report N       the worst N quantisation errors to print (default 20)\n"
@@ -447,7 +452,7 @@ int main(int argc, char** argv) {
     int      max_spec = kMaxSpecDefault;
     bool     max_spec_given = false;
     int      report_n = 20;
-    bool     verbose = false, plan_only = false, list_quant = false;
+    bool     verbose = false, plan_only = false, list_quant = false, skeleton = false;
     std::string reuse_path, changed_path, vision_base;
     std::vector<std::string> reuse_more;   /* --reuse given again: more containers to copy from */
     std::vector<std::string> defer;        /* --defer: globs of the weights this run leaves out */
@@ -507,6 +512,7 @@ int main(int argc, char** argv) {
             vision_base = path;
         }
         else if (a == "--plan-only") plan_only = true;
+        else if (a == "--skeleton")  skeleton = true;
         else if (a == "--report")    report_n = (int)num("--report", 0, INT32_MAX);
         else if (a == "--reuse") {
             const std::string r = next("--reuse");
@@ -606,6 +612,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "rad-convert: --changed says which weights not to copy from the "
                              "container --reuse names, and needs --reuse without --in-place (a "
                              "weight cannot be replaced in place)\n");
+        return 2;
+    }
+    if (skeleton && (in_place || !reuse_path.empty() || plan_only || !lora_paths.empty() || !imat_path.empty())) {
+        std::fprintf(stderr, "rad-convert: --skeleton writes a new container of holes; it takes no "
+                             "--reuse, --in-place, --plan-only, --lora or --imatrix\n");
         return 2;
     }
     if (!lora_paths.empty() && in_place) {
@@ -1491,6 +1502,7 @@ int main(int argc, char** argv) {
 
     /* One weight, start to finish. Its own buffers, so any thread may run it. */
     auto run_job = [&](const Job& j) -> int {
+        if (skeleton) { written += j.bytes; return RAD_OK; }
         Logical& L = *j.L;
         const std::string& name = L.src.name;
         const int64_t idx = j.idx;
@@ -1686,6 +1698,7 @@ int main(int argc, char** argv) {
                               .count(), small.size(), large.size());
 
     const auto tf = std::chrono::steady_clock::now();
+    if (skeleton) w.allow_unwritten_planes();
     if (w.finish() < 0) return 1;
     RAD_INFO("finish   %.0f s", std::chrono::duration<double>(std::chrono::steady_clock::now() - tf)
                                     .count());
