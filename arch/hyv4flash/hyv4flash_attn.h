@@ -94,7 +94,7 @@ struct Attn {
     int64_t bs = 0, window = 0;
     rad_buf xa = 0, ya = 0;
     rad_kvgroup kv = 0;
-    LinearFP8 q_a{}, q_nope{}, q_rope{}, kv_a{}, gate{}, out{};
+    Lin q_a{}, q_nope{}, q_rope{}, kv_a{}, gate{}, out{};
     rad_weight qa_gain = 0, kv_gain = 0, post_gain = 0, kv_b = 0, sinks = 0;
     rad_op op_qa_norm = 0, op_kv_norm = 0, op_q_rope = 0, op_k_rope = 0, op_store = 0;
     rad_op op_absorb = 0, op_paged = 0, op_sel = 0, op_expand = 0;

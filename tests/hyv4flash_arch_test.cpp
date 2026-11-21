@@ -15,7 +15,7 @@ namespace {
 /* The `mini` preset as rad-convert records its config: 3 layers (sparse, sliding, sparse; layer 0
  * dense, 1-2 latent MoE), two streams, an Engram in front of layer 1, dense limit 16. `wide` is
  * `mini4`: 4 sparse and 8 sliding heads and 8 experts, so four ranks hold whole heads. */
-MetaKV mini_meta(bool wide = false) {
+MetaKV mini_meta(bool wide = false, int64_t ff_exp = 128) {
     RadModelMeta m{};
     m.arch_id = "hyv4flash";
     m.name = "test-hy4-mini";
@@ -67,6 +67,7 @@ MetaKV mini_meta(bool wide = false) {
         k.set("num_attention_heads", "4").set("swa_num_attention_heads", "8");
         k.set("n_routed_experts", "8");
     }
+    if (ff_exp != 128) k.set("moe_intermediate_size", std::to_string(ff_exp).c_str());
     return k;
 }
 
@@ -78,17 +79,49 @@ void bf16_encs(RadBuilder* b) {
     b->kv_block_by_consumer = true;
 }
 
+/* The quantised forms of PLAN §4.3 (libquant's encodings, as rad-convert records them). */
+RadEncoding enc_i8(bool rot) {
+    RadEncoding e = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+    if (rot) rad_enc_copy_str(e.transform, "fwht128");
+    return e;
+}
+/* The codebook at E4M3 scales a 64 of K under a fixed f32: w4nl64, w5nl64, w6nl64. */
+RadEncoding enc_nl64(int bits) {
+    RadEncoding e = rad_enc_affine(bits == 4 ? RAD_U4 : bits == 5 ? RAD_U5 : RAD_U6, RAD_F8E4M3,
+                                   1, 64);
+    rad_enc_add_plane(&e, "scale.1", RAD_F32, 0, 0);
+    rad_enc_add_table(&e, "table", RAD_F32, 1, 1 << bits);
+    rad_enc_copy_str(e.transform, "fwht128");
+    return e;
+}
+/* The rotated computed trellis under one f32 scale a row (IQR; tcq_code=mad). */
+RadEncoding enc_trellis(uint32_t codes, bool colf) {
+    RadEncoding e{};
+    rad_enc_clear(&e);
+    rad_enc_copy_str(e.scheme, "trellis");
+    rad_enc_add_plane(&e, "codes", codes, 1, 1);
+    rad_enc_add_plane(&e, "scale", RAD_F32, 1, 0);
+    const int t = rad_enc_add_table(&e, "trellis", RAD_I8, 1 << 16, 1);
+    e.plane[t].block[0] = 128;
+    rad_enc_add_table(&e, "trellis.mad", RAD_U32, 2, 1);
+    if (colf) rad_enc_add_plane(&e, "scale.col", RAD_F32, 0, 128);
+    rad_enc_copy_str(e.transform, "fwht128");
+    return e;
+}
+
 struct Declared {
     MetaKV mk;
     RadBuilder b;
     RadBuildCtx ctx = build_ctx();
     int rc = 0;
     explicit Declared(void (*encs)(RadBuilder*) = bf16_encs, int world = 1, int rank = 0,
-                      bool wide = false)
-        : mk(mini_meta(wide)) {
+                      bool wide = false, int64_t ff_exp = 128)
+        : mk(mini_meta(wide, ff_exp)) {
         encs(&b);
         ctx = build_ctx(rank, world);
-        rc = stderr_of_rc([&] { return hyv4flash::declare(&b, mk.meta(), &ctx); });
+        std::string err;
+        err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
+        if (rc != RAD_OK && std::getenv("HY4_TEST_STDERR")) fputs(err.c_str(), stderr);
     }
 };
 
@@ -289,8 +322,9 @@ TEST(the_debug_taps_are_persistent_buffers_and_lint_clean) {
     }
 }
 
-/* What this build does not serve is refused by name: at declare a quantised kv_b and a recipe over
- * a parameter the model applies in f32; at the step a quantised expert. */
+/* What this build does not serve is refused by name at declare: a quantised kv_b (DECISIONS U2),
+ * a recipe over a parameter the model applies in f32, a quantised token embedding, and a trunk
+ * linear in a form that reads E4M3 codes no producer of this graph writes (MXFP4). */
 TEST(unserved_forms_are_refused_at_declare) {
     auto kvb = [](RadBuilder* b) {
         bf16_encs(b);
@@ -304,23 +338,24 @@ TEST(unserved_forms_are_refused_at_declare) {
         b->encs[0].second = i8;
         b->encs[1].second = i8;
     };
-    {
-        /* Quantised experts declare (rad-convert reads the manifest) and are refused at the step. */
-        Declared q(experts);
-        CHECK_EQ(q.rc, RAD_OK);
-        CHECK(find_w(q.b, "blk.2.ffn_gate_up_exps.3.weight") != nullptr);
-        CHECK(find_w(q.b, "blk.2.glm_router.weight") != nullptr);
-        auto k = kit(q.b, { 1 }, {}, 0);
-        RadCtx c{ .b = &q.b, .batch = &k->b };
-        hyv4flash::step(&c, &k->b);
-        CHECK(c.step_fail.find("quantised") != std::string::npos);
-    }
     auto hc = [](RadBuilder* b) {
         bf16_encs(b);
         b->encs.insert(b->encs.begin(), { "hc_attn.fn", rad_enc_affine(RAD_I8, RAD_BF16, 1, 128) });
     };
     CHECK(Declared(hc).rc < 0);
+    auto tok = [](RadBuilder* b) {
+        bf16_encs(b);
+        b->encs.insert(b->encs.begin(), { "token_embd", enc_i8(false) });
+    };
+    CHECK_EQ(Declared(tok).rc, RAD_E_UNSUPPORTED);
+    auto mx = [](RadBuilder* b) {
+        bf16_encs(b);
+        RadEncoding e = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+        b->encs.insert(b->encs.begin(), { "attn_q_a", e });
+    };
+    CHECK_EQ(Declared(mx).rc, RAD_E_DTYPE);
 }
+
 
 /* ------------------------------------------------------------------ tensor parallelism (PLAN §1.5) */
 namespace {
@@ -522,8 +557,8 @@ TEST(taps_at_more_ranks_are_the_replicated_values) {
 }
 
 /* What does not split is refused by name at declare: a world other than 1, 2 or 4, heads that are
- * not whole a rank (mini's two sparse heads over four), quantised experts at more ranks (not served,
- * WP10), and a library without an exact all-reduce. */
+ * not whole a rank (mini's two sparse heads over four), quantised experts whose width is not whole
+ * 128-column groups a rank (mini's 128 at two), and a library without an exact all-reduce. */
 TEST(tensor_parallel_refusals) {
     CHECK_EQ(Declared(bf16_encs, 3, 0, true).rc, RAD_E_UNSUPPORTED);
     CHECK_EQ(Declared(bf16_encs, 8, 0, true).rc, RAD_E_UNSUPPORTED);
@@ -542,6 +577,190 @@ TEST(tensor_parallel_refusals) {
     };
     CHECK_EQ(Declared(no_ar, 2).rc, RAD_E_UNSUPPORTED);
     CHECK_EQ(Declared(no_ar, 1).rc, RAD_OK);   /* one rank reduces nothing */
+}
+
+/* ------------------------------------------------------------------ quantised formats (PLAN §4.3) */
+namespace {
+
+const RecOp* op_writing(const RadBuilder& b, rad_buf x, const char* name) {
+    for (const auto& o : b.ops)
+        if (o.op == name && in(o.writes, x)) return &o;
+    return nullptr;
+}
+
+/* Every declared weight of the served graph (all but the drafter and the tower, declared and not
+ * served) is a weight operand of some op: no plane is declared and left unread. */
+void every_weight_read(const RadBuilder& b) {
+    std::vector<bool> read(b.weights.size() + 1, false);
+    for (const auto& o : b.ops)
+        for (rad_weight w : o.w)
+            if (w > 0 && (size_t)w <= b.weights.size()) read[(size_t)w] = true;
+    for (size_t i = 0; i < b.weights.size(); ++i) {
+        const std::string& n = b.weights[i].name;
+        if (n.rfind("dfly.", 0) == 0 || n.rfind("v.", 0) == 0) continue;
+        if (!read[i + 1]) fprintf(stderr, "declared and not read: %s\n", n.c_str());
+        CHECK(read[i + 1]);
+    }
+}
+
+/* Layer 1's routed arm in the form `gu` / `dn`: the GEMMs' dtypes, and the clamped product's
+ * chain (swiglu_clamped, then the quantiser the down projection reads). */
+void check_routed(const RadBuilder& b, const char* gu_dt, const char* dn_dt, const char* quant) {
+    int n = 0;
+    for (const auto& o : b.ops)
+        if (o.op == "moe_gemm_q") {
+            CHECK_EQ(pstr(&o, "dtype"), std::string(n % 2 == 0 ? gu_dt : dn_dt));
+            ++n;
+        }
+    CHECK_EQ(n, 4);   /* two MoE layers, gate_up and down */
+    CHECK_EQ(count_op(b, "moe_gemm"), 0);
+    CHECK_EQ(count_op(b, "swiglu_clamped"), 2);
+    const RecOp* cl = find_op(b, "swiglu_clamped");
+    REQUIRE(cl != nullptr);
+    CHECK_EQ(pflt(cl, "limit"), 10.0);
+    REQUIRE_EQ(cl->writes.size(), (size_t)1);
+    const rad_buf prod = cl->writes[0];
+    bool quantised = false;
+    for (const auto& o : b.ops)
+        if (o.op == quant && in(o.reads, prod)) quantised = true;
+    CHECK(quantised);
+}
+
+}  // namespace
+
+/* Every routed-expert form of PLAN §4.3 at K 1536's shape class (here 128), clamped at 10 in every
+ * layer: the codebook forms on the rotated E4M3 arm (clamp, then had_quant_act_fp8 into the down
+ * projection's codes; the latent's rotated copy by had_quant_act_fp8), int8 and the IQR trellis on
+ * the rotated int8 arm (had_quant_act_i8g), and a trellis gate_up with a six-bit codebook down,
+ * whose clamped product is the rotated E4M3 pair beside the int8 gate_up input. Every step kind is
+ * lint clean. */
+TEST(quantised_routed_experts_are_served_clamped) {
+    struct Form {
+        const char* what;
+        void (*encs)(RadBuilder*);
+        const char* gu, *dn, *quant, *hq;
+    };
+    const Form forms[] = {
+        { "w4nl64", [](RadBuilder* b) { bf16_encs(b); b->encs[0].second = b->encs[1].second = enc_nl64(4); },
+          "w4nl64a8h", "w4nl64a8h", "had_quant_act_fp8", "had_quant_act_fp8" },
+        { "w5nl64", [](RadBuilder* b) { bf16_encs(b); b->encs[0].second = b->encs[1].second = enc_nl64(5); },
+          "w5nl64a8h", "w5nl64a8h", "had_quant_act_fp8", "had_quant_act_fp8" },
+        { "w6nl64", [](RadBuilder* b) { bf16_encs(b); b->encs[0].second = b->encs[1].second = enc_nl64(6); },
+          "w6nl64a8h", "w6nl64a8h", "had_quant_act_fp8", "had_quant_act_fp8" },
+        { "i8", [](RadBuilder* b) { bf16_encs(b); b->encs[0].second = b->encs[1].second = enc_i8(true); },
+          "i8a8h", "i8a8h", "had_quant_act_i8g", "had_quant_act_i8g" },
+        { "iqr", [](RadBuilder* b) { bf16_encs(b); b->encs[0].second = b->encs[1].second = enc_trellis(RAD_U4, true); },
+          "i8a8h", "i8a8h", "had_quant_act_i8g", "had_quant_act_i8g" },
+        { "iqr+w6", [](RadBuilder* b) {
+              bf16_encs(b);
+              b->encs[0].second = enc_trellis(RAD_U4, true);
+              b->encs[1].second = enc_nl64(6);
+          }, "i8a8h", "w6nl64a8h", "had_quant_act_fp8", "had_quant_act_i8g" },
+    };
+    for (const Form& f : forms) {
+        fprintf(stderr, "form %s\n", f.what);
+        Declared d(f.encs);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        check_routed(d.b, f.gu, f.dn, f.quant);
+        /* The latent's rotated codes for gate_up, from latent_in's bf16 output. */
+        const rad_buf lat = buf_named(d.b, "moe.latent");
+        bool hq = false;
+        for (const auto& o : d.b.ops)
+            if (o.op == f.hq && in(o.reads, lat)) hq = true;
+        CHECK(hq);
+        every_weight_read(d.b);
+        steps_clean_at(d.b, 0, 1);
+    }
+}
+
+/* Trunk linears a recipe made int8 (rotated or not) or the u5 trellis read int8 codes each writes
+ * itself from its input's bf16 plane into the rank's one scratch pair; the others stay bf16 GEMMs,
+ * and an int8 lm_head is read by logits_gemm at its codes' dtype. */
+TEST(quantised_trunk_linears_quantise_their_own_input) {
+    auto encs = [](RadBuilder* b) {
+        bf16_encs(b);
+        b->encs.insert(b->encs.begin(), { { "attn_output", rad_enc_plain(RAD_BF16) },
+                                          { "attn_q_a.", enc_trellis(RAD_U5, true) },
+                                          { "attn_gate.", enc_i8(true) },
+                                          { "ffn_gate_up_shexp", enc_i8(true) },
+                                          { "ffn_down_shexp", enc_i8(true) },
+                                          { "ffn_gate_up.", enc_i8(true) },
+                                          { "ffn_down.", enc_i8(false) },
+                                          { "ffn_latent_in", enc_i8(true) },
+                                          { "ffn_latent_out", enc_i8(true) },
+                                          { "output.weight", enc_i8(false) } });
+    };
+    Declared d(encs);
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const RadBuilder& b = d.b;
+    /* A pair a width: the 128-wide inputs and the dense down's 256. */
+    for (const char* n : { "trunk_codes.128.128.q8", "trunk_codes.256.128.q8" }) {
+        const RecBuf* q8 = find_b(b, n);
+        REQUIRE(q8 != nullptr);
+        CHECK_EQ(q8->d.dtype, RAD_I8);
+    }
+    CHECK(find_b(b, "trunk_codes.64.128.q8") == nullptr);
+    int i8h = 0, i8 = 0;
+    for (const auto& o : b.ops)
+        if (o.op == "gemm_nt_q") (pstr(&o, "dtype") == "i8a8h" ? i8h : i8) += 1;
+    /* q_a and gate (3 layers each), the dense gate_up, the shared pair and the latent pair (2
+     * MoE layers each): rotated; the dense down: plain. */
+    CHECK_EQ(i8h, 3 + 3 + 1 + 2 * 2 + 2 * 2);
+    CHECK_EQ(i8, 1);
+    CHECK_EQ(count_op(b, "had_quant_act_i8g") >= i8h, true);
+    CHECK_EQ(count_op(b, "quant_act_i8g"), 1);
+    /* Left bf16: q_nope / q_rope, kv_a, attn_output, the indexer (their K or rows do not take
+     * int8 at mini's widths, or no recipe touched them). */
+    CHECK(count_op(b, "gemm_nt") > 0);
+    const RecWeight* head = find_w(b, "output.weight");
+    REQUIRE(head != nullptr);
+    CHECK_EQ(head->d.dtype, RAD_I8);
+    every_weight_read(d.b);
+    steps_clean_at(d.b, 0, 1);
+}
+
+/* Quantised experts at two and four ranks are a slice of every expert's width (PLAN §1.5, 768 /
+ * 384 at the real size; 256 / 128 here at a 512-wide expert): every rank declares all eight
+ * experts, gate_up split by rows in its two parts and down by columns, the routed arm reduced
+ * with the shared expert's; every step kind lint clean on every rank. */
+TEST(quantised_experts_are_sliced_at_more_ranks) {
+    auto nl = [](RadBuilder* b) {
+        bf16_encs(b);
+        b->encs[0].second = b->encs[1].second = enc_nl64(4);
+    };
+    auto i8 = [](RadBuilder* b) {
+        bf16_encs(b);
+        b->encs[0].second = b->encs[1].second = enc_i8(true);
+    };
+    for (auto encs : { +nl, +i8 })
+        for (int world : { 2, 4 })
+            for (int rank = 0; rank < world; ++rank) {
+                Declared d(encs, world, rank, true, 512);
+                REQUIRE_EQ(d.rc, RAD_OK);
+                const RadBuilder& b = d.b;
+                const int64_t F = 512 / world;
+                for (int e = 0; e < 8; ++e) {
+                    char n[64];
+                    std::snprintf(n, sizeof n, "blk.2.ffn_gate_up_exps.%d.weight", e);
+                    const RecWeight* gu = find_w(b, n);
+                    REQUIRE(gu != nullptr);
+                    CHECK_EQ(gu->d.shape[0], 2 * F);
+                    CHECK_EQ(gu->d.shard, (int)RAD_SHARD_ROW);
+                    CHECK_EQ(gu->d.n_row_parts, 2);
+                    std::snprintf(n, sizeof n, "blk.2.ffn_down_exps.%d.weight", e);
+                    const RecWeight* dn = find_w(b, n);
+                    REQUIRE(dn != nullptr);
+                    CHECK_EQ(dn->d.shape[1], F);
+                    CHECK_EQ(dn->d.shard, (int)RAD_SHARD_COL);
+                }
+                for (const auto& o : b.ops)
+                    if (o.op == "moe_gemm_q") CHECK_EQ(pint(&o, "n_expert"), 8);
+                CHECK_EQ(count_op(b, "all_reduce"), 6);
+                every_weight_read(d.b);
+                steps_clean_at(d.b, rank, world);
+            }
+    /* mini's 128-wide expert does not split into whole 128-column groups. */
+    CHECK_EQ(Declared(nl, 2, 0, true).rc, RAD_E_UNSUPPORTED);
 }
 
 RAD_TEST_MAIN()

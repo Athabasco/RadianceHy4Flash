@@ -26,9 +26,13 @@
  *
  * Served: one, two or four ranks (PLAN §1.5: whole heads a rank, the dense and shared widths
  * split, whole experts a rank, the lm_head by vocabulary, two exact all-reduces a layer, the rest
- * replicated; split_ranks, Ffn::place), the text trunk, bf16 weights (the Engram table also as E4M3
- * rows, the bf16 recipe). Refused by name: other worlds, a quantised trunk linear or expert (WP10), a
- * quantised kv_b (DECISIONS U2) or f32 parameter, pictures (WP15). DFly2 and the tower are declared
+ * replicated; split_ranks, Ffn::place), the text trunk, bf16 or quantised (PLAN §4.3): the routed
+ * experts as MoeFP8 reads them (the w4nl64 / w5nl64 / w6nl64 codebooks on the rotated E4M3 arm,
+ * rotated int8 and the IQR trellis on the rotated int8 arm, clamped in every layer; a slice of every
+ * expert a rank at two and four ranks), the trunk linears bf16 or int8 (Lin: rotated or not, IQ8R,
+ * the IQR trellis such as u5), the lm_head bf16 or int8, the Engram table bf16 or E4M3 rows. Refused
+ * by name: other worlds, a trunk linear in another form, a quantised embedding, kv_b (DECISIONS U2),
+ * Engram projection or f32 parameter, pictures (WP15). DFly2 and the tower are declared
  * as the checkpoint holds them and not served (WP13, WP15).
  *
  * The caches (PLAN §1.3): the sliding layers' latent rows in a window group (block 16), the sparse
@@ -88,6 +92,8 @@ struct Model {
     Tap t_embed{}, t_hc_head{}, t_final{};
     bool force_absorbed = false;
     Calib calib{};   /* --calib-dir: the trunk's Hessians (hyv4flash_calib.h) */
+    Codes codes{};   /* the int8 trunk linears' code pair (hyv4flash_common.h, Lin) */
+    int arm = kArmBf16;   /* the routed arms' activation codes (Ffn::arm) */
 };
 static std::unique_ptr<Model> models[MAX_SLOTS];
 
@@ -244,8 +250,8 @@ static int read_shape(Shape& s, const RadModelMeta* m) {
 }
 
 /* ------------------------------------------------------------------ declaring one weight */
-/* The manifest's declarations, for what this build declares and does not serve (DFly2, the tower,
- * quantised routed experts): every weight at the encoding it is stored in, so rad-convert writes the
+/* The manifest's declarations, for what this build declares and does not serve (DFly2, the tower):
+ * every weight at the encoding it is stored in, so rad-convert writes the
  * whole release. The served graph's weights are declared by the blocks that read them. */
 struct Decl {
     RadBuilder* b;
@@ -510,36 +516,6 @@ static rad_kvgroup latent_group(RadBuilder* b, Names& nm, bool sliding, int64_t 
     return rad_decl_kv_group(b, nm.f(sliding ? "kv_latent_sliding" : "kv_latent_sparse"), &d);
 }
 
-/* A layer's routed experts as the manifest declares them, one weight an expert (each its own
- * movement unit of two slots), plane-wise views for a quantised encoding: what rad-convert needs of
- * a layer whose routed arm this build does not serve (Ffn::served). The maps of the experts
- * MoeFP8::probe read are already declared. */
-static int expert_manifest(RadBuilder* b, Model& m, int l, const MoeFP8::Config& pc) {
-    Names& nm = m.nm;
-    const Shape& s = m.s;
-    const char* mp = nm.ckpt("model.layers.%d.mlp", l);
-    const char* gu_src = nm.ckpt("%s.experts.gate_up_proj", mp);
-    const char* dn_src = nm.ckpt("%s.experts.down_proj", mp);
-    Decl d{ b, m, l, RAD_ACCESS_CONDITIONAL };
-    for (int64_t e = 0; e < s.n_expert; ++e) {
-        const char* gu = nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l, (long long)e);
-        const bool probed = pc.probed_layer == l && e >= pc.probed_expert &&
-                            e < pc.probed_expert + pc.probed_count;
-        if (!probed) RAD_ARCH_TRY(map_slice(b, gu, gu_src, (int)e));
-        RAD_ARCH_TRY(map_slice(b, nm.f("blk.%d.ffn_down_exps.%lld.weight", l, (long long)e),
-                               dn_src, (int)e));
-    }
-    for (int64_t e = 0; e < s.n_expert; ++e)
-        RAD_ARCH_TRY(d.put(nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l, (long long)e), RAD_BF16,
-                           { 2 * s.n_ff_exp, s.latent }, grp_expert_slot(l, (int)e, 0)));
-    for (int64_t e = 0; e < s.n_expert; ++e)
-        RAD_ARCH_TRY(d.put(nm.f("blk.%d.ffn_down_exps.%lld.weight", l, (long long)e), RAD_BF16,
-                           { s.latent, s.n_ff_exp }, grp_expert_slot(l, (int)e, 1)));
-    rad_note(b, "hyv4flash: layer %d's routed experts are quantised; declared for conversion, not "
-                "served by this build (WP10)", l);
-    return RAD_OK;
-}
-
 static int buffers(RadBuilder* b, Model& m) {
     auto& s = m.s;
     auto& g = m.g;
@@ -571,7 +547,7 @@ static int buffers(RadBuilder* b, Model& m) {
     if (any_sliding)
         RAD_ARCH_TRY(m.aw_sliding.declare(b, nm, s, s.sliding_r, T, g.max_seqs, "sliding"));
     if (any_sparse) RAD_ARCH_TRY(m.iw.declare(b, nm, s, g));
-    if (any_moe) RAD_ARCH_TRY(m.mw.declare(b, nm, s, g));
+    if (any_moe) RAD_ARCH_TRY(m.mw.declare(b, nm, s, g, m.arm));
     if (any_dense) {
         m.dense_gu = bf("dense_gate_up", { T, 2 * s.n_ff_r });
         m.dense_ff = bf("dense_ff", { T, s.n_ff_r });
@@ -672,8 +648,7 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
     HY4_NEED(lay.op_ffn_norm, "rmsnorm");
     RAD_ARCH_TRY(lay.t_ffn_in.declare(b, nm, T, "ffn_in_norm", l, RAD_BF16, E, m.tr.xn));
     RAD_ARCH_TRY(lay.ffn.declare(b, nm, s, g, l, m.tr.xn, m.tr.y, m.mw, m.dense_gu, m.dense_ff,
-                                 m.dense_out, msrc,
-                                 [&](int layer) { return expert_manifest(b, m, layer, msrc->cfg); }));
+                                 m.dense_out, msrc));
     RAD_ARCH_TRY(lay.hc_ffn.declare_post(b, s, T, m.tr.h, m.tr.post, m.tr.y));
     RAD_ARCH_TRY(lay.t_resid.declare(b, nm, T, "resid", l, RAD_BF16, s.hc * E, m.tr.h));
     RAD_ARCH_TRY(m.calib.layer(b, g, s, l, m.tr.xn, lay.attn, !lay.sliding, lay.ffn,
@@ -740,9 +715,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(read_shape(s, meta));
     RAD_ARCH_TRY(split_ranks(s, ctx->world_size ? ctx->world_size : 1, ctx->rank));
     RAD_ARCH_TRY(geom_from(g, meta, ctx, "bf16", RAD_BF16));
-    /* Every linear of this build reads the bf16 plane (a quantised one is refused by its
-     * LinearFP8): no activation codes are declared. */
+    /* The producers write bf16 planes only: a bf16 trunk linear reads them, an int8 one quantises
+     * its input itself into the rank's code pair (Lin), declared at the first one. */
     g.w_bf16 = true;
+    m.codes.b = b;
+    m.codes.nm = &nm;
+    m.codes.rows = g.max_tok;
+    const CodesScope codes_scope(&m.codes);
     {
         const char* e = std::getenv("RADIANCE_HY4_PREFILL");
         m.force_absorbed = e && !std::strcmp(e, "absorbed");
@@ -755,15 +734,28 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     const char* headn = nm.f("output.weight");
     RAD_ARCH_TRY(map_copy(b, token, "model.embed_tokens.weight"));
     RAD_ARCH_TRY(map_copy_alt(b, headn, "lm_head.weight", "model.embed_tokens.weight"));
-    for (const char* n : { token, headn })
-        if (!is_plain_bf16(b, n))
-            return refuse("a quantised embedding or lm_head is not served yet (WP10)");
+    if (!is_plain_bf16(b, token))
+        return refuse("the token embedding is read by embed_lookup as plain bf16; convert it "
+                      "without a recipe rule");
+    /* The head is bf16 or what a recipe made of it: declared over all its planes at the codes'
+     * dtype, read by the `logits_gemm` whose layout takes that encoding (int8 codes with a bf16
+     * scale per [1 x 128], qwen4exp_fp8's head). */
+    {
+        RadEncoding e{};
+        if (weight_enc(b, headn, &e) && !is_plain_bf16(b, headn) && !linear_is_w8(e)) {
+            char en[256];
+            rad_enc_format(&e, en, sizeof en);
+            fprintf(stderr, "radiance: hyv4flash: the lm_head is %s; it is served bf16 or int8 "
+                            "(i8*bf16[1x128], unrotated)\n", en);
+            return RAD_E_DTYPE;
+        }
+    }
     /* The embedding is replicated (no reduction behind the lookup); the head is split by
      * vocabulary, each rank's logits [rows, n_vocab / world] (Geom::n_vocab, vocab_off). */
     m.token = decl_w(b, token, RAD_BF16, { s.n_vocab, s.n_embd }, RAD_ACCESS_VOCAB, RAD_SHARD_NONE,
                      grp_model());
-    m.head = decl_w(b, headn, RAD_BF16, { g.n_vocab, s.n_embd }, RAD_ACCESS_VOCAB, RAD_SHARD_ROW,
-                    grp_model());
+    m.head = decl_w(b, headn, weight_codes_dtype(b, headn, RAD_BF16), { g.n_vocab, s.n_embd },
+                    RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
     m.final_gain = decl_f32(b, nm.f("output_norm.weight"), "model.norm.weight", { s.n_embd },
                             grp_model());
     if (!m.token || !m.head || !m.final_gain) return RAD_E_INVAL;
@@ -775,18 +767,16 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     for (int l = 0; l < (int)s.n_layer; ++l)
         if (s.is_moe[(size_t)l]) {
             RAD_ARCH_TRY(Ffn::probe(b, nm, s, l, &msrc[(size_t)l]));
-            any_quant = any_quant || !Ffn::served(msrc[(size_t)l]);
+            const int arm = Ffn::arm(msrc[(size_t)l]);
+            any_quant = any_quant || arm != kArmBf16;
+            m.arm = std::max(m.arm, arm);   /* one int8 layer makes the arm int8 */
             calib = calib || msrc[(size_t)l].cfg.calib;
         }
-    /* Quantised experts are declared whole for rad-convert and refused at the step (Ffn::served);
-     * at more ranks that would load every expert on every rank first, so it is refused here. */
-    if (any_quant && s.world > 1)
-        return refuse("quantised routed experts are not served yet (WP10); at more than one rank "
-                      "they would be declared whole on every rank");
+    /* bf16 experts and a calibration run whole a rank, quantised ones a slice of every expert's
+     * width (Ffn::place); the probe read layer l's first expert this rank maps either way. */
     RAD_ARCH_TRY(Ffn::place(s, calib || !any_quant));
     for (int l = 0; l < (int)s.n_layer; ++l)
-        if (s.is_moe[(size_t)l] && Ffn::served(msrc[(size_t)l]))
-            Ffn::apply(s, msrc[(size_t)l].cfg);
+        if (s.is_moe[(size_t)l]) Ffn::apply(s, msrc[(size_t)l].cfg);
 
     RAD_ARCH_TRY(buffers(b, m));
     const int64_t T = g.max_tok, E = s.n_embd;

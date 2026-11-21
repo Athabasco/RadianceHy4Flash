@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -174,6 +175,125 @@ inline rad_op decl_rope_gptj(RadBuilder* b, int64_t rows, int64_t heads, int64_t
                 RAD_STR("mode", "gptj"), RAD_INT("rotary_dim", dim) },
               {}, { x }, { x });
 }
+
+/* ------------------------------------------------------------------ quantised trunk linears
+ * The trunk is bf16 wherever a recipe left it so; a linear a recipe made int8 (`i8*bf16[1x128]`,
+ * rotated `/fwht128` or not, IQ8R) or one of the forms an i8a8h GEMM decodes (the IQR trellis at
+ * u5 and its kin, the rotated four- and five-bit asymmetric ones) reads int8 activation codes,
+ * which it writes itself from its input's bf16 plane (LinearFP8's op_q: quant_act_i8g, or
+ * had_quant_act_i8g for a rotated weight) right in front of its GEMM. No producer of this graph
+ * writes codes, so one scratch pair a width K serves every such linear of the rank: [max_tok, K]
+ * int8 and its f32 scales, declared at the first one of that K (`Codes`, one a builder; a pair is
+ * read at its declared width, so linears of different K cannot share one). Each linear decides
+ * by its own encoding (`Lin`), so a bf16 container declares exactly what it did before and any
+ * mix of bf16 and int8 linears is served. Other quantised forms (block fp8 or MXFP4, which read
+ * E4M3 codes a producer would have to write) are refused by name. */
+struct Codes {
+    RadBuilder* b = nullptr;
+    Names* nm = nullptr;
+    int64_t rows = 0;
+    struct Pair { int64_t k = 0, g8 = 0; rad_buf q8 = 0, s8 = 0; };
+    std::vector<Pair> pairs;
+    int n_linear = 0;              /* int8 linears reading a pair */
+    /* The pair at width `k` and scale group `g8` (128, IQ8R 256), declared on first use. */
+    const Pair* get(int64_t k, int64_t g8) {
+        for (const Pair& p : pairs)
+            if (p.k == k && p.g8 == g8) return &p;
+        Pair p;
+        p.k = k;
+        p.g8 = g8;
+        p.q8 = decl_b(b, nm->f("trunk_codes.%lld.%lld.q8", (long long)k, (long long)g8), RAD_I8,
+                      { rows, k });
+        p.s8 = decl_b(b, nm->f("trunk_codes.%lld.%lld.s8", (long long)k, (long long)g8), RAD_F32,
+                      { rows, (k + g8 - 1) / g8 });
+        if (!p.q8 || !p.s8) return nullptr;
+        pairs.push_back(p);
+        return &pairs.back();
+    }
+};
+inline std::mutex& codes_mu() {
+    static std::mutex m;
+    return m;
+}
+inline std::vector<Codes*>& codes_reg() {
+    static std::vector<Codes*> v;
+    return v;
+}
+/* Registers a rank's pair for the duration of its declare (several ranks declare at once). */
+struct CodesScope {
+    Codes* c;
+    explicit CodesScope(Codes* codes) : c(codes) {
+        std::lock_guard<std::mutex> g(codes_mu());
+        codes_reg().push_back(c);
+    }
+    ~CodesScope() {
+        std::lock_guard<std::mutex> g(codes_mu());
+        auto& v = codes_reg();
+        for (size_t i = 0; i < v.size(); ++i)
+            if (v[i] == c) { v.erase(v.begin() + (long)i); break; }
+    }
+};
+inline Codes* codes_of(RadBuilder* b) {
+    std::lock_guard<std::mutex> g(codes_mu());
+    for (Codes* c : codes_reg())
+        if (c->b == b) return c;
+    return nullptr;
+}
+
+/* A trunk linear: LinearFP8 at the encoding its weight is stored in (a plain bf16 GEMM, or the
+ * int8 forms above over the rank's scratch pair), with LinearFP8's declare and step. */
+struct Lin : LinearFP8 {
+    rad_buf q8 = 0, s8 = 0;
+    int64_t g8 = RAD_FP8_BLOCK;
+    ActFP8 with_codes(const ActFP8& a) const {
+        ActFP8 r = a;
+        if (q8 && !r.q8) {
+            r.q8 = q8;
+            r.s8 = s8;
+            r.g8 = g8;
+        }
+        return r;
+    }
+    int declare(RadBuilder* b, Names& nm, const Geom& g, const char* base, int64_t n_out,
+                int64_t n_in, int shard, RadWeightGroup grp,
+                std::initializer_list<const char*> src, const ActFP8& a, rad_buf y,
+                int64_t max_rows = 0, std::initializer_list<int64_t> row_parts = {},
+                int64_t span_lo = 0, int64_t span_hi = 0) {
+        const char* wn = nm.f("%s.weight", base);
+        if (!mapped) RAD_ARCH_TRY(map_linear(b, wn, src));   /* a row map is the caller's */
+        mapped = true;
+        RadEncoding e{};
+        const bool known = weight_enc(b, wn, &e);
+        const bool plain = !known || (rad_enc_is(&e, "plain") && e.n_planes == 1 &&
+                                      e.plane[0].dtype == RAD_BF16);
+        Geom gl = g;
+        gl.w_bf16 = plain;
+        if (!plain) {
+            if (!linear_is_w8(e) && !linear_is_w8h(e) && !linear_is_wnh(e)) {
+                char en[256];
+                rad_enc_format(&e, en, sizeof en);
+                fprintf(stderr, "radiance: hyv4flash: '%s' is %s; a trunk linear is served bf16, "
+                                "int8 (i8*bf16[1x128], optionally /fwht128, or IQ8R) or in a form "
+                                "the rotated int8 GEMM decodes (the IQR trellis, rotated u4/u5 "
+                                "with a zero point)\n", wn, en);
+                return RAD_E_DTYPE;
+            }
+            Codes* c = codes_of(b);
+            const Codes::Pair* pr = c ? c->get(n_in, linear_w8h_group(e)) : nullptr;
+            if (!pr) return RAD_E_INVAL;
+            q8 = pr->q8;
+            s8 = pr->s8;
+            g8 = pr->g8;
+            ++c->n_linear;
+        }
+        return LinearFP8::declare(b, nm, gl, base, n_out, n_in, shard, grp, src, with_codes(a), y,
+                                  max_rows, row_parts, span_lo, span_hi);
+    }
+    void step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0 = 0, int64_t rows = 0,
+              int64_t y0 = -1) const {
+        LinearFP8::step(c, with_codes(a), y, T, r0, rows, y0);
+    }
+};
 
 /* ------------------------------------------------------------------ debug taps
  * RADIANCE_HY4_TAPS=1 (the harness, ref/README.md "Tap contract"): a PERSIST buffer

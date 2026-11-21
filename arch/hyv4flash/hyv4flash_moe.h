@@ -16,8 +16,6 @@
 
 #include <arch/rad_block_moe_fp8.h>
 
-#include <functional>
-
 #include "hyv4flash_common.h"
 
 namespace hyv4flash {
@@ -26,7 +24,7 @@ namespace hyv4flash {
  * share of the width: gate_up's rows of each half (RAD_SHARD_ROW over two row parts), down's
  * columns (RAD_SHARD_COL); its output is the rank's partial sum. */
 struct GatedMlp {
-    LinearFP8 gate_up{}, down{};
+    Lin gate_up{}, down{};
     GateQuantFP8 act{};
     rad_buf gu = 0;
     ActFP8 ff{};
@@ -56,6 +54,9 @@ struct GatedMlp {
     }
 };
 
+/* The routed arm's activation codes (MoeWire::declare). */
+enum { kArmBf16 = 0, kArmE4M3 = 1, kArmI8 = 2 };
+
 /* The routed arm's planes and the shared arm's, shared by every MoE layer. */
 struct MoeWire {
     ActFP8 lat{};          /* [T, latent] latent_in's output, then the routed sum */
@@ -64,7 +65,13 @@ struct MoeWire {
     rad_buf sff = 0;       /* [T, ff_shared] */
     rad_buf sout = 0;      /* [T, n] */
     MoeFP8::Wire moe{};
-    int declare(RadBuilder* b, Names& nm, const Shape& s, const Geom& g) {
+    /* The routed arm's activation codes, by the experts' format (Ffn::arm): none for bf16
+     * experts; for the codebook forms (w4nl64a8h, w5nl64a8h, w6nl64a8h) the rotated E4M3 pairs of
+     * the latent (`hr`, had_quant_act_fp8) and of the clamped product (`eff`); for int8 and IQR
+     * experts their rotated int8 pairs (had_quant_act_i8g), with the product's E4M3 pair beside
+     * it for a codebook down projection behind a trellis gate_up. The latent's own E4M3 pair is
+     * declared for MoeFP8's prepared-input check and read by nothing: the routed GEMMs read `hr`. */
+    int declare(RadBuilder* b, Names& nm, const Shape& s, const Geom& g, int arm) {
         /* The rank's experts and width (whole experts: n_expert_r of the full width; sliced: all
          * of them, n_ff_exp_r wide); the router scores all of them. */
         const int64_t T = g.max_tok, k = s.top_k, F = s.n_ff_exp_r, L = s.latent;
@@ -86,6 +93,16 @@ struct MoeWire {
         w.egu = bf("moe.expert_gate_up", { T * k, 2 * F });
         w.eff.x = bf("moe.expert_ff", { T * k, F });
         w.edn = bf("moe.expert_down", { T * k, L });
+        if (arm != kArmBf16) {
+            Geom gq = g;
+            gq.w_bf16 = false;
+            const bool i8 = arm == kArmI8;
+            RAD_ARCH_TRY(lat.declare_qs(b, nm, gq, nm.f("moe.latent"), L));
+            RAD_ARCH_TRY(w.hr.declare_qs(b, nm, gq, nm.f("moe.latent_rot"), L, 0, i8, !i8));
+            w.hr.q8_fed = w.hr.q8_rot = i8;
+            RAD_ARCH_TRY(w.eff.declare_qs(b, nm, gq, nm.f("moe.expert_ff"), F, T * k, i8, true));
+            w.eff.q8_fed = w.eff.q8_rot = i8;
+        }
         return lat.x && routed && sgu && sff && sout && w.logits && w.ids && w.ew && w.eoff &&
                        w.ecnt && w.sorted && w.egu && w.eff.x && w.edn
                    ? RAD_OK
@@ -104,18 +121,17 @@ struct Ffn {
     rad_buf mo = 0;
     /* MoE */
     MoeWire w{};
-    LinearFP8 lat_in{}, lat_out{};
+    Lin lat_in{}, lat_out{};
     MoeFP8 moe{};
     GatedMlp shared{};
     rad_op op_join = 0, op_ar = 0;
-    bool routed_served = true;
     rad_weight post_gain = 0;
     rad_op op_post_norm = 0;
     Tap t_logits{}, t_ids{}, t_w{}, t_routed_in{}, t_experts_out{}, t_routed_out{}, t_shared{},
         t_out{};
 
-    /* The routed arm's format, read from layer l's first expert before any buffer is declared.
-     * WP3 serves plain bf16 experts; a quantised one needs the latent's code pair (WP10). */
+    /* The routed arm's format, read from layer l's first expert this rank maps before any buffer
+     * is declared (Ffn::arm then picks the codes the arm reads). */
     static int probe(RadBuilder* b, Names& nm, const Shape& s, int l, MoeFP8::Src* src) {
         const char* mp = nm.ckpt("model.layers.%d.mlp", l);
         MoeFP8::Config& c = src->cfg;
@@ -184,17 +200,17 @@ struct Ffn {
         c.n_ff_exp = s.n_ff_exp_r;
     }
 
-    /* Whether this build serves a layer's routed arm: plain bf16 experts. A quantised one (the
-     * w4nl64 recipe's) needs the latent's code pair and, clamped, a quantiser behind the clamp that
-     * the rotated forms lack (PLAN §4.3, WP10): the layer is then declared for rad-convert (the
-     * experts as the manifest's plane views, the caller's `experts`) and its step is refused by
-     * name. */
-    static bool served(const MoeFP8::Src& src) { return src.cfg.expert_bf16 != 0; }
+    /* The codes a layer's routed arm reads (MoeFP8::probe's format): int8 and IQR experts read
+     * rotated int8, the codebook forms rotated E4M3. */
+    static int arm(const MoeFP8::Src& src) {
+        const MoeFP8::Config& c = src.cfg;
+        if (c.expert_bf16) return kArmBf16;
+        return c.expert_i8 || c.expert_iqr ? kArmI8 : kArmE4M3;
+    }
 
     int declare(RadBuilder* b, Names& nm, const Shape& s, const Geom& geom, int l, rad_buf x,
                 rad_buf y, const MoeWire& wire, rad_buf dense_gu, rad_buf dense_ff,
-                rad_buf dense_out, MoeFP8::Src* src,
-                const std::function<int(int)>& experts) {
+                rad_buf dense_out, MoeFP8::Src* src) {
         g = geom;
         layer = l;
         n_embd = s.n_embd;
@@ -234,21 +250,9 @@ struct Ffn {
             MoeFP8::Wire mw = w.moe;
             mw.h = w.lat;
             mw.route = xf;
-            routed_served = served(*src);
-            if (routed_served) {
-                RAD_ARCH_TRY(moe.declare(b, nm, ge, l, mw, *src, false, false));
-            } else {
-                /* The router under GlmRouter's names, as MoeFP8 declares it, and the experts as
-                 * the manifest holds them. */
-                const char* rn = nm.f("blk.%d.glm_router.weight", l);
-                const char* cn = nm.f("blk.%d.glm_router.correction", l);
-                RAD_ARCH_TRY(map_copy(b, rn, src->router));
-                if (!decl_w(b, rn, RAD_F32, { s.n_expert, s.n_embd }, RAD_ACCESS_PER_TOKEN,
-                            RAD_SHARD_NONE, grp) ||
-                    !decl_f32(b, cn, src->router_bias, { s.n_expert }, grp))
-                    return RAD_E_INVAL;
-                RAD_ARCH_TRY(experts(l));
-            }
+            /* Quantised experts read their codes (MoeWire); bf16 ones the bf16 plane. */
+            ge.w_bf16 = src->cfg.expert_bf16 != 0;
+            RAD_ARCH_TRY(moe.declare(b, nm, ge, l, mw, *src, false, false));
             RAD_ARCH_TRY(lat_out.declare(b, nm, g, nm.f("blk.%d.ffn_latent_out", l), s.n_embd,
                                          s.latent, RAD_SHARD_NONE, grp,
                                          { nm.ckpt("%s.routed_expert_up_proj.weight", mp) }, w.lat,
@@ -306,11 +310,6 @@ struct Ffn {
             a.x = v;
             return a;
         };
-        if (moe_layer && !routed_served) {
-            rad_step_fail(c, "hyv4flash: this container's routed experts are quantised; this build "
-                             "serves plain bf16 experts (the quantised expert forms are WP10)");
-            return false;
-        }
         rad_buf sum = mo;
         if (!moe_layer) {
             mlp.step(c, xf, mo, T);

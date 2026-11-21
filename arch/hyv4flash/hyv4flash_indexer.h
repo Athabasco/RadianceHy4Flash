@@ -81,7 +81,7 @@ struct Indexer {
     int layer = 0;
     rad_buf xa = 0, qa = 0;
     rad_kvgroup index = 0, tail = 0, attn = 0;
-    LinearFP8 key{}, query_nope{}, query_rope{}, head{};
+    Lin key{}, query_nope{}, query_rope{}, head{};
     rad_weight key_gain = 0, wv = 0, wg = 0, ape = 0, pool_gain = 0;
     rad_op op_key_norm = 0, op_work = 0, op_pool = 0, op_tail = 0;
     rad_op op_q_rope = 0, op_qn_copy = 0, op_qr_copy = 0, op_score = 0, op_select = 0;
