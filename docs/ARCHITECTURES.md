@@ -14,7 +14,7 @@ plugin claims.
 | `arch/hyv3_bf16` | `hyv3` | *(empty)* | Tencent Hy-Memory-30B-A3B BF16 safetensors; BF16, W4 or W8A8 weights by recipe; TP1/2, BF16 KV |
 | `arch/hyv3_fp8` | `hyv3` | `fp8` | Tencent Hy-Memory-30B-A3B-FP8's descriptor: the same graph, one dense layer then sigmoid-routed MoE; its per-tensor E4M3 linears are a form this build does not serve; TP1/2, bf16 or int8 KV |
 | `arch/hyv3_gguf` | `hyv3` | `gguf_ftype_15` | llama.cpp Hy-Memory Q4_K_M GGUF, dequantized and recipe-converted to native Radiance weights; TP1/2 |
-| `arch/hyv4flash` | `hyv4flash` | *(empty)* | Tencent Hy4-flash from its bf16 checkpoint: the text trunk at one, two or four ranks (TP1/2/4, whole heads a rank, whole experts a rank) on bf16 weights (the Engram table also as the bf16 recipe's E4M3 rows), the weight manifest and the checkpoint name map, so `rad-convert` quantises the release by a recipe (`data/recipes/hy4-flash-bf16.recipe`, `hy4-flash-w4nl64-rtn.recipe`, `hy4-flash-w4nl64-gptq.recipe`); pictures and video through its tower (`arch/hyv4flash/hyv4flash_vision.h`, 3-D M-RoPE); quantised experts and trunk linears, DFly2 is not served yet ([the graph](#hyv4flash-tencent-hy4-flash)) |
+| `arch/hyv4flash` | `hyv4flash` | *(empty)* | Tencent Hy4-flash from its bf16 checkpoint: the text trunk at one, two or four ranks (TP1/2/4, whole heads a rank, whole experts a rank) on bf16 weights (the Engram table also as the bf16 recipe's E4M3 rows), the weight manifest and the checkpoint name map, so `rad-convert` quantises the release by a recipe (`data/recipes/hy4-flash-bf16.recipe`, `hy4-flash-w4nl64-rtn.recipe`, `hy4-flash-w4nl64-gptq.recipe`); pictures and video through its tower (`arch/hyv4flash/hyv4flash_vision.h`, 3-D M-RoPE); quantised experts and trunk linears; DFly2, the release's block drafter, served at 1 to 5 proposals at TP1/2/4 with bf16 or int8 draft linears (`--num-speculative-tokens`, [DFly2](#dfly2-the-hy4-flash-drafter)) ([the graph](#hyv4flash-tencent-hy4-flash)) |
 | `arch/flint` | `flint` | *(empty)* | Recursive Flint (39.8B-A2.5B): 2 dense layers then 47 sigmoid-routed MoE layers (256 experts top-6, ungated 1024-wide shared expert), GQA 32/4 at head_dim 128 with QK RMSNorm, a learned per-head sink on every layer, RoPE on the 35 sliding layers (window 513) and NoPE on the 14 full layers; two KV groups (full and window), TP1/2 (expert parallel); BF16 or int8 KV. Weights by recipe: an IQ8R trunk with rotated int8 experts (`data/recipes/flint-iq8r.recipe`), or u4 attention, int4 experts and plain int8 dense/shared/head (`data/recipes/flint-bf16-q4.recipe`); `docs/FLINT.md` |
 | `arch/qwen35_w8a8` | `qwen35` | `w8a8_fwht128` | `qwen35_fp8` with an int8 trunk: i8 weights with a bf16 scale per 128 of K, rotated by a 128-wide Hadamard, against int8 activations under the same rotation: IQ8R and IQR-V4 (`data/recipes/q38-27b-iq8r.recipe`, `q38-27b-iq4r-s-v4.recipe`) |
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
@@ -3273,7 +3273,7 @@ geometry  a point's [x | sin | cos] at 8 octaves (51 values, f32, point_fourier)
 `model_type: hy_v4_flash`, `HYV4FlashForConditionalGeneration` (HF `tencent/Hy4-flash`, 220B
 parameters in 148 bf16 shards, 440 GB). `arch/hyv4flash` declares the release's weights, maps
 them to its checkpoint tensors and serves the text trunk at one, two or four ranks on bf16 weights
-(below, "The graph" and "Tensor parallelism"). The reference is transformers' `modeling_hy_v4_flash.py` (pull request 50903 at c2ec8505;
+(below, "The graph" and "Tensor parallelism") and its DFly2 drafter ("DFly2, the Hy4-flash drafter"). The reference is transformers' `modeling_hy_v4_flash.py` (pull request 50903 at c2ec8505;
 the 5.23.0 release has `hy_v4` only), which does not load the drafter.
 
 ```
@@ -3503,8 +3503,9 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   shared widths or the vocabulary do not divide; at declare a quantised kv_b (DECISIONS U2),
   embedding, Engram projection or f32 parameter, a trunk linear in a form that reads E4M3 codes
   (block fp8, MXFP4: no producer of this graph writes them), quantised experts whose width does not
-  split into whole 128-column groups a rank; a library without an exact all-reduce at more ranks;
-  the drafter.
+  split into whole 128-column groups a rank; a library without an exact all-reduce at more ranks.
+  The drafter is declined, not refused, in the cases of [DFly2](#dfly2-the-hy4-flash-drafter): the
+  container still loads and speculation falls back to prompt lookup.
 
 ### Tensor parallelism
 
@@ -3576,6 +3577,97 @@ the taps, the refusals; at two and four ranks every weight covered exactly once,
 experts and vocabulary, two exact reductions a layer, every step kind lint clean on every rank)
 and, against transformers, the harness of the plugin's work directory (`ref/run_rad.py --preset
 mini`, `--tp 2` on fake host ranks; `--preset mini4`, twice mini's heads and experts, at `--tp 4`).
+
+## DFly2, the Hy4-flash drafter
+
+The release's `dfly_layers` (`dfly_num_hidden_layers` 5 in the release) are served as a block
+drafter (`RAD_DRAFT_BLOCK` "dfly2", `arch/hyv4flash/hyv4flash_dfly.h`; the design is
+`kernels/dfly2.md`): one query pass proposes up to five tokens after each committed token, the engine
+verifies them with the trunk in one step of `1 + depth` rows, and the output is the trunk's own
+(greedy proposals; exact at every temperature under the engine's verify). The draft has no cache
+of its own: its layers read the trunk's sparse latent cache (layer `Lkv` of each draft layer) under
+the selection the trunk's indexer made at layer `Lidx` (snapshotted, `dfly_sel` turns it into a
+table), and write their own rows into that cache past the committed end, where the next trunk step
+rewrites them before reading (the rollback gate, below, checks exactly that).
+
+**Enabling it.** Speculation is off unless stated: `probe()` states no draft depth, so
+`--num-speculative-tokens auto` keeps it off and `--num-speculative-tokens N` (1 to 5) turns the
+drafter on at N proposals (a block of N + 1 rows a sequence). Depth 5 is what the drafter was trained
+at; 1 to 4 propose a prefix of the same chain. The container carries the drafter unless
+`rad-convert --max-spec 0` left it out. At startup the log says `DFly2 served (depth N, block N+1, ...
+greedy proposals, bf16 linears | k of its linears int8)` or `DFly2 is declared and not served: <why>`.
+Auto depth stays off until a real-weight acceptance has been measured (below, "Costs").
+
+**What it declines** (the container loads, the reason is printed once, speculation falls back to
+prompt lookup): `RADIANCE_HY4_DFLY=0` (on purpose; `--spec-ngram` needs it, a declared drafter
+refuses `--spec-ngram` otherwise); a depth above 5; a mask token id outside the vocabulary; a
+`dfly_context_local_window` above 0; a Lkv / Lidx that is not a sparse layer above 0, a Lkv named
+twice, or a `dfly_target_index_topk` other than group_topk x ratio; a library without `dfly_sel`
+(libref, libavx and libr4d have it); at more ranks, draft heads or MLP width that do not split, or no
+`all_gather` / `row_topk_merge`; a `dfly.*` weight stored in a form the plugin cannot read (next
+paragraph).
+
+**Weights.** The draft's linears (`attn_q_a`, `attn_q_b`, `attn_kv_a`, `attn_gate`, `attn_output`,
+`ffn_gate_up`, `ffn_down`, and the fusion's `eh_proj` and the correction's gate, up and down) are read
+as stored, as the trunk's are (`Lin`): bf16 as one `gemm_nt`; rotated int8 (`i8*bf16[1x128]/fwht128`),
+plain int8 or IQ8R (`i8*u8[1x256]*bf16[1x*]/fwht128`) as an int8 GEMM over the input quantised into a
+code pair (`had_quant_act_i8g` then `gemm_nt_q` at i8a8h; the chain's pairs are private and
+persistent, because the chain issues one op several times). Any mix is served. The plugin does not
+choose the format: the recipe does (`data/recipes/hy4-flash-dfly-i8.recipe`, `hy4-flash-dfly-iq8r.recipe`
+are the two this tree tests; the friend's container ships it IQ8R). What stays bf16 or f32 by
+construction: `attn_kv_b` (read by `mla_project_kv`; a quantised one declines the drafter, as the
+trunk's), the token embedding, the norms and gates, the sinks, the confidence head (declared, not
+read). The int8 forms need `K` in whole 128 (256 for IQ8R) groups a rank and rows in 16s; a recipe line
+for a weight that does not fit fails the container load, as the trunk's does (the real sizes fit at
+TP1, 2 and 4; `kv_a` has 576 rows and is no whole 128-row tile of libr4d's int8 prefill tile, so a
+draft pass of more than 64 rows, that is more than ten sequences at depth 5, would run its int8 `kv_a`
+on the host: the recipes leave it bf16). The trellis and zero-point forms the trunk reads are not read
+by the draft (declined by name).
+
+**Tensor parallelism** (1, 2 or 4 ranks): whole heads a rank in `q_b`, `kv_b`, the gate and the sinks
+(rows) and in `attn_output` (columns); the MLP's width evenly (`ffn_gate_up`'s rows of each half,
+`ffn_down`'s columns); two exact all-reduces a layer (after the output projection, after the MLP);
+`q_a`, `kv_a`, the norms, the fusion, the correction and the embedding replicated, as is the latent
+cache. A quantised linear is sliced the same way (its codes and scales), by the same shard spans as
+the trunk's. The chain's logits are the trunk head's vocabulary shard: `row_topk` (global ids,
+a pair plane), `all_gather`, `row_topk_merge`, so every rank proposes the same tokens (ties to the lower
+id in both stages). Taps at TP are rank 0's.
+
+**With the other speculation levers** (GUIDE.md, "SuffixDecoding", "Adaptive window"):
+`--draft-window adaptive` is the core's and applies to any block drafter; `--draft-suffix on` runs
+beside DFly2 (a suffix chain is cut to `num-speculative-tokens`, with a warning: the probe states the
+depth fixed when the container has the drafter); `--draft-depth adaptive` and `--draft-depth-load on`
+are refused ("--draft-coupling on, but the architecture declared no coupled MTP planes"): DFly2 is
+uncoupled (the coupled walk, WP13.8, is not built). `--spec-ngram` is refused beside a declared
+drafter (`RADIANCE_HY4_DFLY=0` gives prompt lookup alone).
+
+**Losslessness** is the gate, since a draft can never change the text: (1) `hyv4flash_arch_test`
+(the declared graph at one, two and four ranks, lint clean on every step kind, the query pass touching
+no trunk state, the refusals above, quantised linears at TP1 and TP2); (2) greedy ids and logprobs
+byte-equal drafter off against on at depths 5, 3 and 1 and with every proposal sabotaged
+(`RADIANCE_HY4_DFLY_SABOTAGE=1`: proposals = the mask id, so nearly every draft is rejected): on
+`mini4-dfly` at TP1 and TP2 fake ranks on the host, on `gpu-mini` at TP1 and TP2 on the cards, one and
+several streams (the multi-stream caveat is the trunk's batch-dependent GEMMs, notes/wp13-7); (3)
+`tools/hy4flash_rollback_gate.py --gpu` modes `dfly` and `dfly-sabotage` (rejections at every group
+boundary and past 2048); (4) parity of every draft tensor against `ref/dfly_ref.py` (the vLLM port)
+conditioned on radiance's own trunk taps; (5) the kbench rows (`data/kernels_hy4.rkb`: `dfly_sel`,
+`row_topk`, `mla_attn_sel_sink` at 514 blocks).
+
+**Costs** (gpu-mini, one request, decode ms a token, bf16 linears; the real-size ratio is not
+measured): a plain step 1.10 ms (TP1) / 0.89 ms (TP2); a depth-5 step with every draft rejected 1.68 /
+1.47 ms; the draft pass is 0.36 to 0.42 ms at TP1 (33 to 37 % of a plain step), 0.40 to 0.47 ms at TP2
+(45 to 50 %), 129 / 141 dispatches, launch-bound (33 % idle); the five extra verify rows 0.21 to
+0.32 ms. At depth 5 a step must therefore gain 0.52 to 0.72 tokens (about 1.6 to 1.7 tokens a step) to
+break even, at depth 1 more than 27 to 31 % acceptance at position 1. The distilled dummy drafter
+accepts about 1 %, so it only shows the cost; the acceptance that decides is the real weights' (the
+friend's container measured 54 % when rewriting code and 93 % when copying). Int8 draft linears (WP13.9, the same harness, p511, 128 tokens, median of three; the draft pass is a
+depth-5 step with every draft rejected minus the six-row verify step): TP1 bf16 0.39 ms, rotated int8 0.45
+ms, IQ8R 0.37 ms; TP2 bf16 0.29 ms, int8 0.36 ms, IQ8R 0.28 ms. At gpu-mini's sizes (hidden 512, MLP 192) the
+pass is launch-bound and its weights are small, so int8 buys nothing and costs a quantiser launch before each
+GEMM (23 more launches); what it is for is the real size, where the draft's linears are about a billion
+weights a pass (five layers of 150 M, the fusion, five corrections of 47 M: about 2 GB in bf16, half of it
+in int8; the friend measured them as 11 % of a decode step). That gain is arithmetic, not measured here:
+dummy weights cannot show it.
 
 ## Converting
 
@@ -3753,9 +3845,10 @@ encoding it is stored in; nothing is chosen by a flag.
 | | rotated int8 (`i8*bf16[1x128]/fwht128`), the IQR trellis (`trellis:...scale=f32[1x*],scale.col`), `w4nl64` beside them | `MoeFP8` on the rotated int8 arm: `had_quant_act_i8g` for both inputs; a `w5nl64` / `w6nl64` down behind a trellis gate_up reads the clamped product's rotated E4M3 pair |
 | | bf16 | `moe_gemm`, whole experts a rank |
 | trunk linears (`attn_q_a`, `attn_q_nope`, `attn_q_rope`, `attn_kv_a`, `attn_gate`, `attn_output`, layer 0's `ffn_gate_up` / `ffn_down`, the shared expert, `ffn_latent_in` / `ffn_latent_out`, the indexer's) | bf16; int8 rotated or not, IQ8R; the forms the i8a8h GEMM decodes (the IQR trellis such as u5, rotated u4 / u5 with a zero point) | `Lin` (`hyv4flash_common.h`): `LinearFP8` at the weight's own encoding; an int8 one quantises its input from the bf16 plane (`had_quant_act_i8g` / `quant_act_i8g`) into the rank's code pair of that width, right before its GEMM |
+| DFly2's linears (`dfly.blk.<i>.attn_q_a`, `attn_q_b`, `attn_kv_a`, `attn_gate`, `attn_output`, `ffn_gate_up`, `ffn_down`; `dfly.fusion`, `dfly.correct_gate` / `_up` / `_down`) | bf16; int8 rotated or not, IQ8R (the trellis and zero-point forms are not read here) | `Lin`, as the trunk's, with the chain's code pairs private; sliced at TP (WP13.9) |
 | `output.weight` | bf16, int8 (unrotated) | `logits_gemm` at the codes' dtype |
 | Engram table | bf16 (the E4M3 round trip at run time, `quant_act_fp8` multiplying by 1/scale), E4M3 rows at a bf16 or f32 scale a row | `embed_lookup_q` |
-| kv_b, router, iHC, sinks, norms, pooling, Engram projections, `token_embd` | as shipped | refused by name when a recipe touched them |
+| kv_b, router, iHC, sinks, norms, pooling, Engram projections, `token_embd` (the draft's `kv_b` and embedding too) | as shipped | refused by name when a recipe touched them (a draft one declines the drafter) |
 
 The clamp: every layer clamps the routed SwiGLU (gate <= 10, |up| <= 10). The clamped product is
 written in bf16 and quantised after it (clamp, then quantise), at one launch more than the unclamped

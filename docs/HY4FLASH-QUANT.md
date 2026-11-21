@@ -18,7 +18,7 @@ Convert once with the current tree; a container made earlier does not load. The 
 | (unchanged) | `attn_kv_b` | stays bf16 plain: the plugin projects through it as stored, a recipe naming it is refused by name |
 
 Recipe patterns must use the new names: `blk.*.attn_q_nope.weight`, not `attn_q_b`. The routed experts,
-Engram tables, DFly2 and the tower keep their names. Router, iHC, sinks, indexer pooling and the
+Engram tables, DFly2 (`dfly.*`) and the tower keep their names. Router, iHC, sinks, indexer pooling and the
 position parameters are not quantisable (a recipe naming one is refused at declare).
 
 ## What changed since "ready" (6dcaa5c8)
@@ -43,6 +43,17 @@ position parameters are not quantisable (a recipe naming one is refused at decla
   differs from the exact path (see notes/idxint8.md for fp8 / int8 Jaccard and KL), so your KL with real
   weights decides which, if any, to use.
 - **Chained launches are on** for Hy4-flash decode (about 8 % faster on gpu-mini); nothing to set.
+- **DFly2 is served** (the release's block drafter; `--num-speculative-tokens 1..5`, off unless stated; TP1/2/4;
+  [ARCHITECTURES.md, "DFly2, the Hy4-flash drafter"](ARCHITECTURES.md#dfly2-the-hy4-flash-drafter)). Nothing to
+  re-convert: the `dfly.*` names are unchanged. **Its linears are read in whatever the container stores**: bf16
+  (as before), rotated or plain int8, IQ8R, in any mix, sliced at TP like the bf16 ones. The decision is the
+  recipe's: `data/recipes/hy4-flash-dfly-i8.recipe` and `hy4-flash-dfly-iq8r.recipe` (append their lines to a
+  trunk recipe, or use one alone for a bf16 trunk with an int8 drafter) are the two forms the tree tests.
+  The draft's bf16 linears were 11 % of a decode step in the friend's measurement (about 2 GB a draft pass at the
+  real size, half of it in int8; on gpu-mini, whose draft is launch-bound, the int8 form is not faster: draft pass
+  0.39 ms bf16, 0.45 rotated int8, 0.37 IQ8R at TP1). Not quantisable, as in the trunk: `attn_kv_b`
+  and the token embedding (a recipe naming one declines the drafter, which then falls back to prompt lookup, and says
+  so at startup). `kv_a` is left bf16 by the recipes (576 rows; above 64 draft rows an int8 one runs on the host).
 - **TP4 and `tcq_rows`**: unchanged, already in the section on tensor parallelism below (128 rows on the
   gate_ups, 256 on the attention projections); a trellis container with other runs is refused at TP4.
 
@@ -71,7 +82,8 @@ Recipes in `data/recipes/`: `hy4-flash-bf16.recipe` (Engram E4M3 only), `hy4-fla
 (the same at an f32 scale a row, code for code the port's f32 round trip), `hy4-flash-w4nl64-rtn.recipe`
 (uncalibrated baseline, also the boot container a calibration can run from), `hy4-flash-w4nl64-gptq.recipe`,
 `hy4-flash-w5nl64-rtn.recipe`, `hy4-flash-w6nl64-rtn.recipe`, `hy4-flash-i8.recipe` (trunk, experts and
-head int8), `hy4-flash-iqr-gptq.recipe` (u4 trellis gate_up, w6nl64 down, u5 trellis trunk, int8 rest).
+head int8), `hy4-flash-iqr-gptq.recipe` (u4 trellis gate_up, w6nl64 down, u5 trellis trunk, int8 rest),
+`hy4-flash-dfly-i8.recipe` / `hy4-flash-dfly-iq8r.recipe` (the DFly2 drafter's linears only, rotated int8 / IQ8R).
 Write your own from them; ARCHITECTURES.md "Quantised Hy4-flash" lists every form the graph reads, per weight.
 
 What is served (all of it measured only on random-weight dummies):
@@ -82,7 +94,8 @@ What is served (all of it measured only on random-weight dummies):
 | trunk linears | bf16; int8 rotated (`/fwht128`) or not; IQ8R; the i8a8h trellis (u5 ...); rotated u4/u5 with a zero point | each int8 linear quantises its own input; kv_a stays bf16 in the recipes: 576 rows are no whole 128-row tile of libr4d's trellis GEMM nor of its int8 prefill tile (`gemm_i8a8_tiled`), so above 64 tokens an int8 kv_a falls to the host |
 | lm_head | bf16, int8 | |
 | Engram table | bf16, E4M3 rows at a bf16 or f32 scale | |
-| kv_b, router, iHC, sinks, norms, indexer pooling, Engram projections, token embedding | as shipped | refused by name when a recipe touches them |
+| DFly2 draft linears (`dfly.blk.i.attn_q_a`, `attn_q_b`, `attn_kv_a`, `attn_gate`, `attn_output`, `ffn_gate_up`, `ffn_down`, `dfly.fusion`, `dfly.correct_gate` / `_up` / `_down`) | bf16; rotated or plain int8; IQ8R (not the trellis or zero-point forms) | the same `Lin`; sliced at TP; K in whole 128 (IQ8R 256) groups a rank |
+| kv_b (also the draft's), router, iHC, sinks, norms, indexer pooling, Engram projections, token embedding (also the draft's) | as shipped | refused by name when a recipe touches them (a draft one declines the drafter) |
 
 The IQR trellis (experts or trunk) is decoded by libr4d only: such a container serves on the cards, not
 on the host. libavx has no w6nl64 kernel; on the host a w6nl64 container runs on libref.
@@ -149,7 +162,10 @@ listed as OPEN with the command that decides them.
   (bf16 activation rounding), TP4 against TP1 to 2 %.
 - The indexer's selection ties (relu scores of 0) and the router's near-ties break differently from HF's `topk`;
   a parity comparison on random weights needs the conditioned reference of `ref/` (README there).
-- DFly2 (speculation) is not served; `--max-spec 0` is a `rad-convert` flag. Pictures and video are served on the
+- DFly2 is served (see above) but its acceptance on the real weights is not measured here: `--num-speculative-tokens`
+  stays off by default and the draft depth is not chosen automatically until it is (the friend's container
+  measured 54 % when rewriting code, 93 % when copying, ~1 % on the distilled dummies). `--max-spec 0` is a
+  `rad-convert` flag that leaves the drafter out. Pictures and video are served on the
   dummies only (no real tower weight has run).
 - `gpu-mini` does not start on a card in some builds (Engram round trip kernels); the real-geometry card
   numbers are not measured.
