@@ -1262,7 +1262,7 @@ TEST(op_vocabulary) {
         /* Hy4-flash: independent hyper-connections, sink attention, the compressed indexer, Engram. */
         "ihc_pre", "ihc_post", "mla_project_kv", "mla_attn_paged_sink", "mla_attn_sel_sink",
         "mla_kv_split", "attn_kv_sink", "gate_mul", "mla_expand_gate", "idx_pool_gated", "idx_score", "engram_ids",
-        "engram_norm", "engram_gate", "idx_pool_gated_fp8", "dfly_sel",
+        "engram_norm", "engram_gate", "idx_pool_gated_fp8", "dfly_sel", "rmsnorm_ihc_junction",
         "kda_update", "ssd_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
         "seg_softmax_pool",
@@ -10825,6 +10825,9 @@ std::vector<Geo> geometries() {
         G("ihc_pre", "M", 3, a.i("M", R).i("n", 8).i("hc", 2).i("rows", 4).d("eps", 1e-5)
                                  .d("hc_eps", 1e-6).d("post_mag", 2.0).s("dtype", "f32")),
         G("ihc_post", "M", 3, a.i("M", R).i("n", 8).i("hc", 2).s("dtype", "f32")),
+        G("rmsnorm_ihc_junction", "M", 3, a.i("M", R).i("n", 8).i("hc", 2).i("rows", 4)
+                                              .d("eps", 1e-6).d("ihc_eps", 1e-5).d("hc_eps", 1e-6)
+                                              .d("post_mag", 2.0).s("dtype", "f32")),
         G("mla_project_kv", "M", 3, a.i("M", R).i("heads", 2).i("k_dim", 4).i("v_dim", 5)
                                        .i("latent_dim", 6).s("mode", "expand").s("dtype", "bf16")),
         G("mla_attn_paged_sink", "M", 3, a.i("M", R).i("heads", 2).i("latent_dim", 8).i("rope_dim", 4)

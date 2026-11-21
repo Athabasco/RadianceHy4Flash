@@ -11,38 +11,46 @@
 // libref/ref_hy4.cpp is the oracle, kernels/ihc.md the design. Written for this repository; the
 // semantics are HYV4FlashHyperConnection / HyperHead as the design note states them.
 //
-// ihc_pre: one workgroup of 8 waves a token row. Each thread strides the row's hc*n columns (t,
-// t+256, ...) keeping rows+1 f32 partial sums (the projections and the sum of squares); lanes then
-// reduce through r4d_xor_sum, the 8 waves through LDS in wave order. One thread forms r, the gates
-// and `post`; every thread then forms x for its columns. libref sums in ascending order (the sum
-// of squares in double), so the kernel agrees with it to rounding and not in bytes: relative
-// 1e-5 on c, and x within one bf16 ulp except where a sum straddles a rounding boundary. The
-// reduction order does not depend on M, so a row's bytes do not depend on the batch.
-// LDS: (8 * (rows + 1) + 2 hc) floats, under 1 KiB. No scratch.
+// ihc_pre: one workgroup of 512 threads a token row, the order r4d_ihc.h states (16-byte pieces of
+// the flattened row, rows + 1 f32 sums a thread, r4d_xor_sum over the lanes, the 16 waves in order).
+// It replaced (WP16.2) a kernel whose 256 threads strided single columns with 2-byte loads, 18.7 us
+// a row at n = 3072; that changed the sums' order once, inside the bound below. One thread forms r,
+// the gates and `post`; every thread then forms x for its 8-column groups. libref sums in ascending
+// order (the sum of squares in double), so the kernel agrees with it to rounding and not in bytes:
+// relative 1e-5 on c, x within one bf16 ulp except where a sum straddles a rounding boundary, post
+// within 2e-4. The order does not depend on M, the pitch or alignment (the scalar-load form for odd
+// widths or pointers runs it too), so a row's bytes do not depend on the batch. The fused junction
+// (below) and ar_rmsnorm_ihc_junction (r4d_ar_ihc_junction.hip) run the same order.
+// LDS: (16 * (rows + 1) + hc) floats, under 1.2 KiB. No scratch.
 #include <hip/hip_runtime.h>
 #include "r4d_args.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
+#include "r4d_chain.h"
+#include "r4d_ihc.h"
+#include "r4d_launch.h"
 #include <climits>
 #include <cmath>
 #include <cstdint>
 
 namespace {
 
-enum { kIhcThreads = 256, kIhcWaves = kIhcThreads / 32 };
+using namespace r4d_ihc;
 
-__device__ __forceinline__ float ihc_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
+__device__ __forceinline__ float ihc_sigmoid(float x) { return r4d_ihc::sigmoid(x); }
 
-template <int HC, bool POST>
-__global__ __launch_bounds__(kIhcThreads) void ihc_pre_kernel(
+// VEC: n % 8 == 0, h, x and fn rows 16-byte aligned with whole-word pitches (16-byte loads of h
+// and x, float4 loads of fn). Otherwise the same pieces through scalar loads.
+template <int HC, bool POST, bool VEC>
+__device__ __forceinline__ void ihc_pre_body(
     const uint16_t* __restrict__ h, const float* __restrict__ fn, const float* __restrict__ scale,
     const float* __restrict__ base, uint16_t* __restrict__ x, float* __restrict__ post,
     uint32_t n, float eps, float heps, float pmag, uint64_t hp, uint64_t fp, uint64_t xp,
     uint64_t pp) {
     constexpr int R = POST ? 2 * HC : HC;
-    __shared__ float part[kIhcWaves][R + 1];
+    __shared__ float part[kWaves][R + 1];
     __shared__ float gate[HC];
-    const uint32_t t = threadIdx.x, lane = t & 31, wave = t >> 5;
+    const uint32_t t = threadIdx.x;
     const uint64_t row = blockIdx.x;
     const uint32_t width = (uint32_t)HC * n;
     const uint16_t* __restrict__ hr = h + row * hp;
@@ -50,45 +58,84 @@ __global__ __launch_bounds__(kIhcThreads) void ihc_pre_kernel(
     float acc[R + 1];
 #pragma unroll
     for (int k = 0; k <= R; ++k) acc[k] = 0.0f;
-    for (uint32_t c = t; c < width; c += kIhcThreads) {
-        const float f = bf16_to_f32(hr[c]);
-        acc[R] += f * f;
-#pragma unroll
-        for (int j = 0; j < R; ++j) acc[j] += fn[(uint64_t)j * fp + c] * f;
-    }
-#pragma unroll
-    for (int k = 0; k <= R; ++k) {
-        const float s = r4d_xor_sum<32>(acc[k]);
-        if (lane == 0) part[wave][k] = s;
-    }
-    __syncthreads();
-    if (t == 0) {
-        float s[R + 1];
-#pragma unroll
-        for (int k = 0; k <= R; ++k) {
-            float v = 0.0f;
-            for (int w = 0; w < kIhcWaves; ++w) v += part[w][k];
-            s[k] = v;
-        }
-        const float inv = 1.0f / sqrtf(s[R] / (float)width + eps);
-#pragma unroll
-        for (int j = 0; j < HC; ++j) gate[j] = ihc_sigmoid(s[j] * inv * scale[0] + base[j]) + heps;
-        if (POST) {
-#pragma unroll
-            for (int j = 0; j < HC; ++j) {
-                const int k = POST ? HC + j : 0;
-                post[row * pp + j] = pmag * ihc_sigmoid(s[k] * inv * scale[POST ? 1 : 0] + base[k]) + heps;
-            }
+    const uint32_t pieces = (width + 7u) / 8u;
+    for (uint32_t p = t; p < pieces; p += kThreads) {
+        const uint32_t c0 = 8u * p;
+        float f[8];
+        if (VEC) {
+            unpack8(*(const uint4*)(hr + c0), f);
+            acc_piece<R, true>(acc, f, 8u, fn, fp, c0);
+        } else {
+            const uint32_t cnt = width - c0 < 8u ? width - c0 : 8u;
+            for (uint32_t e = 0; e < cnt; ++e) f[e] = bf16_to_f32(hr[c0 + e]);
+            acc_piece<R, false>(acc, f, cnt, fn, fp, c0);
         }
     }
-    __syncthreads();
+    finish<HC, POST>(acc, part, gate, scale, base, POST ? post + row * pp : nullptr, width, eps,
+                     heps, pmag);
     uint16_t* __restrict__ xr = x + row * xp;
-    for (uint32_t i = t; i < n; i += kIhcThreads) {
-        float v = 0.0f;
+    if (VEC) {
+        collapse8<HC>(hr, gate, n, [&](uint32_t q, uint4 w) { *(uint4*)(xr + 8u * q) = w; });
+    } else {
+        for (uint32_t i = t; i < n; i += kThreads) {
+            float v = 0.0f;
 #pragma unroll
-        for (int j = 0; j < HC; ++j) v += gate[j] * bf16_to_f32(hr[(uint32_t)j * n + i]);
-        xr[i] = f32_to_bf16(v);
+            for (int j = 0; j < HC; ++j) v += gate[j] * bf16_to_f32(hr[(uint32_t)j * n + i]);
+            xr[i] = f32_to_bf16(v);
+        }
     }
+}
+
+#define R4D_IHC_PRE_PARAMS                                                                         \
+    const uint16_t* __restrict__ h, const float* __restrict__ fn, const float* __restrict__ scale, \
+    const float* __restrict__ base, uint16_t* __restrict__ x, float* __restrict__ post,            \
+    uint32_t n, float eps, float heps, float pmag, uint64_t hp, uint64_t fp, uint64_t xp,          \
+    uint64_t pp
+// CH `r4dchain`: the chained form (r4d_chain.h); no block returns early. Scale and base are read
+// through scalar loads, so the wait is the full one.
+template <int HC, bool POST, bool VEC, class CH>
+__global__ __launch_bounds__(kThreads) void ihc_pre_kernel(R4D_IHC_PRE_PARAMS) {
+    if (CH::on) r4d_chain_wait();
+    ihc_pre_body<HC, POST, VEC>(h, fn, scale, base, x, post, n, eps, heps, pmag, hp, fp, xp, pp);
+    if (CH::on) r4d_chain_done();
+}
+
+// rmsnorm_ihc_junction: `[add] -> rmsnorm -> ihc_post -> [ihc_pre -> rmsnorm]` a token row a
+// workgroup of 512 threads (r4d_ihc.h's junction_row), byte-identical to add_bf16, rmsnorm_bf16,
+// ihc_post_bf16, ihc_pre_bf16 and rmsnorm_bf16 in sequence. ADD: the row is bf16(a + b), stored
+// back into `a` as add_bf16 stores it. TAIL 0 stops behind the write (an Engram in front of the
+// next layer writes h between). LDS: n bf16 (the row, then x) + about 0.9 KiB; no scratch.
+template <int HC, bool POST, bool TAIL, bool ADD, class CH>
+__global__ __launch_bounds__(kThreads) void ihc_junction_kernel(
+    uint16_t* __restrict__ a, const uint16_t* __restrict__ b, JuncRow r, uint64_t ap, uint64_t bp,
+    uint64_t pp, uint64_t hp, uint64_t xnp, uint64_t yp, uint64_t xp) {
+    if (CH::on) r4d_chain_wait();
+    R4D_DYN_LDS(uint4, jbuf);
+    __shared__ JuncLds<HC, POST> L;
+    uint16_t* const ybuf = (uint16_t*)jbuf;
+    const uint64_t row = blockIdx.x;
+    uint16_t* __restrict__ ar = a + row * ap;
+    for (uint32_t q = threadIdx.x; q < r.n / 8u; q += kThreads) {
+        uint4 w = *(const uint4*)(ar + 8u * q);
+        if (ADD) {
+            float u[8], v[8];
+            unpack8(w, u);
+            unpack8(*(const uint4*)(b + row * bp + 8u * q), v);
+            uint16_t o[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) o[e] = f32_to_bf16(u[e] + v[e]);
+            w = pack8(o);
+            *(uint4*)(ar + 8u * q) = w;
+        }
+        jbuf[q] = w;
+    }
+    r.post_row += row * pp;
+    r.hr += row * hp;
+    if (TAIL) r.xnr += row * xnp;
+    if (r.yr) r.yr += row * yp;
+    if (r.xr) r.xr += row * xp;
+    junction_row<HC, POST, TAIL>(L, ybuf, r);
+    if (CH::on) r4d_chain_done();
 }
 
 // h[j][i] = bf16(post[j] * y[i] + h[j][i]). The product is its own f32 rounding, as libref's.
@@ -212,12 +259,19 @@ extern "C" int r4d_rad_ihc_pre(const RadArgs* a, RadStream s) {
     if (r4d_numel(sc) != (has_post ? 2 : 1) || r4d_numel(bs) != rows) return R4D_NO(RAD_E_SHAPE);
     if (!r4d_contig(sc) || !r4d_contig(bs)) return R4D_NO(RAD_E_STRIDE);
 
-#define R4D_IHC(HC_, POST_)                                                                       \
-    R4D_EMIT(s, (ihc_pre_kernel<HC_, POST_>), dim3((uint32_t)M), dim3(kIhcThreads), 0,            \
+    const bool vec = n % 8 == 0 && ihc_vec(h->data, hp) && ihc_vec(x->data, xp) &&
+                     ((uintptr_t)fn->data & 15) == 0 && fn->stride[0] % 4 == 0;
+    /* The chained form at the vector form only (the real geometry); the scalar one stays plain. */
+    const bool ch = vec && r4d_geti_or(a, "chain", 0) != 0;
+#define R4D_IHC_K(HC_, POST_, VEC_, CH_)                                                           \
+    R4D_EMIT(s, (ihc_pre_kernel<HC_, POST_, VEC_, CH_>), dim3((uint32_t)M), dim3(kThreads), 0,     \
              (const uint16_t*)h->data, (const float*)fn->data, (const float*)sc->data,            \
              (const float*)bs->data, (uint16_t*)x->data, (float*)(has_post ? post->data : nullptr), \
              (uint32_t)n, eps, heps, pmag, (uint64_t)hp, (uint64_t)fn->stride[0], (uint64_t)xp,   \
              (uint64_t)pp)
+#define R4D_IHC(HC_, POST_)                                                                        \
+    (ch ? R4D_IHC_K(HC_, POST_, true, r4dchain)                                                    \
+        : vec ? R4D_IHC_K(HC_, POST_, true, R4dUnchained) : R4D_IHC_K(HC_, POST_, false, R4dUnchained))
 #define R4D_IHC_HC(HC_) return has_post ? R4D_IHC(HC_, true) : R4D_IHC(HC_, false)
     switch (hc) {
         case 2: R4D_IHC_HC(2);
@@ -230,6 +284,7 @@ extern "C" int r4d_rad_ihc_pre(const RadArgs* a, RadStream s) {
     }
 #undef R4D_IHC_HC
 #undef R4D_IHC
+#undef R4D_IHC_K
 }
 
 extern "C" int r4d_rad_ihc_post(const RadArgs* a, RadStream s) {
@@ -276,4 +331,128 @@ extern "C" int r4d_rad_gate_mul(const RadArgs* a, RadStream s) {
                : R4D_EMIT(s, gate_mul_kernel<false>, grid, dim3(256), 0, (const uint16_t*)x->data,
                           (const uint16_t*)g->data, (uint16_t*)y->data, (uint32_t)n, (uint64_t)ap,
                           (uint64_t)gp, (uint64_t)yp);
+}
+
+/* ---- rmsnorm_ihc_junction. Operands (docs/OPS.md):
+ *   [0] a:inout  [1] b?  [2] w_post w  [3] post:inout  [4] h:inout  [5] fn w?  [6] scale w?
+ *   [7] base w?  [8] w_next w?  [9] xn?  [10] y?  [11] x?
+ * `tail` 1 needs fn, scale, base, w_next and xn; `rows` 2 hc (post_mag given) writes the next
+ * write weights into `post`, `rows` hc (the head) leaves it. */
+enum { IJ_A = 0, IJ_B, IJ_WPOST, IJ_POST, IJ_H, IJ_FN, IJ_SCALE, IJ_BASE, IJ_WNEXT, IJ_XN, IJ_Y, IJ_X };
+
+int r4d_ihc_junction_args(const RadArgs* a, r4d_ihc::R4dIhcJunction* o) {
+    *o = R4dIhcJunction{};
+    const RadTensor* t[12];
+    for (int i = 0; i < 12; ++i) t[i] = r4d_opt(a, i);
+    const long long n = r4d_geti_or(a, "n", 0), hc = r4d_geti_or(a, "hc", 0),
+                    rows = r4d_geti_or(a, "rows", 0), tail = r4d_geti_or(a, "tail", 1);
+    if (!t[IJ_A] || !t[IJ_WPOST] || !t[IJ_POST] || !t[IJ_H]) return RAD_E_INVAL;
+    if (tail != 0 && tail != 1) return RAD_E_INVAL;
+    if (tail && (!t[IJ_FN] || !t[IJ_SCALE] || !t[IJ_BASE] || !t[IJ_WNEXT] || !t[IJ_XN]))
+        return RAD_E_INVAL;
+    for (int i : { IJ_A, IJ_B, IJ_H, IJ_XN, IJ_Y, IJ_X })
+        if (t[i] && !ihc_bf16(t[i])) return RAD_E_DTYPE;
+    for (int i : { IJ_WPOST, IJ_POST, IJ_FN, IJ_SCALE, IJ_BASE, IJ_WNEXT })
+        if (t[i] && !ihc_f32(t[i])) return RAD_E_DTYPE;
+    if (n < 8 || n > 16384 || n % 8 || hc < 2 || hc > 8) return RAD_E_SHAPE;
+    const bool post = rows == 2 * hc;
+    if (tail && !post && rows != hc) return RAD_E_SHAPE;
+    const float eps = (float)r4d_getf(a, "eps", 0), ieps = (float)r4d_getf(a, "ihc_eps", 0),
+                heps = (float)r4d_getf(a, "hc_eps", 0);
+    if (!std::isfinite(eps) || eps <= 0) return RAD_E_SHAPE;
+    float pmag = 0.0f;
+    if (tail) {
+        if (!std::isfinite(ieps) || ieps <= 0 || !std::isfinite(heps) || heps < 0) return RAD_E_SHAPE;
+        if (post) {
+            if (r4d_getf(a, "post_mag", -1e30) == -1e30) return RAD_E_INVAL;
+            pmag = (float)r4d_getf(a, "post_mag", 0);
+            if (!std::isfinite(pmag)) return RAD_E_SHAPE;
+        }
+    }
+    const long long W = hc * n;
+    long long M = 0, m2 = 0;
+    const long long ap = r4d_rows_pitch(t[IJ_A], n, &M);
+    if (ap < 0 || M < 1 || M > 65535) return ap < 0 ? RAD_E_STRIDE : RAD_E_SHAPE;
+    auto pitch = [&](int i, long long w, long long* out) {
+        if (!t[i]) { *out = 0; return true; }
+        *out = r4d_rows_pitch(t[i], w, &m2);
+        return *out >= 0 && m2 == M;
+    };
+    long long bp, pp, hp, xnp = 0, yp, xp;
+    if (!pitch(IJ_B, n, &bp) || !pitch(IJ_POST, hc, &pp) || !pitch(IJ_H, W, &hp) ||
+        !pitch(IJ_Y, n, &yp) || !pitch(IJ_X, n, &xp) || (tail && !pitch(IJ_XN, n, &xnp)))
+        return RAD_E_SHAPE;
+    /* whole 16-byte words a row everywhere a row moves as words */
+    for (int i : { IJ_A, IJ_B, IJ_H, IJ_XN, IJ_Y, IJ_X }) {
+        if (!t[i] || (i == IJ_XN && !tail)) continue;
+        long long pv = 0;
+        pitch(i, i == IJ_H ? W : n, &pv);
+        if (!ihc_vec(t[i]->data, (uint64_t)pv)) return RAD_E_ALIGN;
+    }
+    if (r4d_numel(t[IJ_WPOST]) != n || !r4d_contig(t[IJ_WPOST]) ||
+        ((uintptr_t)t[IJ_WPOST]->data & 15))
+        return RAD_E_SHAPE;
+    if (tail) {
+        const RadTensor* fn = t[IJ_FN];
+        if (fn->rank != 2 || fn->shape[0] != rows || fn->shape[1] != W || fn->stride[1] != 1 ||
+            fn->stride[0] % 4 || ((uintptr_t)fn->data & 15))
+            return RAD_E_SHAPE;
+        if (r4d_numel(t[IJ_SCALE]) != (post ? 2 : 1) || r4d_numel(t[IJ_BASE]) != rows ||
+            !r4d_contig(t[IJ_SCALE]) || !r4d_contig(t[IJ_BASE]))
+            return RAD_E_SHAPE;
+        if (r4d_numel(t[IJ_WNEXT]) != n || !r4d_contig(t[IJ_WNEXT]) ||
+            ((uintptr_t)t[IJ_WNEXT]->data & 15))
+            return RAD_E_SHAPE;
+    }
+    o->a = (uint16_t*)t[IJ_A]->data;
+    o->b = t[IJ_B] ? (const uint16_t*)t[IJ_B]->data : nullptr;
+    JuncRow& r = o->r;
+    r.n = (uint32_t)n;
+    r.eps = eps; r.ieps = ieps; r.heps = heps; r.pmag = pmag; r.wadd = 0.0f; r.mult = 1.0f;
+    r.w_post = (const float*)t[IJ_WPOST]->data;
+    r.post_row = (float*)t[IJ_POST]->data;
+    r.hr = (uint16_t*)t[IJ_H]->data;
+    r.fn = tail ? (const float*)t[IJ_FN]->data : nullptr;
+    r.fp = tail ? (uint64_t)t[IJ_FN]->stride[0] : 0;
+    r.scale = tail ? (const float*)t[IJ_SCALE]->data : nullptr;
+    r.base = tail ? (const float*)t[IJ_BASE]->data : nullptr;
+    r.w_next = tail ? (const float*)t[IJ_WNEXT]->data : nullptr;
+    r.xnr = tail ? (uint16_t*)t[IJ_XN]->data : nullptr;
+    r.yr = t[IJ_Y] ? (uint16_t*)t[IJ_Y]->data : nullptr;
+    r.xr = t[IJ_X] ? (uint16_t*)t[IJ_X]->data : nullptr;
+    o->M = M; o->hc = (int)hc; o->post = post; o->tail = tail != 0;
+    o->ap = ap; o->bp = bp; o->pp = pp; o->hp = hp; o->xnp = xnp; o->yp = yp; o->xp = xp;
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_rmsnorm_ihc_junction(const RadArgs* a, RadStream s) {
+    R4dIhcJunction j;
+    const int rc = r4d_ihc_junction_args(a, &j);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    const bool add = j.b != nullptr;
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0;
+    const uint32_t lds = j.r.n * 2u;
+#define R4D_IJ_K(HC_, PO_, TA_, AD_, CH_)                                                          \
+    R4D_EMIT(s, (ihc_junction_kernel<HC_, PO_, TA_, AD_, CH_>), dim3((uint32_t)j.M),              \
+             dim3(kThreads), lds, j.a, j.b, j.r, (uint64_t)j.ap, (uint64_t)j.bp, (uint64_t)j.pp,  \
+             (uint64_t)j.hp, (uint64_t)j.xnp, (uint64_t)j.yp, (uint64_t)j.xp)
+#define R4D_IJ_C(HC_, PO_, TA_, AD_)                                                               \
+    (ch ? R4D_IJ_K(HC_, PO_, TA_, AD_, r4dchain) : R4D_IJ_K(HC_, PO_, TA_, AD_, R4dUnchained))
+#define R4D_IJ_A(HC_, PO_, TA_) (add ? R4D_IJ_C(HC_, PO_, TA_, true) : R4D_IJ_C(HC_, PO_, TA_, false))
+#define R4D_IJ_HC(HC_)                                                                             \
+    return !j.tail ? R4D_IJ_A(HC_, false, false)                                                   \
+                   : j.post ? R4D_IJ_A(HC_, true, true) : R4D_IJ_A(HC_, false, true)
+    switch (j.hc) {
+        case 2: R4D_IJ_HC(2);
+        case 3: R4D_IJ_HC(3);
+        case 4: R4D_IJ_HC(4);
+        case 5: R4D_IJ_HC(5);
+        case 6: R4D_IJ_HC(6);
+        case 7: R4D_IJ_HC(7);
+        default: R4D_IJ_HC(8);
+    }
+#undef R4D_IJ_HC
+#undef R4D_IJ_A
+#undef R4D_IJ_C
+#undef R4D_IJ_K
 }

@@ -837,3 +837,86 @@ extern "C" int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam* p, int n_p, uint64_
         return RAD_E_NOTFOUND;
     }
 }
+
+/* ==========================================================================================
+ * rmsnorm_ihc_junction -- [add] -> rmsnorm -> ihc_post -> [ihc_pre -> rmsnorm].
+ * (kernel: libr4d/r4d_ihc_bf16.hip, ihc_junction_kernel over r4d_ihc.h's junction_row)
+ *
+ * Operands: [0] a (inout)  [1] b?  [2] w_post  [3] post (inout)  [4] h (inout)  [5] fn?  [6] scale?
+ *           [7] base?  [8] w_next?  [9] xn?  [10] y?  [11] x?
+ *
+ * The add (when `b` is present) writes the sum back into `a`, which the norm then reads, as the
+ * Hy4 plugin's MoE join does. `y` and `x` are the chain's intermediates: a fused operand when the
+ * caller passed one, else a temporary. `post` is ihc_post's input and, at rows == 2 hc, ihc_pre's
+ * output (the next connection's weights); the head form (rows == hc) passes ihc_pre no `post`.
+ * ihc_pre's `eps` is the junction's `ihc_eps`.
+ */
+namespace {
+int fuse_ihc_junction(const RadParam* p, int n_p, uint64_t present, int step, RadFuseStep* out,
+                      bool ar) {
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc"),
+                  rows = pi(p, n_p, "rows"), tail = pi(p, n_p, "tail", 1);
+    if (M <= 0 || n <= 0 || hc <= 0 || (tail && rows != hc && rows != 2 * hc))
+        return RAD_E_UNSUPPORTED;
+    const bool add = RAD_FUSE_HAS(present, 1);
+    const int y = RAD_FUSE_HAS(present, 10) ? 10 : RAD_FUSE_TMP(0);
+    const int x = RAD_FUSE_HAS(present, 11) ? 11 : RAD_FUSE_TMP(1);
+    int k = step;
+    if (add) {
+        if (k == 0) {
+            Step s(out, "add");
+            s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "dtype");
+            return s.wire({ 0, 1, 0 });                     /* a, b, y = a */
+        }
+        --k;
+    }
+    if (ar) {
+        if (k == 0) {
+            Step s(out, "all_reduce");
+            s.mirror(p, n_p, "world_size").pint("numel", (long long)(M * n))
+             .pstr("dtype", "bf16").pint("exact", 1);
+            return s.wire({ 0, RAD_FUSE_NONE });            /* x (inout), y */
+        }
+        --k;
+    }
+    switch (k) {
+    case 0: {
+        Step s(out, "rmsnorm");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "eps").mirror(p, n_p, "dtype");
+        return s.wire({ 0, 2, y });                         /* x = a, w_post, y */
+    }
+    case 1: {
+        Step s(out, "ihc_post");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "hc").mirror(p, n_p, "dtype");
+        return s.wire({ y, 3, 4 });                         /* y, post, h */
+    }
+    case 2: {
+        if (!tail) return RAD_E_NOTFOUND;
+        const RadParam* ie = rad_param_find(p, n_p, "ihc_eps");
+        const RadParam* he = rad_param_find(p, n_p, "hc_eps");
+        if (!ie || !he) return RAD_E_UNSUPPORTED;
+        const bool post = rows == 2 * hc;
+        Step s(out, "ihc_pre");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "hc").mirror(p, n_p, "rows")
+         .pf64("eps", ie->dval).mirror(p, n_p, "hc_eps");
+        if (post) s.mirror(p, n_p, "post_mag");
+        s.mirror(p, n_p, "dtype");
+        return s.wire({ 4, 5, 6, 7, x, post ? 3 : RAD_FUSE_NONE });   /* h, fn, scale, base, x, post */
+    }
+    case 3: {
+        if (!tail) return RAD_E_NOTFOUND;
+        Step s(out, "rmsnorm");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "eps").mirror(p, n_p, "dtype");
+        return s.wire({ x, 8, 9 });                         /* x, w_next, xn */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+}  /* namespace */
+
+extern "C" int r4d_fuse_rmsnorm_ihc_junction(const RadParam* p, int n_p, uint64_t present,
+                                             int step, RadFuseStep* out) {
+    return fuse_ihc_junction(p, n_p, present, step, out, false);
+}

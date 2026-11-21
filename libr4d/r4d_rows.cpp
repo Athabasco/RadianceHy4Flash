@@ -652,6 +652,18 @@ static const RadParamSpec pIhcPost[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_
 static const RadOperandSpec oIhcPost[] = {
     {"y", RAD_OPD_IN, 0}, {"post", RAD_OPD_IN, 0}, {"h", RAD_OPD_INOUT, 0},
 };
+/* rmsnorm_ihc_junction: `[add] -> rmsnorm -> ihc_post -> [ihc_pre -> rmsnorm]` in one launch
+ * (WP16.2). `tail` 0 stops behind ihc_post (no fn .. xn). */
+static const RadParamSpec pIhcJunction[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("rows"), P_F64("eps"), P_F64O("ihc_eps"),
+    P_F64O("hc_eps"), P_F64O("post_mag"), P_INTO("tail"), P_STR("dtype"),
+};
+static const RadOperandSpec oIhcJunction[] = {
+    {"a", RAD_OPD_INOUT, 0}, {"b", RAD_OPD_IN, 1}, {"w_post", RAD_OPD_WEIGHT, 0},
+    {"post", RAD_OPD_INOUT, 0}, {"h", RAD_OPD_INOUT, 0}, {"fn", RAD_OPD_WEIGHT, 1},
+    {"scale", RAD_OPD_WEIGHT, 1}, {"base", RAD_OPD_WEIGHT, 1}, {"w_next", RAD_OPD_WEIGHT, 1},
+    {"xn", RAD_OPD_OUT, 1}, {"y", RAD_OPD_OUT, 1}, {"x", RAD_OPD_OUT, 1},
+};
 static const RadOperandSpec oGateMul[] = {
     {"a", RAD_OPD_IN, 0}, {"g", RAD_OPD_IN, 0}, {"y", RAD_OPD_OUT, 0},
 };
@@ -3791,6 +3803,12 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("ihc_post", pIhcPost, oIhcPost,
            "h[j][i] = round(post[j] * f32(y[i]) + f32(h[j][i])), in place on the hc streams; the product is "
            "rounded to f32 before the add. Nothing normalises the stream."),
+    SCHEMA("rmsnorm_ihc_junction", pIhcJunction, oIhcJunction,
+           "The iHC junction between two blocks in one op: [y = a + b, rounded and stored into a] "
+           "y = rmsnorm(a or the sum; w_post, eps); ihc_post(y, post, h); with `tail` (default 1) "
+           "ihc_pre(h; fn, scale, base; rows, ihc_eps, hc_eps, post_mag) -> x and, at rows == 2*hc, "
+           "the next post (into `post`); xn = rmsnorm(x; w_next, eps). `y` and `x` are stored only "
+           "when passed. Byte-identical to the five ops in sequence."),
     SCHEMA("gate_mul", pMnDtype, oGateMul,
            "y = round(f32(a) * sigmoid(f32(g))): one rounding. act_mul's sigmoid form rounds the sigmoid "
            "first, which is a different bf16 result."),
@@ -5250,6 +5268,11 @@ static const RadConstraint cMhcPre[] = {
 static const RadConstraint cIhcPre[] = {
     C_GE("M", 1), C_LE("M", 65535), C_GE("n", 1), C_LE("n", 16384), C_GE("hc", 2), C_LE("hc", 8),
     C_GE("rows", 2), C_LE("rows", 16), C_IN("dtype", "bf16"),
+};
+/* The junction moves rows as 16-byte words and holds one in LDS. */
+static const RadConstraint cIhcJunction[] = {
+    C_GE("M", 1), C_LE("M", 65535), C_GE("n", 8), C_LE("n", 16384), C_DIV("n", 8),
+    C_GE("hc", 2), C_LE("hc", 8), C_GE("rows", 2), C_LE("rows", 16), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cGateMul[] = { C_GE("M", 1), C_LE("M", 65535), C_GE("n", 1),
                                           C_IN("dtype", "bf16") };
@@ -8599,6 +8622,17 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMhcPlain), NOTUNE,
   nullptr, nullptr, r4d_rad_ihc_post, nullptr, nullptr, nullptr,
   r4d_shape_ihc_post },
+{ "rmsnorm_ihc_junction_bf16", "rmsnorm_ihc_junction", "norm",
+  "the iHC junction in one launch, a 512-thread workgroup a token row: [add,] the block's sandwich "
+  "norm, ihc_post into the streams, the next connection's ihc_pre from the same registers and the "
+  "next block's input norm, with every intermediate the chain stores rounded as it stores it",
+  "M 1..65535, n a multiple of 8 up to 16384 (n bf16 in LDS), hc 2..8, rows hc (the head) or 2 hc; "
+  "rows of whole 16-byte words, gains and fn 16-byte aligned; tail 0 stops behind ihc_post",
+  "bf16 activations, f32 gains, tables and coefficients; byte-identical to add_bf16, rmsnorm_bf16, "
+  "ihc_post_bf16, ihc_pre_bf16 and rmsnorm_bf16 in sequence",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cIhcJunction), NOTUNE,
+  nullptr, nullptr, r4d_rad_rmsnorm_ihc_junction, nullptr, nullptr, nullptr,
+  r4d_shape_rmsnorm_ihc_junction, nullptr, r4d_fuse_rmsnorm_ihc_junction },
 { "gate_mul_bf16", "gate_mul", "elem", "a * sigmoid(g) with one rounding, eight entries a thread",
   "M 1..65535, any n", "bf16",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cGateMul), NOTUNE,
@@ -11600,6 +11634,9 @@ extern "C" int rad_kernel_chain(int i) {
          * tail form (the two-shot with the junction after it) only */
         "ar_rmsnorm_quant_i8", "ar_rmsnorm_quant_i8g", "ar_rmsnorm_quant_i8_4rank",
         "ar_rmsnorm_had_quant_i8g", "ar_rmsnorm_had_quant_iq8r",
+        /* Hy4-flash's iHC read and its fused junction (the read's scalar-load form for odd
+         * widths stays plain) */
+        "ihc_pre_bf16", "rmsnorm_ihc_junction_bf16",
         /* the 31B's full layers: the windowed attention and its merge (r4d_attn_paged_window.hip,
          * at decode heights) and the int8 quantiser before o_proj; h512 at every TP's gqa */
         "attn_qrow_h512_gqa2_i8kv", "attn_qrow_h512_gqa2_bf16kv",

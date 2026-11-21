@@ -184,6 +184,14 @@ std::vector<Case> build_cases() {
         add("ihc_pre", { HI("M", 5), HI("n", 65), HI("hc", 2), HI("rows", 2), HF("eps", 1e-5),
                          HF("hc_eps", 1e-6), HS("dtype", dt) });
         add("ihc_post", { HI("M", 3), HI("n", 129), HI("hc", 4), HS("dtype", dt) });
+        add("rmsnorm_ihc_junction", { HI("M", 3), HI("n", 129), HI("hc", 4), HI("rows", 8),
+                                      HF("eps", 1e-6), HF("ihc_eps", 1e-5), HF("hc_eps", 1e-6),
+                                      HF("post_mag", 2.0), HS("dtype", dt) });
+        add("rmsnorm_ihc_junction", { HI("M", 2), HI("n", 65), HI("hc", 2), HI("rows", 2),
+                                      HF("eps", 1e-6), HF("ihc_eps", 1e-5), HF("hc_eps", 1e-6),
+                                      HS("dtype", dt) });
+        add("rmsnorm_ihc_junction", { HI("M", 3), HI("n", 64), HI("hc", 4), HI("rows", 8),
+                                      HF("eps", 1e-6), HI("tail", 0), HS("dtype", dt) });
         add("gate_mul", { HI("M", 5), HI("n", 133), HS("dtype", dt) });
         add("mla_kv_split", { HI("M", 5), HI("heads", 3), HI("k_dim", 17), HI("v_dim", 23),
                               HI("rope_dim", 8), HS("dtype", dt) });

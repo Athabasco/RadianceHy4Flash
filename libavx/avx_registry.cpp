@@ -186,6 +186,13 @@ static const RadParamSpec pIhcPre[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_I
     P_F64("eps"), P_F64("hc_eps"), P_F64O("post_mag"), P_STR("dtype") };
 static const RadOperandSpec oIhcPre[] = { OPD("h"), WGT("fn"), WGT("scale"), WGT("base"),
     OUT("x"), OUT_O("post") };
+/* rmsnorm_ihc_junction (WP16.2): the same lists as libr4d's and libref's. */
+static const RadParamSpec pIhcJunction[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("rows"),
+    P_F64("eps"), P_F64O("ihc_eps"), P_F64O("hc_eps"), P_F64O("post_mag"), P_INTO("tail"),
+    P_STR("dtype") };
+static const RadOperandSpec oIhcJunction[] = { INOUT("a"), OPD_O("b"), WGT("w_post"),
+    INOUT("post"), INOUT("h"), WGT_O("fn"), WGT_O("scale"), WGT_O("base"), WGT_O("w_next"),
+    OUT_O("xn"), OUT_O("y"), OUT_O("x") };
 static const RadParamSpec pIhcPost[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype") };
 static const RadOperandSpec oIhcPost[] = { OPD("y"), OPD("post"), INOUT("h") };
 static const RadParamSpec pMlaProjectKv[] = { P_INT("M"), P_INT("heads"), P_INT("k_dim"),
@@ -1161,6 +1168,12 @@ static const RadOpSchema kSchemas[] = {
 { "ihc_post", ARR(pIhcPost), ARR(oIhcPost),
   "h[j][i] = round(post[j] * f32(y[i]) + f32(h[j][i])), in place on the hc streams; the product is "
   "rounded to f32 before the add. Nothing normalises the stream." },
+{ "rmsnorm_ihc_junction", ARR(pIhcJunction), ARR(oIhcJunction),
+  "The iHC junction between two blocks in one op: [y = a + b, rounded and stored into a] "
+  "y = rmsnorm(a or the sum; w_post, eps); ihc_post(y, post, h); with `tail` (default 1) "
+  "ihc_pre(h; fn, scale, base; rows, ihc_eps, hc_eps, post_mag) -> x and, at rows == 2*hc, "
+  "the next post (into `post`); xn = rmsnorm(x; w_next, eps). `y` and `x` are stored only "
+  "when passed. Byte-identical to the five ops in sequence." },
 { "mla_project_kv", ARR(pMlaProjectKv), ARR(oGemm),
   "Per-head absorption or expansion through the checkpoint's kv_b, rows head-major with each head's "
   "k_dim key rows then its v_dim value rows. absorb: [M,heads,k_dim] -> [M,heads,latent]; expand: "
@@ -1897,6 +1910,9 @@ SIMPLE("avx_ihc_pre", "ihc_pre", "norm", "independent hyper-connection read (no 
        L(ihc_pre)),
 SIMPLE("avx_ihc_post", "ihc_post", "norm", "independent hyper-connection write into the streams",
        DT_FLOAT, L(ihc_post)),
+SIMPLE("avx_rmsnorm_ihc_junction", "rmsnorm_ihc_junction", "norm",
+       "the iHC junction: [add,] rmsnorm, ihc_post, [ihc_pre, rmsnorm], this library's ops in sequence",
+       DT_FLOAT, L(rmsnorm_ihc_junction)),
 SIMPLE("avx_mla_project_kv", "mla_project_kv", "attn", "absorbed MLA projections, K and V widths apart",
        DT_FLOAT, L(mla_project_kv)),
 SIMPLE("avx_mla_attn_paged_sink", "mla_attn_paged_sink", "attn",

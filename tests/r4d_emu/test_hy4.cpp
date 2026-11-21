@@ -451,9 +451,223 @@ static void dfly_sel() {
     std::printf("dfly_sel: %d case(s), %d failure(s)\n", g_cases - cases, g_fails - before);
 }
 
+/* ---- ihc_pre's order (r4d_ihc.h), restated on the host: 512 threads own the row's 8-value pieces
+ * t, t + 512, ...; per thread the pieces and their values ascending; a wave's lanes by the xor
+ * butterfly 16, 8, 4, 2, 1; the 16 waves from 0.0f in order. The kernel must give these bytes, on
+ * the 16-byte form and on the scalar-load form alike. */
+static float host_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
+static void host_ihc_pre_row(const uint16_t* h, const float* fn, int64_t fp, const float* scale,
+                             const float* base, int hc, int n, bool post, float eps, float heps,
+                             float pmag, uint16_t* x, float* prow) {
+    const int R = post ? 2 * hc : hc, W = hc * n, T = 512;
+    std::vector<float> acc((size_t)T * (R + 1), 0.0f);
+    for (int p = 0; 8 * p < W; ++p) {
+        const int t = p % T, c0 = 8 * p, cnt = W - c0 < 8 ? W - c0 : 8;
+        float f[8];
+        for (int e = 0; e < cnt; ++e) f[e] = b2f(h[c0 + e]);
+        for (int j = 0; j < R; ++j)
+            for (int e = 0; e < cnt; ++e) acc[(size_t)t * (R + 1) + j] += fn[(int64_t)j * fp + c0 + e] * f[e];
+        for (int e = 0; e < cnt; ++e) acc[(size_t)t * (R + 1) + R] += f[e] * f[e];
+    }
+    std::vector<float> s((size_t)R + 1, 0.0f);
+    for (int k = 0; k <= R; ++k) {
+        float tot = 0.0f;
+        for (int w = 0; w < T / 32; ++w) {
+            float l[32];
+            for (int i = 0; i < 32; ++i) l[i] = acc[(size_t)(w * 32 + i) * (R + 1) + k];
+            for (int d = 16; d >= 1; d >>= 1) {
+                float nl[32];
+                for (int i = 0; i < 32; ++i) nl[i] = l[i] + l[i ^ d];
+                std::memcpy(l, nl, sizeof l);
+            }
+            tot += l[0];
+        }
+        s[(size_t)k] = tot;
+    }
+    const float inv = 1.0f / sqrtf(s[(size_t)R] / (float)W + eps);
+    float gate[16];
+    for (int j = 0; j < hc; ++j) gate[j] = host_sigmoid(s[(size_t)j] * inv * scale[0] + base[j]) + heps;
+    if (post)
+        for (int j = 0; j < hc; ++j)
+            prow[j] = pmag * host_sigmoid(s[(size_t)(hc + j)] * inv * scale[1] + base[hc + j]) + heps;
+    for (int i = 0; i < n; ++i) {
+        float v = 0.0f;
+        for (int j = 0; j < hc; ++j) v += gate[j] * b2f(h[j * n + i]);
+        x[i] = f2b(v);
+    }
+}
+
+static RadTensor t2(void* p, uint32_t dt, int64_t M, int64_t n, int64_t ld) {
+    RadTensor t{}; t.data = p; t.dtype = dt; t.rank = 2; t.shape[0] = M; t.shape[1] = n; t.stride[0] = ld; t.stride[1] = 1;
+    return t;
+}
+static RadTensor t1(void* p, uint32_t dt, int64_t n) {
+    RadTensor t{}; t.data = p; t.dtype = dt; t.rank = 1; t.shape[0] = n; t.stride[0] = 1;
+    return t;
+}
+template <class T>
+static std::vector<T> aligned_like(size_t n) { return std::vector<T>(n + 64); }
+
+static void ihc_pre_order() {
+    struct G { int64_t hc, n, M, pad; bool post; };
+    for (const G& g : { G{ 4, 3072, 2, 0, true }, G{ 4, 3072, 1, 3, true }, G{ 4, 512, 3, 0, true },
+                        G{ 2, 128, 2, 0, true }, G{ 4, 512, 2, 0, false }, G{ 3, 37, 2, 1, true } }) {
+        Rng rng((uint32_t)(g.hc * 7 + g.n + g.pad));
+        const int64_t W = g.hc * g.n, rows = g.post ? 2 * g.hc : g.hc, hp = W + g.pad, xp = g.n + g.pad;
+        std::vector<uint16_t> h((size_t)(g.M * hp)), xk((size_t)(g.M * xp), 0x7e7e), xh((size_t)(g.M * g.n));
+        for (auto& v : h) v = f2b(rng.n() * 2);
+        std::vector<float> fn((size_t)(rows * W)), base((size_t)rows), scale = { 3.0f, 2.1f };
+        for (auto& v : fn) v = rng.n() * 0.05f;
+        for (auto& v : base) v = rng.n() * 0.7f;
+        std::vector<float> pk((size_t)(g.M * g.hc), 0.0f), ph((size_t)(g.M * g.hc), 0.0f);
+        RadTensor t[6] = { t2(h.data(), RAD_BF16, g.M, W, hp), t2(fn.data(), RAD_F32, rows, W, W),
+                           t1(scale.data(), RAD_F32, g.post ? 2 : 1), t1(base.data(), RAD_F32, rows),
+                           t2(xk.data(), RAD_BF16, g.M, g.n, xp),
+                           g.post ? t2(pk.data(), RAD_F32, g.M, g.hc, g.hc) : RadTensor{} };
+        std::vector<RadParam> p = { pi("M", g.M), pi("n", g.n), pi("hc", g.hc), pi("rows", rows),
+                                    pf("eps", 1e-5), pf("hc_eps", 1e-6), ps("dtype", "bf16") };
+        if (g.post) p.push_back(pf("post_mag", 2.0));
+        RadArgs a{}; a.t = t; a.n_t = 6; a.p = p.data(); a.n_p = (int)p.size(); a.world_size = 1;
+        ++g_cases;
+        char w[120];
+        std::snprintf(w, sizeof w, "ihc_pre order hc %lld n %lld M %lld%s%s, bit for bit", (long long)g.hc,
+                      (long long)g.n, (long long)g.M, g.post ? "" : " head", g.pad ? " pitched (scalar loads)" : "");
+        if (r4d_rad_ihc_pre(&a, nullptr) != RAD_OK) { std::printf("FAIL %s: launch\n", w); ++g_fails; continue; }
+        long bad = 0;
+        for (int64_t r = 0; r < g.M; ++r) {
+            host_ihc_pre_row(h.data() + r * hp, fn.data(), W, scale.data(), base.data(), (int)g.hc, (int)g.n,
+                             g.post, 1e-5f, 1e-6f, 2.0f, xh.data() + r * g.n, ph.data() + r * g.hc);
+            for (int64_t i = 0; i < g.n; ++i) bad += xk[(size_t)(r * xp + i)] != xh[(size_t)(r * g.n + i)];
+            if (g.post) bad += std::memcmp(pk.data() + r * g.hc, ph.data() + r * g.hc, (size_t)g.hc * 4) != 0;
+        }
+        if (bad) { std::printf("FAIL %s: %ld differ\n", w, bad); ++g_fails; }
+        else std::printf("ok   %s\n", w);
+    }
+}
+
+/* ---- rmsnorm_ihc_junction against its chain, byte for byte: the add (host, add_bf16's
+ * arithmetic), rmsnorm in rmsnorm_bf16's order (host: kR4dSumLanes' partition, the wave butterfly,
+ * the waves in order, rsqrtf as the emulator has it), the emulated ihc_post and ihc_pre kernels,
+ * rmsnorm again. Every form: with and without the add, `y` / `x` stored or not, tail 0, the head. */
+static void host_rmsnorm_row(const uint16_t* x, const float* g, int n, float eps, uint16_t* y) {
+    float part[256];
+    for (int t = 0; t < 256; ++t) {
+        float ss = 0.0f;
+        for (int i = t; i < n; i += 256) { const float v = b2f(x[i]); ss += v * v; }
+        part[t] = ss;
+    }
+    float total = 0.0f;
+    for (int w = 0; w < 8; ++w) {
+        float l[32];
+        for (int i = 0; i < 32; ++i) l[i] = part[w * 32 + i];
+        for (int d = 16; d >= 1; d >>= 1) {
+            float nl[32];
+            for (int i = 0; i < 32; ++i) nl[i] = l[i] + l[i ^ d];
+            std::memcpy(l, nl, sizeof l);
+        }
+        total += l[0];
+    }
+    const float s = 1.0f / std::sqrt(total / (float)n + eps);
+    const float wadd = 0.0f, mult = 1.0f;
+    for (int i = 0; i < n; ++i) y[i] = f2b(b2f(x[i]) * s * (g[i] + wadd) * mult);
+}
+
+static void ihc_junction() {
+    struct G { int64_t hc, n, M; bool add, ys, xs, tail, head; };
+    const G cases[] = {
+        { 4, 3072, 1, false, false, false, true, false }, { 4, 3072, 6, true, true, true, true, false },
+        { 4, 512, 17, true, false, true, true, false },   { 4, 512, 6, false, true, false, true, true },
+        { 2, 128, 6, true, true, true, false, false },    { 2, 128, 64, false, false, false, true, false },
+        { 4, 512, 3, true, false, false, true, true },    { 8, 64, 2, false, true, true, true, false },
+        { 2, 128, 1024, true, true, false, true, false },
+    };
+    for (const G& g : cases) {
+        Rng rng((uint32_t)(g.hc * 13 + g.n + g.M));
+        const int64_t M = g.M, n = g.n, hc = g.hc, W = hc * n, rows = g.head ? hc : 2 * hc;
+        const bool post = !g.head;
+        std::vector<uint16_t> A((size_t)(M * n)), B((size_t)(M * n)), H((size_t)(M * W));
+        for (auto& v : A) v = f2b(rng.n() * 1.5f);
+        for (auto& v : B) v = f2b(rng.n() * 1.5f);
+        for (auto& v : H) v = f2b(rng.n() * 2);
+        std::vector<float> wp((size_t)n), wn((size_t)n), P((size_t)(M * hc)), fn((size_t)(rows * W)),
+            base((size_t)rows), scale = { 3.0f, 2.1f };
+        for (auto& v : wp) v = 1.0f + rng.n() * 0.4f;
+        for (auto& v : wn) v = 1.0f + rng.n() * 0.4f;
+        for (auto& v : P) v = 0.5f + rng.u();
+        for (auto& v : fn) v = rng.n() * 0.05f;
+        for (auto& v : base) v = rng.n() * 0.7f;
+        /* the fused kernel */
+        auto Ak = A, Hk = H;
+        auto Pk = P;
+        std::vector<uint16_t> XNk((size_t)(M * n), 0x7e7e), Yk((size_t)(M * n), 0x7e7e), Xk((size_t)(M * n), 0x7e7e);
+        RadTensor t[12] = {
+            t2(Ak.data(), RAD_BF16, M, n, n), g.add ? t2(B.data(), RAD_BF16, M, n, n) : RadTensor{},
+            t1(wp.data(), RAD_F32, n), t2(Pk.data(), RAD_F32, M, hc, hc), t2(Hk.data(), RAD_BF16, M, W, W),
+            g.tail ? t2(fn.data(), RAD_F32, rows, W, W) : RadTensor{},
+            g.tail ? t1(scale.data(), RAD_F32, post ? 2 : 1) : RadTensor{},
+            g.tail ? t1(base.data(), RAD_F32, rows) : RadTensor{},
+            g.tail ? t1(wn.data(), RAD_F32, n) : RadTensor{},
+            g.tail ? t2(XNk.data(), RAD_BF16, M, n, n) : RadTensor{},
+            g.ys ? t2(Yk.data(), RAD_BF16, M, n, n) : RadTensor{},
+            g.xs && g.tail ? t2(Xk.data(), RAD_BF16, M, n, n) : RadTensor{} };
+        std::vector<RadParam> p = { pi("M", M), pi("n", n), pi("hc", hc), pi("rows", rows), pf("eps", 1e-6),
+                                    pf("ihc_eps", 1e-5), pf("hc_eps", 1e-6), pi("tail", g.tail ? 1 : 0),
+                                    ps("dtype", "bf16") };
+        if (post) p.push_back(pf("post_mag", 2.0));
+        RadArgs a{}; a.t = t; a.n_t = 12; a.p = p.data(); a.n_p = (int)p.size(); a.world_size = 1;
+        char w[160];
+        std::snprintf(w, sizeof w, "rmsnorm_ihc_junction hc %lld n %lld M %lld%s%s%s%s vs the chain, bit for bit",
+                      (long long)hc, (long long)n, (long long)M, g.add ? " add" : "", g.tail ? "" : " tail 0",
+                      g.head ? " head" : "", g.ys || g.xs ? " y/x stored" : "");
+        ++g_cases;
+        if (r4d_rad_rmsnorm_ihc_junction(&a, nullptr) != RAD_OK) { std::printf("FAIL %s: launch\n", w); ++g_fails; continue; }
+        /* the chain */
+        auto Ac = A, Hc = H;
+        auto Pc = P;
+        std::vector<uint16_t> Yc((size_t)(M * n)), Xc((size_t)(M * n)), XNc((size_t)(M * n));
+        if (g.add)
+            for (size_t i = 0; i < Ac.size(); ++i) Ac[i] = f2b(b2f(Ac[i]) + b2f(B[i]));
+        for (int64_t r = 0; r < M; ++r) host_rmsnorm_row(Ac.data() + r * n, wp.data(), (int)n, 1e-6f, Yc.data() + r * n);
+        {
+            RadTensor tp[3] = { t2(Yc.data(), RAD_BF16, M, n, n), t2(Pc.data(), RAD_F32, M, hc, hc),
+                                t2(Hc.data(), RAD_BF16, M, W, W) };
+            std::vector<RadParam> q = { pi("M", M), pi("n", n), pi("hc", hc), ps("dtype", "bf16") };
+            RadArgs b{}; b.t = tp; b.n_t = 3; b.p = q.data(); b.n_p = (int)q.size(); b.world_size = 1;
+            if (r4d_rad_ihc_post(&b, nullptr) != RAD_OK) { std::printf("FAIL %s: chain ihc_post\n", w); ++g_fails; continue; }
+        }
+        if (g.tail) {
+            RadTensor tp[6] = { t2(Hc.data(), RAD_BF16, M, W, W), t2(fn.data(), RAD_F32, rows, W, W),
+                                t1(scale.data(), RAD_F32, post ? 2 : 1), t1(base.data(), RAD_F32, rows),
+                                t2(Xc.data(), RAD_BF16, M, n, n),
+                                post ? t2(Pc.data(), RAD_F32, M, hc, hc) : RadTensor{} };
+            std::vector<RadParam> q = { pi("M", M), pi("n", n), pi("hc", hc), pi("rows", rows),
+                                        pf("eps", 1e-5), pf("hc_eps", 1e-6), ps("dtype", "bf16") };
+            if (post) q.push_back(pf("post_mag", 2.0));
+            RadArgs b{}; b.t = tp; b.n_t = 6; b.p = q.data(); b.n_p = (int)q.size(); b.world_size = 1;
+            if (r4d_rad_ihc_pre(&b, nullptr) != RAD_OK) { std::printf("FAIL %s: chain ihc_pre\n", w); ++g_fails; continue; }
+            for (int64_t r = 0; r < M; ++r) host_rmsnorm_row(Xc.data() + r * n, wn.data(), (int)n, 1e-6f, XNc.data() + r * n);
+        }
+        long bad = 0;
+        auto cmpv = [&](const void* x, const void* y, size_t bytes, const char* what) {
+            if (std::memcmp(x, y, bytes)) { if (!bad) std::printf("  first difference in %s\n", what); ++bad; }
+        };
+        cmpv(Ak.data(), Ac.data(), Ac.size() * 2, "a");
+        cmpv(Hk.data(), Hc.data(), Hc.size() * 2, "h");
+        cmpv(Pk.data(), Pc.data(), Pc.size() * 4, "post");
+        if (g.tail) cmpv(XNk.data(), XNc.data(), XNc.size() * 2, "xn");
+        if (g.ys) cmpv(Yk.data(), Yc.data(), Yc.size() * 2, "y");
+        else for (auto v : Yk) if (v != 0x7e7e) { cmpv("a", "b", 1, "y written though absent"); break; }
+        if (g.xs && g.tail) cmpv(Xk.data(), Xc.data(), Xc.size() * 2, "x");
+        if (bad) { std::printf("FAIL %s\n", w); ++g_fails; }
+        else std::printf("ok   %s\n", w);
+    }
+}
+
 int main() {
     ihc_pre();
     ihc_post();
+    ihc_pre_order();
+    ihc_junction();
     gate_mul();
     mla_kv();
     engram_ids();

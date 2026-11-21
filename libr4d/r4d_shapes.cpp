@@ -507,6 +507,21 @@ extern "C" int r4d_shape_ihc_post(const RadParam* p, int n_p, int operand, RadOp
     const RadOpdDesc l[] = { opd(D, M, n), opd((uint32_t)RAD_F32, M, hc), opd(D, M, hc * n) };
     R4D_PICK(l);
 }
+/* rmsnorm_ihc_junction and its all-reduce twin: every optional operand described (the add form,
+ * `y` and `x` stored), the next connection's only with `tail` (default 1). */
+extern "C" int r4d_shape_rmsnorm_ihc_junction(const RadParam* p, int n_p, int operand,
+                                              RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc"),
+                  rows = pi(p, n_p, "rows"), tail = pi(p, n_p, "tail", 1);
+    if (hc < 1 || (tail && rows != hc && rows != 2 * hc)) return RAD_E_UNSUPPORTED;
+    const bool post = rows == 2 * hc;
+    const uint32_t D = dt_act(p, n_p, "dtype"), F = (uint32_t)RAD_F32;
+    const RadOpdDesc l[] = { opd(D, M, n), opd(D, M, n), opd(F, n), opd(F, M, hc), opd(D, M, hc * n),
+        tail ? opd(F, rows, hc * n) : opd_none(), tail ? opd(F, post ? 2 : 1) : opd_none(),
+        tail ? opd(F, rows) : opd_none(), tail ? opd(F, n) : opd_none(),
+        tail ? opd(D, M, n) : opd_none(), opd(D, M, n), tail ? opd(D, M, n) : opd_none() };
+    R4D_PICK(l);
+}
 extern "C" int r4d_shape_gate_mul(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
     const uint32_t D = dt_act(p, n_p, "dtype");

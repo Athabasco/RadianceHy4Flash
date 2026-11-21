@@ -1021,6 +1021,36 @@ int ref_ihc_post_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     return o.finish("ihc_post", operand, out);
 }
 
+/* rmsnorm_ihc_junction: every optional operand passed (the add form, y and x stored); the next
+ * connection's only with `tail` (default 1). */
+int ref_rmsnorm_ihc_junction_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p), F = (uint32_t)RAD_F32;
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), hc = gi(p, n_p, "hc", 0),
+                  rows = gi(p, n_p, "rows", 0), tail = gi(p, n_p, "tail", 1);
+    if (M <= 0 || n <= 0 || hc < 1 || hc > 16 || (tail && rows != 2 * hc && rows != hc))
+        return RAD_E_UNSUPPORTED;
+    const bool post = rows == 2 * hc;
+    Opd o;
+    o.t(D, { M, n });                                 /* a, INOUT */
+    o.t(D, { M, n });                                 /* b */
+    o.t(F, { n });                                    /* w_post */
+    o.t(F, { M, hc });                                /* post, INOUT */
+    o.t(D, { M, hc * n });                            /* h, INOUT */
+    if (tail) {
+        o.t(F, { rows, hc * n });                     /* fn */
+        o.t(F, { post ? 2 : 1 });                     /* scale */
+        o.t(F, { rows });                             /* base */
+        o.t(F, { n });                                /* w_next */
+        o.t(D, { M, n });                             /* xn */
+    } else {
+        for (int i = 0; i < 5; ++i) o.skip();
+    }
+    o.t(D, { M, n });                                 /* y */
+    if (tail) o.t(D, { M, n });                       /* x */
+    else o.skip();
+    return o.finish("rmsnorm_ihc_junction", operand, out);
+}
+
 int ref_mla_project_kv_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), h = gi(p, n_p, "heads", 0), kd = gi(p, n_p, "k_dim", 0),
                   vd = gi(p, n_p, "v_dim", 0), l = gi(p, n_p, "latent_dim", 0);

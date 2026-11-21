@@ -33828,6 +33828,204 @@ static void hy4_ihc_post_case(const Plugin& pl) {
     }
 }
 
+/* ---- rmsnorm_ihc_junction (WP16.2) against its chain of libr4d rows on the card, byte for byte:
+ * [add_bf16,] rmsnorm_bf16, ihc_post_bf16, [ihc_pre_bf16, rmsnorm_bf16], each launched as the
+ * graph would (y and x through buffers of their own). Every operand of the junction compares:
+ * a (the add's sum), post, h, xn, y and x where stored. The real stream (4 x 3072), gpu-mini's
+ * (4 x 512), a narrow one; decode heights to a prefill chunk; the head form and tail 0. The same
+ * host data drive the all-reduce twin's reference below (ij_ref). */
+struct IjCase {
+    int64_t M = 1, n = 512, hc = 4;
+    bool add = false, ys = false, xs = false, tail = true, head = false;
+};
+struct IjData {
+    std::vector<uint16_t> a, b, h, xn, y, x;
+    std::vector<float> wp, wn, post, fn, base, scale;
+};
+static IjData ij_data(const IjCase& c, uint32_t seed) {
+    Hy4Rng rng(seed);
+    const int64_t M = c.M, n = c.n, W = c.hc * n, rows = c.head ? c.hc : 2 * c.hc;
+    IjData d;
+    d.a.resize((size_t)(M * n)); d.b.resize((size_t)(M * n)); d.h.resize((size_t)(M * W));
+    for (auto& v : d.a) v = h_to_bf16(rng.n() * 1.5f);
+    for (auto& v : d.b) v = h_to_bf16(rng.n() * 1.5f);
+    for (auto& v : d.h) v = h_to_bf16(rng.n() * 2.0f);
+    d.wp.resize((size_t)n); d.wn.resize((size_t)n);
+    for (auto& v : d.wp) v = 1.0f + rng.n() * 0.4f;
+    for (auto& v : d.wn) v = 1.0f + rng.n() * 0.4f;
+    d.post.resize((size_t)(M * c.hc));
+    for (auto& v : d.post) v = 0.5f + rng.u() * 0.7f;
+    d.fn.resize((size_t)(rows * W)); d.base.resize((size_t)rows);
+    for (auto& v : d.fn) v = rng.n() * 0.02f;
+    for (auto& v : d.base) v = rng.n() * 0.7f;
+    d.scale = { 3.0f, 2.1f };
+    d.xn.assign((size_t)(M * n), 0x7e7e); d.y.assign((size_t)(M * n), 0x7e7e);
+    d.x.assign((size_t)(M * n), 0x7e7e);
+    return d;
+}
+static std::vector<RadParam> ij_params(const IjCase& c) {
+    std::vector<RadParam> p = { PI("M", c.M), PI("n", c.n), PI("hc", c.hc),
+                                PI("rows", c.head ? c.hc : 2 * c.hc), PF("eps", 1e-6),
+                                PF("ihc_eps", 1e-5), PF("hc_eps", 1e-6), PI("tail", c.tail ? 1 : 0),
+                                PS("dtype", "bf16") };
+    if (!c.head) p.push_back(PF("post_mag", 2.0));
+    return p;
+}
+/* Device copies of the data (hipMalloc'd: the twin's rank threads use it too). */
+struct IjDev {
+    void *a = nullptr, *b = nullptr, *wp = nullptr, *post = nullptr, *h = nullptr, *fn = nullptr,
+         *scale = nullptr, *base = nullptr, *wn = nullptr, *xn = nullptr, *y = nullptr, *x = nullptr;
+    bool up(const IjCase& c, const IjData& d) {
+        auto put = [](void*& p, const void* src, size_t bytes) {
+            if (hipMalloc(&p, bytes) != hipSuccess) { p = nullptr; return false; }
+            st_memcpy(p, src, bytes, hipMemcpyHostToDevice);
+            return true;
+        };
+        return put(a, d.a.data(), d.a.size() * 2) && put(b, d.b.data(), d.b.size() * 2) &&
+               put(wp, d.wp.data(), d.wp.size() * 4) && put(post, d.post.data(), d.post.size() * 4) &&
+               put(h, d.h.data(), d.h.size() * 2) && put(fn, d.fn.data(), d.fn.size() * 4) &&
+               put(scale, d.scale.data(), 8) && put(base, d.base.data(), d.base.size() * 4) &&
+               put(wn, d.wn.data(), d.wn.size() * 4) && put(xn, d.xn.data(), d.xn.size() * 2) &&
+               put(y, d.y.data(), d.y.size() * 2) && put(x, d.x.data(), d.x.size() * 2) &&
+               c.M > 0;
+    }
+    void down(IjData& d) const {
+        st_memcpy(d.a.data(), a, d.a.size() * 2, hipMemcpyDeviceToHost);
+        st_memcpy(d.post.data(), post, d.post.size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(d.h.data(), h, d.h.size() * 2, hipMemcpyDeviceToHost);
+        st_memcpy(d.xn.data(), xn, d.xn.size() * 2, hipMemcpyDeviceToHost);
+        st_memcpy(d.y.data(), y, d.y.size() * 2, hipMemcpyDeviceToHost);
+        st_memcpy(d.x.data(), x, d.x.size() * 2, hipMemcpyDeviceToHost);
+    }
+    void free_all() {
+        for (void* p : { a, b, wp, post, h, fn, scale, base, wn, xn, y, x }) if (p) st_free(p);
+        *this = IjDev{};
+    }
+    /* The junction's twelve operands; `add` false leaves b out (the twin's reference runs on the
+     * reduced sum with no add). */
+    std::vector<RadTensor> ts(const IjCase& c, bool add) const {
+        const int64_t M = c.M, n = c.n, W = c.hc * n, rows = c.head ? c.hc : 2 * c.hc;
+        std::vector<RadTensor> t = {
+            T(a, RAD_BF16, { M, n }), T(b, RAD_BF16, { M, n }), T(wp, RAD_F32, { n }),
+            T(post, RAD_F32, { M, c.hc }), T(h, RAD_BF16, { M, W }), T(fn, RAD_F32, { rows, W }),
+            T(scale, RAD_F32, { c.head ? 1 : 2 }), T(base, RAD_F32, { rows }), T(wn, RAD_F32, { n }),
+            T(xn, RAD_BF16, { M, n }), T(y, RAD_BF16, { M, n }), T(x, RAD_BF16, { M, n }) };
+        if (!add) absent(t[1]);
+        if (!c.tail) for (int i : { 5, 6, 7, 8, 9, 11 }) absent(t[(size_t)i]);
+        if (!c.ys) absent(t[10]);
+        if (!c.xs) absent(t[11]);
+        return t;
+    }
+};
+static int ij_run_row(const RadKernelInfo* row, std::vector<RadTensor>& ts, std::vector<RadParam>& ps) {
+    RadArgs a{};
+    a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
+    const int rc = row->launch(&a, nullptr);
+    return st_stream_sync(nullptr) == hipSuccess ? rc : RAD_E_DEVICE;
+}
+/* The chain on the card over `d`'s buffers (y and x always through buffers here). */
+static int ij_chain(const Plugin& pl, const IjCase& c, const IjDev& d, bool add) {
+    const RadKernelInfo* addr = find(pl, "add_bf16");
+    const RadKernelInfo* nrm = find(pl, "rmsnorm_bf16");
+    const RadKernelInfo* post = find(pl, "ihc_post_bf16");
+    const RadKernelInfo* pre = find(pl, "ihc_pre_bf16");
+    if (!addr || !nrm || !post || !pre) return RAD_E_NOKERNEL;
+    const int64_t M = c.M, n = c.n, W = c.hc * n, rows = c.head ? c.hc : 2 * c.hc;
+    int rc = RAD_OK;
+    if (add) {
+        std::vector<RadTensor> t = { T(d.a, RAD_BF16, { M, n }), T(d.b, RAD_BF16, { M, n }),
+                                     T(d.a, RAD_BF16, { M, n }) };
+        std::vector<RadParam> p = { PI("M", M), PI("n", n), PS("dtype", "bf16") };
+        if ((rc = ij_run_row(addr, t, p)) != RAD_OK) return rc;
+    }
+    {
+        std::vector<RadTensor> t = { T(d.a, RAD_BF16, { M, n }), T(d.wp, RAD_F32, { n }),
+                                     T(d.y, RAD_BF16, { M, n }) };
+        std::vector<RadParam> p = { PI("M", M), PI("n", n), PF("eps", 1e-6), PS("dtype", "bf16") };
+        if ((rc = ij_run_row(nrm, t, p)) != RAD_OK) return rc;
+    }
+    {
+        std::vector<RadTensor> t = { T(d.y, RAD_BF16, { M, n }), T(d.post, RAD_F32, { M, c.hc }),
+                                     T(d.h, RAD_BF16, { M, W }) };
+        std::vector<RadParam> p = { PI("M", M), PI("n", n), PI("hc", c.hc), PS("dtype", "bf16") };
+        if ((rc = ij_run_row(post, t, p)) != RAD_OK) return rc;
+    }
+    if (!c.tail) return RAD_OK;
+    {
+        std::vector<RadTensor> t = { T(d.h, RAD_BF16, { M, W }), T(d.fn, RAD_F32, { rows, W }),
+                                     T(d.scale, RAD_F32, { c.head ? 1 : 2 }), T(d.base, RAD_F32, { rows }),
+                                     T(d.x, RAD_BF16, { M, n }), T(d.post, RAD_F32, { M, c.hc }) };
+        if (c.head) absent(t[5]);
+        std::vector<RadParam> p = { PI("M", M), PI("n", n), PI("hc", c.hc), PI("rows", rows),
+                                    PF("eps", 1e-5), PF("hc_eps", 1e-6), PS("dtype", "bf16") };
+        if (!c.head) p.push_back(PF("post_mag", 2.0));
+        if ((rc = ij_run_row(pre, t, p)) != RAD_OK) return rc;
+    }
+    std::vector<RadTensor> t = { T(d.x, RAD_BF16, { M, n }), T(d.wn, RAD_F32, { n }),
+                                 T(d.xn, RAD_BF16, { M, n }) };
+    std::vector<RadParam> p = { PI("M", M), PI("n", n), PF("eps", 1e-6), PS("dtype", "bf16") };
+    return ij_run_row(nrm, t, p);
+}
+/* Bytes of the junction's outputs that differ between two runs (y / x only where stored). */
+static int64_t ij_diff(const IjCase& c, const IjData& g, const IjData& w, std::string* first) {
+    int64_t bad = 0;
+    auto cmp = [&](const void* x, const void* y, size_t n, size_t es, const char* what) {
+        for (size_t i = 0; i < n; ++i)
+            if (std::memcmp((const char*)x + i * es, (const char*)y + i * es, es)) {
+                if (!bad && first) *first = fmt("%s element %zu", what, i);
+                ++bad;
+            }
+    };
+    cmp(g.a.data(), w.a.data(), w.a.size(), 2, "a");
+    cmp(g.post.data(), w.post.data(), w.post.size(), 4, "post");
+    cmp(g.h.data(), w.h.data(), w.h.size(), 2, "h");
+    if (c.tail) cmp(g.xn.data(), w.xn.data(), w.xn.size(), 2, "xn");
+    if (c.ys) cmp(g.y.data(), w.y.data(), w.y.size(), 2, "y");
+    if (c.xs && c.tail) cmp(g.x.data(), w.x.data(), w.x.size(), 2, "x");
+    return bad;
+}
+static void hy4_ihc_junction_case(const Plugin& pl) {
+    if (!sel("rmsnorm_ihc_junction_bf16")) return;
+    const RadKernelInfo* row = find(pl, "rmsnorm_ihc_junction_bf16");
+    if (!row) { ok("rmsnorm_ihc_junction_bf16", false, "row absent"); return; }
+    std::vector<IjCase> cs;
+    auto C = [&](int64_t M, int64_t n, int64_t hc, bool add, bool ys, bool xs, bool tail, bool head) {
+        IjCase c; c.M = M; c.n = n; c.hc = hc; c.add = add; c.ys = ys; c.xs = xs; c.tail = tail; c.head = head;
+        cs.push_back(c);
+    };
+    C(1, 3072, 4, false, false, false, true, false);  C(1, 3072, 4, true, true, true, true, false);
+    C(6, 3072, 4, true, false, false, true, false);   C(17, 3072, 4, false, true, false, true, false);
+    C(1024, 3072, 4, true, false, false, true, false); C(1, 512, 4, false, false, false, true, false);
+    C(6, 512, 4, true, true, true, true, false);      C(1024, 512, 4, false, false, true, true, false);
+    C(3, 3072, 4, false, true, true, true, true);     C(1, 512, 4, true, false, false, true, true);
+    C(5, 3072, 4, true, true, false, false, false);   C(6, 128, 2, false, true, true, true, false);
+    C(1, 64, 8, true, false, true, true, false);
+    for (const IjCase& c : cs) {
+        const std::string what = fmt("rmsnorm_ihc_junction is byte-identical to its chain: hc %lld n %lld "
+                                     "M %lld%s%s%s%s", (long long)c.hc, (long long)c.n, (long long)c.M,
+                                     c.add ? ", add" : "", c.tail ? "" : ", tail 0",
+                                     c.head ? ", head form" : "", c.ys || c.xs ? ", y / x stored" : "");
+        IjData d0 = ij_data(c, (uint32_t)(c.M * 131 + c.n + c.hc * 7 + c.add + 2 * c.head));
+        IjDev fu, ch;
+        if (!fu.up(c, d0) || !ch.up(c, d0)) { ok(what.c_str(), false, "allocation"); fu.free_all(); ch.free_all(); continue; }
+        std::vector<RadTensor> t = fu.ts(c, c.add);
+        std::vector<RadParam> p = ij_params(c);
+        const int r1 = ij_run_row(row, t, p), r2 = ij_chain(pl, c, ch, c.add);
+        if (r1 != RAD_OK || r2 != RAD_OK) {
+            ok(what.c_str(), false, fmt("rc %d / chain %d", r1, r2));
+        } else {
+            IjData g = d0, w = d0;
+            fu.down(g);
+            ch.down(w);
+            std::string first;
+            const int64_t bad = ij_diff(c, g, w, &first);
+            ok(what.c_str(), bad == 0, fmt("%lld values differ%s%s", (long long)bad, bad ? ", first " : "", first.c_str()));
+        }
+        fu.free_all();
+        ch.free_all();
+    }
+}
+
 static void hy4_gate_mul_case(const Plugin& pl) {
     if (!sel("gate_mul_bf16")) return;
     struct G { int64_t M, n, pad; };
@@ -34370,6 +34568,7 @@ static void device_phase(const Plugin& pl) {
     hy4_embed_row_scale_case(pl);
     hy4_ihc_pre_case(pl);
     hy4_ihc_post_case(pl);
+    hy4_ihc_junction_case(pl);
     hy4_gate_mul_case(pl);
     hy4_misc_case(pl);
     hy4_mla_project_kv_case(pl);

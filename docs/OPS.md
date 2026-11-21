@@ -3751,6 +3751,7 @@ refuses the graph rather than resolving a similar op.
 |---|---|---|
 | `ihc_pre` | `M`(range) `n` `hc` `rows` `eps`:f64 `hc_eps`:f64 `post_mag`:f64/opt `dtype` | `h`, `fn`w, `scale`w, `base`w → `x`, `post`? |
 | `ihc_post` | `M`(range) `n` `hc` `dtype` | `y`, `post`, `h`:inout |
+| `rmsnorm_ihc_junction` | `M`(range) `n` `hc` `rows` `eps`:f64 `ihc_eps`:f64/opt `hc_eps`:f64/opt `post_mag`:f64/opt `tail`/opt `dtype` | `a`:inout, `b`?, `w_post`w, `post`:inout, `h`:inout, `fn`w?, `scale`w?, `base`w?, `w_next`w?, `xn`?, `y`?, `x`? |
 | `mla_project_kv` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `mode` `dtype` | `a`, `b`w → `y` |
 | `mla_expand_gate` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `dtype` | `x`, `w`w, `g` → `y` |
 | `mla_attn_paged_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `block_size` `window` `scale`:f64 `dtype` | `q`, `q_rope`, `kv`, `block_table`, `seqused`, `cu_seqlens`, `sinks`w → `out` |
@@ -3792,6 +3793,30 @@ post[j]  = post_mag * sigmoid(c[hc+j] * scale[1] + base[hc+j]) + hc_eps     with
 - `fn`, `scale`, `base` and `post` are f32; `h` and `x` take the activation dtype.
 - `ihc_post`: `h[j*n + i] = round( post[j] * f32(y[i]) + f32(h[j*n + i]) )`, in place, the product
   rounded to f32 before the add. No stream reads another, so in place is safe.
+- The libraries' sums: libref as above; libr4d (`ihc_pre_bf16`, since WP16.2) in 16-byte pieces
+  of the flattened row, thread `t` of 512 owning pieces `t, t + 512, ...`, the pieces and their
+  eight values ascending, the lanes of a wave by the xor butterfly (16, 8, 4, 2, 1), the 16 waves
+  from 0.0f in order, the sum of squares in f32 the same way. It agrees with libref within the
+  op's bound (`x` one bf16 ulp, `post` 2e-4 relative) and its bytes depend on the row alone.
+
+### `rmsnorm_ihc_junction`
+
+The junction between two blocks of an iHC model in one op. In sequence:
+
+```
+[a = round(a + b)]                                  `add`, when b is passed; stored into a
+y  = rmsnorm(a; w_post, eps)                        the block's sandwich norm
+ihc_post(y, post, h)                                h updated in place
+[ihc_pre(h; fn, scale, base; rows, ihc_eps, hc_eps, post_mag) -> x, post]     tail 1 (default)
+[xn = rmsnorm(x; w_next, eps)]                      the next block's input norm
+```
+
+Byte-identical to those ops of the same library in sequence (libr4d's row publishes the chain as
+its `replaces` hook; libref and libavx compose their own ops). `rows` 2 hc writes the next write
+weights into `post` (which ihc_post read first); `rows` hc is the head's collapse and leaves
+`post`. `tail` 0 stops behind ihc_post (fn .. xn absent): an Engram writes h in front of the next
+layer. `y` and `x` are the chain's intermediates, stored only when passed (the debug taps).
+
 
 ### `mla_project_kv`
 

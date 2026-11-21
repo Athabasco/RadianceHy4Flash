@@ -148,6 +148,86 @@ int ref_ihc_post(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ================================================================== rmsnorm_ihc_junction */
+
+/* The iHC junction between two blocks: `[add] -> rmsnorm -> ihc_post -> [ihc_pre -> rmsnorm]`, by
+ * definition these ops of libref in sequence (docs/OPS.md); the intermediates `y` and `x` are
+ * stored where passed and held in temporaries of the activation dtype otherwise.
+ * Operands: a (inout), b?, w_post, post (inout), h (inout), fn?, scale?, base?, w_next?, xn?, y?, x?. */
+int ref_rmsnorm_ihc_junction(const RadArgs* a, RadStream s) {
+    if (!a || a->n_t < 5) return RAD_E_INVAL;
+    auto opd = [&](int i) -> const RadTensor* { return i < a->n_t ? t_in(a, i) : nullptr; };
+    const RadTensor *A = opd(0), *B = opd(1), *wp = opd(2), *post = opd(3), *h = opd(4);
+    const RadTensor *fn = opd(5), *sc = opd(6), *bs = opd(7), *wn = opd(8), *xn = opd(9);
+    const RadTensor *Y = opd(10), *X = opd(11);
+    const int64_t n = p_int(a, "n", 0), hc = p_int(a, "hc", 0), rows = p_int(a, "rows", 0),
+                  tail = p_int(a, "tail", 1);
+    if (!A || !wp || !post || !h) return RAD_E_INVAL;
+    if (tail != 0 && tail != 1) return RAD_E_INVAL;
+    if (tail && (!fn || !sc || !bs || !wn || !xn)) return RAD_E_INVAL;
+    if (n < 1 || hc < 1 || A->rank != 2 || A->shape[0] < 1 || A->shape[1] != n) return RAD_E_SHAPE;
+    const int64_t M = A->shape[0];
+    if (tail && rows != hc && rows != 2 * hc) return RAD_E_SHAPE;
+    const RadParam* eps = p_find(a, "eps");
+    if (!eps) return RAD_E_INVAL;
+    /* temporaries for the intermediates the caller did not pass */
+    const size_t es = A->dtype == RAD_F32 ? 4 : 2;
+    std::vector<unsigned char> ty, tx;
+    RadTensor yt{}, xt{};
+    auto tmp = [&](std::vector<unsigned char>& buf, RadTensor& t) {
+        buf.assign((size_t)(M * n) * es, 0);
+        t = RadTensor{};
+        t.data = buf.data();
+        t.dtype = A->dtype;
+        t.rank = 2;
+        t.shape[0] = M;
+        t.shape[1] = n;
+        t.stride[0] = n;
+        t.stride[1] = 1;
+    };
+    if (!Y) { tmp(ty, yt); Y = &yt; }
+    if (tail && !X) { tmp(tx, xt); X = &xt; }
+    RadParam pm[8]{};
+    auto P = [&](int k, const char* key, long long v) { pm[k] = RadParam{}; pm[k].key = key; pm[k].kind = RAD_P_INT; pm[k].ival = v; };
+    auto PF = [&](int k, const char* key, double v) { pm[k] = RadParam{}; pm[k].key = key; pm[k].kind = RAD_P_F64; pm[k].dval = v; };
+    auto run = [&](int (*fnp)(const RadArgs*, RadStream), std::initializer_list<const RadTensor*> ts,
+                   int np) {
+        RadTensor tv[8]{};
+        int k = 0;
+        for (const RadTensor* t : ts) tv[k++] = t ? *t : RadTensor{};
+        RadArgs sa{};
+        sa.t = tv;
+        sa.n_t = k;
+        sa.p = pm;
+        sa.n_p = np;
+        sa.world_size = 1;
+        return fnp(&sa, s);
+    };
+    P(0, "M", M);
+    P(1, "n", n);
+    if (B) RAD_REF_TRY(run(ref_add, { A, B, A }, 2));
+    PF(2, "eps", eps->kind == RAD_P_F64 ? eps->dval : (double)p_f32(a, "eps", 1e-6f));
+    RAD_REF_TRY(run(ref_rmsnorm, { A, wp, Y }, 3));
+    P(2, "hc", hc);
+    RAD_REF_TRY(run(ref_ihc_post, { Y, post, h }, 3));
+    if (!tail) return RAD_OK;
+    const bool has_post = rows == 2 * hc;
+    P(3, "rows", rows);
+    PF(4, "eps", (double)p_f32(a, "ihc_eps", 0.0f));
+    PF(5, "hc_eps", (double)p_f32(a, "hc_eps", 0.0f));
+    int np = 6;
+    if (has_post) {
+        if (!p_find(a, "post_mag")) return RAD_E_INVAL;
+        PF(6, "post_mag", (double)p_f32(a, "post_mag", 0.0f));
+        np = 7;
+    }
+    RAD_REF_TRY(run(ref_ihc_pre, { h, fn, sc, bs, X, has_post ? post : nullptr }, np));
+    P(0, "M", M);
+    P(1, "n", n);
+    PF(2, "eps", eps->kind == RAD_P_F64 ? eps->dval : (double)p_f32(a, "eps", 1e-6f));
+    return run(ref_rmsnorm, { X, wn, xn }, 3);
+}
+
 /* ================================================================== mla_project_kv */
 
 /* The checkpoint's kv_b read per head: head h's rows start at h (k_dim + v_dim), its k_dim key rows
