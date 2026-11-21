@@ -3504,6 +3504,7 @@ rad-info -v hy4-flash-w4nl64.rad
 |---|---|---|---|---|
 | none | bf16, 277 GiB | bf16, 118 GiB | bf16 | 410.3 GiB |
 | `hy4-flash-bf16.recipe` | bf16 | E4M3 rows at a bf16 scale each, 60.2 GiB | bf16 | 352.5 GiB |
+| `hy4-flash-bf16-f32.recipe` | bf16 | E4M3 rows at an f32 scale each, `divide=1`: the port's f32 round trip code for code, 61.5 GiB | bf16 | |
 | `hy4-flash-w4nl64-rtn.recipe` | the `w4nl` codebook at an E4M3 scale a 64 of K, rotated, round to nearest: 71.3 GiB | as above | bf16 | 147.1 GiB |
 | `hy4-flash-w4nl64-gptq.recipe` | the same form, GPTQ against `CALIB=<grams dir>` ([Calibrating](#calibrating-hy4-flash)) | as above | bf16 | 147.1 GiB |
 | `hy4-flash-w5nl64-rtn.recipe`, `hy4-flash-w6nl64-rtn.recipe` | the `w5nl` / `w6nl` codebook at an E4M3 scale a 64 of K, rotated | as above | bf16 | |
@@ -3666,7 +3667,7 @@ encoding it is stored in; nothing is chosen by a flag.
 | | bf16 | `moe_gemm`, whole experts a rank |
 | trunk linears (`attn_q_a`, `attn_q_nope`, `attn_q_rope`, `attn_kv_a`, `attn_gate`, `attn_output`, layer 0's `ffn_gate_up` / `ffn_down`, the shared expert, `ffn_latent_in` / `ffn_latent_out`, the indexer's) | bf16; int8 rotated or not, IQ8R; the forms the i8a8h GEMM decodes (the IQR trellis such as u5, rotated u4 / u5 with a zero point) | `Lin` (`hyv4flash_common.h`): `LinearFP8` at the weight's own encoding; an int8 one quantises its input from the bf16 plane (`had_quant_act_i8g` / `quant_act_i8g`) into the rank's code pair of that width, right before its GEMM |
 | `output.weight` | bf16, int8 (unrotated) | `logits_gemm` at the codes' dtype |
-| Engram table | bf16, E4M3 rows at a bf16 scale a row | `embed_lookup_q` |
+| Engram table | bf16 (the E4M3 round trip at run time, `quant_act_fp8` multiplying by 1/scale), E4M3 rows at a bf16 or f32 scale a row | `embed_lookup_q` |
 | kv_b, router, iHC, sinks, norms, pooling, Engram projections, `token_embd` | as shipped | refused by name when a recipe touched them |
 
 The clamp: every layer clamps the routed SwiGLU (gate <= 10, |up| <= 10). The clamped product is
