@@ -231,7 +231,7 @@ struct Dfly {
         rad_buf rowk = 0;
         rad_op op_rowk = 0, op_zk = 0, op_pe = 0, op_hn = 0, op_en = 0, op_g = 0, op_u = 0,
                op_silu = 0, op_down = 0, op_add = 0, op_head = 0, op_lcast = 0, op_topk = 0,
-               op_tok = 0, op_prev = 0;
+               op_tok = 0, op_prev = 0, op_gcp = 0, op_ucp = 0;
         rad_op op_gather = 0, op_merge = 0;   /* TP: the vocabulary shards' merge; 0 at one rank */
         Tap t_corr{}, t_logits{}, t_idx{}, t_val{};
     };
@@ -245,7 +245,7 @@ struct Dfly {
     rad_buf emb = 0, x = 0, xn = 0, y = 0, ffgu = 0, ffo = 0, qa = 0, q = 0, q_nope = 0, q_rope = 0,
             row = 0, q_lat = 0, lat = 0, ao = 0, gt = 0, ag = 0, o = 0, z = 0;
     rad_buf row0 = 0, ea = 0, th = 0, cat = 0, fu = 0;
-    rad_buf zk = 0, pe = 0, ccat = 0, cgu = 0, cff = 0, cd = 0, zc = 0, logits = 0, lbf = 0,
+    rad_buf zk = 0, pe = 0, ccat = 0, cg = 0, cup = 0, cgu = 0, cff = 0, cd = 0, zc = 0, logits = 0, lbf = 0,
             cidx = 0, cval = 0, prev = 0, tokens = 0;
     rad_buf pairs = 0, gath = 0;   /* TP: this rank's top-R as (id, value) pairs, every rank's */
     rad_op op_ar_o = 0, op_ar_y = 0;   /* TP: the layers' two reductions; 0 at one rank */
@@ -381,6 +381,11 @@ struct Dfly {
         zk = bf("chain_hidden", { S, E });
         pe = bf("chain_prev_embed", { S, E });
         ccat = bf("chain_in", { S, 2 * E });
+        /* gate and up each into a buffer of its own, then copied into the halves silu_mul reads: a GEMM
+         * output as a column half of one [S, 2E] buffer is strided once two sequences draft, and
+         * libr4d's GEMMs refuse a strided output (the copies are exact, so the bytes are unchanged). */
+        cg = bf("chain_gate", { S, E });
+        cup = bf("chain_up", { S, E });
         cgu = bf("chain_gate_up", { S, 2 * E });
         cff = bf("chain_act", { S, E });
         cd = bf("chain_delta", { S, E });
@@ -397,7 +402,7 @@ struct Dfly {
         }
         if (!tokens || !emb || !x || !xn || !y || !ffgu || !ffo || !qa || !q || !q_nope ||
             !q_rope || !row || !q_lat || !lat || !ao || !gt || !ag || !o || !z || !row0 || !ea ||
-            !th || !cat || !fu || !zk || !pe || !ccat || !cgu || !cff || !cd || !zc || !logits ||
+            !th || !cat || !fu || !zk || !pe || !ccat || !cg || !cup || !cgu || !cff || !cd || !zc || !logits ||
             !lbf || !cidx || !cval || !prev)
             return RAD_E_INVAL;
         for (int64_t i = 0; i < layers; ++i) {
@@ -608,8 +613,10 @@ struct Dfly {
                               { token }, { prev }, { pe });
             st.op_hn = decl_rmsnorm(b, S, E, s.eps, c_hnorm, zk, ccat);
             st.op_en = decl_rmsnorm(b, S, E, s.eps, c_enorm, pe, ccat);
-            st.op_g = gemm(S, E, 2 * E, c_gate, ccat, cgu);
-            st.op_u = gemm(S, E, 2 * E, c_up, ccat, cgu);
+            st.op_g = gemm(S, E, 2 * E, c_gate, ccat, cg);
+            st.op_u = gemm(S, E, 2 * E, c_up, ccat, cup);
+            st.op_gcp = decl_copy(b, S, E, RAD_BF16, cg, cgu);
+            st.op_ucp = decl_copy(b, S, E, RAD_BF16, cup, cgu);
             st.op_silu = mk(b, "silu_mul", { RAD_RANGE("M", 1, S), RAD_INT("n", E), RAD_STR("dtype", "bf16") },
                             {}, { cgu }, { cff });
             st.op_down = gemm(S, E, E, c_down, cff, cd);
@@ -662,7 +669,7 @@ struct Dfly {
             HY4_NEED(st.op_g && st.op_u && st.op_down && st.op_add && st.op_silu,
                      "gemm_nt / silu_mul / add");
             HY4_NEED(st.op_head, "logits_gemm");
-            HY4_NEED(st.op_lcast && st.op_tok && st.op_prev, "cast");
+            HY4_NEED(st.op_lcast && st.op_tok && st.op_prev && st.op_gcp && st.op_ucp, "cast");
             HY4_NEED(st.op_topk, "row_topk (bf16)");
         }
         if (sabotage) {
@@ -846,8 +853,10 @@ struct Dfly {
                 RAD_ISSUE_N(c, st.op_pe, n, brows(prev, n), RAD_W(token), brows(pe, n));
             RAD_ISSUE_N(c, st.op_hn, n, brows(zk, n), RAD_W(c_hnorm), bcol(ccat, 0, E, n));
             RAD_ISSUE_N(c, st.op_en, n, brows(pe, n), RAD_W(c_enorm), bcol(ccat, E, E, n));
-            RAD_ISSUE_N(c, st.op_g, n, brows(ccat, n), RAD_W(c_gate), bcol(cgu, 0, E, n));
-            RAD_ISSUE_N(c, st.op_u, n, brows(ccat, n), RAD_W(c_up), bcol(cgu, E, E, n));
+            RAD_ISSUE_N(c, st.op_g, n, brows(ccat, n), RAD_W(c_gate), brows(cg, n));
+            RAD_ISSUE_N(c, st.op_u, n, brows(ccat, n), RAD_W(c_up), brows(cup, n));
+            RAD_ISSUE_N(c, st.op_gcp, n, brows(cg, n), bcol(cgu, 0, E, n));
+            RAD_ISSUE_N(c, st.op_ucp, n, brows(cup, n), bcol(cgu, E, E, n));
             RAD_ISSUE_N(c, st.op_silu, n, brows(cgu, n), brows(cff, n));
             RAD_ISSUE_N(c, st.op_down, n, brows(cff, n), RAD_W(c_down), brows(cd, n));
             RAD_ISSUE_N(c, st.op_add, n, brows(zk, n), brows(cd, n), brows(zc, n));

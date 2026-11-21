@@ -1010,6 +1010,14 @@ std::vector<std::string> lint_step(const RadBuilder& b, const std::vector<const 
                         bad.push_back(at + ": " + o->op + " reads " + std::to_string(od.cols) +
                                       " of " + std::to_string(width) + " columns of '" + name(h) +
                                       "' as its input, which is not contiguous");
+                    /* ... and its output is written as contiguous rows too: a column slice is
+                     * refused once it holds more than one row (WP13.7, the DFly2 chain at two
+                     * drafting sequences). */
+                    if (k == is.opd.size() - 1 && w && !r && o->op.rfind("gemm_nt", 0) == 0 &&
+                        od.cols > 0 && od.rows != 1 && (od.cols != width || od.offset % width))
+                        bad.push_back(at + ": " + o->op + " writes " + std::to_string(od.cols) +
+                                      " of " + std::to_string(width) + " columns of '" + name(h) +
+                                      "' as its output, which is not contiguous");
                 } else if (od.kind == RAD_OPK_WEIGHT) {
                     const uint32_t h = od.handle;
                     if (h == 0 || h > b.weights.size()) {
