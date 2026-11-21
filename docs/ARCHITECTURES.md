@@ -3547,7 +3547,10 @@ trunk step with media rows: embed_lookup, the encoder's rows over their placehol
 - **Measured** against HF f32 (`ref/run_vis.py --preset mini-vis`: two pictures in one prompt, a
   2-frame clip, the indexer selecting): the patches equal HF's own bf16, the tower's rows within
   relL2 3e-3 .. 6e-3, every trunk tap within twice HF bf16's own distance under radiance's decisions,
-  on libref and libavx at TP1 and libref on two fake ranks; `--preset gpu-mini-vis --gpu` on cards.
+  on libref and libavx at TP1 and libref on two fake ranks (129 comparisons each, 0 fail); on the
+  cards `--preset gpu-mini-vis --gpu` (a 144-wide tower of 2 x 72 heads, patch 16, pictures of
+  126 and 144 rows, a 3-frame clip, a 2247-token prompt whose indexer selects past 2048) at TP1
+  and TP2, 136 comparisons each, 0 fail. `data/kernels_hy4.rkb` carries the vision rows.
 
 Tests: `hyv4flash_arch_test` (the declared graph of the `mini` geometry, each step kind lint clean,
 the taps, the refusals; at two and four ranks every weight covered exactly once, each rank's heads,
