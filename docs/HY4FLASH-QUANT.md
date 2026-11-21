@@ -54,7 +54,7 @@ What is served (all of it measured only on random-weight dummies):
 | weights | forms | note |
 |---|---|---|
 | routed experts | w4nl64, w5nl64, w6nl64 (rotated E4M3 activations); rotated int8, the IQR trellis, w4nl64 (rotated int8 activations); a w5nl64 / w6nl64 down behind a trellis gate_up; bf16 | SwiGLU clamp (gate <= 10, \|up\| <= 10) in every layer, every form: clamp in bf16, then quantise. TP2 / TP4: a slice of every expert (768 / 384 columns) |
-| trunk linears | bf16; int8 rotated (`/fwht128`) or not; IQ8R; the i8a8h trellis (u5 ...); rotated u4/u5 with a zero point | each int8 linear quantises its own input; kv_a not as a trellis on the cards (576 rows) |
+| trunk linears | bf16; int8 rotated (`/fwht128`) or not; IQ8R; the i8a8h trellis (u5 ...); rotated u4/u5 with a zero point | each int8 linear quantises its own input; kv_a stays bf16 in the recipes: 576 rows are no whole 128-row tile of libr4d's trellis GEMM nor of its int8 prefill tile (`gemm_i8a8_tiled`), so above 64 tokens an int8 kv_a falls to the host |
 | lm_head | bf16, int8 | |
 | Engram table | bf16, E4M3 rows at a bf16 or f32 scale | |
 | kv_b, router, iHC, sinks, norms, indexer pooling, Engram projections, token embedding | as shipped | refused by name when a recipe touches them |

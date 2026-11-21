@@ -3,8 +3,9 @@
 # as the rotated computed trellis at u4 under one f32 scale a row (libquant's tcq_code=mad, read by
 # moe_gemm_iqr against rotated int8 activations, docs/IQR.md), their down projection as the w6nl64
 # codebook (docs/MOE-W6.md, read against the rotated E4M3 pair of the clamped product); the wide
-# trunk projections as the u5 trellis and the narrow ones as rotated int8, both read at i8a8h (kv_a
-# too: its 576 rows are not whole 128-row tiles of libr4d's trellis GEMM); the
+# trunk projections as the u5 trellis and the narrow ones as rotated int8, both read at i8a8h (not
+# kv_a: its 576 rows are not whole 128-row tiles of libr4d's trellis GEMM nor of its int8 prefill
+# tile, so it stays bf16, as in hy4-flash-i8.recipe); the
 # lm_head as int8; the Engram tables as E4M3 rows. The form of qwen4exp-u4-w6nl-bf16ple.recipe.
 #
 #   CALIB=<grams dir> rad-convert <Hy4-flash checkpoint> --add engram-tables.safetensors \
@@ -22,7 +23,6 @@ blk.*.attn_gate.weight             gptq       codes=u5 tcq=16 tcq_code=mad tcq_r
 blk.*.ffn_gate_up.weight           gptq       codes=u5 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_gain=1.16 calib=$CALIB tcq_order=1
 blk.*.ffn_gate_up_shexp.weight     gptq       codes=u5 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_gain=1.16 calib=$CALIB tcq_order=1
 blk.*.ffn_latent_in.weight         gptq       codes=u5 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_gain=1.16 calib=$CALIB tcq_order=1
-blk.*.attn_kv_a.weight             gptq       codes=i8 group=128 scale=bf16 transform=fwht128 damp=0.01 calib=$CALIB
 blk.*.attn_output.weight           gptq       codes=i8 group=128 scale=bf16 transform=fwht128 damp=0.01 calib=$CALIB
 blk.*.ffn_down.weight              gptq       codes=i8 group=128 scale=bf16 transform=fwht128 damp=0.01 calib=$CALIB
 blk.*.ffn_down_shexp.weight        gptq       codes=i8 group=128 scale=bf16 transform=fwht128 damp=0.01 calib=$CALIB
