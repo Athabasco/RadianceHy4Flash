@@ -18,7 +18,7 @@ hy4_mla_sink.rkb is WP6b's (notes/wp6b-mkfix.py, rerecorded). The vision rows (W
   rad-kbench -m gpu-mini-vis.rad --kernels libref --max-ctx 4096 --max-tok 1024 --mm-max-patches 4096 --record vis.rkb
   python3 data/kernels_hy4.py vis data/kernels_hy4.rkb vis.rkb data/kernels_hy4.rkb
 
-Check a card with
+WP16.3 appended mla_project_kv points at 16 / 8 heads (`wp163`, `append` below). Check a card with
   rad-kbench --fixture data/kernels_hy4.rkb --kernels libr4d:libref [--bench]
 """
 import copy, struct, sys
@@ -161,6 +161,37 @@ def raw(src, out):
     x = dict(fx, source='hy4-flash TP shards / real n / M 6 (WP8, clones of the gpu-mini graph)', cases=new)
     save(x, out); print(len(new), 'cases')
 
+def wp163(src, out):
+    """WP16.3's points of mla_project_kv: the TP2 / TP4 head shares (16 / 8) at the heights the
+    gpu-mini graph only declares at 32 / 64 heads -- a verify (6), a full token tile (16), one past
+    it (17, the mb law's step), 128 and a ragged prefill chunk (1000) -- cloned from the recorded
+    16 / 8-head points and recorded again by libref:
+      python3 data/kernels_hy4.py wp163 data/kernels_hy4.rkb raw163.rkb
+      rad-kbench --fixture raw163.rkb --kernels libref --rerecord extra163.rkb
+      python3 data/kernels_hy4.py append data/kernels_hy4.rkb extra163.rkb data/kernels_hy4.rkb"""
+    fx = load(src)
+    have = {(c['op'], par(c, 'mode'), par(c, 'heads'), c['m']) for c in fx['cases']}
+    base = {}
+    for c in fx['cases']:
+        if c['op'] == 'mla_project_kv' and par(c, 'heads') in (8, 16) and c['m'] == 8:
+            base[(par(c, 'mode'), par(c, 'heads'))] = c
+    new, salt = [], 16300
+    for (mode, H), c in sorted(base.items()):
+        for M2 in (6, 16, 17, 128, 1000):
+            if ('mla_project_kv', mode, H, M2) in have: continue
+            new.append(m_clone(c, M2, salt)); salt += 1
+    x = dict(fx, source='hy4-flash: mla_project_kv at the TP2 / TP4 head shares, WP16.3 heights', cases=new)
+    save(x, out); print(len(new), 'cases')
+
+def append(base, extra, out):
+    """base's cases, then extra's (recorded) ones that base does not have."""
+    fx, ex = load(base), load(extra)
+    key = lambda c: (c['op'], repr(c['params']), repr([(o['role'], o['dtype'], o['shape']) for o in c['opd']]))
+    seen = {key(c) for c in fx['cases']}
+    add = [c for c in ex['cases'] if key(c) not in seen and any(o.get('have_ref') for o in c['opd'])]
+    fx['cases'] += add
+    save(fx, out); print(len(add), 'cases added,', len(fx['cases']), '->', out)
+
 def merge(*paths):
     out = paths[-1]; cases = []
     for i, p in enumerate(paths[:-1]):
@@ -202,4 +233,4 @@ def vis(base, rec, out):
     save(fx, out); print(len(add), 'vision cases added ->', out, len(fx['cases']), 'in all')
 
 if __name__ == '__main__':
-    {'raw': raw, 'merge': merge, 'vis': vis}[sys.argv[1]](*sys.argv[2:])
+    {'raw': raw, 'merge': merge, 'vis': vis, 'wp163': wp163, 'append': append}[sys.argv[1]](*sys.argv[2:])

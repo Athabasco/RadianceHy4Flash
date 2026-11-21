@@ -3393,8 +3393,9 @@ per layer
   [sparse] index_key, rmsnorm, qsa_work, idx_pool_gated into the indexer cache, qsa_tail_store;
            selecting: index_query_nope / _rope, rope, index_head, idx_score, qsa_select(own 1)
   absorbed:     mla_project_kv absorb, mla_attn_paged_sink (window) or mla_attn_sel_sink, expand
+                and gate_mul as one mla_expand_gate (libr4d fuses it; libref / libavx run the pair)
   non-absorbed: the latent copied, gemm_nt kv_b, mla_kv_split, the query assembled, attn_kv_sink
-  gate_mul, attn_output, rmsnorm (attn_post_norm), ihc_post
+  gate_mul (the rows no mla_expand_gate gated), attn_output, rmsnorm (attn_post_norm), ihc_post
   ihc_pre (hc_ffn), rmsnorm (ffn_norm)
   layer 0: ffn_gate_up, silu_mul, ffn_down; else ffn_latent_in, MoeFP8 (GlmRouter over x, the
            bf16 experts' clamped SwiGLU), ffn_latent_out, the shared expert, add
@@ -3408,10 +3409,17 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   contiguous key block). That is a speed choice, not a numerical one: both paths write the same
   cache rows, and the chunked-prefill harness runs (chunk 16 on `mini`, `mini6`) are within the
   same tolerance of HF as the one-shot ones. A paged gather of the cached latent rows belongs to
-  the non-absorbed prefill kernel's tuning (WP16), if profiling shows the expansion pays there. The sparse layers attend through the indexer's selection for every row
+  the non-absorbed prefill kernel's tuning (WP16), if profiling shows the expansion pays there;
+  with `mla_project_kv` on WMMA (WP16.3) an absorbed chunk of 1024 tokens behind a cached 1024 is
+  31 ms on gpu-mini at TP1 (66 before), which leaves little for such a gather to win. The sparse layers attend through the indexer's selection for every row
   once the step's longest context passes `compressed_indexer_group_topk * ratio` (2048; HF's
   `candidate_topk`), densely below it, where the selection would take every closed group.
   `RADIANCE_HY4_PREFILL=absorbed` sends every row down the absorbed path.
+- **The expansion and the gate.** The absorbed rows take `mla_expand_gate`: on libr4d the expansion
+  stores the gated product directly, byte for byte the pair it replaces (one launch a layer less);
+  the host libraries run the pair under the one op. `RADIANCE_HY4_EXPAND_GATE=0` issues the pair. libr4d's `mla_project_kv` sums on WMMA
+  (WP16.3), in a different order from libref but row by row: a token's bytes are the same at any
+  M, so verify rows still equal decode rows.
 - **The caches.** The sliding layers' latent rows in a `RAD_KV_WINDOW` group (block 16, window
   `sliding_window` = 512 keys with the own one), the sparse layers' in a full group of block 4, so
   a page is an indexer group and `qsa_select`'s table is the attention's; the indexer's pooled keys

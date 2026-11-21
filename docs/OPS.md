@@ -3752,6 +3752,7 @@ refuses the graph rather than resolving a similar op.
 | `ihc_pre` | `M`(range) `n` `hc` `rows` `eps`:f64 `hc_eps`:f64 `post_mag`:f64/opt `dtype` | `h`, `fn`w, `scale`w, `base`w → `x`, `post`? |
 | `ihc_post` | `M`(range) `n` `hc` `dtype` | `y`, `post`, `h`:inout |
 | `mla_project_kv` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `mode` `dtype` | `a`, `b`w → `y` |
+| `mla_expand_gate` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `dtype` | `x`, `w`w, `g` → `y` |
 | `mla_attn_paged_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `block_size` `window` `scale`:f64 `dtype` | `q`, `q_rope`, `kv`, `block_table`, `seqused`, `cu_seqlens`, `sinks`w → `out` |
 | `mla_attn_sel_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `blocks` `block_size` `scale`:f64 `dtype` | `q`, `q_rope`, `kv`, `bt`, `length`, `sinks`w → `out` |
 | `mla_kv_split` | `M`(range) `heads` `k_dim` `v_dim` `rope_dim` `dtype` | `kvb`, `k_rope` → `k`, `v` |
@@ -3800,6 +3801,18 @@ and then its `v_dim` value rows. `absorb`: `y[m,h,j] = sum_{c<k_dim} a[m,h,c] * 
 `[M, heads, k_dim] -> [M, heads, latent]`. `expand`: `y[m,h,c] = sum_{j<latent} a[m,h,j] *
 b[h*(kd+vd) + kd + c][j]`, `[M, heads, latent] -> [M, heads, v_dim]`. f32 accumulation, `c` / `j`
 ascending, one rounding.
+
+The order is libref's; a kernel may sum in another as long as a token's result depends on its own
+row only, never on `M` or the launch's other rows (libr4d's WMMA law, `r4d_mla_kv_bf16.hip`:
+absorb in steps of 16 ascending, expand in four ascending quarters added in order; within one bf16
+ulp of libref). A tuned axis of such a kernel (libr4d's `mb`) moves no bit.
+
+`mla_expand_gate` is `expand` followed by `gate_mul` over its output, `y[m, h*v_dim + c] =
+round(f32(round(expand[m,h,c])) * sigmoid(f32(g[m, h*v_dim + c])))`: the expansion is rounded to
+bf16 before the product, as the pair stores and reads it. libref and libavx run the pair itself
+(their `mla_project_kv` expand, then their `gate_mul` in place); libr4d's fused row is held to its
+own pair byte for byte (rad-kbench's fusion oracle, `r4d_fuse.cpp`). A graph whose libraries lack
+the op issues the pair (`arch/hyv4flash`, `rad_op_declared`).
 
 ### `mla_attn_paged_sink`, `mla_attn_sel_sink`, `attn_kv_sink`
 

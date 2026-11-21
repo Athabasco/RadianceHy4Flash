@@ -112,6 +112,7 @@ struct Attn {
     rad_op op_absorb = 0, op_paged = 0, op_sel = 0, op_expand = 0;
     rad_op op_lat_copy = 0, op_kvb = 0, op_split = 0, op_qn_copy = 0, op_qr_copy = 0, op_dense = 0, op_rebase = 0;
     rad_op op_gate = 0, op_post_norm = 0, op_ar = 0;
+    rad_op op_expand_gate = 0;   /* the expansion with the gate folded in, where a library has it */
     Tap t_in_norm{}, t_q_resid{}, t_kv_latent{}, t_kv_rope{}, t_gate{}, t_o_proj{}, t_out{};
 
     /* `ap` is the checkpoint's `model.layers.<l>.self_attn`. `group` is the layer's latent KV
@@ -279,6 +280,20 @@ struct Attn {
                       { sinks }, { w.q_lat, w.q_rope }, { w.lat });
         op_expand = proj("expand", w.lat, w.ao);
         HY4_NEED(op_absorb && op_expand, "mla_project_kv");
+        /* mla_expand_gate is the expansion followed by gate_mul, byte for byte (libr4d in one
+         * launch, the host libraries as the pair): the absorbed rows take it where it resolves,
+         * the non-absorbed ones keep gate_mul.
+         * RADIANCE_HY4_EXPAND_GATE=0 keeps the pair everywhere (an A/B switch). Declared beside
+         * the expansion, where it is issued: declaration order is liveness. */
+        const char* eg = std::getenv("RADIANCE_HY4_EXPAND_GATE");
+        if (!(eg && !std::strcmp(eg, "0")) && rad_op_declared(b, "mla_expand_gate")) {
+            op_expand_gate = mk(b, "mla_expand_gate",
+                                { RAD_RANGE("M", 1, T), RAD_INT("heads", H), RAD_INT("k_dim", N),
+                                  RAD_INT("v_dim", a.v), RAD_INT("latent_dim", L),
+                                  RAD_STR("dtype", "bf16") },
+                                { kv_b }, { w.lat, w.gate }, { w.ag });
+            if (op_expand_gate && !rad_op_resolved(b, op_expand_gate)) op_expand_gate = 0;
+        }
         HY4_NEED(op_paged, "mla_attn_paged_sink");
         if (!sliding) {
             op_sel = mk(b, "mla_attn_sel_sink",
@@ -478,11 +493,21 @@ struct Attn {
                             brows(w.lat, T));
             else
                 paged(c, batch, abs_seqs, abs_rows);
-            RAD_ISSUE_N(c, op_expand, abs_rows, brows(w.lat, abs_rows), RAD_W(kv_b),
-                        brows(w.ao, abs_rows));
+            if (op_expand_gate)
+                RAD_ISSUE_N(c, op_expand_gate, abs_rows, brows(w.lat, abs_rows), RAD_W(kv_b),
+                            brows(w.gate, abs_rows), brows(w.ag, abs_rows));
+            else
+                RAD_ISSUE_N(c, op_expand, abs_rows, brows(w.lat, abs_rows), RAD_W(kv_b),
+                            brows(w.ao, abs_rows));
         }
         if (p.nonabs && !selecting && p.P > 0) dense(c, batch, p);
-        RAD_ISSUE_N(c, op_gate, T, brows(w.ao, T), brows(w.gate, T), brows(w.ag, T));
+        /* the rows the fused expansion has not gated already */
+        const int64_t g0 = op_expand_gate ? abs_rows : 0;
+        if (g0 < T) {
+            const int64_t vw = a.v_width();
+            RAD_ISSUE_N(c, op_gate, T - g0, brow_slice(w.ao, g0, T - g0, vw),
+                        brow_slice(w.gate, g0, T - g0, vw), brow_slice(w.ag, g0, T - g0, vw));
+        }
         out.step(c, act(w.ag), w.o, T);
         issue_all_reduce(c, op_ar, w.o, T, s.n_embd);
         t_o_proj.step(c, brows(w.o, T), T);
