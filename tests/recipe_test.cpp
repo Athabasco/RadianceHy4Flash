@@ -7,6 +7,7 @@
 #include "rad_test.h"
 #include "format/recipe.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
@@ -717,6 +718,60 @@ TEST(the_ling_flash_iq8r_w4nl64_recipe_decides_the_model_it_was_written_for) {
                            "blk.5.attn_kv_b.weight", "blk.5.attn_head_gate.weight",
                            "blk.0.ssm_conv.weight", "token_embd.weight", "output.weight" };
     for (const char* n : kept) CHECK(r.match(n) == nullptr);
+}
+
+/* hy4-flash-iqr-gptq.recipe: a trellis is tail-biting over runs of tcq_rows rows and a rank may
+ * take only whole runs (core/format/share.cpp refuses the cut), so every row-sharded trellis
+ * linear's rows a rank of each stacked part are whole runs at the TPs Hy4-flash serves at:
+ * Tencent Hy4-flash at TP2 and TP4, the gpu-mini preset at TP2. 256-row runs on the shared
+ * expert's gate_up served gpu-mini at TP2 with three wrong rows at every half-run cut (TP2-vs-TP1
+ * median KL 1.9e-2). Replicated linears (q_a, latent_in) are whole on every rank. */
+TEST(the_hy4flash_iqr_recipe_trellis_runs_are_whole_on_every_rank) {
+    std::string dir = __FILE__;
+    dir = dir.substr(0, dir.find_last_of('/')) + "/../data/recipes";
+    std::ifstream in(dir + "/hy4-flash-iqr-gptq.recipe");
+    REQUIRE(in.good());
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const char* old = std::getenv("CALIB");
+    const std::string saved = old ? old : "";
+    setenv("CALIB", "/tmp/hy4-calib", 1);
+    Recipe r;
+    std::string why;
+    const int rc = r.add_text(text, "hy4-flash-iqr-gptq.recipe", &why);
+    if (old) setenv("CALIB", saved.c_str(), 1);
+    else unsetenv("CALIB");
+    REQUIRE_EQ(rc, RAD_OK);
+    /* rows of one stacked part, whole model: {weight, Hy4-flash sparse / sliding, gpu-mini} */
+    struct Geo { int64_t heads, swa_heads, ff, ff_shared, ff_exp; int max_tp; };
+    const Geo geos[] = { { 32, 64, 13824, 1536, 1536, 4 },    /* Tencent Hy4-flash */
+                         { 32, 64, 1024, 256, 256, 2 } };     /* gpu-mini */
+    for (const Geo& g : geos) {
+        struct Lin { const char* name; int64_t part_rows[2]; };
+        const Lin lins[] = {
+            { "blk.1.attn_q_nope.weight", { g.heads * 192, g.swa_heads * 192 } },
+            { "blk.1.attn_q_rope.weight", { g.heads * 64, g.swa_heads * 64 } },
+            { "blk.1.attn_gate.weight", { g.heads * 256, g.swa_heads * 256 } },
+            { "blk.0.ffn_gate_up.weight", { g.ff, g.ff } },
+            { "blk.1.ffn_gate_up_shexp.weight", { g.ff_shared, g.ff_shared } },
+            { "blk.1.ffn_gate_up_exps.7.weight", { g.ff_exp, g.ff_exp } },
+        };
+        for (const Lin& l : lins) {
+            const RecipeRule* m = r.match(l.name);
+            REQUIRE(m != nullptr);
+            int64_t run = 0;
+            for (const auto& kv : m->options)
+                if (kv.first == "tcq_rows") run = std::atoll(kv.second.c_str());
+            REQUIRE(run > 0);
+            for (int tp = 2; tp <= g.max_tp; tp *= 2)
+                for (int64_t rows : l.part_rows) {
+                    const bool whole = rows % tp == 0 && (rows / tp) % run == 0;
+                    if (!whole)
+                        fprintf(stderr, "  %s: %lld rows a part at TP%d cut %lld-row runs\n", l.name,
+                                (long long)(rows / tp), tp, (long long)run);
+                    CHECK(whole);
+                }
+        }
+    }
 }
 
 RAD_TEST_MAIN()
