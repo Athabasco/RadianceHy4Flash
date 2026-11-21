@@ -823,21 +823,50 @@ def a11(c):
             cc = Ctx()
             cc.build, cc.work, cc.home = b, c.work, f"{b}/radiance_home"
             nm = os.path.basename(b.rstrip("/"))
-            rc, nrun, nfail, nskip, out = ctest(cc, ".", f"a11-suite-{nm}", timeout=4 * 3600)
+            # libr4d needs the HIP runtime preloaded in tools without HIP in their link (oot_plugins, rad-schemas): an environment fact
+            pre = {"LD_PRELOAD": HIP_RT} if os.path.exists(HIP_RT) else {}
+            rc, nrun, nfail, nskip, out = ctest(cc, ".", f"a11-suite-{nm}", pre, timeout=4 * 3600)
             failed = sorted(set(re.findall(r"^\s*\d+ - (\S+)", out.split("The following tests FAILED:")[-1], re.M))) if nfail else []
+            notes = []
             if failed:
-                # serial rerun of what failed under the CPU-budget scale: parallel runs flake (BASELINE_TESTS.md)
-                e = dict(host_env(cc), RAD_TEST_CPU_BUDGET_SCALE="4")
-                e.pop("RADIANCE_KERNELS", None)
-                rc2, out2 = run(["ctest", "--test-dir", b, "-R", "^(" + "|".join(failed) + ")$", "-j1", "--output-on-failure"],
-                                f"{c.work}/a11-suite-{nm}-rerun.log", e, 4 * 3600)
-                failed = sorted(set(re.findall(r"^\s*\d+ - (\S+)", out2.split("The following tests FAILED:")[-1], re.M))) if rc2 else []
+                # (1) serial rerun under the CPU-budget scale: parallel runs flake (BASELINE_TESTS.md); the card tests (kbench*, *_card) are
+                # masked from the cards by the host environment of the parallel run, so they rerun under gpu.lock with the cards visible
+                cards = [t for t in failed if re.match(r"^(kbench.*|.*_card)$", t)]
+                rest = [t for t in failed if t not in cards]
+                still = []
+                for grp, gpu in ((rest, False), (cards, True)):
+                    if not grp:
+                        continue
+                    e = dict(host_env(cc), RAD_TEST_CPU_BUDGET_SCALE="4", **pre)
+                    e.pop("RADIANCE_KERNELS", None)
+                    if gpu:
+                        if not c.gpu:
+                            still += grp
+                            continue
+                        for k in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"):
+                            e.pop(k, None)
+                    cmd = ["ctest", "--test-dir", b, "-R", "^(" + "|".join(grp) + ")$", "-j1", "--output-on-failure"]
+                    rc2, out2 = run((["flock", GPU_LOCK] if gpu else []) + cmd, f"{c.work}/a11-suite-{nm}-rerun-{'cards' if gpu else 'host'}.log", e, 4 * 3600)
+                    still += sorted(set(re.findall(r"^\s*\d+ - (\S+)", out2.split("The following tests FAILED:")[-1], re.M))) if rc2 else []
+                # (2) ctest runs them from a relative path (ninja's __FILE__ is ../tests/x.cpp): these pass run from the build directory
+                artefacts = [t for t in still if t in CTEST_PATH_ARTEFACTS]
+                for t in artefacts:
+                    r3, _ = run([f"{b}/tests/{t}"], f"{c.work}/a11-{nm}-{t}.log", dict(host_env(cc), **pre), 3600, cwd=b)
+                    if r3 == 0:
+                        still.remove(t)
+                        notes.append(t)
+                failed = sorted(still)
             new = [t for t in failed if t not in base]
             say("A11", "PASS" if nrun and not new else "FAIL",
-                f"whole suite in {b}: {nrun} run, {nskip} skipped; failing after a serial rerun: {len(failed)} ({', '.join(failed) or 'none'}); "
+                f"whole suite in {b}: {nrun} run, {nskip} skipped; {len(notes)} fail under ctest only and pass from the build directory "
+                f"({', '.join(notes) or 'none'}), card tests rerun under the lock; still failing: {len(failed)} ({', '.join(failed) or 'none'}); "
                 f"not in BASELINE_TESTS.md: {new or 'none'}")
     else:
         say("A11", "OPEN", "whole suite on the no-ROCm and the HIP build: run with --full-suite BUILD1 [BUILD2 ...]")
+
+
+HIP_RT = "/opt/rocm-repeatable/lib/libamdhip64.so"
+CTEST_PATH_ARTEFACTS = {"quant_test", "recipe_test", "text_test", "engine_e2e_test"}
 
 
 def baseline_failures():
@@ -845,9 +874,7 @@ def baseline_failures():
     for d in (os.path.join(SRC, "..", ".."), os.path.join(SRC, "..")):
         f = os.path.join(d, "BASELINE_TESTS.md")
         if os.path.exists(f):
-            # quant_test / recipe_test: fail under ctest only (ninja's relative __FILE__ in their path checks), pass run from build/
-            # (coordinator, after BASELINE_TESTS.md was written)
-            return (set(re.findall(r"^\| (\w+) \|", open(f).read(), re.M)) - {"Test"}) | {"quant_test", "recipe_test"}
+            return set(re.findall(r"^\| (\w+) \|", open(f).read(), re.M)) - {"Test"}
     return set()
 
 
