@@ -234,7 +234,7 @@ static const RadParamSpec pEngramIds[] = { P_INT("M"), P_INT("heads"), P_INT("ng
     P_INT("pad"), P_INT("map_size"), P_INTO("image"), P_INTO("video") };
 static const RadOperandSpec oEngramIds[] = { OPD("tok"), INOUT("state"), OPD("cu"), OPD("pos"),
     WGT("token_map"), WGT("mult"), WGT("vocab_sizes"), WGT("offsets"), OPD_O("num_accepted"),
-    OPD_O("cache_idx"), OUT("ids"), OUT("mask") };
+    OPD_O("cache_idx"), OUT("ids"), OUT("mask"), OUT_O("ahead_ids") };
 static const RadParamSpec pEngramNorm[] = { P_INT("M"), P_INT("heads"), P_INT("n"), P_F64("eps"),
     P_STR("dtype") };
 static const RadOperandSpec oEngramNorm[] = { OPD("e"), WGT("gain"), OUT("y") };
@@ -1230,7 +1230,10 @@ static const RadOpSchema kSchemas[] = {
   "Engram's hash ids: c_k = map[tok_k] (pad before the document start and for an id at or past "
   "map_size), m_k = c_k * mult[k] in wrapping int64, mix_g = m_0 ^ .. ^ m_{g-1}, head i of order g: "
   "floor_mod(mix_g, vocab_sizes[i]) + offsets[i]; mask = tok not in {pad, image, video}. `state` is "
-  "ngram_ids' window of committed ids." },
+  "ngram_ids' window of committed ids. With `ahead_ids` present, `tok` holds the following "
+  "prompt of the last sequence past the step's rows (numel(ahead_ids) / heads tokens, positions "
+  "continuing its last), and their ids land in `ahead_ids` (a read-ahead hint); the window written "
+  "back is the step's own." },
 { "engram_norm", ARR(pEngramNorm), ARR(oEngramNorm),
   "One rms norm a head over the gathered rows: y[i] = round(gain[i] * x[i] * rsqrt(mean_head(x^2) + "
   "eps)). eps is a parameter: 0.0078125 (HF in bf16) or 1.19e-7." },

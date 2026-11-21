@@ -22,6 +22,12 @@
 
 namespace hyv4flash {
 
+/* RADIANCE_HY4_ENGRAM_AHEAD=0: no read-ahead (an A/B switch for the first prefill pass). */
+inline bool no_ahead() {
+    const char* e = std::getenv("RADIANCE_HY4_ENGRAM_AHEAD");
+    return e && *e && std::strcmp(e, "0") == 0;
+}
+
 inline double engram_eps() {
     const char* e = std::getenv("RADIANCE_HY4_ENGRAM_EPS");
     if (!e || !*e || !std::strcmp(e, "f32")) return 1.1920928955078125e-07;
@@ -34,11 +40,27 @@ inline double engram_eps() {
     return 1.1920928955078125e-07;
 }
 
-/* The planes every Engram layer shares. */
+/* The planes every Engram layer shares.
+ *
+ * The ids and the gathered rows are host-domain buffers, as rad_block_ple.h declares its own: the
+ * table's placement (--ngram-placement) is decided after the declare, and a table on `disk` is
+ * gathered by libavx's host kernel, which reads the ids and writes the rows in the host arena. The
+ * host arena is mapped, so a device gather (vram, ram) and the norm behind it read and write them
+ * over the link instead (3 KiB of rows and 64 bytes of ids a token).
+ *
+ * The read-ahead (RadBatch::n_ahead, docs/OPS.md "ahead_ids and ahead"): a prefill chunk's
+ * engram_ids also hashes up to kAheadChunks steps of the prompt that follows it into `ahead`, and
+ * the gather hands those ids to libavx's reader thread, which fills its row cache while the chunk
+ * runs. With the table on a drive a fresh prompt's chunks otherwise wait on their row reads. No
+ * output depends on them; a device gather ignores them. */
 struct EngramWire {
-    rad_buf ids = 0;      /* [T, heads] i32 */
+    /* The ahead queue's depth in steps: core/sched/batch.cpp's k_ahead_chunks (as kAheadChunks in
+     * rad_block_ple.h); a larger offer is clamped to the buffer. */
+    static constexpr int64_t kAheadChunks = 2;
+    rad_buf ids = 0;      /* [T, heads] i32, host domain */
+    rad_buf ahead = 0;    /* [kAheadChunks * T, heads] i32, host domain: the following prompt's ids */
     rad_buf mask = 0;     /* [T] i32 */
-    rad_buf raw = 0;      /* [T, heads * hd] the gathered rows */
+    rad_buf raw = 0;      /* [T, heads * hd] the gathered rows, host domain */
     rad_buf q = 0;        /* [T * heads, hd] e4m3, the round trip's codes */
     rad_buf qs = 0;       /* [T * heads, 1] f32 */
     rad_buf rt = 0;       /* [T, heads * hd] the round trip */
@@ -49,9 +71,11 @@ struct EngramWire {
     rad_buf m1 = 0;       /* [T, hc * n] -1, the tap's subtraction */
     int declare(RadBuilder* b, Names& nm, const Shape& s, const Geom& g) {
         const int64_t T = g.max_tok, H = s.engram_heads, HD = s.engram_head_dim, W = H * HD;
-        ids = decl_b(b, nm.f("eg.ids"), RAD_I32, { T, H });
+        ids = decl_b(b, nm.f("eg.ids"), RAD_I32, { T, H }, RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
+        ahead = decl_b(b, nm.f("eg.ids_ahead"), RAD_I32, { kAheadChunks * T, H }, RAD_BUF_TRANSIENT,
+                       RAD_DOMAIN_HOST);
         mask = decl_b(b, nm.f("eg.mask"), RAD_I32, { T });
-        raw = decl_b(b, nm.f("eg.rows"), RAD_BF16, { T, W });
+        raw = decl_b(b, nm.f("eg.rows"), RAD_BF16, { T, W }, RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
         q = decl_b(b, nm.f("eg.rows.q"), RAD_F8E4M3, { T * H, HD });
         qs = decl_b(b, nm.f("eg.rows.s"), RAD_F32, { T * H, 1 });
         rt = decl_b(b, nm.f("eg.rows.rt"), RAD_BF16, { T, W });
@@ -63,7 +87,7 @@ struct EngramWire {
             before = decl_b(b, nm.f("eg.before"), RAD_BF16, { T, s.hc * s.n_embd }, RAD_BUF_PERSIST);
             m1 = decl_b(b, nm.f("eg.minus_one"), RAD_BF16, { T, s.hc * s.n_embd }, RAD_BUF_PERSIST);
         }
-        return ids && mask && raw && q && qs && rt && e && key && val &&
+        return ids && ahead && mask && raw && q && qs && rt && e && key && val &&
                        (!taps_on() || (before && m1))
                    ? RAD_OK
                    : RAD_E_INVAL;
@@ -228,7 +252,10 @@ struct Engram {
                                     RAD_INT("video", s.video_token) };
             const rad_weight ws[] = { map, mult, vsz, off };
             rad_op& op = dec ? op_ids_dec : op_ids;
-            op = rw(b, rad_decl_op(b, "engram_ids", ps, 7, ws, 4), {}, { w.ids, w.mask });
+            /* The prefill form also writes the following prompt's ids (`ahead`). */
+            op = dec ? rw(b, rad_decl_op(b, "engram_ids", ps, 7, ws, 4), {}, { w.ids, w.mask })
+                     : rw(b, rad_decl_op(b, "engram_ids", ps, 7, ws, 4), {},
+                          { w.ids, w.mask, w.ahead });
             HY4_NEED(op, "engram_ids");
         }
         {
@@ -236,7 +263,7 @@ struct Engram {
             const RadParam ps[] = { RAD_RANGE("M", 1, T * H), RAD_INT("n_embd", HD),
                                     RAD_INT("n_vocab", rows), RAD_STR("dtype", "bf16") };
             op_gather = rw(b, rad_decl_op(b, "embed_lookup_q", ps, 4, ws, table_bf16 ? 1 : 2),
-                           { w.ids }, { w.raw });
+                           { w.ids, w.ahead }, { w.raw });
             HY4_NEED(op_gather, "embed_lookup_q");
         }
         if (roundtrip) {
@@ -327,16 +354,23 @@ struct Engram {
                         RAD_W(vsz), RAD_W(off), praw(batch->num_accepted, RAD_I32, D), sd,
                         brows(w.ids, T), brows(w.mask, T));
         }
+        /* The prompt after the last prefill chunk (RadBatch::n_ahead, stored in token_ids past the
+         * step's), hashed by the same launch as a continuation of that sequence. */
+        const int64_t A = P > 0 && !no_ahead() ? std::min<int64_t>(batch->n_ahead,
+                                                                    EngramWire::kAheadChunks * g.max_tok)
+                                               : 0;
         if (P > 0) {
             RadOperand sp = praw2(sidx + D * pitch, RAD_I32, P, pitch);
             sp.cols = 1;
-            RAD_ISSUE_N(c, op_ids, T, tok, kv_cache(hist, layer),
+            RAD_ISSUE_N(c, op_ids, T, praw(batch->token_ids, RAD_I32, T + A), kv_cache(hist, layer),
                         praw(batch->cu_seqlens + D, RAD_I32, P + 1), pos, RAD_W(map), RAD_W(mult),
-                        RAD_W(vsz), RAD_W(off), RAD_NONE, sp, brows(w.ids, T), brows(w.mask, T));
+                        RAD_W(vsz), RAD_W(off), RAD_NONE, sp, brows(w.ids, T), brows(w.mask, T),
+                        A > 0 ? brows(w.ahead, A) : RAD_NONE);
         }
         t_ids.step(c, brows(w.ids, T), T);
         RAD_ISSUE_N(c, op_gather, T * H, brows(w.ids, T), RAD_W(table),
-                    table_bf16 ? RAD_NONE : RAD_W(table_scale), brows(w.raw, T), RAD_NONE);
+                    table_bf16 ? RAD_NONE : RAD_W(table_scale), brows(w.raw, T),
+                    A > 0 ? brows(w.ahead, A) : RAD_NONE);
         if (roundtrip) {
             RadOperand raw = brows(w.raw, T);
             RAD_ISSUE_N(c, op_quant, T * H, raw, brows(w.q, T * H), brows(w.qs, T * H));

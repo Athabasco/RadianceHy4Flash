@@ -1101,11 +1101,13 @@ struct EngramCase {
 };
 }  // namespace
 
-static int run_ids(EngramCase& c, T* nacc = nullptr, T* cache_idx = nullptr) {
+static int run_ids(EngramCase& c, T* nacc = nullptr, T* cache_idx = nullptr, T* ahead = nullptr) {
     A a; a.t(c.tok).t(c.state).t(c.cu).t(c.pos).t(c.map).t(c.mult).t(c.vsz).t(c.off);
     if (nacc) a.t(*nacc); else a.tnull();
     if (cache_idx) a.t(*cache_idx); else a.tnull();
-    a.t(c.ids).t(c.mask).i("M", c.tok.t.shape[0]).i("heads", 10).i("ngram", 3).i("pad", eg_dims[0])
+    a.t(c.ids).t(c.mask);
+    if (ahead) a.t(*ahead);
+    a.i("M", c.tok.t.shape[0]).i("heads", 10).i("ngram", 3).i("pad", eg_dims[0])
         .i("map_size", eg_dims[1]).i("image", 311).i("video", 313);
     return run("engram_ids", a);
 }
@@ -1184,6 +1186,35 @@ TEST(engram_ids_carry_the_window_across_steps_in_both_layouts_and_through_cache_
     for (int64_t i = 0; i < 40; ++i) CHECK_EQ(f.ids.iat(i), full_ids.iat(60 + i));
     CHECK_EQ(f.state.iat(0), 77); CHECK_EQ(f.state.iat(1), 88);                                      // untouched
     CHECK_EQ(f.state.iat(2), (int64_t)eg_tok[8]); CHECK_EQ(f.state.iat(3), (int64_t)eg_tok[9]);
+}
+
+/* `ahead_ids`: `tok` runs on past the step's rows into the last sequence's following prompt, whose
+ * ids land there (the read-ahead hint) as the step that runs those rows will compute them; the ids,
+ * the mask and the window the step writes back are those of the step alone. */
+TEST(engram_ids_hashes_the_following_prompt_into_ahead_ids) {
+    EngramCase full(13);
+    REQUIRE_EQ(run_ids(full), (int)RAD_OK);
+    struct Case { int64_t r0, M, A; bool carry; };
+    /* The second document's first two rows with four more of it ahead; the first document's rows
+     * 2..3 behind a carried window with three ahead; one row with one ahead. */
+    for (const Case& k : { Case{ 7, 2, 4, false }, Case{ 2, 2, 3, true }, Case{ 5, 1, 1, true } }) {
+        EngramCase plain(k.M), c(k.M);
+        for (EngramCase* e : { &plain, &c }) {
+            e->pos.n(eg_pos + k.r0, k.M);
+            if (k.carry) { st_int(RAD_I32, e->state.t.data, 0, eg_tok[k.r0 - 2]); st_int(RAD_I32, e->state.t.data, 1, eg_tok[k.r0 - 1]); }
+        }
+        plain.tok.n(eg_tok + k.r0, k.M);
+        c.tok = T(RAD_I32, {k.M + k.A});
+        c.tok.n(eg_tok + k.r0, k.M + k.A);
+        T ahead(RAD_I32, {k.A, 10});
+        REQUIRE_EQ(run_ids(plain), (int)RAD_OK);
+        REQUIRE_EQ(run_ids(c, nullptr, nullptr, &ahead), (int)RAD_OK);
+        for (int64_t i = 0; i < k.A * 10; ++i) CHECK_EQ(ahead.iat(i), full.ids.iat((k.r0 + k.M) * 10 + i));
+        for (int64_t i = 0; i < k.M * 10; ++i) CHECK_EQ(c.ids.iat(i), plain.ids.iat(i));
+        for (int64_t i = 0; i < k.M; ++i) CHECK_EQ(c.mask.iat(i), plain.mask.iat(i));
+        CHECK_EQ(c.state.iat(0), plain.state.iat(0));
+        CHECK_EQ(c.state.iat(1), plain.state.iat(1));
+    }
 }
 
 /* The engine hands a CONV group's state as [slots, n_head_kv * head_dim, W], [slots, 1, W] for the
