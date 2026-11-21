@@ -175,6 +175,58 @@ std::vector<Case> build_cases() {
                                 HS("dtype", dt) });
         add("mla_attn", { HI("M", 3), HI("latent_dim", 32), HI("heads", 2), HI("blocks", 7),
                           HI("block_size", 4), HF("scale", 0.125), HS("dtype", dt) });
+        /* Hy4-flash (docs/OPS.md): odd widths so the vector bodies and their tails both run. */
+        add("ihc_pre", { HI("M", 3), HI("n", 129), HI("hc", 4), HI("rows", 8), HF("eps", 1e-5),
+                         HF("hc_eps", 1e-6), HF("post_mag", 2.0), HS("dtype", dt) });
+        add("ihc_pre", { HI("M", 5), HI("n", 65), HI("hc", 2), HI("rows", 2), HF("eps", 1e-5),
+                         HF("hc_eps", 1e-6), HS("dtype", dt) });
+        add("ihc_post", { HI("M", 3), HI("n", 129), HI("hc", 4), HS("dtype", dt) });
+        add("gate_mul", { HI("M", 5), HI("n", 133), HS("dtype", dt) });
+        add("mla_kv_split", { HI("M", 5), HI("heads", 3), HI("k_dim", 17), HI("v_dim", 23),
+                              HI("rope_dim", 8), HS("dtype", dt) });
+        add("attn_kv_sink", { HI("M", 5), HI("N", 9), HI("heads", 3), HI("head_dim", 37),
+                              HI("window", 0), HF("scale", 0.1644), HS("dtype", dt) });
+        add("attn_kv_sink", { HI("M", 9), HI("N", 9), HI("heads", 2), HI("head_dim", 64),
+                              HI("window", 4), HF("scale", 0.125), HS("dtype", dt) });
+        add("attn_kv_sink", { HI("M", 1), HI("N", 70), HI("heads", 2), HI("head_dim", 32),
+                              HI("window", 0), HF("scale", 0.125), HS("dtype", dt) });
+        add("mla_attn_paged_sink", { HI("M", 5), HI("heads", 3), HI("latent_dim", 64),
+                                     HI("rope_dim", 16), HI("block_size", 4), HI("window", 0),
+                                     HF("scale", 0.0721687836), HI("ctx", 23), HS("dtype", dt) });
+        add("mla_attn_paged_sink", { HI("M", 5), HI("heads", 3), HI("latent_dim", 37),
+                                     HI("rope_dim", 8), HI("block_size", 16), HI("window", 9),
+                                     HF("scale", 0.0721687836), HI("ctx", 40), HS("dtype", dt) });
+        add("mla_attn_paged_sink", { HI("M", 1), HI("heads", 2), HI("latent_dim", 32),
+                                     HI("rope_dim", 8), HI("block_size", 4), HI("window", 512),
+                                     HF("scale", 0.125), HI("ctx", 50), HS("dtype", dt) });
+        add("mla_attn_sel_sink", { HI("M", 3), HI("heads", 2), HI("latent_dim", 40),
+                                   HI("rope_dim", 8), HI("blocks", 7), HI("block_size", 4),
+                                   HF("scale", 0.125), HS("dtype", dt) });
+        add("idx_pool_gated", { HI("M", 3), HI("n", 128), HI("ratio", 4), HI("rotary_dim", 64),
+                                HF("eps", 1e-5), HF("theta", 1e7), HS("mode", "gptj"),
+                                HS("dtype", dt) });
+        add("idx_pool_gated", { HI("M", 3), HI("n", 36), HI("ratio", 4), HI("rotary_dim", 12),
+                                HF("eps", 1e-5), HF("theta", 1e4), HS("mode", "imrope_gptj"),
+                                HS("sections", "2 2 2"), HS("dtype", dt) });
+        add("idx_score", { HI("M", 5), HI("n", 128), HI("heads", 16), HI("blocks", 70),
+                           HI("seqs", 2), HS("dtype", dt) });
+        add("idx_score", { HI("M", 4), HI("n", 36), HI("heads", 3), HI("blocks", 9),
+                           HI("seqs", 3), HS("dtype", dt) });
+        add("engram_norm", { HI("M", 5), HI("heads", 10), HI("n", 9), HF("eps", 0.0078125),
+                             HS("dtype", dt) });
+        add("engram_norm", { HI("M", 3), HI("heads", 4), HI("n", 96), HF("eps", 1.19e-7),
+                             HS("dtype", dt) });
+        add("engram_gate", { HI("M", 5), HI("n", 129), HI("hc", 2), HF("eps", 0.0078125),
+                             HS("dtype", dt) });
+        add("engram_gate", { HI("M", 4), HI("n", 96), HI("hc", 4), HF("eps", 1.19e-7),
+                             HS("dtype", dt) });
+        if (!std::strcmp(dt, "bf16"))
+            for (const char* mode : { "absorb", "expand" }) {
+                add("mla_project_kv", { HI("M", 3), HI("heads", 3), HI("k_dim", 17), HI("v_dim", 23),
+                                        HI("latent_dim", 61), HS("mode", mode), HS("dtype", "bf16") });
+                add("mla_project_kv", { HI("M", 2), HI("heads", 2), HI("k_dim", 192), HI("v_dim", 256),
+                                        HI("latent_dim", 512), HS("mode", mode), HS("dtype", "bf16") });
+            }
         for (const char* mode : { "prefill", "verify" })
             add("kda_update", { HI("M", 3), HI("heads", 2), HI("head_k", 32), HI("head_v", 32),
                                 HF("lower_bound", -5), HF("scale", 0.1767766952966369),
@@ -210,6 +262,10 @@ std::vector<Case> build_cases() {
         add("causal_conv1d", { HI("M", 9), HI("n", 128), HI("width", 3), HS("dtype", dt) });
     }
     add("ngram_ids", { HI("M", 9), HI("heads", 3), HI("ngram", 4), HI("eos", 2) });
+    add("engram_ids", { HI("M", 9), HI("heads", 6), HI("ngram", 3), HI("pad", 2),
+                        HI("map_size", 300), HI("image", 5), HI("video", 7) });
+    add("engram_ids", { HI("M", 5), HI("heads", 9), HI("ngram", 4), HI("pad", 0),
+                        HI("map_size", 40) });
 
     for (const char* order : { "token", "sorted" })
         add("moe_gemm_q",
@@ -595,6 +651,15 @@ std::vector<Case> build_cases() {
                         HI("seqs", 1), HI("signed", 1) });
     add("qsa_select", { HI("M", 7), HI("blocks", 129), HI("topk", 16), HI("ratio", 4),
                         HI("seqs", 3), HI("signed", 1) });
+    /* `own`: the query's own block never competes and is always last (Hy4-flash's indexer). */
+    add("qsa_select", { HI("M", 4), HI("blocks", 300), HI("topk", 32), HI("ratio", 4),
+                        HI("seqs", 1), HI("signed", 1), HI("own", 1) });
+    add("qsa_select", { HI("M", 7), HI("blocks", 129), HI("topk", 16), HI("ratio", 4),
+                        HI("seqs", 3), HI("own", 1) });
+    add("qsa_select", { HI("M", 3), HI("blocks", 300), HI("topk", 511), HI("ratio", 4),
+                        HI("seqs", 1), HI("signed", 1), HI("own", 1) });
+    add("qsa_select", { HI("M", 2), HI("blocks", 1), HI("topk", 1), HI("ratio", 3),
+                        HI("seqs", 1), HI("own", 1) });
     add("qsa_tail_store", { HI("M", 3), HI("n", 37), HI("ratio", 2), HI("ring", 2), HI("seqs", 3),
                             HS("dtype", "f32") });
     add("qsa_work", { HI("M", 3), HI("n", 40), HI("ratio", 2), HI("ring", 3), HI("seqs", 3),
@@ -1386,6 +1451,52 @@ std::vector<Case> build_cases() {
                   (double)M * blocks * 8, 0);
     speed("qsa_select", { HI("M", 2048), HI("blocks", 16384), HI("topk", 512), HI("ratio", 4),
                           HI("seqs", 1) }, 2048.0 * 16384 * 8, 0);
+    /* Hy4-flash at its own widths (hidden 3072, hc 4, 32 heads a rank of 64 over 512 + 64 latent
+     * columns, the indexer's 16 heads of 128, Engram's 16 heads of 96): a decode row and a prefill
+     * chunk. */
+    for (int M : { 1, 512 }) {
+        speed("ihc_pre", { HI("M", M), HI("n", 3072), HI("hc", 4), HI("rows", 8), HF("eps", 1e-5),
+                           HF("hc_eps", 1e-6), HF("post_mag", 2.0), HS("dtype", "bf16") },
+              (double)M * 12288 * 2 + 8.0 * 12288 * 4, 2.0 * M * 9 * 12288);
+        speed("ihc_post", { HI("M", M), HI("n", 3072), HI("hc", 4), HS("dtype", "bf16") },
+              (double)M * 3072 * 5 * 2 * 2, 0);
+        speed("gate_mul", { HI("M", M), HI("n", 4096), HS("dtype", "bf16") },
+              (double)M * 4096 * 2 * 3, 0);
+        speed("engram_norm", { HI("M", M), HI("heads", 16), HI("n", 96), HF("eps", 0.0078125),
+                               HS("dtype", "bf16") }, (double)M * 1536 * 2 * 2, 0);
+        speed("engram_gate", { HI("M", M), HI("n", 3072), HI("hc", 4), HF("eps", 0.0078125),
+                               HS("dtype", "bf16") }, (double)M * 12288 * 2 * 3, 0);
+        speed("engram_ids", { HI("M", M), HI("heads", 16), HI("ngram", 3), HI("pad", 120002),
+                              HI("map_size", 120818) }, 0, 0);
+    }
+    for (int M : { 1, 16 }) {
+        speed("mla_project_kv", { HI("M", M), HI("heads", 32), HI("k_dim", 192), HI("v_dim", 256),
+                                  HI("latent_dim", 512), HS("mode", "absorb"), HS("dtype", "bf16") },
+              0, 2.0 * M * 32 * 192 * 512);
+        speed("mla_project_kv", { HI("M", M), HI("heads", 32), HI("k_dim", 192), HI("v_dim", 256),
+                                  HI("latent_dim", 512), HS("mode", "expand"), HS("dtype", "bf16") },
+              0, 2.0 * M * 32 * 256 * 512);
+    }
+    speed("mla_attn_paged_sink", { HI("M", 1), HI("heads", 32), HI("latent_dim", 512),
+                                   HI("rope_dim", 64), HI("block_size", 16), HI("window", 0),
+                                   HF("scale", 0.0625), HI("ctx", 2048), HS("dtype", "bf16") },
+          2048.0 * 576 * 2, 2.0 * 32 * 2048 * 1088);
+    speed("mla_attn_paged_sink", { HI("M", 1), HI("heads", 64), HI("latent_dim", 512),
+                                   HI("rope_dim", 64), HI("block_size", 16), HI("window", 512),
+                                   HF("scale", 0.0625), HI("ctx", 512), HS("dtype", "bf16") },
+          512.0 * 576 * 2, 2.0 * 64 * 512 * 1088);
+    speed("attn_kv_sink", { HI("M", 64), HI("N", 576), HI("heads", 8), HI("head_dim", 256),
+                            HI("window", 512), HF("scale", 0.0625), HS("dtype", "bf16") },
+          0, 2.0 * 64 * 8 * 256 * 2 * 544);
+    speed("idx_pool_gated", { HI("M", 256), HI("n", 128), HI("ratio", 4), HI("rotary_dim", 64),
+                              HF("eps", 1e-5), HF("theta", 1e7), HS("mode", "gptj"),
+                              HS("dtype", "bf16") }, 0, 256.0 * 131072 * 2);
+    for (const int64_t blocks : { 2048, 16384 })
+        for (const int64_t M : { 1, 4 })
+            speed("idx_score", { HI("M", M), HI("n", 128), HI("heads", 16), HI("blocks", blocks),
+                                 HI("seqs", 1), HS("dtype", "bf16") },
+                  (double)blocks * 128 * 2 + (double)M * blocks * 4,
+                  2.0 * M * blocks * 16 * 128);
     /* The residency map at a decode step: an 8K-block id space over a 2048-slot ring, one query row
      * and a four-row verify, 512 blocks a row. All-resident, so this times the selection passes,
      * the claim compaction, the rewrite and the bookkeeping, not the copies. */

@@ -40,6 +40,7 @@ set(AVX_KERNEL_SRC
   avx_glm.cpp
   avx_dsa.cpp
   avx_mla.cpp
+  avx_hy4.cpp
   avx_quant.cpp
   avx_gemm.cpp
   avx_gemm_tile.cpp

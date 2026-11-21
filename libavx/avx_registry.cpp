@@ -179,6 +179,53 @@ static const RadParamSpec pMlaAttnPaged[] = { P_INT("M"), P_INT("heads"), P_INT(
     P_INT("rope_dim"), P_INT("block_size"), P_F64("scale"), P_STR("dtype") };
 static const RadOperandSpec oMlaAttnPaged[] = { OPD("q"), OPD_O("q_rope"), OPD("kv"),
     OPD("block_table"), OPD("seqused"), OPD("cu_seqlens"), OPD_O("gate"), OUT("out") };
+/* ---- Hy4-flash (docs/OPS.md, "Hy4-flash") ---------------------------------------------------- */
+static const RadParamSpec pIhcPre[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("rows"),
+    P_F64("eps"), P_F64("hc_eps"), P_F64O("post_mag"), P_STR("dtype") };
+static const RadOperandSpec oIhcPre[] = { OPD("h"), WGT("fn"), WGT("scale"), WGT("base"),
+    OUT("x"), OUT_O("post") };
+static const RadParamSpec pIhcPost[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype") };
+static const RadOperandSpec oIhcPost[] = { OPD("y"), OPD("post"), INOUT("h") };
+static const RadParamSpec pMlaProjectKv[] = { P_INT("M"), P_INT("heads"), P_INT("k_dim"),
+    P_INT("v_dim"), P_INT("latent_dim"), P_STR("mode"), P_STR("dtype") };
+static const RadParamSpec pMlaAttnPagedSink[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
+    P_INT("rope_dim"), P_INT("block_size"), P_INT("window"), P_F64("scale"), P_STR("dtype") };
+static const RadOperandSpec oMlaAttnPagedSink[] = { OPD("q"), OPD("q_rope"), OPD("kv"),
+    OPD("block_table"), OPD("seqused"), OPD("cu_seqlens"), WGT("sinks"), OUT("out") };
+static const RadParamSpec pMlaAttnSelSink[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
+    P_INT("rope_dim"), P_INT("blocks"), P_INT("block_size"), P_F64("scale"), P_STR("dtype") };
+static const RadOperandSpec oMlaAttnSelSink[] = { OPD("q"), OPD("q_rope"), OPD("kv"), OPD("bt"),
+    OPD("length"), WGT("sinks"), OUT("out") };
+static const RadParamSpec pMlaKvSplit[] = { P_INT("M"), P_INT("heads"), P_INT("k_dim"),
+    P_INT("v_dim"), P_INT("rope_dim"), P_STR("dtype") };
+static const RadOperandSpec oMlaKvSplit[] = { OPD("kvb"), OPD("k_rope"), OUT("k"), OUT("v") };
+static const RadParamSpec pAttnKvSink[] = { P_INT("M"), P_INT("N"), P_INT("heads"),
+    P_INT("head_dim"), P_INT("window"), P_F64("scale"), P_STR("dtype") };
+static const RadOperandSpec oAttnKvSink[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_q"),
+    OPD("cu_k"), WGT("sinks"), OUT("out") };
+static const RadOperandSpec oGateMul[] = { OPD("a"), OPD("g"), OUT("y") };
+static const RadParamSpec pIdxPoolGated[] = { P_INT("M"), P_INT("n"), P_INT("ratio"),
+    P_INT("rotary_dim"), P_F64("eps"), P_F64("theta"), P_STR("mode"), P_STRO("sections"),
+    P_INTO("block_size"), P_STR("dtype") };
+static const RadOperandSpec oIdxPoolGated[] = { OPD("k"), WGT("wv"), WGT("wg"), WGT("ape"),
+    WGT("gain"), OPD("pos"), OPD_O("page"), INOUT_O("cache"), OUT_O("out") };
+static const RadParamSpec pIdxScore[] = { P_INT("M"), P_INT("n"), P_INT("heads"), P_INT("blocks"),
+    P_INT("seqs"), P_STR("dtype") };
+static const RadOperandSpec oIdxScore[] = { OPD("q"), OPD("gate"), OPD("k"), OPD("bt"), OPD("cu"),
+    OPD("nc"), OUT("score") };
+static const RadParamSpec pEngramIds[] = { P_INT("M"), P_INT("heads"), P_INT("ngram"),
+    P_INT("pad"), P_INT("map_size"), P_INTO("image"), P_INTO("video") };
+static const RadOperandSpec oEngramIds[] = { OPD("tok"), INOUT("state"), OPD("cu"), OPD("pos"),
+    WGT("token_map"), WGT("mult"), WGT("vocab_sizes"), WGT("offsets"), OPD_O("num_accepted"),
+    OPD_O("cache_idx"), OUT("ids"), OUT("mask") };
+static const RadParamSpec pEngramNorm[] = { P_INT("M"), P_INT("heads"), P_INT("n"), P_F64("eps"),
+    P_STR("dtype") };
+static const RadOperandSpec oEngramNorm[] = { OPD("e"), WGT("gain"), OUT("y") };
+static const RadParamSpec pEngramGate[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("eps"),
+    P_STR("dtype") };
+static const RadOperandSpec oEngramGate[] = { OPD("key"), OPD("val"), OPD("mask"), WGT("w_key"),
+    WGT("w_query"), WGT("w_val"), WGT("w_branch"), INOUT("h") };
+
 static const RadParamSpec pDsaScore[] = { P_INT("M"), P_INT("n"), P_INT("heads"),
     P_INT("blocks"), P_INT("seqs"), P_STR("dtype"), P_INTO("row_part") };
 static const RadOperandSpec oDsaScore[] = { OPD("q"), OPD("q_scale"), OPD("gate"), OPD("k"),
@@ -1087,6 +1134,60 @@ static const RadOpSchema kSchemas[] = {
   "Dense causal latent attention over a paged cache whose token row is the latent then the rotated "
   "key part: score = scale * (q . latent + q_rope . rope), value = the latent; sequences as in "
   "attn_paged. With `gate`, out = bf16(bf16(out) * bf16(sigmoid(gate[head])))." },
+{ "ihc_pre", ARR(pIhcPre), ARR(oIhcPre),
+  "Independent hyper-connection read (Hy4-flash; no mixing matrix, no Sinkhorn). f = f32(h); r = "
+  "rsqrt(sum f^2 / (hc*n) + eps); c[j] = (fn[j] . f) * r; pre[j] = sigmoid(c[j]*scale[0] + base[j]) "
+  "+ hc_eps; x = round(sum_j pre[j] f[j]). With `post` present (rows == 2*hc, scale has two "
+  "entries, post_mag required): post[j] = post_mag * sigmoid(c[hc+j]*scale[1] + base[hc+j]) + "
+  "hc_eps, f32. Without it (rows == hc, one scale entry) the head's collapse." },
+{ "ihc_post", ARR(pIhcPost), ARR(oIhcPost),
+  "h[j][i] = round(post[j] * f32(y[i]) + f32(h[j][i])), in place on the hc streams; the product is "
+  "rounded to f32 before the add. Nothing normalises the stream." },
+{ "mla_project_kv", ARR(pMlaProjectKv), ARR(oGemm),
+  "Per-head absorption or expansion through the checkpoint's kv_b, rows head-major with each head's "
+  "k_dim key rows then its v_dim value rows. absorb: [M,heads,k_dim] -> [M,heads,latent]; expand: "
+  "[M,heads,latent] -> [M,heads,v_dim]. mla_project with unequal K and V widths." },
+{ "mla_attn_paged_sink", ARR(pMlaAttnPagedSink), ARR(oMlaAttnPagedSink),
+  "mla_attn_paged with a window and a sink. A row at position p sees keys [max(0, p-window+1), p] "
+  "(window 0: all), the window counting the row's own token. s_j = scale*(q.latent_j + "
+  "q_rope.rope_j); out = sum exp(s_j) latent_j / (sum exp(s_j) + exp(sink[h])): the sink joins the "
+  "softmax once and carries no value. No visible key gives zero." },
+{ "mla_attn_sel_sink", ARR(pMlaAttnSelSink), ARR(oMlaAttnSelSink),
+  "mla_attn's per-query page table and visible length with a rotary part and a sink: tokens "
+  "[0, length[r]) of table row bt[r]. The score and the sink are mla_attn_paged_sink's." },
+{ "mla_kv_split", ARR(pMlaKvSplit), ARR(oMlaKvSplit),
+  "kvb [N, heads*(k_dim+v_dim)] and k_rope [N, rope_dim] -> k [N, heads, k_dim+rope_dim] (the rope "
+  "part shared by every head) and v [N, heads, v_dim]. A copy." },
+{ "attn_kv_sink", ARR(pAttnKvSink), ARR(oAttnKvSink),
+  "Dense causal attention with a key prefix, a window and a sink. Sequence s has m_s query rows and "
+  "n_s >= m_s key rows (cu_q, cu_k); query i sits at key index p = n_s - m_s + i and sees j <= p "
+  "with p - j < window (window 0: all). out = sum exp(s_j) v_j / (sum exp(s_j) + exp(sink[h]))." },
+{ "gate_mul", ARR(pMnD), ARR(oGateMul),
+  "y = round(f32(a) * sigmoid(f32(g))): one rounding. act_mul's sigmoid form rounds the sigmoid "
+  "first, which is a different bf16 result." },
+{ "idx_pool_gated", ARR(pIdxPoolGated), ARR(oIdxPoolGated),
+  "The compressed indexer's group key (Hy4-flash). Per group of `ratio` token keys, in f32: "
+  "val_s = wv x_s; gat_s = wg x_s + ape[s]; softmax over the slots per channel; y = sum_s val_s p_s; "
+  "z = round(gain * (y * rsqrt(mean y^2 + eps))); then the last `rotary_dim` channels rotated as "
+  "adjacent pairs at the group's first position (mode gptj, or imrope_gptj with `sections`, pos "
+  "[3, W]) and rounded again. Written to cache[page[w]] and/or out[w]." },
+{ "idx_score", ARR(pIdxScore), ARR(oIdxScore),
+  "Group scores of the compressed indexer: w_h = gate[m][h] * (heads*n)^-0.5, d_h = q[m][h] . key, "
+  "score = (sum_{h < heads/2} w_h relu(d_h)) + (sum_{h >= heads/2} w_h relu(d_h)). A block past "
+  "nc[seq], with a page < 0 or out of range, or past the table: -inf." },
+{ "engram_ids", ARR(pEngramIds), ARR(oEngramIds),
+  "Engram's hash ids: c_k = map[tok_k] (pad before the document start and for an id at or past "
+  "map_size), m_k = c_k * mult[k] in wrapping int64, mix_g = m_0 ^ .. ^ m_{g-1}, head i of order g: "
+  "floor_mod(mix_g, vocab_sizes[i]) + offsets[i]; mask = tok not in {pad, image, video}. `state` is "
+  "ngram_ids' window of committed ids." },
+{ "engram_norm", ARR(pEngramNorm), ARR(oEngramNorm),
+  "One rms norm a head over the gathered rows: y[i] = round(gain[i] * x[i] * rsqrt(mean_head(x^2) + "
+  "eps)). eps is a parameter: 0.0078125 (HF in bf16) or 1.19e-7." },
+{ "engram_gate", ARR(pEngramGate), ARR(oEngramGate),
+  "Engram's gate and its add into the hc streams: main = w_val * val * rsqrt(mean(val^2) + eps); per "
+  "stream c, d = (sum kn*qn) n^-0.5 over kn = w_key*key*rsqrt(..), qn = w_query*h_c*rsqrt(..); g = "
+  "sigmoid(sign(d) sqrt(max(|d|, 1e-6))); h_c += round(g*main + w_branch[c]*main). Rows with mask 0 "
+  "are untouched." },
 { "mla_project", ARR(pMlaProject), ARR(oGemm),
   "Per-head query absorption or value expansion through the shared [head,(K|V),latent] BF16 matrix." },
 { "dsa_score", ARR(pDsaScore), ARR(oDsaScore),
@@ -1753,6 +1854,33 @@ SIMPLE("avx_attn_local_rel", "attn_local_rel", "attn",
        L(attn_local_rel)),
 SIMPLE("avx_mla_attn_paged", "mla_attn_paged", "attn", "dense paged latent attention with a rotary part",
        DT_FLOAT, L(mla_attn_paged)),
+SIMPLE("avx_ihc_pre", "ihc_pre", "norm", "independent hyper-connection read (no Sinkhorn)", DT_FLOAT,
+       L(ihc_pre)),
+SIMPLE("avx_ihc_post", "ihc_post", "norm", "independent hyper-connection write into the streams",
+       DT_FLOAT, L(ihc_post)),
+SIMPLE("avx_mla_project_kv", "mla_project_kv", "attn", "absorbed MLA projections, K and V widths apart",
+       DT_FLOAT, L(mla_project_kv)),
+SIMPLE("avx_mla_attn_paged_sink", "mla_attn_paged_sink", "attn",
+       "paged latent attention with a window and a sink", DT_FLOAT, L(mla_attn_paged_sink)),
+SIMPLE("avx_mla_attn_sel_sink", "mla_attn_sel_sink", "attn",
+       "selected-page latent attention with a rotary part and a sink", DT_FLOAT,
+       L(mla_attn_sel_sink)),
+SIMPLE("avx_mla_kv_split", "mla_kv_split", "attn", "kv_b output split into k and v heads", DT_FLOAT,
+       L(mla_kv_split)),
+SIMPLE("avx_attn_kv_sink", "attn_kv_sink", "attn", "prefix attention with a window and a sink",
+       DT_FLOAT, L(attn_kv_sink)),
+SIMPLE("avx_gate_mul", "gate_mul", "elem", "a * sigmoid(g) with one rounding", DT_FLOAT,
+       L(gate_mul)),
+SIMPLE("avx_idx_pool_gated", "idx_pool_gated", "attn",
+       "compressed indexer group key: gated pool, norm, rotary", DT_FLOAT, L(idx_pool_gated)),
+SIMPLE("avx_idx_score", "idx_score", "attn", "compressed indexer group scores", DT_FLOAT,
+       L(idx_score)),
+SIMPLE("avx_engram_ids", "engram_ids", "vocab", "Engram hash ids and mask", DT_ANY,
+       L(engram_ids)),
+SIMPLE("avx_engram_norm", "engram_norm", "norm", "Engram per-head rms norm", DT_FLOAT,
+       L(engram_norm)),
+SIMPLE("avx_engram_gate", "engram_gate", "norm", "Engram gate and stream add", DT_FLOAT,
+       L(engram_gate)),
 SIMPLE("avx_mla_attn", "mla_attn", "attn", "absorbed latent MQA attention", DT_FLOAT,
        L(mla_attn)),
 SIMPLE("avx_dsa_score", "dsa_score", "attn", "weighted FP8 index scoring", DT_FLOAT,
