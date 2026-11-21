@@ -3502,10 +3502,13 @@ rad-info -v hy4-flash-w4nl64.rad
 | `hy4-flash-w4nl64-rtn.recipe` | the `w4nl` codebook at an E4M3 scale a 64 of K, rotated, round to nearest: 71.3 GiB | as above | bf16 | 147.1 GiB |
 | `hy4-flash-w4nl64-gptq.recipe` | the same form, GPTQ against `CALIB=<grams dir>` ([Calibrating](#calibrating-hy4-flash)) | as above | bf16 | 147.1 GiB |
 
-The sizes are `rad-convert --plan-only`'s over the release's 1964 tensors (43699 declared weights,
+The sizes are `rad-convert --plan-only`'s over the release's 1964 tensors (43753 declared weights,
 41984 of them expert projections), which is how the name map was checked against the release: its
 safetensors headers and config, without the 440 GB of data. No Hy4-flash weight has been through a
 quantiser yet, so neither recipe has an error report or a quality number.
+
+For whoever quantises it: [HY4FLASH-QUANT.md](HY4FLASH-QUANT.md) (what to run, the KL reference from HF logits,
+`tools/hy4flash_ready.py`, known limits).
 
 Chat: `rad-convert` bakes the release's `tokenizer.json` (120832 tokens, bos 120000, eos 120025 =
 `<｜hy_end:opensource｜>`) and `chat_template.jinja` from the checkpoint directory. Every marker has
