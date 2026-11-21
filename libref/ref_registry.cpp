@@ -241,6 +241,8 @@ static const RadParamSpec pIdxPoolGated[] = { P_INT("M"), P_INT("n"), P_INT("rat
     P_INTO("block_size"), P_STR("dtype") };
 static const RadOperandSpec oIdxPoolGated[] = { OPD("k"), WGT("wv"), WGT("wg"), WGT("ape"),
     WGT("gain"), OPD("pos"), OPD_O("page"), INOUT_O("cache"), OUT_O("out") };
+static const RadOperandSpec oIdxPoolGatedFp8[] = { OPD("k"), WGT("wv"), WGT("wg"), WGT("ape"),
+    WGT("gain"), OPD("pos"), OPD_O("page"), INOUT_O("cache"), OUT_O("q"), OUT_O("scale") };
 static const RadParamSpec pIdxScore[] = { P_INT("M"), P_INT("n"), P_INT("heads"), P_INT("blocks"),
     P_INT("seqs"), P_STR("dtype") };
 static const RadOperandSpec oIdxScore[] = { OPD("q"), OPD("gate"), OPD("k"), OPD("bt"), OPD("cu"),
@@ -1446,6 +1448,12 @@ static const RadOpSchema kSchemas[] = {
   "z = round(gain * (y * rsqrt(mean y^2 + eps))); then the last `rotary_dim` channels rotated as "
   "adjacent pairs at the group's first position (mode gptj, or imrope_gptj with `sections`, pos "
   "[3, W]) and rounded again. Written to cache[page[w]] and/or out[w]." },
+{ "idx_pool_gated_fp8", ARR(pIdxPoolGated), ARR(oIdxPoolGatedFp8),
+  "idx_pool_gated's group key kept in f32 (no rounding after the norm or the rotation), then "
+  "quantised as vLLM's IndexPool does: ascending-stride Walsh-Hadamard transform times n^-0.5, "
+  "E4M3 codes at scale 2^ceil(log2(max(amax, 1e-4) / 448)), nearest even, nothing rounded to "
+  "bf16 in between. Written to the packed u8 cache page (dsa_pool's [pages, 1, 4, 34]: 128 codes, "
+  "f32 scale at byte 128; n 128) and/or q [W, n] E4M3 with scale [W, 1] f32." },
 { "idx_score", ARR(pIdxScore), ARR(oIdxScore),
   "Group scores of the compressed indexer: w_h = gate[m][h] * (heads*n)^-0.5, d_h = q[m][h] . key, "
   "score = (sum_{h < heads/2} w_h relu(d_h)) + (sum_{h >= heads/2} w_h relu(d_h)). A block past "
@@ -2545,6 +2553,9 @@ SIMPLE("ref_gate_mul", "gate_mul", "elem", "a * sigmoid(g) with one rounding", D
        ref_gate_mul),
 SIMPLE("ref_idx_pool_gated", "idx_pool_gated", "attn", "compressed indexer group key: gated pool, norm, rotary",
        DT_FLOAT, ref_idx_pool_gated),
+SIMPLE("ref_idx_pool_gated_fp8", "idx_pool_gated_fp8", "attn",
+       "compressed indexer group key in f32, Hadamard and E4M3 (the FP8 indexer)", DT_FLOAT,
+       ref_idx_pool_gated_fp8),
 SIMPLE("ref_idx_score", "idx_score", "attn", "compressed indexer group scores", DT_FLOAT,
        ref_idx_score),
 SIMPLE("ref_engram_ids", "engram_ids", "vocab", "Engram hash ids and mask", DT_ANY, ref_engram_ids),

@@ -446,6 +446,126 @@ int imrope_component(int64_t j, int64_t sec_h, int64_t sec_w) {
     return 0;
 }
 
+/* The operands and parameters both pooling ops share (idx_pool_gated, idx_pool_gated_fp8): the
+ * token keys, the pooling weights, the rotary and the group count. Returns RAD_OK or the refusal. */
+struct PoolArgs {
+    const RadTensor *k = nullptr, *wv = nullptr, *wg = nullptr, *ape = nullptr, *gain = nullptr,
+                    *pos = nullptr;
+    int64_t n = 0, ratio = 0, rd = 0, W = 0, sec_h = 0, sec_w = 0;
+    float eps = 0;
+    double theta = 0;
+    bool imrope = false;
+};
+
+int pool_args(const RadArgs* a, PoolArgs& P) {
+    if (a->n_t < 6 || !t_in(a, 0) || !t_in(a, 1) || !t_in(a, 2) || !t_in(a, 3) || !t_in(a, 4) ||
+        !t_in(a, 5))
+        return RAD_E_INVAL;
+    P.k = &a->t[0];
+    P.wv = &a->t[1];
+    P.wg = &a->t[2];
+    P.ape = &a->t[3];
+    P.gain = &a->t[4];
+    P.pos = &a->t[5];
+    P.n = p_int(a, "n", 0);
+    P.ratio = p_int(a, "ratio", 0);
+    P.rd = p_int(a, "rotary_dim", 0);
+    P.eps = p_f32(a, "eps", 0);
+    P.theta = (double)p_f32(a, "theta", 0);
+    const char* mode = p_str(a, "mode", "");
+    const bool gptj = !std::strcmp(mode, "gptj");
+    P.imrope = !std::strcmp(mode, "imrope_gptj");
+    const int64_t n = P.n, ratio = P.ratio, rd = P.rd;
+    if (n < 1 || ratio < 1 || ratio > 16 || rd < 2 || rd > n || (rd & 1) || !(P.eps > 0) ||
+        !std::isfinite(P.eps) || !(P.theta > 1.0) || (!gptj && !P.imrope))
+        return RAD_E_SHAPE;
+    if (P.imrope) {
+        const char* s = p_str(a, "sections", nullptr);
+        long t = 0, h = 0, w = 0;
+        if (!s || std::sscanf(s, "%ld %ld %ld", &t, &h, &w) != 3 || t < 0 || h < 0 || w < 0 ||
+            t + h + w != rd / 2)
+            return RAD_E_SHAPE;
+        P.sec_h = h;
+        P.sec_w = w;
+    }
+    const RadTensor &k = *P.k, &pos = *P.pos;
+    if (k.rank != 2 || k.shape[0] < ratio || k.shape[0] % ratio || k.shape[1] != n)
+        return RAD_E_SHAPE;
+    P.W = k.shape[0] / ratio;
+    const int64_t W = P.W;
+    if (!matrix(*P.wv, n, n) || !matrix(*P.wg, n, n) || !matrix(*P.ape, ratio, n) ||
+        P.gain->rank != 1 || numel(P.gain) != n || pos.rank != (P.imrope ? 2 : 1) ||
+        (P.imrope ? (pos.shape[0] != 3 || pos.shape[1] < W) : pos.shape[0] < W))
+        return RAD_E_SHAPE;
+    return RAD_OK;
+}
+
+/* Two groups naming one page is a caller bug that would make the result depend on the thread
+ * order. */
+bool pages_unique(const RadTensor* page, int64_t W, int64_t pages) {
+    for (int64_t w = 0; w < W; ++w) {
+        const int64_t pw = ld_idx(page, w);
+        if (pw < 0 || pw >= pages) continue;
+        for (int64_t u = 0; u < w; ++u)
+            if (ld_idx(page, u) == pw) return false;
+    }
+    return true;
+}
+
+/* Group w's key into z[n]: the gated pool, the norm and the rotary, in f32. `round` rounds to the
+ * token keys' dtype after the norm and after the rotation, as HF does (idx_pool_gated); without
+ * it every value stays f32 (idx_pool_gated_fp8, vLLM's IndexPool). */
+void pool_group(const PoolArgs& P, int64_t w, bool round, float* z) {
+    const RadTensor &k = *P.k, &wv = *P.wv, &wg = *P.wg, &ape = *P.ape, &gain = *P.gain,
+                    &pos = *P.pos;
+    const int64_t n = P.n, ratio = P.ratio, rd = P.rd;
+    std::vector<float> val((size_t)(ratio * n)), gat((size_t)(ratio * n)), y((size_t)n);
+    for (int64_t s = 0; s < ratio; ++s) {
+        const int64_t kb = rowoff(&k, w * ratio + s, n), ks = laststride(&k);
+        for (int64_t c = 0; c < n; ++c) {
+            float dv = 0, dg = 0;
+            for (int64_t j = 0; j < n; ++j) {
+                const float xj = ldt(&k, kb + j * ks);
+                dv += ldt(&wv, c * wv.stride[0] + j * wv.stride[1]) * xj;
+                dg += ldt(&wg, c * wg.stride[0] + j * wg.stride[1]) * xj;
+            }
+            val[(size_t)(s * n + c)] = dv;
+            gat[(size_t)(s * n + c)] = dg + ldt(&ape, s * ape.stride[0] + c * ape.stride[1]);
+        }
+    }
+    for (int64_t c = 0; c < n; ++c) {
+        float mx = -INFINITY;
+        for (int64_t s = 0; s < ratio; ++s) mx = std::max(mx, gat[(size_t)(s * n + c)]);
+        float e[16], den = 0;
+        for (int64_t s = 0; s < ratio; ++s) {
+            e[s] = ref_exp(gat[(size_t)(s * n + c)] - mx);
+            den += e[s];
+        }
+        float acc = 0;
+        for (int64_t s = 0; s < ratio; ++s) acc += val[(size_t)(s * n + c)] * (e[s] / den);
+        y[(size_t)c] = acc;
+    }
+    double sq = 0;
+    for (int64_t c = 0; c < n; ++c) sq += (double)y[(size_t)c] * (double)y[(size_t)c];
+    const float inv = 1.0f / std::sqrt((float)(sq / (double)n) + P.eps);
+    auto rnd = [&](float v) { return round ? round_dt(k.dtype, v) : v; };
+    for (int64_t c = 0; c < n; ++c)
+        z[c] = rnd(ldt(&gain, c * gain.stride[0]) * (y[(size_t)c] * inv));
+    for (int64_t i = 0; i < rd / 2; ++i) {
+        const int comp = P.imrope ? imrope_component(i, P.sec_h, P.sec_w) : 0;
+        const int64_t pv = P.imrope
+                               ? ld_int(pos.dtype, pos.data, comp * pos.stride[0] + w * pos.stride[1])
+                               : ld_int(pos.dtype, pos.data, w * pos.stride[0]);
+        const float inv_freq = (float)(1.0 / std::pow(P.theta, (double)(2 * i) / (double)rd));
+        const float ang = (float)pv * inv_freq;
+        const float cs = ref_cos(ang), sn = ref_sin(ang);
+        const int64_t o0 = n - rd + 2 * i;
+        const float x0 = z[o0], x1 = z[o0 + 1];
+        z[o0] = rnd(x0 * cs - x1 * sn);
+        z[o0 + 1] = rnd(x1 * cs + x0 * sn);
+    }
+}
+
 }  // namespace
 
 /* Pools each closed group of `ratio` token keys into one rotated key (HYV4FlashCompressedIndexer.
@@ -453,102 +573,25 @@ int imrope_component(int64_t j, int64_t sec_h, int64_t sec_w) {
  * twice as HF does: after the norm, and after the rotation. "Rounded" means to `k`'s dtype, as HF
  * rounds to the token keys' dtype (an f32 model rounds nothing). */
 int ref_idx_pool_gated(const RadArgs* a, RadStream) {
-    if (a->n_t < 6 || !t_in(a, 0) || !t_in(a, 1) || !t_in(a, 2) || !t_in(a, 3) || !t_in(a, 4) ||
-        !t_in(a, 5))
-        return RAD_E_INVAL;
-    const RadTensor &k = a->t[0], &wv = a->t[1], &wg = a->t[2], &ape = a->t[3], &gain = a->t[4],
-                    &pos = a->t[5];
+    PoolArgs P;
+    if (const int rc = pool_args(a, P)) return rc;
     const RadTensor* page = a->n_t > 6 ? t_in(a, 6) : nullptr;
     const RadTensor* cache = a->n_t > 7 ? t_in(a, 7) : nullptr;
     const RadTensor* out = a->n_t > 8 ? t_in(a, 8) : nullptr;
-    const int64_t n = p_int(a, "n", 0), ratio = p_int(a, "ratio", 0), rd = p_int(a, "rotary_dim", 0);
-    const float eps = p_f32(a, "eps", 0);
-    const double theta = (double)p_f32(a, "theta", 0);
-    const char* mode = p_str(a, "mode", "");
-    const bool gptj = !std::strcmp(mode, "gptj"), imrope = !std::strcmp(mode, "imrope_gptj");
-    if (n < 1 || ratio < 1 || ratio > 16 || rd < 2 || rd > n || (rd & 1) || !(eps > 0) ||
-        !std::isfinite(eps) || !(theta > 1.0) || (!gptj && !imrope))
-        return RAD_E_SHAPE;
-    int64_t sec_h = 0, sec_w = 0;
-    if (imrope) {
-        const char* s = p_str(a, "sections", nullptr);
-        long t = 0, h = 0, w = 0;
-        if (!s || std::sscanf(s, "%ld %ld %ld", &t, &h, &w) != 3 || t < 0 || h < 0 || w < 0 ||
-            t + h + w != rd / 2)
-            return RAD_E_SHAPE;
-        sec_h = h;
-        sec_w = w;
-    }
+    const int64_t n = P.n, W = P.W;
     if (!page != !cache) return RAD_E_INVAL;
     if (!cache && !out) return RAD_E_INVAL;
-    if (k.rank != 2 || k.shape[0] < ratio || k.shape[0] % ratio || k.shape[1] != n)
-        return RAD_E_SHAPE;
-    const int64_t W = k.shape[0] / ratio;
-    if (!matrix(wv, n, n) || !matrix(wg, n, n) || !matrix(ape, ratio, n) || gain.rank != 1 ||
-        numel(&gain) != n || pos.rank != (imrope ? 2 : 1) ||
-        (imrope ? (pos.shape[0] != 3 || pos.shape[1] < W) : pos.shape[0] < W))
-        return RAD_E_SHAPE;
     if (page && (page->rank != 1 || page->shape[0] < W)) return RAD_E_SHAPE;
     if (cache && (cache->rank != 4 || cache->shape[0] < 1 || cache->shape[1] != 1 ||
                   cache->shape[2] * cache->shape[3] != n || cache->stride[3] != 1 ||
                   cache->stride[2] != cache->shape[3] || cache->stride[0] < n))
         return RAD_E_SHAPE;
     if (out && !matrix(*out, W, n)) return RAD_E_SHAPE;
-    /* Pages are written by distinct groups; two groups naming one page is a caller bug that would
-     * make the result depend on the thread order. */
-    if (page)
-        for (int64_t w = 0; w < W; ++w) {
-            const int64_t pw = ld_idx(page, w);
-            if (pw < 0 || pw >= cache->shape[0]) continue;
-            for (int64_t u = 0; u < w; ++u)
-                if (ld_idx(page, u) == pw) return RAD_E_INVAL;
-        }
-    REF_PAR_FOR_DYN(W * 2 * n * n * ratio)
+    if (page && !pages_unique(page, W, cache->shape[0])) return RAD_E_INVAL;
+    REF_PAR_FOR_DYN(W * 2 * n * n * P.ratio)
     for (int64_t w = 0; w < W; ++w) {
-        std::vector<float> val((size_t)(ratio * n)), gat((size_t)(ratio * n)), y((size_t)n);
-        for (int64_t s = 0; s < ratio; ++s) {
-            const int64_t kb = rowoff(&k, w * ratio + s, n), ks = laststride(&k);
-            for (int64_t c = 0; c < n; ++c) {
-                float dv = 0, dg = 0;
-                for (int64_t j = 0; j < n; ++j) {
-                    const float xj = ldt(&k, kb + j * ks);
-                    dv += ldt(&wv, c * wv.stride[0] + j * wv.stride[1]) * xj;
-                    dg += ldt(&wg, c * wg.stride[0] + j * wg.stride[1]) * xj;
-                }
-                val[(size_t)(s * n + c)] = dv;
-                gat[(size_t)(s * n + c)] = dg + ldt(&ape, s * ape.stride[0] + c * ape.stride[1]);
-            }
-        }
-        for (int64_t c = 0; c < n; ++c) {
-            float mx = -INFINITY;
-            for (int64_t s = 0; s < ratio; ++s) mx = std::max(mx, gat[(size_t)(s * n + c)]);
-            float e[16], den = 0;
-            for (int64_t s = 0; s < ratio; ++s) {
-                e[s] = ref_exp(gat[(size_t)(s * n + c)] - mx);
-                den += e[s];
-            }
-            float acc = 0;
-            for (int64_t s = 0; s < ratio; ++s) acc += val[(size_t)(s * n + c)] * (e[s] / den);
-            y[(size_t)c] = acc;
-        }
-        double sq = 0;
-        for (int64_t c = 0; c < n; ++c) sq += (double)y[(size_t)c] * (double)y[(size_t)c];
-        const float inv = 1.0f / std::sqrt((float)(sq / (double)n) + eps);
         std::vector<float> z((size_t)n);
-        for (int64_t c = 0; c < n; ++c)
-            z[(size_t)c] = round_dt(k.dtype, ldt(&gain, c * gain.stride[0]) * (y[(size_t)c] * inv));
-        for (int64_t i = 0; i < rd / 2; ++i) {
-            const int comp = imrope ? imrope_component(i, sec_h, sec_w) : 0;
-            const int64_t pv = imrope ? ld_int(pos.dtype, pos.data, comp * pos.stride[0] + w * pos.stride[1])
-                                      : ld_int(pos.dtype, pos.data, w * pos.stride[0]);
-            const float inv_freq = (float)(1.0 / std::pow(theta, (double)(2 * i) / (double)rd));
-            const float ang = (float)pv * inv_freq;
-            const float cs = ref_cos(ang), sn = ref_sin(ang);
-            const int64_t o0 = n - rd + 2 * i;
-            const float x0 = z[(size_t)o0], x1 = z[(size_t)o0 + 1];
-            z[(size_t)o0] = round_dt(k.dtype, x0 * cs - x1 * sn);
-            z[(size_t)o0 + 1] = round_dt(k.dtype, x1 * cs + x0 * sn);
-        }
+        pool_group(P, w, true, z.data());
         if (out)
             for (int64_t c = 0; c < n; ++c)
                 stt(out, rowoff(out, w, n) + c * laststride(out), z[(size_t)c]);
@@ -556,6 +599,75 @@ int ref_idx_pool_gated(const RadArgs* a, RadStream) {
             const int64_t pg = ld_idx(page, w);
             if (pg >= 0 && pg < cache->shape[0])
                 for (int64_t c = 0; c < n; ++c) stt(cache, pg * cache->stride[0] + c, z[(size_t)c]);
+        }
+    }
+    return RAD_OK;
+}
+
+/* idx_pool_gated's key kept in f32 (no rounding after the norm or the rotation), then GLM's
+ * index-key quantiser as vLLM's IndexPool applies it (fwht_quantize): the ascending-stride
+ * Walsh-Hadamard transform, times n^-0.5, and E4M3 codes at scale 2^ceil(log2(max(amax, 1e-4) /
+ * 448)), nearest even. Unlike dsa_pool, nothing is rounded to bf16 between the transform and the
+ * codes. The packed cache page is dsa_pool's: 128 codes, then the f32 scale at byte 128. */
+int ref_idx_pool_gated_fp8(const RadArgs* a, RadStream) {
+    PoolArgs P;
+    if (const int rc = pool_args(a, P)) return rc;
+    const RadTensor* page = a->n_t > 6 ? t_in(a, 6) : nullptr;
+    const RadTensor* cache = a->n_t > 7 ? t_in(a, 7) : nullptr;
+    const RadTensor* q = a->n_t > 8 ? t_in(a, 8) : nullptr;
+    const RadTensor* sc = a->n_t > 9 ? t_in(a, 9) : nullptr;
+    const int64_t n = P.n, W = P.W;
+    if (!page != !cache || !q != !sc || (!cache && !q)) return RAD_E_INVAL;
+    if (P.k->dtype != RAD_BF16 && P.k->dtype != RAD_F32) return RAD_E_DTYPE;
+    if (n > 256 || (n & (n - 1))) return RAD_E_SHAPE;
+    if (cache) {
+        if (page->dtype != RAD_I32 || cache->dtype != RAD_U8) return RAD_E_DTYPE;
+        if (n != 128 || page->rank != 1 || page->shape[0] < W || cache->rank != 4 ||
+            cache->shape[0] < 1 || cache->shape[1] != 1 || cache->shape[2] != 4 ||
+            cache->shape[3] != 34 || cache->stride[3] != 1 || cache->stride[2] != 34 ||
+            cache->stride[0] < 136 || cache->stride[0] % 4 || ((uintptr_t)cache->data & 3))
+            return RAD_E_SHAPE;
+        if (!pages_unique(page, W, cache->shape[0])) return RAD_E_INVAL;
+    }
+    if (q) {
+        if (q->dtype != RAD_F8E4M3 || sc->dtype != RAD_F32) return RAD_E_DTYPE;
+        if (!matrix(*q, W, n) || !matrix(*sc, W, 1)) return RAD_E_SHAPE;
+    }
+    REF_PAR_FOR_DYN(W * 2 * n * n * P.ratio)
+    for (int64_t w = 0; w < W; ++w) {
+        float v[256];
+        pool_group(P, w, false, v);
+        for (int64_t h = 1; h < n; h *= 2)
+            for (int64_t i = 0; i < n; i += 2 * h)
+                for (int64_t j = 0; j < h; ++j) {
+                    const float lo = v[i + j], hi = v[i + j + h];
+                    v[i + j] = lo + hi;
+                    v[i + j + h] = lo - hi;
+                }
+        const float norm = 1.0f / std::sqrt((float)n);
+        float am = 1e-4f;
+        for (int64_t d = 0; d < n; ++d) {
+            v[d] = v[d] * norm;
+            am = std::max(am, std::fabs(v[d]));
+        }
+        int exponent = 0;
+        const float fraction = std::frexp(am * (1.0f / 448.0f), &exponent);
+        const float scale = std::ldexp(1.0f, exponent - (fraction == 0.5f));
+        uint8_t codes[256];
+        for (int64_t d = 0; d < n; ++d)
+            codes[d] = f32_to_fp8e4m3(std::clamp(v[d] / scale, -448.0f, 448.0f));
+        if (q) {
+            for (int64_t d = 0; d < n; ++d)
+                ((uint8_t*)q->data)[rowoff(q, w, n) + d * laststride(q)] = codes[d];
+            stt(sc, rowoff(sc, w, 1), scale);
+        }
+        if (cache) {
+            const int64_t pg = ld_idx(page, w);
+            if (pg >= 0 && pg < cache->shape[0]) {
+                auto* dst = (uint8_t*)cache->data + pg * cache->stride[0];
+                std::memcpy(dst, codes, 128);
+                std::memcpy(dst + 128, &scale, sizeof(scale));
+            }
         }
     }
     return RAD_OK;

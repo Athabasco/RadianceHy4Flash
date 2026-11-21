@@ -1580,6 +1580,18 @@ static const RadOperandSpec oIdxPoolGated[] = {
     { "cache", RAD_OPD_INOUT,  1 },
     { "out",   RAD_OPD_OUT,    1 },
 };
+static const RadOperandSpec oIdxPoolGatedFp8[] = {
+    { "k",     RAD_OPD_IN,     0 },
+    { "wv",    RAD_OPD_WEIGHT, 0 },
+    { "wg",    RAD_OPD_WEIGHT, 0 },
+    { "ape",   RAD_OPD_WEIGHT, 0 },
+    { "gain",  RAD_OPD_WEIGHT, 0 },
+    { "pos",   RAD_OPD_IN,     0 },
+    { "page",  RAD_OPD_IN,     1 },
+    { "cache", RAD_OPD_INOUT,  1 },
+    { "q",     RAD_OPD_OUT,    1 },
+    { "scale", RAD_OPD_OUT,    1 },
+};
 static const RadParamSpec pIdxScore[] = {
     P_INT("M"), P_INT("n"), P_INT("heads"), P_INT("blocks"), P_INT("seqs"), P_STR("dtype"),
 };
@@ -4052,6 +4064,13 @@ static const RadOpSchema kSchemas[] = {
            "`rotary_dim` channels rotated as adjacent pairs at the group's first position (mode "
            "gptj, or imrope_gptj with `sections`, pos [3, W]) and rounded again. Written to "
            "cache[page[w]] and/or out[w]."),
+    SCHEMA("idx_pool_gated_fp8", pIdxPoolGated, oIdxPoolGatedFp8,
+           "idx_pool_gated's group key kept in f32 (no rounding after the norm or the rotation), "
+           "then quantised as vLLM's IndexPool does: ascending-stride Walsh-Hadamard transform "
+           "times n^-0.5, E4M3 codes at scale 2^ceil(log2(max(amax, 1e-4) / 448)), nearest even, "
+           "nothing rounded to bf16 in between. Written to the packed u8 cache page (dsa_pool's "
+           "[pages, 1, 4, 34]: 128 codes, f32 scale at byte 128; n 128) and/or q [W, n] E4M3 with "
+           "scale [W, 1] f32."),
     SCHEMA("idx_score", pIdxScore, oIdxScore,
            "Group scores of the compressed indexer: w_h = gate[m][h] * (heads*n)^-0.5, d_h = "
            "q[m][h] . key, score = (sum_{h < heads/2} w_h relu(d_h)) + (sum_{h >= heads/2} w_h "
@@ -5215,6 +5234,10 @@ static const RadConstraint cGemmNtF32[] = { C_GE("M", 1),         C_LE("M", 6553
                                             C_IN("dtype", "bf16") };
 static const RadConstraint cDsaScore[] = {
     C_GE("M", 1),      C_LE("M", 65535), C_EQ("n", 128),           C_EQ("heads", 32),
+    C_GE("blocks", 1), C_GE("seqs", 1),  C_IN("dtype", "fp8_e4m3")
+};
+static const RadConstraint cDsaScore16[] = {
+    C_GE("M", 1),      C_LE("M", 65535), C_EQ("n", 128),           C_EQ("heads", 16),
     C_GE("blocks", 1), C_GE("seqs", 1),  C_IN("dtype", "fp8_e4m3")
 };
 static const RadConstraint cMlaAttn[] = {
@@ -7023,6 +7046,11 @@ static const RadKernelInfo kKernels[] = {
 { "dsa_score_fp8", "dsa_score", "attn", "32-head FP8 WMMA index scoring over paged keys",
   "n=128, heads=32; ragged sequences and pitched tensors", "E4M3 codes, f32 scales and gates",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDsaScore), NOTUNE,
+  nullptr, nullptr, r4d_rad_dsa_score, nullptr, nullptr, nullptr,
+  r4d_shape_dsa_score },
+{ "dsa_score_fp8_h16", "dsa_score", "attn", "16-head FP8 WMMA index scoring over paged keys (Hy4-flash)",
+  "n=128, heads=16; ragged sequences and pitched tensors", "E4M3 codes, f32 scales and gates",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDsaScore16), NOTUNE,
   nullptr, nullptr, r4d_rad_dsa_score, nullptr, nullptr, nullptr,
   r4d_shape_dsa_score },
 { "mla_attn_paged_bf16", "mla_attn_paged", "attn",
@@ -9633,6 +9661,19 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 /* The Hy4-flash indexer's group key. 128 threads, a channel each; 4 groups a workgroup from 16
  * groups up so a weight row read serves four. Byte-equal to libref (the same order of every sum, f64
  * exp, trig and norm). */
+/* The FP8 indexer's form of the same key (RADIANCE_HY4_INDEXER=fp8): the kernel above with nothing
+ * rounded to bf16, then a wave a group runs the Hadamard and the power-of-two E4M3 quantiser of
+ * dsa_pool_fp8 into its packed page. Byte-equal to libref. */
+{ "idx_pool_gated_fp8", "idx_pool_gated_fp8", "attn",
+  "pool 4 token keys into one f32 indexer key (gated softmax pool, norm, rotary), then the "
+  "128-wide Hadamard and E4M3 codes at a power-of-two scale",
+  "n 128, ratio 4, any even rotary_dim up to 128, mode gptj or imrope_gptj",
+  "bf16 keys, f32 wv/wg/ape, f32 or bf16 gain, i32 positions and pages, dsa_pool's packed u8 cache "
+  "page, E4M3 codes and f32 scales",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cIdxPoolGated), NOTUNE,
+  nullptr, nullptr, r4d_rad_idx_pool_gated_fp8, nullptr, nullptr, nullptr,
+  nullptr },
 { "idx_pool_gated_f32", "idx_pool_gated", "attn",
   "pool 4 token keys into one indexer key: gated softmax pool in f32, norm, rotary at the group's "
   "first position, bf16",

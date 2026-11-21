@@ -150,9 +150,12 @@ std::vector<Case> build_cases() {
             for (const char* mode : { "absorb", "expand" })
                 add("mla_project", { HI("M", 3), HI("heads", 2), HI("head_dim", 17),
                                      HI("latent_dim", 31), HS("mode", mode), HS("dtype", "bf16") });
-        if (!std::strcmp(dt, "bf16"))
+        if (!std::strcmp(dt, "bf16")) {
             add("dsa_score", { HI("M", 3), HI("n", 128), HI("heads", 32), HI("blocks", 17),
                                HI("seqs", 2), HS("dtype", "fp8_e4m3") });
+            add("dsa_score", { HI("M", 3), HI("n", 128), HI("heads", 16), HI("blocks", 70),
+                               HI("seqs", 2), HS("dtype", "fp8_e4m3") });
+        }
         for (int norm : { 0, 1 })
             add("router_sigmoid_topk",
                 { HI("M", 5), HI("n_expert", 288), HI("top_k", 8), HI("norm", norm),
@@ -208,6 +211,12 @@ std::vector<Case> build_cases() {
         add("idx_pool_gated", { HI("M", 3), HI("n", 36), HI("ratio", 4), HI("rotary_dim", 12),
                                 HF("eps", 1e-5), HF("theta", 1e4), HS("mode", "imrope_gptj"),
                                 HS("sections", "2 2 2"), HS("dtype", dt) });
+        add("idx_pool_gated_fp8", { HI("M", 3), HI("n", 128), HI("ratio", 4), HI("rotary_dim", 64),
+                                    HF("eps", 1e-5), HF("theta", 1e7), HS("mode", "gptj"),
+                                    HS("dtype", dt) });
+        add("idx_pool_gated_fp8", { HI("M", 3), HI("n", 32), HI("ratio", 4), HI("rotary_dim", 12),
+                                    HF("eps", 1e-5), HF("theta", 1e4), HS("mode", "imrope_gptj"),
+                                    HS("sections", "2 2 2"), HS("dtype", dt) });
         add("idx_score", { HI("M", 5), HI("n", 128), HI("heads", 16), HI("blocks", 70),
                            HI("seqs", 2), HS("dtype", dt) });
         add("idx_score", { HI("M", 4), HI("n", 36), HI("heads", 3), HI("blocks", 9),

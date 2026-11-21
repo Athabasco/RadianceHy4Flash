@@ -1131,6 +1131,33 @@ int ref_idx_pool_gated_shape(const RadParam* p, int n_p, int operand, RadOpdDesc
     return o.finish("idx_pool_gated", operand, out);
 }
 
+/* idx_pool_gated's operands with the codes out: q [W, n] E4M3 and scale [W, 1]; the packed cache
+ * and its page list are optional and not drawn. */
+int ref_idx_pool_gated_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), ratio = gi(p, n_p, "ratio", 0),
+                  rd = gi(p, n_p, "rotary_dim", 0);
+    const char* mode = gs(p, n_p, "mode");
+    const bool imrope = mode && !std::strcmp(mode, "imrope_gptj");
+    if (M < 1 || n < 1 || n > 256 || (n & (n - 1)) || ratio < 1 || ratio > 16 || rd < 2 ||
+        rd > n || (rd & 1) || (!imrope && !(mode && !std::strcmp(mode, "gptj"))))
+        return RAD_E_UNSUPPORTED;
+    if (imrope && !gs(p, n_p, "sections")) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, { M * ratio, n });                         /* k */
+    o.t((uint32_t)RAD_F32, { n, n });                 /* wv */
+    o.t((uint32_t)RAD_F32, { n, n });                 /* wg */
+    o.t((uint32_t)RAD_F32, { ratio, n });             /* ape */
+    o.t((uint32_t)RAD_F32, { n });                    /* gain */
+    if (imrope) o.t_idx({ 3, M }, 4096, -1, 0);       /* pos */
+    else o.t_idx({ M }, 4096, -1, 0);
+    o.skip();                                         /* page */
+    o.skip();                                         /* cache */
+    o.t((uint32_t)RAD_F8E4M3, { M, n });              /* q */
+    o.t((uint32_t)RAD_F32, { M, 1 });                 /* scale */
+    return o.finish("idx_pool_gated_fp8", operand, out);
+}
+
 int ref_idx_score_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), H = gi(p, n_p, "heads", 0);

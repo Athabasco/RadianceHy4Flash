@@ -19447,8 +19447,9 @@ static void glm_index_layout_check(const Plugin& pl) {
         }
 }
 
-static void dsa_score_check(const Plugin& pl, int64_t rows, int64_t blocks, bool packed = false) {
-    const auto* row = find(pl, "dsa_score_fp8");
+static void dsa_score_check(const Plugin& pl, int64_t rows, int64_t blocks, bool packed = false,
+                            int64_t heads_n = 32) {
+    const auto* row = find(pl, heads_n == 16 ? "dsa_score_fp8_h16" : "dsa_score_fp8");
     if (!row || !g_plugin) {
         ok("DSA scorer", false, "row or plugin missing");
         return;
@@ -19472,7 +19473,7 @@ static void dsa_score_check(const Plugin& pl, int64_t rows, int64_t blocks, bool
         return;
     }
     const int64_t seqs = rows > 1 ? 2 : 1;
-    std::vector<RadParam> ps = { PI("M", rows),        PI("n", 128),     PI("heads", 32),
+    std::vector<RadParam> ps = { PI("M", rows),        PI("n", 128),     PI("heads", heads_n),
                                  PI("blocks", blocks), PI("seqs", seqs), PS("dtype", "fp8_e4m3") };
     std::vector<RadTensor> host, device;
     std::vector<std::vector<uint8_t>> bytes(9);
@@ -19571,12 +19572,12 @@ static void dsa_score_check(const Plugin& pl, int64_t rows, int64_t blocks, bool
         for (auto* ts : { &host, &device }) {
             auto& q = (*ts)[0];
             q.rank = 2;
-            q.shape[0] = rows * 32;
+            q.shape[0] = rows * heads_n;
             q.shape[1] = 128;
             q.stride[0] = q.stride[1];
             q.stride[1] = 1;
             auto& qs = (*ts)[1];
-            qs.shape[0] = rows * 32;
+            qs.shape[0] = rows * heads_n;
             qs.shape[1] = 1;
             qs.stride[0] = qs.stride[1];
         }
@@ -19609,8 +19610,8 @@ static void dsa_score_check(const Plugin& pl, int64_t rows, int64_t blocks, bool
     for (int64_t r = 0; r < rows; ++r)
         for (int64_t b = blocks * 4; b < out.stride[0] * 4; ++b)
             guards = guards && got[128 + (size_t)r * out.stride[0] * 4 + b] == 0xa5;
-    ok(fmt("DSA FP8 WMMA M=%lld blocks=%lld, signed gates, ragged cu, max error %.8g",
-           (long long)rows, (long long)blocks, max_error)
+    ok(fmt("DSA FP8 WMMA %lld heads M=%lld blocks=%lld, signed gates, ragged cu, max error %.8g",
+           (long long)heads_n, (long long)rows, (long long)blocks, max_error)
            .c_str(),
        matches);
     ok("DSA scorer guards and pitched output", guards);
@@ -28153,6 +28154,114 @@ static void idx_pool_case(const Plugin& pl) {
     }
 }
 
+/* idx_pool_gated_fp8 against libref on the same bytes: the packed u8 cache pages (codes and the
+ * scale at byte 128; the last four bytes of a page and skipped pages untouched) and q/scale. The
+ * device keeps libref's order for every sum, so the bytes must match. */
+static void idx_pool_fp8_case(const Plugin& pl) {
+    const char* what = "idx_pool_gated_fp8 against libref";
+    const RadKernelInfo* r = find(pl, "idx_pool_gated_fp8");
+    const RadKernelInfo* ref = usel_libref_row("idx_pool_gated_fp8");
+    if (!r) { ok(what, false, "row absent"); return; }
+    if (!ref) { skip(what, "libref's idx_pool_gated_fp8 unavailable"); return; }
+    const int64_t n = 128, ratio = 4, pitch = 144;
+    for (int64_t W : { (int64_t)3, (int64_t)37 }) {
+        for (int mode = 0; mode < 2; ++mode) {
+            const bool imrope = mode == 1;
+            std::vector<uint16_t> hk((size_t)(W * ratio * n));
+            for (size_t i = 0; i < hk.size(); ++i) hk[i] = h_to_bf16(1.7f * ix_rf(21, (uint32_t)i));
+            std::vector<float> hwv((size_t)(n * n)), hwg((size_t)(n * n)), hape((size_t)(ratio * n)),
+                hgain((size_t)n);
+            for (size_t i = 0; i < hwv.size(); ++i) {
+                hwv[i] = 0.15f * ix_rf(22, (uint32_t)i);
+                hwg[i] = 0.15f * ix_rf(23, (uint32_t)i);
+            }
+            for (size_t i = 0; i < hape.size(); ++i) hape[i] = ix_rf(24, (uint32_t)i);
+            for (size_t i = 0; i < hgain.size(); ++i) hgain[i] = 1.0f + 0.2f * ix_rf(25, (uint32_t)i);
+            const int64_t comps = imrope ? 3 : 1, pages = W + 6;
+            std::vector<int32_t> pos((size_t)(comps * W)), page((size_t)W);
+            for (int64_t w = 0; w < W; ++w) {
+                pos[(size_t)w] = (int32_t)(4 * (w * 7919 + 3));
+                if (imrope) {
+                    pos[(size_t)(W + w)] = (int32_t)(w * 3 + 1);
+                    pos[(size_t)(2 * W + w)] = (int32_t)(w * 5 + 2);
+                }
+                page[(size_t)w] = (int32_t)(pages - 1 - w);
+            }
+            if (W > 2) { page[1] = -1; page[2] = (int32_t)pages + 3; }
+            std::vector<uint8_t> dcache((size_t)(pages * pitch), 0x5a), rcache = dcache;
+            std::vector<uint8_t> dq((size_t)(W * n), 0xa5), rq = dq;
+            std::vector<float> dsc((size_t)W, -1.0f), rsc = dsc;
+            void *d_k = dalloc(hk.size() * 2), *d_wv = dalloc(hwv.size() * 4),
+                 *d_wg = dalloc(hwg.size() * 4), *d_ape = dalloc(hape.size() * 4),
+                 *d_gain = dalloc((size_t)n * 4), *d_pos = dalloc(pos.size() * 4),
+                 *d_page = dalloc(page.size() * 4), *d_cache = dalloc(dcache.size()),
+                 *d_q = dalloc(dq.size()), *d_sc = dalloc(dsc.size() * 4);
+            if (!d_k || !d_wv || !d_wg || !d_ape || !d_gain || !d_pos || !d_page || !d_cache ||
+                !d_q || !d_sc) {
+                ok(what, false, "alloc failed");
+                return;
+            }
+            st_memcpy(d_k, hk.data(), hk.size() * 2, hipMemcpyHostToDevice);
+            st_memcpy(d_wv, hwv.data(), hwv.size() * 4, hipMemcpyHostToDevice);
+            st_memcpy(d_wg, hwg.data(), hwg.size() * 4, hipMemcpyHostToDevice);
+            st_memcpy(d_ape, hape.data(), hape.size() * 4, hipMemcpyHostToDevice);
+            st_memcpy(d_gain, hgain.data(), hgain.size() * 4, hipMemcpyHostToDevice);
+            st_memcpy(d_pos, pos.data(), pos.size() * 4, hipMemcpyHostToDevice);
+            st_memcpy(d_page, page.data(), page.size() * 4, hipMemcpyHostToDevice);
+            st_memcpy(d_cache, dcache.data(), dcache.size(), hipMemcpyHostToDevice);
+            st_memcpy(d_q, dq.data(), dq.size(), hipMemcpyHostToDevice);
+            st_memcpy(d_sc, dsc.data(), dsc.size() * 4, hipMemcpyHostToDevice);
+            auto tensors = [&](void* k_, void* wv_, void* wg_, void* ape_, void* gain_, void* pos_,
+                               void* page_, void* cache_, void* q_, void* sc_) {
+                RadTensor c = T(cache_, RAD_U8, { pages, 1, 4, 34 });
+                c.stride[0] = pitch;
+                return std::vector<RadTensor>{
+                    T(k_, RAD_BF16, { W * ratio, n }), T(wv_, RAD_F32, { n, n }),
+                    T(wg_, RAD_F32, { n, n }), T(ape_, RAD_F32, { ratio, n }),
+                    T(gain_, RAD_F32, { n }),
+                    imrope ? T(pos_, RAD_I32, { 3, W }) : T(pos_, RAD_I32, { W }),
+                    T(page_, RAD_I32, { W }), c, T(q_, RAD_F8E4M3, { W, n }),
+                    T(sc_, RAD_F32, { W, 1 }) };
+            };
+            std::vector<RadParam> ps = { PI("M", W), PI("n", n), PI("ratio", ratio),
+                                         PI("rotary_dim", 64), PF("eps", 1e-5), PF("theta", 1e7),
+                                         PS("mode", imrope ? "imrope_gptj" : "gptj"),
+                                         PS("dtype", "bf16") };
+            if (imrope) ps.push_back(PS("sections", "12 10 10"));
+            RadArgs a;
+            std::memset(&a, 0, sizeof a);
+            a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
+            auto td = tensors(d_k, d_wv, d_wg, d_ape, d_gain, d_pos, d_page, d_cache, d_q, d_sc);
+            a.t = td.data(); a.n_t = (int)td.size();
+            const int rc = r->launch(&a, nullptr);
+            st_stream_sync(nullptr);
+            st_memcpy(dcache.data(), d_cache, dcache.size(), hipMemcpyDeviceToHost);
+            st_memcpy(dq.data(), d_q, dq.size(), hipMemcpyDeviceToHost);
+            st_memcpy(dsc.data(), d_sc, dsc.size() * 4, hipMemcpyDeviceToHost);
+            auto th = tensors(hk.data(), hwv.data(), hwg.data(), hape.data(), hgain.data(),
+                              pos.data(), page.data(), rcache.data(), rq.data(), rsc.data());
+            a.t = th.data(); a.n_t = (int)th.size();
+            const int rrc = ref->launch(&a, nullptr);
+            int64_t nq = 0, nc = 0, ns = 0;
+            for (size_t i = 0; i < dq.size(); ++i) nq += dq[i] != rq[i];
+            for (size_t i = 0; i < dcache.size(); ++i) nc += dcache[i] != rcache[i];
+            for (size_t i = 0; i < dsc.size(); ++i) ns += dsc[i] != rsc[i];
+            bool untouched = true;
+            for (int64_t p = 0; p < pages; ++p) {
+                bool written = false;
+                for (int64_t w = 0; w < W; ++w) written = written || page[(size_t)w] == p;
+                for (int64_t b = written ? 132 : 0; b < pitch; ++b)
+                    untouched = untouched && dcache[(size_t)(p * pitch + b)] == 0x5a;
+            }
+            ok(fmt("%s (%s, %lld groups): codes %lld, cache bytes %lld, scales %lld differ; tail "
+                   "bytes and skipped pages untouched",
+                   what, imrope ? "imrope_gptj" : "gptj", (long long)W, (long long)nq,
+                   (long long)nc, (long long)ns).c_str(),
+               rc == RAD_OK && rrc == RAD_OK && nq == 0 && nc == 0 && ns == 0 && untouched);
+        }
+    }
+}
+
 static void idx_score_run(const Plugin& pl, const char* what, const std::vector<int64_t>& qn,
                           int64_t BT, int64_t SC, int64_t pages, std::vector<int32_t> nc,
                           bool extra) {
@@ -36173,6 +36282,11 @@ static void device_phase(const Plugin& pl) {
         idx_pool_case(pl);
     }
 
+    if (sel("idx_pool_gated_fp8")) {
+        if (!g_case) std::printf("\nthe FP8 indexer's group key, against libref\n");
+        idx_pool_fp8_case(pl);
+    }
+
     if (sel("idx_score_bf16")) {
         if (!g_case) std::printf("\nthe indexer's group score, against libref\n");
         idx_score_case(pl);
@@ -36646,6 +36760,16 @@ static void device_phase(const Plugin& pl) {
         dsa_score_check(pl, 1, 17, true);
         dsa_score_check(pl, 4, 257, true);
         dsa_score_check(pl, 4, 32768, true);
+    }
+    if (sel("dsa_score_fp8_h16")) {
+        if (!g_case) std::printf("\nthe 16-head DSA scorer (Hy4-flash's FP8 indexer), against libref\n");
+        dsa_score_check(pl, 1, 17, false, 16);
+        dsa_score_check(pl, 7, 257, false, 16);
+        dsa_score_check(pl, 33, 17, false, 16);
+        dsa_score_check(pl, 4, 32768, false, 16);
+        dsa_score_check(pl, 1, 17, true, 16);
+        dsa_score_check(pl, 4, 257, true, 16);
+        dsa_score_check(pl, 4, 32768, true, 16);
     }
     if (sel("mla_attn_bf16")) {
         mla_check(pl, 1, 1, 3);

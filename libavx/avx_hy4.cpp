@@ -551,13 +551,19 @@ int imrope_component(int64_t j, int64_t sec_h, int64_t sec_w) {
 /* Pools each closed group of `ratio` token keys into one rotated key: gated softmax over the slots
  * per channel, an rms norm with a gain, the rotary on the last `rotary_dim` channels at the group's
  * first position; rounded to k's dtype after the norm and after the rotation, as HF does. */
-AVX_KERNEL(idx_pool_gated) {
+namespace {
+/* `fp8` 0: idx_pool_gated. `fp8` 1: idx_pool_gated_fp8, the key kept in f32 (nothing rounded), then
+ * the ascending-stride Walsh-Hadamard transform times n^-0.5 and E4M3 codes at a power-of-two
+ * scale, into dsa_pool's packed cache page and/or q/scale (libref's ref_idx_pool_gated_fp8). */
+int pool_gated(const RadArgs* a, bool fp8) {
     if (a->n_t < 6 || !rad_args_have(a, 6)) return RAD_E_INVAL;
     const RadTensor &k = a->t[0], &wv = a->t[1], &wg = a->t[2], &ape = a->t[3], &gain = a->t[4],
                     &pos = a->t[5];
     const RadTensor* page = a->n_t > 6 ? rad_arg_in(a, 6) : nullptr;
     const RadTensor* cache = a->n_t > 7 ? rad_arg_in(a, 7) : nullptr;
-    const RadTensor* out = a->n_t > 8 ? rad_arg_in(a, 8) : nullptr;
+    const RadTensor* out = !fp8 && a->n_t > 8 ? rad_arg_in(a, 8) : nullptr;
+    const RadTensor* q = fp8 && a->n_t > 8 ? rad_arg_in(a, 8) : nullptr;
+    const RadTensor* qs = fp8 && a->n_t > 9 ? rad_arg_in(a, 9) : nullptr;
     const int64_t n = p_int(a, "n", 0), ratio = p_int(a, "ratio", 0), rd = p_int(a, "rotary_dim", 0);
     const float eps = p_f32(a, "eps", 0);
     const double theta = (double)p_f32(a, "theta", 0);
@@ -577,7 +583,8 @@ AVX_KERNEL(idx_pool_gated) {
         sec_w = w;
     }
     if (!page != !cache) return RAD_E_INVAL;
-    if (!cache && !out) return RAD_E_INVAL;
+    if (!fp8 && !cache && !out) return RAD_E_INVAL;
+    if (fp8 && (!q != !qs || (!cache && !q))) return RAD_E_INVAL;
     if (k.rank != 2 || k.shape[0] < ratio || k.shape[0] % ratio || k.shape[1] != n)
         return RAD_E_SHAPE;
     const int64_t W = k.shape[0] / ratio;
@@ -586,11 +593,27 @@ AVX_KERNEL(idx_pool_gated) {
         (imrope ? (pos.shape[0] != 3 || pos.shape[1] < W) : pos.shape[0] < W))
         return RAD_E_SHAPE;
     if (page && (page->rank != 1 || page->shape[0] < W)) return RAD_E_SHAPE;
-    if (cache && (cache->rank != 4 || cache->shape[0] < 1 || cache->shape[1] != 1 ||
+    if (!fp8 && cache && (cache->rank != 4 || cache->shape[0] < 1 || cache->shape[1] != 1 ||
                   cache->shape[2] * cache->shape[3] != n || cache->stride[3] != 1 ||
                   cache->stride[2] != cache->shape[3] || cache->stride[0] < n))
         return RAD_E_SHAPE;
     if (out && !matrix(*out, W, n)) return RAD_E_SHAPE;
+    if (fp8) {
+        if (k.dtype != RAD_BF16 && k.dtype != RAD_F32) return RAD_E_DTYPE;
+        if (n > 256 || (n & (n - 1))) return RAD_E_SHAPE;
+        if (cache) {
+            if (page->dtype != RAD_I32 || cache->dtype != RAD_U8) return RAD_E_DTYPE;
+            if (n != 128 || cache->rank != 4 || cache->shape[0] < 1 || cache->shape[1] != 1 ||
+                cache->shape[2] != 4 || cache->shape[3] != 34 || cache->stride[3] != 1 ||
+                cache->stride[2] != 34 || cache->stride[0] < 136 || cache->stride[0] % 4 ||
+                ((uintptr_t)cache->data & 3))
+                return RAD_E_SHAPE;
+        }
+        if (q) {
+            if (q->dtype != RAD_F8E4M3 || qs->dtype != RAD_F32) return RAD_E_DTYPE;
+            if (!matrix(*q, W, n) || !matrix(*qs, W, 1)) return RAD_E_SHAPE;
+        }
+    }
     /* Two groups naming one page would make the result depend on the thread order. */
     if (page) {
         std::vector<int64_t> seen;
@@ -643,7 +666,8 @@ AVX_KERNEL(idx_pool_gated) {
         double sq = 0;
         for (int64_t c = 0; c < n; ++c) sq += (double)y[c] * (double)y[c];
         const float inv = 1.0f / std::sqrt((float)(sq / (double)n) + eps);
-        for (int64_t c = 0; c < n; ++c) z[c] = narrow1(k.dtype, ldt(&gain, c * gain.stride[0]) * (y[c] * inv));
+        auto rnd = [&](float v) { return fp8 ? v : narrow1(k.dtype, v); };
+        for (int64_t c = 0; c < n; ++c) z[c] = rnd(ldt(&gain, c * gain.stride[0]) * (y[c] * inv));
         for (int64_t i = 0; i < rd / 2; ++i) {
             const int comp = imrope ? imrope_component(i, sec_h, sec_w) : 0;
             const int64_t pv = imrope ? ld_int_dt(pos.dtype, pos.data, comp * pos.stride[0] + w * pos.stride[1])
@@ -652,8 +676,43 @@ AVX_KERNEL(idx_pool_gated) {
             const float cs = sc_cos(ang), sn = sc_sin(ang);
             const int64_t o0 = n - rd + 2 * i;
             const float x0 = z[o0], x1 = z[o0 + 1];
-            z[o0] = narrow1(k.dtype, x0 * cs - x1 * sn);
-            z[o0 + 1] = narrow1(k.dtype, x1 * cs + x0 * sn);
+            z[o0] = rnd(x0 * cs - x1 * sn);
+            z[o0 + 1] = rnd(x1 * cs + x0 * sn);
+        }
+        if (fp8) {
+            for (int64_t h = 1; h < n; h *= 2)
+                for (int64_t i = 0; i < n; i += 2 * h)
+                    for (int64_t j = 0; j < h; ++j) {
+                        const float lo = z[i + j], hi = z[i + j + h];
+                        z[i + j] = lo + hi;
+                        z[i + j + h] = lo - hi;
+                    }
+            const float norm = 1.0f / std::sqrt((float)n);
+            float am = 1e-4f;
+            for (int64_t d = 0; d < n; ++d) {
+                z[d] = z[d] * norm;
+                am = std::max(am, std::fabs(z[d]));
+            }
+            int exponent = 0;
+            const float fraction = std::frexp(am * (1.0f / 448.0f), &exponent);
+            const float scale = std::ldexp(1.0f, exponent - (fraction == 0.5f));
+            uint8_t codes[256];
+            for (int64_t d = 0; d < n; ++d)
+                codes[d] = rad_f32_to_fp8e4m3(std::clamp(z[d] / scale, -448.0f, 448.0f));
+            if (q) {
+                for (int64_t d = 0; d < n; ++d)
+                    ((uint8_t*)q->data)[rowoff(q, w, n) + d * laststride(q)] = codes[d];
+                stt(qs, rowoff(qs, w, 1), scale);
+            }
+            if (cache) {
+                const int64_t pg = ldi(page, offlin(page, w));
+                if (pg >= 0 && pg < cache->shape[0]) {
+                    auto* dst = (uint8_t*)cache->data + pg * cache->stride[0];
+                    std::memcpy(dst, codes, 128);
+                    std::memcpy(dst + 128, &scale, sizeof(scale));
+                }
+            }
+            continue;
         }
         if (out) out_row(out, rowoff(out, w, n), n, z);
         if (cache) {
@@ -665,6 +724,10 @@ AVX_KERNEL(idx_pool_gated) {
     }
     return RAD_OK;
 }
+}  // namespace
+
+AVX_KERNEL(idx_pool_gated) { return pool_gated(a, false); }
+AVX_KERNEL(idx_pool_gated_fp8) { return pool_gated(a, true); }
 
 /* score[m][b] = sum_h w_h relu(q[m][h] . key_b), w_h = gate[m][h] (heads n)^-0.5, the heads summed
  * as two halves in ascending order and the halves added. Blocks past nc[seq], with a page < 0 or

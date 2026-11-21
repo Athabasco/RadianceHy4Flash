@@ -3745,6 +3745,7 @@ refuses the graph rather than resolving a similar op.
 | `attn_kv_sink` | `M`(range) `N` `heads` `head_dim` `window` `scale`:f64 `dtype` | `q`, `k`, `v`, `cu_q`, `cu_k`, `sinks`w → `out` |
 | `gate_mul` | `M`(range) `n` `dtype` | `a`, `g` → `y` |
 | `idx_pool_gated` | `M`(range) `n` `ratio` `rotary_dim` `eps`:f64 `theta`:f64 `mode` `sections`/opt `block_size`/opt `dtype` | `k`, `wv`w, `wg`w, `ape`w, `gain`w, `pos`, `page`?, `cache`:inout? → `out`? |
+| `idx_pool_gated_fp8` | `M`(range) `n` `ratio` `rotary_dim` `eps`:f64 `theta`:f64 `mode` `sections`/opt `block_size`/opt `dtype` | `k`, `wv`w, `wg`w, `ape`w, `gain`w, `pos`, `page`?, `cache`:inout? → `q`?, `scale`? |
 | `idx_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` | `q`, `gate`, `k`, `bt`, `cu`, `nc` → `score` |
 | `engram_ids` | `M`(range) `heads` `ngram` `pad` `map_size` `image`/opt `video`/opt | `tok`, `state`:inout, `cu`, `pos`, `token_map`w, `mult`w, `vocab_sizes`w, `offsets`w, `num_accepted`?, `cache_idx`? → `ids`, `mask` |
 | `engram_norm` | `M`(range) `heads` `n` `eps`:f64 `dtype` | `e`, `gain`w → `y` |
@@ -3871,6 +3872,20 @@ a page < 0 or >= the pool, or past `bt`'s width: `-inf`. The op does no causal w
 `qsa_select(topk = group_topk - 1, ratio, signed = 1, own = 1)`; with it a query on a boundary
 (`(p + 1) % 4 == 0`) keeps its complete own group out of the ranking and attends it whole, as HF
 does, where the default would let it compete.
+
+**`idx_pool_gated_fp8`** is the FP8 indexer's form (`RADIANCE_HY4_INDEXER=fp8`), vLLM's IndexPool
+numerics on GLM's key layout: the key of `idx_pool_gated` with `round_k` the identity (the pooled,
+normed, rotated key stays f32), then the quantiser of `dsa_pool` as vLLM's `fwht_quantize` applies
+it: the ascending-stride Walsh-Hadamard transform, times `n^-0.5`, and E4M3 codes at
+`scale = 2^ceil(log2(max(amax, 1e-4) / 448))`, nearest even. Unlike `dsa_pool` nothing is rounded to
+bf16 between the transform and the codes. `n` is a power of two up to 256. `page` and `cache`, both
+or neither, store into `dsa_pool`'s packed page (`cache` u8 `[pages, 1, 4, 34]`, `n` 128: the codes,
+then the f32 scale at byte 128, the last four bytes untouched; a page < 0 or out of range skipped,
+two groups naming one page `RAD_E_INVAL`); `q [M, n]` E4M3 and `scale [M, 1]` f32, both or neither,
+receive the same codes and scales. The query side is `dsa_query` over the rotated query a row a
+head (which rounds to bf16 after its transform), the score `dsa_score` at `heads` 16 with
+`index_head`'s output cast to f32 as the gates (its `(heads n)^-0.5` is `idx_score`'s `w_h`
+scale). libr4d serves both (`idx_pool_gated_fp8`, byte-equal to libref; `dsa_score_fp8_h16`).
 
 ### `engram_ids`, `engram_norm`, `engram_gate`
 
