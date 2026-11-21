@@ -5447,7 +5447,7 @@ int Engine::dump() {
     if (cfg_.debug_selection) fputs(reg_->selection_table().c_str(), stdout);
     /* The exit code reports device holes by declare()'s rule (Program::device_holes). */
     for (auto& r : ranks_)
-        if (!r->program.device_holes(device_is_host() && !cfg_.debug_graph).empty()) return RAD_E_NOKERNEL;
+        if (!r->program.device_holes(device_is_host()).empty()) return RAD_E_NOKERNEL;
     return RAD_OK;
 }
 

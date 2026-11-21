@@ -2819,7 +2819,7 @@ keys are refused on it, and so are the pixel bands.
 
 | key | |
 |---|---|
-| `debug-graph: true` | print the declared graph and the selection table, and exit. It loads no weight and launches nothing, so on the host backend (`RADIANCE_HOST_DEVICES=N` fake ranks, no card) the device rows of `libr4d` stay in selection and no kernel's `init()` runs: the table shows what N cards would resolve to, over a container of the real size that is only a skeleton (`rad-convert --skeleton`, sparse). The exit status counts device holes as a card would |
+| `debug-graph: true` | print the declared graph and the selection table, and exit. It loads no weight and launches nothing, so on the host backend (`RADIANCE_HOST_DEVICES=N` fake ranks, no card) the device rows of `libr4d` stay in selection and no kernel's `init()` runs: the table shows what N cards would resolve to, over a container of the real size that is only a skeleton (`rad-convert --skeleton`, sparse). The exit status keeps the host rule; a device question answered `-- none` in the selection table is the hole a card would have |
 | `debug-selection: true` | print the selection table |
 | `debug-placement: true` | print the placement plan |
 | `debug-draft-oracle: FILE` | a verify-path test, not a drafter: with `spec-ngram`, prompt lookup proposes from the token ids in `FILE` (a plain greedy run's continuation of the one prompt the test sends) with 30% of the drafts corrupted, so verifies accept and reject at every depth; the text must stay the plain run's |
