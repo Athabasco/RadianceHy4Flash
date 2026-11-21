@@ -2177,6 +2177,24 @@ int ref_qsa_select_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("qsa_select", operand, out);
 }
 
+int ref_dfly_sel_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), blocks = gi(p, n_p, "blocks", 0);
+    const int64_t bin = gi(p, n_p, "blocks_in", 0), ratio = gi(p, n_p, "ratio", 0);
+    if (M <= 0 || blocks <= 0 || bin <= 0 || ratio <= 0 || blocks < bin + 2) return RAD_E_UNSUPPORTED;
+    const int64_t S = qsa_seqs(p, n_p, M), pitch = blocks;
+    Opd o;
+    o.t_idx({ M, bin }, S * pitch, -1, 0);                       /* sel -- page ids, by trunk row */
+    o.t_idx({ M }, bin + 1, -1, 0);                              /* nsel -- 0 .. blocks_in */
+    o.t_idx({ S }, M, -1, 0);                                    /* src -- trunk rows */
+    o.t_idx({ S, pitch }, S * pitch, -1, 0);                     /* bt -- page ids */
+    o.t_idx({ M }, (bin - 1) * ratio, -1, 0);                    /* pos */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);       /* cu */
+    o.t((uint32_t)RAD_I32, { M, blocks });                       /* out */
+    o.t((uint32_t)RAD_I32, { M });                               /* len */
+    o.t((uint32_t)RAD_I32, { M });                               /* count */
+    return o.finish("dfly_sel", operand, out);
+}
+
 int ref_qsa_tail_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
     const int64_t ratio = gi(p, n_p, "ratio", 0), ring = gi(p, n_p, "ring", ratio);

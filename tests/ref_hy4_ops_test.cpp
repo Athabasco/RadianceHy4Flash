@@ -12,6 +12,7 @@
 #include "rad_abi.h"
 #include "../libref/ref_common.h"
 #include "hy4_ref_golden.h"
+#include "hy4_dfly_golden.h"
 
 #include <algorithm>
 #include <cmath>
@@ -199,7 +200,7 @@ struct Uniform {
 TEST(every_hy4_op_has_a_schema_with_f64_floats_and_str_enums_and_a_shape_description) {
     const char* ops[] = { "ihc_pre", "ihc_post", "mla_project_kv", "mla_attn_paged_sink",
         "mla_attn_sel_sink", "mla_kv_split", "attn_kv_sink", "gate_mul", "idx_pool_gated", "idx_pool_gated_fp8",
-        "idx_score", "engram_ids", "engram_norm", "engram_gate" };
+        "idx_score", "engram_ids", "engram_norm", "engram_gate", "dfly_sel" };
     const char* f64[] = { "eps", "hc_eps", "post_mag", "scale", "theta" };
     const char* str[] = { "dtype", "mode", "sections" };
     for (const char* op : ops) {
@@ -252,6 +253,8 @@ TEST(every_hy4_op_describes_all_its_operands_at_a_typical_geometry) {
                           RAD_INT("map_size", 300) } },
         { "engram_norm", { RAD_INT("M", 5), RAD_INT("heads", 10), RAD_INT("n", 8), S("dtype", "bf16") } },
         { "engram_gate", { RAD_INT("M", 5), RAD_INT("n", 32), RAD_INT("hc", 2), S("dtype", "bf16") } },
+        { "dfly_sel", { RAD_INT("M", 12), RAD_INT("blocks_in", 4), RAD_INT("blocks", 6), RAD_INT("ratio", 4),
+                        RAD_INT("seqs", 2) } },
     };
     for (const Case& c : cases) {
         const RadKernelInfo* k = kern(c.op);
@@ -1155,4 +1158,167 @@ TEST(embed_lookup_q_with_a_scale_a_row_multiplies_each_row_by_its_own_and_rounds
     CHECK_EQ(x2.at(0), 0.25f); CHECK_EQ(x2.at(1), 1.5f);       // id 11 = row 1 of the shard: [0.5, 3] * scale[1] = 0.5
     CHECK_EQ(x2.at(2), bf(2 * 1.0078125f)); CHECK_EQ(x2.at(3), bf(1.0078125f));
 }
+/* ================================================================== DFly2: dfly_sel */
+namespace {
+/* The golden cases (hy4_dfly_golden.h, tests/data/hy4/gen_dfly_golden.py): ref/test_dfly_ref.py
+ * check (c), each row's key set as vLLM's own code gives it. One call over the cases `idx`, a
+ * sequence each, every sequence with its own shuffled page map (so a table that reads the wrong
+ * sequence's pages, or a page by its block index, expands to the wrong tokens) and its source row
+ * at a different snapshot row. Returns the number of rows whose expanded table differs. */
+struct DflyCall {
+    std::vector<int> idx;
+    int64_t ratio = 4, G = 0;
+    uint64_t seed = 1;
+    int rc = 0;
+    int run_and_compare(int* rows_seen = nullptr) {
+        const int S = (int)idx.size();
+        int64_t M = 0, pitch = 0, R = 0;
+        for (int c : idx) {
+            const int32_t* k = &kDflyCase[c * 7];
+            M += k[2];
+            pitch = std::max<int64_t>(pitch, (k[1] + k[2]) / ratio + 3);
+            R += 2;
+        }
+        const int64_t blocks = G + 2;
+        T sel(RAD_I32, {R, G}), nsel(RAD_I32, {R}), src(RAD_I32, {S}), bt(RAD_I32, {S, pitch});
+        T pos(RAD_I32, {M}), cu(RAD_I32, {S + 1}), out(RAD_I32, {M, blocks}), len(RAD_I32, {M});
+        auto rnd = [&]() { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
+        std::vector<std::vector<int64_t>> inv((size_t)S);   /* page id -> block index, per sequence */
+        for (int64_t i = 0; i < R * G; ++i) st_int(RAD_I32, sel.t.data, i, -7);
+        for (int64_t i = 0; i < R; ++i) st_int(RAD_I32, nsel.t.data, i, 99);
+        int64_t r = 0;
+        for (int s = 0; s < S; ++s) {
+            const int32_t* k = &kDflyCase[idx[(size_t)s] * 7];
+            const int64_t a = k[1], B = k[2], g0 = (a - 1) / ratio;
+            /* Page ids unique across sequences: block b of sequence s is page perm[b] * S + s. */
+            std::vector<int64_t> perm((size_t)pitch);
+            for (int64_t b = 0; b < pitch; ++b) perm[(size_t)b] = b;
+            for (int64_t b = pitch - 1; b > 0; --b) std::swap(perm[(size_t)b], perm[(size_t)(rnd() % (b + 1))]);
+            inv[(size_t)s].assign((size_t)(pitch * S), -1);
+            for (int64_t b = 0; b < pitch; ++b) {
+                const int64_t pg = perm[(size_t)b] * S + s;
+                st_int(RAD_I32, bt.t.data, s * pitch + b, pg);
+                inv[(size_t)s][(size_t)pg] = b;
+            }
+            /* The source row: snapshot row 2s+1 (row 2s is another row's, left as garbage). */
+            const int64_t kr = 2 * s + 1;
+            st_int(RAD_I32, src.t.data, s, kr);
+            if (k[3] == 0) {
+                st_int(RAD_I32, nsel.t.data, kr, 0);        /* a densely attended source */
+            } else {
+                /* qsa_select's form with `own` 1: the recalled pages in any order, the own page last. */
+                std::vector<int64_t> rec(&kDflyRec[k[4]], &kDflyRec[k[4]] + k[5]);
+                for (int64_t i = (int64_t)rec.size() - 1; i > 0; --i) std::swap(rec[(size_t)i], rec[(size_t)(rnd() % (i + 1))]);
+                for (size_t i = 0; i < rec.size(); ++i)
+                    st_int(RAD_I32, sel.t.data, kr * G + (int64_t)i, perm[(size_t)rec[i]] * S + s);
+                st_int(RAD_I32, sel.t.data, kr * G + (int64_t)rec.size(), perm[(size_t)g0] * S + s);
+                st_int(RAD_I32, nsel.t.data, kr, (int64_t)rec.size() + 1);
+            }
+            st_int(RAD_I32, cu.t.data, s, r);
+            for (int64_t j = 0; j < B; ++j) st_int(RAD_I32, pos.t.data, r++, a + j);
+        }
+        st_int(RAD_I32, cu.t.data, S, r);
+        A args; args.t(sel).t(nsel).t(src).t(bt).t(pos).t(cu).t(out).t(len)
+            .i("M", M).i("blocks_in", G).i("blocks", blocks).i("ratio", ratio).i("seqs", S);
+        rc = ::run("dfly_sel", args);
+        int bad = 0;
+        r = 0;
+        for (int s = 0; s < S; ++s) {
+            const int32_t* k = &kDflyCase[idx[(size_t)s] * 7];
+            for (int64_t j = 0; j < k[2]; ++j, ++r) {
+                const int32_t* rw = &kDflyRow[(k[6] + j) * 2];
+                std::vector<int64_t> want;
+                for (int32_t v = 0; v < rw[1]; ++v)
+                    for (int32_t t = kDflyIv[(rw[0] + v) * 2]; t < kDflyIv[(rw[0] + v) * 2 + 1]; ++t) want.push_back(t);
+                std::vector<int64_t> got;
+                const int64_t L = len.iat(r);
+                bool ok = L >= 0 && L <= blocks * ratio;
+                for (int64_t t = 0; ok && t < L; ++t) {
+                    const int64_t pg = out.iat(r * blocks + t / ratio);
+                    const int64_t b = pg >= 0 && pg < (int64_t)inv[(size_t)s].size() ? inv[(size_t)s][(size_t)pg] : -1;
+                    if (b < 0) { ok = false; break; }
+                    got.push_back(b * ratio + t % ratio);
+                }
+                /* Entries past the table's pages are -1. */
+                for (int64_t c = (L + ratio - 1) / ratio; ok && c < blocks; ++c) ok = out.iat(r * blocks + c) == -1;
+                std::sort(got.begin(), got.end());
+                if (!ok || got != want) ++bad;
+                if (rows_seen) ++*rows_seen;
+            }
+        }
+        return bad;
+    }
+};
+}  // namespace
+
+TEST(dfly_sel_gives_every_golden_row_the_key_set_vllm_gives_it_one_sequence_at_a_time) {
+    REQUIRE_EQ(kDflyCases, 210);
+    int bad = 0, rows = 0;
+    for (int c = 0; c < kDflyCases; ++c) {
+        DflyCall call;
+        call.idx = { c };
+        call.G = kDflyCase[c * 7];
+        call.seed = 1000 + (uint64_t)c;
+        bad += call.run_and_compare(&rows);
+        CHECK_EQ(call.rc, (int)RAD_OK);
+    }
+    CHECK_EQ(bad, 0);
+    CHECK(rows > 800);
+}
+
+TEST(dfly_sel_reads_each_sequence_through_its_own_source_and_table_in_one_call) {
+    /* Every case of one G in one call: a sequence's rows must take its own source row, page map
+     * and anchor (cu), never a neighbour's. */
+    for (int64_t G : { 4, 512 }) {
+        DflyCall call;
+        call.G = G;
+        call.seed = 77;
+        for (int c = 0; c < kDflyCases; ++c)
+            if (kDflyCase[c * 7] == G) call.idx.push_back(c);
+        int rows = 0;
+        CHECK_EQ(call.run_and_compare(&rows), 0);
+        CHECK_EQ(call.rc, (int)RAD_OK);
+        CHECK(rows > 100);
+    }
+}
+
+TEST(dfly_sel_empties_a_row_with_no_source_and_a_table_wider_than_blocks) {
+    /* One sequence at a = 9 (g0 2), three rows 9..11; a selecting source of two recalled pages. */
+    auto call = [&](int64_t srcrow, int64_t blocks, std::vector<int64_t>& o, std::vector<int64_t>& l) {
+        T sel(RAD_I32, {2, 4}), nsel(RAD_I32, {2}), src(RAD_I32, {1}), bt(RAD_I32, {1, 6});
+        T pos(RAD_I32, {3}), cu(RAD_I32, {2}), out(RAD_I32, {3, blocks}), len(RAD_I32, {3}), cnt(RAD_I32, {3});
+        cnt.n({5, 5, 5});
+        sel.n({0, 0, 0, 0, 50, 10, 30, -1}); nsel.n({0, 3}); src.n({srcrow});
+        bt.n({10, 50, 30, 60, 70, 80}); pos.n({9, 10, 11}); cu.n({0, 3});
+        A a; a.t(sel).t(nsel).t(src).t(bt).t(pos).t(cu).t(out).t(len).t(cnt)
+            .i("M", 3).i("blocks_in", 4).i("blocks", blocks).i("ratio", 4).i("seqs", 1);
+        const int rc = run("dfly_sel", a);
+        o.clear(); l.clear();
+        for (int64_t i = 0; i < 3 * blocks; ++i) o.push_back(out.iat(i));
+        for (int64_t i = 0; i < 3; ++i) l.push_back(len.iat(i));
+        for (int64_t i = 0; i < 3; ++i) l.push_back(cnt.iat(i));
+        return rc;
+    };
+    std::vector<int64_t> o, l;
+    /* The worked case: nrec 2 (pages 50, 10; the own page 30 is read from bt[2]), rows 9..11 all in
+     * group 2: [50, 10, 30, -1], len 8 + (p - 8) + 1. */
+    REQUIRE_EQ(call(1, 4, o, l), (int)RAD_OK);
+    CHECK_EQ(o[0], (int64_t)50); CHECK_EQ(o[1], (int64_t)10); CHECK_EQ(o[2], (int64_t)30); CHECK_EQ(o[3], (int64_t)-1);
+    CHECK_EQ(l[0], (int64_t)10); CHECK_EQ(l[1], (int64_t)11); CHECK_EQ(l[2], (int64_t)12);
+    CHECK_EQ(l[3], (int64_t)3); CHECK_EQ(l[4], (int64_t)3); CHECK_EQ(l[5], (int64_t)3);   /* count */
+    /* The dense source (row 0, nsel 0): every closed page from the table, bt[0], bt[1], then bt[2]. */
+    REQUIRE_EQ(call(0, 4, o, l), (int)RAD_OK);
+    CHECK_EQ(o[0], (int64_t)10); CHECK_EQ(o[1], (int64_t)50); CHECK_EQ(o[2], (int64_t)30);
+    CHECK_EQ(l[0], (int64_t)10);
+    /* No source (-1, a row the card did not position): every entry -1, len 0. */
+    REQUIRE_EQ(call(-1, 4, o, l), (int)RAD_OK);
+    for (int64_t v : o) CHECK_EQ(v, (int64_t)-1);
+    for (int64_t v : l) CHECK_EQ(v, (int64_t)0);
+    /* blocks 2 < nrec + 1: the rows fail (len 0, all -1); a debug build also returns RAD_E_SHAPE. */
+    const int rc = call(1, 2, o, l);
+    CHECK(rc == (int)RAD_OK || rc == (int)RAD_E_SHAPE);
+    for (int64_t v : o) CHECK_EQ(v, (int64_t)-1);
+    for (int64_t v : l) CHECK_EQ(v, (int64_t)0);
+}
+
 RAD_TEST_MAIN()

@@ -602,6 +602,12 @@ static const RadParamSpec pQsaSelect[] = { P_INT("M"), P_INT("blocks"), P_INT("t
                                            P_INT("ratio"), P_INT("seqs"), P_INTO("signed"), P_INTO("own") };
 static const RadOperandSpec oQsaSelect[] = { OPD("score"), OPD("bt"), OPD("nc"), OPD("pos"),
                                              OPD("cu"), OUT("sel"), OUT("nsel"), OUT("seqused") };
+/* DFly2's draft table (ref_dfly.cpp): `sel`/`nsel` the trunk's selection snapshot by trunk row,
+ * `src` each sequence's source row, `bt` the latent group's block table, `pos`/`cu` the query rows. */
+static const RadParamSpec pDflySel[] = { P_INT("M"), P_INT("blocks_in"), P_INT("blocks"),
+                                         P_INT("ratio"), P_INT("seqs") };
+static const RadOperandSpec oDflySel[] = { OPD("sel"), OPD("nsel"), OPD("src"), OPD("bt"), OPD("pos"),
+                                           OPD("cu"), OUT("out"), OUT("len"), OUT_O("count") };
 static const RadParamSpec pQsaTailStore[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("ring"),
                                               P_INT("seqs"), P_STR("dtype") };
 static const RadOperandSpec oQsaTailStore[] = { OPD("k"), OPD("pos"), OPD("cu"), INOUT("state"),
@@ -1773,6 +1779,12 @@ static const RadOpSchema kSchemas[] = {
   "index, the blocks above the threshold first and the tied ones after, then the partial page when "
   "(pos + 1) % ratio != 0, then -1 to topk + 1. nsel counts the entries and seqused is the "
   "attention's length over them." },
+{ "dfly_sel", ARR(pDflySel), ARR(oDflySel),
+  "A DFly2 draft row's page table and length: the source row's recalled pages (sel[src][0, nsel-1), "
+  "or bt[0, g0) when nsel is 0, g0 = (a-1)/ratio, a the sequence's first position), then bt[g0] "
+  "through bt[pos/ratio], -1 after; len = ratio*nrec + pos - ratio*g0 + 1. A source of -1 or a "
+  "table wider than `blocks` gives the row -1 and len 0. `count`, when given, is each row's entry "
+  "count (nrec + pos/ratio - g0 + 1, 0 for an emptied row)." },
 { "qsa_tail_store", ARR(pQsaTailStore), ARR(oQsaTailStore),
   "state[sidx[s][0]][pos[t] % ring] = k[t] for the last `ring` tokens of each sequence; the other "
   "rows of the tail keep what they held." },
@@ -2811,6 +2823,9 @@ SIMPLE("ref_qsa_score", "qsa_score", "attn",
 SIMPLE("ref_qsa_select", "qsa_select", "attn",
        "QSA selection: the top-k blocks as a page-id table, partial page last",
        "f32 scores, i32 tables", ref_qsa_select),
+SIMPLE("ref_dfly_sel", "dfly_sel", "attn",
+       "DFly2 draft table: the source row's recalled pages, then the block's own pages",
+       "i32 tables", ref_dfly_sel),
 SIMPLE("ref_qsa_tail_store", "qsa_tail_store", "attn",
        "QSA tail: the raw keys of open blocks into a per-sequence ring", DT_FLOAT,
        ref_qsa_tail_store),

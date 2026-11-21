@@ -1513,6 +1513,27 @@ static const RadOperandSpec oQsaSelect[] = {
     { "seqused", RAD_OPD_OUT, 0 },
 };
 
+/* `dfly_sel`, DFly2's draft table (libref/ref_dfly.cpp, docs/OPS.md). The schema is fixed here so
+ * every library agrees; libr4d has no kernel for it yet (WP13.5), so a card resolves it elsewhere. */
+static const RadParamSpec pDflySel[] = {
+    { "M",         RAD_P_INT, RAD_REQUIRED },
+    { "blocks_in", RAD_P_INT, RAD_REQUIRED },
+    { "blocks",    RAD_P_INT, RAD_REQUIRED },
+    { "ratio",     RAD_P_INT, RAD_REQUIRED },
+    { "seqs",      RAD_P_INT, RAD_REQUIRED },
+};
+static const RadOperandSpec oDflySel[] = {
+    { "sel",  RAD_OPD_IN,  0 },
+    { "nsel", RAD_OPD_IN,  0 },
+    { "src",  RAD_OPD_IN,  0 },
+    { "bt",   RAD_OPD_IN,  0 },
+    { "pos",  RAD_OPD_IN,  0 },
+    { "cu",   RAD_OPD_IN,  0 },
+    { "out",  RAD_OPD_OUT, 0 },
+    { "len",  RAD_OPD_OUT, 0 },
+    { "count", RAD_OPD_OUT, 1 },
+};
+
 /* `kv_resolve`: the residency map of a streamed KV group, between `qsa_select` and the attention
  * (docs/OPS.md). `sel` is block ids in, ring slots out; the maps and `ctl` are state kept between
  * calls, so the row is not concurrent. The miss list is the row's scratch. `block_bytes`, not
@@ -4068,6 +4089,12 @@ static const RadOpSchema kSchemas[] = {
            "break to the LOWER block index through a prefix count, never through atomic order. "
            "`signed` 1 ranks signed finite scores; absent or 0 ranks max(score, 0). `own` 1 keeps the "
            "query's own block out of the candidates and appends it last, complete or not."),
+    SCHEMA("dfly_sel", pDflySel, oDflySel,
+           "DFly2's draft table: for each query row of a sequence whose first row sits at position "
+           "a, the source row src[s]'s recalled pages (sel[src][0, nsel-1), or bt[0, g0) when nsel "
+           "is 0, g0 = (a-1)/ratio), then bt[g0] .. bt[pos/ratio], -1 to `blocks`; len = "
+           "ratio*nrec + pos - ratio*g0 + 1. A source of -1 or a table past `blocks` gives the row "
+           "-1 and len 0. Integer only, byte-equal across libraries."),
     SCHEMA("idx_pool_gated", pIdxPoolGated, oIdxPoolGated,
            "The compressed indexer's group key (Hy4-flash). Per group of `ratio` token keys, in "
            "f32: val_s = wv x_s; gat_s = wg x_s + ape[s]; softmax over the slots per channel; y = "

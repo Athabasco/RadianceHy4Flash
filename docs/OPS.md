@@ -3763,6 +3763,7 @@ refuses the graph rather than resolving a similar op.
 | `engram_ids` | `M`(range) `heads` `ngram` `pad` `map_size` `image`/opt `video`/opt | `tok`, `state`:inout, `cu`, `pos`, `token_map`w, `mult`w, `vocab_sizes`w, `offsets`w, `num_accepted`?, `cache_idx`? → `ids`, `mask` |
 | `engram_norm` | `M`(range) `heads` `n` `eps`:f64 `dtype` | `e`, `gain`w → `y` |
 | `engram_gate` | `M`(range) `n` `hc` `eps`:f64 `dtype` | `key`, `val`, `mask`, `w_key`w, `w_query`w, `w_val`w, `w_branch`w, `h`:inout |
+| `dfly_sel` | `M`(range) `blocks_in` `blocks` `ratio` `seqs` | `sel`, `nsel`, `src`, `bt`, `pos`, `cu` → `out`, `len`, `count`? |
 
 `embed_lookup_q` with a scale a row (Engram's table) and `qsa_select`'s `own` are described in their
 own sections; the rotary mode `imrope_gptj` is `idx_pool_gated`'s (below) and `rope`'s (its
@@ -3954,6 +3955,40 @@ rounded, the 3072-term dot summed in bf16); the op computes in f32 and rounds wh
 why Engram layers get their own row in the parity report.
 
 ---
+
+### `dfly_sel`
+
+The page table a DFly2 draft row attends through (`libref/ref_dfly.cpp`; design
+kernels/dfly2.md §1.4, §4). A block drafter's query pass runs a sequence's rows at positions
+`a .. a+rows-1` past its committed end `a`; draft layer i reads the latent cache of a trunk sparse
+layer and the selection that layer made at the trunk row of position `a - 1` (the *source* row,
+`RadBatch::anchor_rows`). Over pages of `ratio` tokens (one indexer group a page) the keys of the
+row at position `p` are the recalled closed pages and the tokens `[ratio*g0, p]`, `g0 = (a-1)/ratio`,
+which is the form `mla_attn_sel_sink` reads (tokens `[0, len)` of a per-row table). No new
+attention op is needed. For sequence `s` (rows `[cu[s], cu[s+1])`):
+
+```
+a = pos[cu[s]];  g0 = a > 0 ? (a-1)/ratio : 0;  k = src[s];  n = nsel[k]
+n > 0:  nrec = n - 1, out[r][c] = sel[k][c]   for c < nrec     (the selecting source; its own page,
+                                                               sel[k][n-1] = bt[g0], is read from bt)
+n = 0:  nrec = g0,    out[r][c] = bt[s][c]    for c < nrec     (a densely attended source)
+e = pos[r]/ratio - g0;  out[r][nrec + j] = bt[s][g0 + j] for j = 0..e;  -1 up to `blocks`
+len[r] = nrec*ratio + (pos[r] - g0*ratio) + 1
+```
+
+`sel` is `[rows, blocks_in]` (qsa_select's output with `own` 1, snapshotted by trunk row), `nsel` its
+counts (0 for a row that attended densely), `bt` the latent group's block table `[S, pitch]`, `pos`
+and `cu` the query rows'. A row whose source is `-1` (the card did not position it) or outside
+`sel`, or whose table needs more than `blocks` entries (`nrec + e + 1 > blocks`, a recalled count
+past `blocks_in`, a page past the block table's pitch), gets `-1` everywhere and `len` 0 (the
+attention then reads nothing; the proposal is verified anyway); libref returns `RAD_E_SHAPE` for
+such a table in a debug build. Rows no sequence holds are emptied the same way. `count`, when
+given, is each row's entry count (`nrec + e + 1`, 0 for an emptied row): `kv_resolve`'s `nsel` when
+the latent group streams (the table's entries are block ids until it rewrites them as ring slots). The caller sizes
+`blocks >= blocks_in + 1 + (rows - 1)/ratio` (Hy4-flash: `group_topk + 2`, 514 at real size). The
+dense branch is exact because a trunk step writes `nsel` 0 only when every sequence ends at or below
+`group_topk*ratio` keys, so `g0 <= group_topk - 1` and every closed page is recalled. Integer
+only: libavx and libr4d (WP13.5) must give the same bytes.
 
 ## Adding an op
 
