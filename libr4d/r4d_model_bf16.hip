@@ -112,7 +112,7 @@ __global__ __launch_bounds__(kThreads) void r4dchain_embed_lookup(R4D_EL_PARAMS)
 // software form in r4d_fp8_wmma.h), the scale product rounds once in f32, and f32_to_bf16 rounds
 // to nearest even. An id outside [0, n_vocab) after the offset writes a zero row.
 template <uint32_t V, bool Q>
-__global__ __launch_bounds__(kThreads) void embed_lookup_q_kernel(
+__device__ __forceinline__ void embed_lookup_q_body(
     const int32_t* __restrict__ tok, const void* __restrict__ wte, const void* __restrict__ sc,
     uint32_t sc_f32, uint32_t sc_row, uint16_t* __restrict__ x, uint32_t M, uint32_t n_embd,
     int32_t n_vocab, int32_t vocab_off, uint32_t x_ld) {
@@ -153,6 +153,17 @@ __global__ __launch_bounds__(kThreads) void embed_lookup_q_kernel(
     } else {
         dst[0] = f32_to_bf16(v[0] * s);
     }
+}
+
+// CH `r4dchain`: the chained form (r4d_chain.h); the body keeps its early returns.
+template <uint32_t V, bool Q, class CH>
+__global__ __launch_bounds__(kThreads) void embed_lookup_q_kernel(
+    const int32_t* __restrict__ tok, const void* __restrict__ wte, const void* __restrict__ sc,
+    uint32_t sc_f32, uint32_t sc_row, uint16_t* __restrict__ x, uint32_t M, uint32_t n_embd,
+    int32_t n_vocab, int32_t vocab_off, uint32_t x_ld) {
+    if (CH::on) r4d_chain_wait();
+    embed_lookup_q_body<V, Q>(tok, wte, sc, sc_f32, sc_row, x, M, n_embd, n_vocab, vocab_off, x_ld);
+    if (CH::on) r4d_chain_done();
 }
 
 // ---------------------------------------------------------------------------- gather_rows
@@ -212,15 +223,20 @@ __global__ __launch_bounds__(kThreads) void gather_rows_u8_kernel(
 
 // The mirror. A negative index writes nothing: the destination is a live pool, so the gather's
 // zero-fill would be data loss here.
+// CH `r4dchain`: the chained form (r4d_chain.h); a dropped row still counts.
+template <class CH>
 __global__ __launch_bounds__(kThreads) void scatter_rows_u8_kernel(
     const uchar4* __restrict__ v, const int32_t* __restrict__ idx, uchar4* __restrict__ x,
     uint32_t n4, int32_t dst_rows, uint32_t v_ld4, uint32_t x_ld4) {
+    if (CH::on) r4d_chain_wait();
     const uint32_t m = blockIdx.x;
     const int32_t r = idx[m];
-    if (r < 0 || r >= dst_rows) return;
-    const uchar4* __restrict__ src = v + (size_t)m * v_ld4;
-    uchar4* __restrict__ dst = x + (size_t)r * x_ld4;
-    for (uint32_t i = threadIdx.x; i < n4; i += kThreads) dst[i] = src[i];
+    if (r >= 0 && r < dst_rows) {
+        const uchar4* __restrict__ src = v + (size_t)m * v_ld4;
+        uchar4* __restrict__ dst = x + (size_t)r * x_ld4;
+        for (uint32_t i = threadIdx.x; i < n4; i += kThreads) dst[i] = src[i];
+    }
+    if (CH::on) r4d_chain_done();
 }
 
 // ---------------------------------------------------------------------------- rmsnorm
@@ -405,14 +421,17 @@ __global__ __launch_bounds__(kThreads) void binary_f32_kernel(
 
 // ref_mul_weight over an f32 weight (a layer scale kept f32): y = x * w, one row of n elements
 // broadcast down the rows, or with `w_step` 0 one element for the whole op.
+template <class CH>
 __global__ __launch_bounds__(kThreads) void mul_wf32_kernel(
     const uint16_t* __restrict__ x, const float* __restrict__ w, uint16_t* __restrict__ y,
     uint32_t n, uint32_t x_ld, uint32_t y_ld, uint32_t w_step) {
+    if (CH::on) r4d_chain_wait();
     const uint32_t m = blockIdx.x;
     const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
     for (uint32_t i = threadIdx.x; i < n; i += kThreads)
         yr[i] = f32_to_bf16(bf16_to_f32(xr[i]) * w[i * w_step]);
+    if (CH::on) r4d_chain_done();
 }
 
 // ref_mul_weight into an f32 output (a layer scale on a branch about to join an f32 residual):
@@ -1025,18 +1044,21 @@ extern "C" int r4d_embed_lookup_bf16(long tok, long wte, long x, int M, int n_em
  * 8 bytes); otherwise one entry per thread. */
 static int embed_lookup_q_emit(const int32_t* tok, const void* wte, bool q, const void* sc,
                                bool sc_f32, bool sc_row, uint16_t* x, long long M, int n_embd, int n_vocab,
-                               int vocab_off, long long x_ld, RadStream stream) {
+                               int vocab_off, long long x_ld, RadStream stream, bool chain = false) {
     const bool quad = n_embd % 4 == 0 && x_ld % 4 == 0 && r4d_aligned(x, 8) &&
                       r4d_aligned(wte, q ? 4 : 8);
     const uint64_t threads = (uint64_t)M * (uint64_t)(quad ? n_embd / 4 : n_embd);
     const dim3 grid((uint32_t)((threads + kThreads - 1) / kThreads));
-#define R4D_ELQ(V, Q)                                                                             \
-    R4D_EMIT(stream, (embed_lookup_q_kernel<V, Q>), grid, dim3(kThreads), 0, tok, wte, sc,      \
+    const bool ch = chain && M <= 1024;   /* a decode step's rows times the n-gram heads */
+#define R4D_ELQ1(V, Q, CH)                                                                        \
+    R4D_EMIT(stream, (embed_lookup_q_kernel<V, Q, CH>), grid, dim3(kThreads), 0, tok, wte, sc,   \
              (uint32_t)(sc_f32 ? 1u : 0u), (uint32_t)(sc_row ? 1u : 0u), x, (uint32_t)M, (uint32_t)n_embd, (int32_t)n_vocab,   \
              (int32_t)vocab_off, (uint32_t)x_ld)
+#define R4D_ELQ(V, Q) (ch ? R4D_ELQ1(V, Q, r4dchain) : R4D_ELQ1(V, Q, R4dUnchained))
     const int rc = quad ? (q ? R4D_ELQ(4, true) : R4D_ELQ(4, false))
                         : (q ? R4D_ELQ(1, true) : R4D_ELQ(1, false));
 #undef R4D_ELQ
+#undef R4D_ELQ1
     return rc == RAD_OK ? 0 : -4;
 }
 
@@ -1087,16 +1109,18 @@ extern "C" int r4d_gather_rows_u8(long x, long idx, long y, int M, int n, int sr
 }
 
 static int scatter_rows_u8_emit(long v, long idx, long x, int M, int n, int dst_rows,
-                                int v_ld, int x_ld, RadStream stream) {
+                                int v_ld, int x_ld, RadStream stream, bool chain = false) {
     if (!v || !idx || !x) return -1;
     if (M <= 0 || n <= 0 || dst_rows <= 0) return -2;
     if (!v_ld) v_ld = n;
     if (!x_ld) x_ld = n;
     if ((n | v_ld | x_ld) & 3) return -2;
-    return R4D_EMIT(stream, scatter_rows_u8_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
-                    (const uchar4*)v, (const int32_t*)idx, (uchar4*)x,
-                    (uint32_t)(n / 4), (int32_t)dst_rows,
-                    (uint32_t)(v_ld / 4), (uint32_t)(x_ld / 4)) == RAD_OK ? 0 : -4;
+#define R4D_SRU(CH_)                                                                              \
+    R4D_EMIT(stream, (scatter_rows_u8_kernel<CH_>), dim3((uint32_t)M), dim3(kThreads), 0,         \
+             (const uchar4*)v, (const int32_t*)idx, (uchar4*)x, (uint32_t)(n / 4),               \
+             (int32_t)dst_rows, (uint32_t)(v_ld / 4), (uint32_t)(x_ld / 4))
+    return (chain && M <= 64 ? R4D_SRU(r4dchain) : R4D_SRU(R4dUnchained)) == RAD_OK ? 0 : -4;
+#undef R4D_SRU
 }
 
 extern "C" int r4d_scatter_rows_u8(long v, long idx, long x, int M, int n, int dst_rows,
@@ -1279,11 +1303,13 @@ extern "C" int r4d_sigmoid_bf16(long x, long y, int M, int n, int x_ld, int y_ld
 // downstream reader (an all-reduce, a residual) still needs a defined buffer. A memset cannot
 // handle the pitch or a two-byte value.
 // T is the element's bits: uint16_t for bf16, uint32_t for f32.
-template<typename T>
+template<typename T, class CH = R4dUnchained>
 __global__ __launch_bounds__(kThreads) void fill_kernel(T* __restrict__ y, uint32_t n,
                                                         uint32_t y_ld, T v) {
+    if (CH::on) r4d_chain_wait();
     T* __restrict__ yr = y + (size_t)blockIdx.x * y_ld;
     for (uint32_t i = threadIdx.x; i < n; i += kThreads) yr[i] = v;
+    if (CH::on) r4d_chain_done();
 }
 
 // Host form of r4d_common.h's f32_to_bf16 (which is __device__), round-to-nearest-even.
@@ -1293,33 +1319,42 @@ static inline uint16_t f32_to_bf16_host(float f) {
     return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
 
-extern "C" int r4d_fill_bf16(long y, int M, int n, int y_ld, float value, long stream) {
+static int fill_bf16_emit(long y, int M, int n, int y_ld, float value, long stream, bool chain) {
     if (!y) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (!y_ld) y_ld = n;
-    hipLaunchKernelGGL(fill_kernel<uint16_t>, dim3((uint32_t)M), dim3(kThreads), 0,
+    hipLaunchKernelGGL((chain && M <= 64 ? fill_kernel<uint16_t, r4dchain> : fill_kernel<uint16_t, R4dUnchained>),
+                       dim3((uint32_t)M), dim3(kThreads), 0,
                        (hipStream_t)stream, (uint16_t*)y, (uint32_t)n, (uint32_t)y_ld,
                        f32_to_bf16_host(value));
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
+extern "C" int r4d_fill_bf16(long y, int M, int n, int y_ld, float value, long stream) {
+    return fill_bf16_emit(y, M, n, y_ld, value, stream, false);
+}
 
-extern "C" int r4d_fill_f32(long y, int M, int n, int y_ld, float value, long stream) {
+static int fill_u32_emit(long y, int M, int n, int y_ld, uint32_t bits, long stream, bool chain) {
     if (!y) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (!y_ld) y_ld = n;
-    uint32_t bits;
-    std::memcpy(&bits, &value, sizeof bits);
-    hipLaunchKernelGGL(fill_kernel<uint32_t>, dim3((uint32_t)M), dim3(kThreads), 0,
+    hipLaunchKernelGGL((chain && M <= 64 ? fill_kernel<uint32_t, r4dchain> : fill_kernel<uint32_t, R4dUnchained>),
+                       dim3((uint32_t)M), dim3(kThreads), 0,
                        (hipStream_t)stream, (uint32_t*)y, (uint32_t)n, (uint32_t)y_ld, bits);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
+static int fill_f32_emit(long y, int M, int n, int y_ld, float value, long stream, bool chain) {
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof bits);
+    return fill_u32_emit(y, M, n, y_ld, bits, stream, chain);
+}
+extern "C" int r4d_fill_f32(long y, int M, int n, int y_ld, float value, long stream) {
+    return fill_f32_emit(y, M, n, y_ld, value, stream, false);
+}
+
 // The value as libref stores it into an i32 (ref_common.h st_dt): rounded to nearest even,
 // saturated to the type's range, NaN as 0.
-extern "C" int r4d_fill_i32(long y, int M, int n, int y_ld, float value, long stream) {
-    if (!y) return -1;
-    if (M <= 0 || n <= 0) return -2;
-    if (!y_ld) y_ld = n;
+static int fill_i32_emit(long y, int M, int n, int y_ld, float value, long stream, bool chain) {
     int32_t iv = 0;
     if (value == value) {
         const float r = std::nearbyintf(value);
@@ -1327,9 +1362,10 @@ extern "C" int r4d_fill_i32(long y, int M, int n, int y_ld, float value, long st
     }
     uint32_t bits;
     std::memcpy(&bits, &iv, sizeof bits);
-    hipLaunchKernelGGL(fill_kernel<uint32_t>, dim3((uint32_t)M), dim3(kThreads), 0,
-                       (hipStream_t)stream, (uint32_t*)y, (uint32_t)n, (uint32_t)y_ld, bits);
-    return hipGetLastError() == hipSuccess ? 0 : -4;
+    return fill_u32_emit(y, M, n, y_ld, bits, stream, chain);
+}
+extern "C" int r4d_fill_i32(long y, int M, int n, int y_ld, float value, long stream) {
+    return fill_i32_emit(y, M, n, y_ld, value, stream, false);
 }
 
 /* `chain`: the chained form (the plugin entry, where the row resolved with `chain`). */
@@ -1565,7 +1601,7 @@ namespace {
 constexpr uint32_t kLgRows = 8;    // rows held in registers at once
 constexpr uint32_t kLgVec  = 8;    // bf16 per 128-bit load
 
-__global__ __launch_bounds__(kThreads) void logits_gemm_kernel(
+__device__ __forceinline__ void logits_gemm_body(
     const uint16_t* __restrict__ a, const uint16_t* __restrict__ w, float* __restrict__ c,
     uint32_t M, uint32_t K, uint32_t N, uint32_t a_ld, uint32_t c_ld) {
     __shared__ float lds[kWaves][kLgRows];
@@ -1610,6 +1646,16 @@ __global__ __launch_bounds__(kThreads) void logits_gemm_kernel(
 }
 
 
+// CH `r4dchain`: the chained forms (r4d_chain.h), a wrapper round the body with its early return.
+template <class CH>
+__global__ __launch_bounds__(kThreads) void logits_gemm_kernel(
+    const uint16_t* __restrict__ a, const uint16_t* __restrict__ w, float* __restrict__ c,
+    uint32_t M, uint32_t K, uint32_t N, uint32_t a_ld, uint32_t c_ld) {
+    if (CH::on) r4d_chain_wait();
+    logits_gemm_body(a, w, c, M, K, N, a_ld, c_ld);
+    if (CH::on) r4d_chain_done();
+}
+
 // The same projection with each wave taking four whole vocabulary columns, for a head where the
 // 256-thread block per column is the cost: at n_embd 4096 a thread of that kernel makes two 16-byte
 // weight loads before the block-wide sum, and each row widens both operands for its own product.
@@ -1622,7 +1668,7 @@ __global__ __launch_bounds__(kThreads) void logits_gemm_kernel(
 // column. A q's loads (four columns and up to kLgRows rows, two chunks each) are issued before its
 // arithmetic.
 constexpr uint32_t kLgCols = 4, kLgKi = 2;   // columns a wave; 2048-wide chunks of n_embd 4096
-__global__ __launch_bounds__(kThreads) void logits_gemm_cols_kernel(
+__device__ __forceinline__ void logits_gemm_cols_body(
     const uint16_t* __restrict__ a, const uint16_t* __restrict__ w, float* __restrict__ c,
     uint32_t M, uint32_t N, uint32_t a_ld, uint32_t c_ld) {
     constexpr uint32_t C = kLgCols, KI = kLgKi, K = KI * kThreads * kLgVec, V = KI * kLgVec;
@@ -1702,6 +1748,46 @@ __global__ __launch_bounds__(kThreads) void logits_gemm_cols_kernel(
     }
 }
 
+template <class CH>
+__global__ __launch_bounds__(kThreads) void logits_gemm_cols_kernel(
+    const uint16_t* __restrict__ a, const uint16_t* __restrict__ w, float* __restrict__ c,
+    uint32_t M, uint32_t N, uint32_t a_ld, uint32_t c_ld) {
+    if (CH::on) r4d_chain_wait();
+    logits_gemm_cols_body(a, w, c, M, N, a_ld, c_ld);
+    if (CH::on) r4d_chain_done();
+}
+
+static int logits_gemm_bf16_emit(long a, long w, long c, int M, int K, int N, int a_ld, int c_ld,
+                                 long stream, bool chain) {
+    if (!a || !w || !c) return -1;
+    if (M <= 0 || K <= 0 || N <= 0) return -2;
+    if (K % (int)kLgVec) return -3;      // a thread owns eight columns; see the kernel
+    if (!a_ld) a_ld = K;
+    if (!c_ld) c_ld = N;
+    const bool ch = chain && M <= 64;
+    hipLaunchKernelGGL(ch ? logits_gemm_kernel<r4dchain> : logits_gemm_kernel<R4dUnchained>,
+                       dim3((uint32_t)N), dim3(kThreads), 0,
+                       (hipStream_t)stream, (const uint16_t*)a, (const uint16_t*)w, (float*)c,
+                       (uint32_t)M, (uint32_t)K, (uint32_t)N, (uint32_t)a_ld, (uint32_t)c_ld);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+static int logits_gemm_bf16_cols_emit(long a, long w, long c, int M, int K, int N, int a_ld,
+                                      int c_ld, long stream, bool chain) {
+    if (!a || !w || !c) return -1;
+    if (M <= 0 || N <= 0) return -2;
+    if (!a_ld) a_ld = K;
+    if (!c_ld) c_ld = N;
+    if (K != (int)(kLgKi * kThreads * kLgVec) || a_ld % (int)kLgVec) return -3;
+    const uint32_t per = kWaves * kLgCols;
+    const bool ch = chain && M <= 64;
+    hipLaunchKernelGGL(ch ? logits_gemm_cols_kernel<r4dchain> : logits_gemm_cols_kernel<R4dUnchained>,
+                       dim3(((uint32_t)N + per - 1) / per), dim3(kThreads),
+                       0, (hipStream_t)stream, (const uint16_t*)a, (const uint16_t*)w, (float*)c,
+                       (uint32_t)M, (uint32_t)N, (uint32_t)a_ld, (uint32_t)c_ld);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
 }  // namespace
 
 //   a  [M][K]       bf16, `a_ld` elements a row (0 = K)
@@ -1709,30 +1795,13 @@ __global__ __launch_bounds__(kThreads) void logits_gemm_cols_kernel(
 //   c  [M][N]       f32,  `c_ld` elements a row (0 = N)
 extern "C" int r4d_logits_gemm_bf16(long a, long w, long c, int M, int K, int N,
                                     int a_ld, int c_ld, long stream) {
-    if (!a || !w || !c) return -1;
-    if (M <= 0 || K <= 0 || N <= 0) return -2;
-    if (K % (int)kLgVec) return -3;      // a thread owns eight columns; see the kernel
-    if (!a_ld) a_ld = K;
-    if (!c_ld) c_ld = N;
-    hipLaunchKernelGGL(logits_gemm_kernel, dim3((uint32_t)N), dim3(kThreads), 0,
-                       (hipStream_t)stream, (const uint16_t*)a, (const uint16_t*)w, (float*)c,
-                       (uint32_t)M, (uint32_t)K, (uint32_t)N, (uint32_t)a_ld, (uint32_t)c_ld);
-    return hipGetLastError() == hipSuccess ? 0 : -4;
+    return logits_gemm_bf16_emit(a, w, c, M, K, N, a_ld, c_ld, stream, false);
 }
 
 // The column form; n_embd must be 4096 and an activation row whole 16 bytes.
 extern "C" int r4d_logits_gemm_bf16_cols(long a, long w, long c, int M, int K, int N, int a_ld,
                                          int c_ld, long stream) {
-    if (!a || !w || !c) return -1;
-    if (M <= 0 || N <= 0) return -2;
-    if (!a_ld) a_ld = K;
-    if (!c_ld) c_ld = N;
-    if (K != (int)(kLgKi * kThreads * kLgVec) || a_ld % (int)kLgVec) return -3;
-    const uint32_t per = kWaves * kLgCols;
-    hipLaunchKernelGGL(logits_gemm_cols_kernel, dim3(((uint32_t)N + per - 1) / per), dim3(kThreads),
-                       0, (hipStream_t)stream, (const uint16_t*)a, (const uint16_t*)w, (float*)c,
-                       (uint32_t)M, (uint32_t)N, (uint32_t)a_ld, (uint32_t)c_ld);
-    return hipGetLastError() == hipSuccess ? 0 : -4;
+    return logits_gemm_bf16_cols_emit(a, w, c, M, K, N, a_ld, c_ld, stream, false);
 }
 
 // ============================================================== the plugin ABI entry points
@@ -1834,7 +1903,8 @@ extern "C" int r4d_rad_embed_lookup_q(const RadArgs* a, RadStream stream) {
     return embed_lookup_q_emit((const int32_t*)r4d_addr(tok), (const void*)r4d_addr(wte), q,
                                sc ? (const void*)r4d_addr(sc) : nullptr,
                                sc && sc->dtype == RAD_F32, sc_row, (uint16_t*)r4d_addr(x), M,
-                               (int)n_embd, (int)n_vocab, (int)voff, x_ld, stream) == 0
+                               (int)n_embd, (int)n_vocab, (int)voff, x_ld, stream,
+                               r4d_geti_or(a, "chain", 0) != 0) == 0
                ? RAD_OK : RAD_E_DEVICE;
 }
 
@@ -1914,7 +1984,7 @@ extern "C" int r4d_rad_scatter_rows_u8(const RadArgs* a, RadStream stream) {
 
     return scatter_rows_u8_emit(r4d_addr(v), r4d_addr(idx), r4d_addr(x),
                                 (int)M, (int)n, (int)dst, (int)v_ld, (int)x_ld,
-                                stream) == 0 ? RAD_OK : RAD_E_DEVICE;
+                                stream, r4d_geti_or(a, "chain", 0) != 0) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
 /* The same copy for rows declared bf16 (e.g. an encoder's rows over a language model's
@@ -1939,7 +2009,7 @@ extern "C" int r4d_rad_scatter_rows_bf16(const RadArgs* a, RadStream stream) {
 
     return scatter_rows_u8_emit(r4d_addr(v), r4d_addr(idx), r4d_addr(x),
                                 (int)M, (int)(2 * n), (int)dst, (int)(2 * v_ld), (int)(2 * x_ld),
-                                stream) == 0 ? RAD_OK : RAD_E_DEVICE;
+                                stream, r4d_geti_or(a, "chain", 0) != 0) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
 /* ------------------------------------------------------------------ cast (bf16 -> bf16) */
@@ -2272,7 +2342,9 @@ extern "C" int r4d_rad_mul_weight(const RadArgs* a, RadStream s) {
         return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
     }
     if (W->dtype == RAD_F32) {
-        hipLaunchKernelGGL(mul_wf32_kernel, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)s,
+        const bool mch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;   /* decode heights */
+        hipLaunchKernelGGL(mch ? mul_wf32_kernel<r4dchain> : mul_wf32_kernel<R4dUnchained>,
+                           dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)s,
                            (const uint16_t*)X->data, (const float*)W->data, (uint16_t*)Y->data,
                            (uint32_t)n, (uint32_t)x_ld, (uint32_t)y_ld, w_ld < 0 ? 0u : 1u);
         return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
@@ -2321,10 +2393,11 @@ extern "C" int r4d_rad_fill(const RadArgs* a, RadStream s) {
     if (y_ld < 0) return R4D_NO(RAD_E_STRIDE);
     if (M <= 0) return R4D_NO(RAD_E_SHAPE);
     const double v = r4d_getf(a, "value", 0.0);
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0;
     const int e = y->dtype == RAD_I32
-        ? r4d_fill_i32(r4d_addr(y), (int)M, (int)n, (int)y_ld, (float)v, (long)(uintptr_t)s)
-        : (y->dtype == RAD_F32 ? r4d_fill_f32 : r4d_fill_bf16)(
-              r4d_addr(y), (int)M, (int)n, (int)y_ld, (float)v, (long)(uintptr_t)s);
+        ? fill_i32_emit(r4d_addr(y), (int)M, (int)n, (int)y_ld, (float)v, (long)(uintptr_t)s, ch)
+        : (y->dtype == RAD_F32 ? fill_f32_emit : fill_bf16_emit)(
+              r4d_addr(y), (int)M, (int)n, (int)y_ld, (float)v, (long)(uintptr_t)s, ch);
     return e == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
@@ -2771,9 +2844,9 @@ extern "C" int r4d_rad_logits_gemm(const RadArgs* a, RadStream s) {
     if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
     if (!r4d_aligned(x->data, 16) || !r4d_aligned(w->data, 16)) return R4D_NO(RAD_E_ALIGN);
 
-    return r4d_logits_gemm_bf16(r4d_addr(x), r4d_addr(w), r4d_addr(y), (int)M, (int)n_embd,
-                                (int)n_vocab, (int)x_ld, (int)y_ld,
-                                (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
+    return logits_gemm_bf16_emit(r4d_addr(x), r4d_addr(w), r4d_addr(y), (int)M, (int)n_embd,
+                                 (int)n_vocab, (int)x_ld, (int)y_ld, (long)(uintptr_t)s,
+                                 r4d_geti_or(a, "chain", 0) != 0) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
 /* logits_gemm_bf16_cols: the operands and checks above, then the column form at the n_embd of its
@@ -2799,7 +2872,7 @@ extern "C" int r4d_rad_logits_gemm_cols(const RadArgs* a, RadStream s) {
     if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
     if (!r4d_aligned(x->data, 16) || !r4d_aligned(w->data, 16) || x_ld % 8)
         return R4D_NO(RAD_E_ALIGN);
-    return r4d_logits_gemm_bf16_cols(r4d_addr(x), r4d_addr(w), r4d_addr(y), (int)M, (int)n_embd,
-                                     (int)n_vocab, (int)x_ld, (int)y_ld,
-                                     (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
+    return logits_gemm_bf16_cols_emit(r4d_addr(x), r4d_addr(w), r4d_addr(y), (int)M, (int)n_embd,
+                                      (int)n_vocab, (int)x_ld, (int)y_ld, (long)(uintptr_t)s,
+                                      r4d_geti_or(a, "chain", 0) != 0) == 0 ? RAD_OK : RAD_E_DEVICE;
 }

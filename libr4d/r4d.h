@@ -380,7 +380,7 @@ void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, lo
                          long seq_ctrs, long slot_stride16, long inp, long out, long n_elem,
                          long dtype, long rank, long row_elems, long stream, long nblocks,
                          long nthreads, long drain, long acq, long dpitch,
-                         long spitch, long stage = 0);
+                         long spitch, long stage = 0, long chain = 0);
 
 // ---- all-reduce: one-shot, push, 4 or 8 ranks over P2P -------------------------------------
 // The same algorithm at width (r4d_ar_oneshot_Nrank_exact.hip). Peer arguments are in ascending

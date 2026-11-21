@@ -11839,6 +11839,23 @@ extern "C" int rad_kernel_chain(int i) {
         /* Hy4-flash's kv_b projections at decode heights (M <= 64; r4d_mla_kv_bf16.hip), the
          * absorption and the expansion, alone or with the gate folded in */
         "mla_project_kv_bf16", "mla_expand_gate_bf16",
+        /* the rest of Hy4-flash's decode pass (WP16.1b), at decode heights (the launches decline
+         * above 64 rows): the connection's write and the gate product, the latent attention's
+         * rows kernel and its merge, the indexer's pool and score, the f32 router GEMM, the
+         * sigmoid router (alone and with the sort's scatter), the sort's small form, the clamped
+         * SwiGLU, the Engram's ids / norm / gate, its E4M3 round trip's quantiser and
+         * dequantiser and the n-gram table's gather, the f32-logits head and DFly2's table */
+        "ihc_post_bf16", "gate_mul_bf16", "mla_attn_paged_sink_bf16", "mla_attn_sel_sink_bf16",
+        "idx_pool_gated_f32", "idx_pool_gated_fp8", "idx_pool_gated_i8", "idx_score_bf16",
+        "gemm_nt_f32_bf16", "router_sigmoid_topk_f32", "router_sigmoid_topk_scatter_f32",
+        "moe_scatter_i32", "moe_scatter_inv_i32", "swiglu_clamped_bf16",
+        "engram_ids_i32", "engram_norm_bf16", "engram_gate_bf16", "embed_lookup_q_bf16",
+        "quant_act_fp8_grp", "dequant_fp8_bf16", "logits_gemm_bf16", "logits_gemm_bf16_cols",
+        "dfly_sel_i32", "gemm_bf16_nt_bias_tiled",
+        /* ...and the small rows of DFly2's draft pass (a launch-bound pass: 33 % idle): its index
+         * and fill rows, the f32 narrowing, the layer scale and the draft cache's row scatter */
+        "ar_gather_2rank", "iota", "fill_bf16", "fill_f32", "fill_i32", "cast_f32_bf16", "mul_weight_bf16",
+        "scatter_rows_u8", "scatter_rows_bf16",
     };
     for (const char* p : kChained)
         if (std::strcmp(k->name, p) == 0) return 2;

@@ -24,6 +24,7 @@
 // rounding: d to 1e-5 relative, h within one bf16 ulp of the update's size. LDS under 1 KiB.
 #include <hip/hip_runtime.h>
 #include "r4d_args.h"
+#include "r4d_chain.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
 #include <cmath>
@@ -69,8 +70,8 @@ struct EngramIds {
 };
 
 template <bool I64>
-__global__ __launch_bounds__(256) void engram_ids_kernel(EngramIds p, void* __restrict__ ids_,
-                                                         int32_t* __restrict__ mask) {
+__device__ __forceinline__ void engram_ids_body(EngramIds p, void* __restrict__ ids_,
+                                                int32_t* __restrict__ mask) {
     const uint64_t g = (uint64_t)blockIdx.x * 256u + threadIdx.x;
     if (g >= (uint64_t)p.M * (uint64_t)p.heads) return;
     const int32_t m = (int32_t)(g / (uint32_t)p.heads), head = (int32_t)(g % (uint32_t)p.heads);
@@ -107,8 +108,18 @@ __global__ __launch_bounds__(256) void engram_ids_kernel(EngramIds p, void* __re
     }
 }
 
+// CH `r4dchain`: the chained form (r4d_chain.h). Each kernel of this file keeps its body (early
+// returns and all) in a device function and the wrapper brackets it, so every block counts once.
+template <bool I64, class CH>
+__global__ __launch_bounds__(256) void engram_ids_kernel(EngramIds p, void* __restrict__ ids_,
+                                                         int32_t* __restrict__ mask) {
+    if (CH::on) r4d_chain_wait();
+    engram_ids_body<I64>(p, ids_, mask);
+    if (CH::on) r4d_chain_done();
+}
+
 // The window after the step; one thread a sequence, the old ids copied out before any is written.
-__global__ __launch_bounds__(64) void engram_state_kernel(EngramIds p) {
+__device__ __forceinline__ void engram_state_body(EngramIds p) {
     const int32_t s = (int32_t)(blockIdx.x * 64u + threadIdx.x);
     if (s >= p.n_seq) return;
     const int32_t bos = p.cu[s], T = p.cu[s + 1] - bos;
@@ -141,13 +152,20 @@ __global__ __launch_bounds__(64) void engram_state_kernel(EngramIds p) {
         for (int32_t t = 1; t < T; ++t) sb[ctx - 1 + t] = p.tok[bos + t];
 }
 
+template <class CH>
+__global__ __launch_bounds__(64) void engram_state_kernel(EngramIds p) {
+    if (CH::on) r4d_chain_wait();
+    engram_state_body(p);
+    if (CH::on) r4d_chain_done();
+}
+
 // A gain or gate weight as f32: bf16 (the checkpoint's) or f32 (the plugin's declared form).
 __device__ __forceinline__ float eg_w(const uint16_t* p, uint32_t i) { return bf16_to_f32(p[i]); }
 __device__ __forceinline__ float eg_w(const float* p, uint32_t i) { return p[i]; }
 
 // One wave a (row, head), eight to a workgroup.
 template <typename WT>
-__global__ __launch_bounds__(256) void engram_norm_kernel(
+__device__ __forceinline__ void engram_norm_body(
     const uint16_t* __restrict__ e, const WT* __restrict__ gain, uint16_t* __restrict__ y,
     uint32_t M, uint32_t heads, uint32_t n, float eps, uint64_t ep, uint64_t yp) {
     const uint64_t job = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5);
@@ -166,6 +184,15 @@ __global__ __launch_bounds__(256) void engram_norm_kernel(
     const WT* __restrict__ gr = gain + hd * n;
     for (uint32_t i = lane; i < n; i += 32)
         yr[i] = f32_to_bf16(eg_w(gr, i) * bf16_to_f32(er[i]) * inv);
+}
+
+template <typename WT, class CH>
+__global__ __launch_bounds__(256) void engram_norm_kernel(
+    const uint16_t* __restrict__ e, const WT* __restrict__ gain, uint16_t* __restrict__ y,
+    uint32_t M, uint32_t heads, uint32_t n, float eps, uint64_t ep, uint64_t yp) {
+    if (CH::on) r4d_chain_wait();
+    engram_norm_body<WT>(e, gain, y, M, heads, n, eps, ep, yp);
+    if (CH::on) r4d_chain_done();
 }
 
 // A workgroup-wide sum of K values: lanes through r4d_xor_sum, waves through LDS in wave order.
@@ -189,7 +216,7 @@ __device__ __forceinline__ void eg_block_sum(float (&v)[K], float (*part)[K]) {
 }
 
 template <int HC, typename WT>
-__global__ __launch_bounds__(kEgThreads) void engram_gate_kernel(
+__device__ __forceinline__ void engram_gate_body(
     const uint16_t* __restrict__ key, const uint16_t* __restrict__ val,
     const int32_t* __restrict__ mask, const WT* __restrict__ wk,
     const WT* __restrict__ wq, const WT* __restrict__ wv,
@@ -264,6 +291,18 @@ __global__ __launch_bounds__(kEgThreads) void engram_gate_kernel(
     }
 }
 
+template <int HC, typename WT, class CH>
+__global__ __launch_bounds__(kEgThreads) void engram_gate_kernel(
+    const uint16_t* __restrict__ key, const uint16_t* __restrict__ val,
+    const int32_t* __restrict__ mask, const WT* __restrict__ wk,
+    const WT* __restrict__ wq, const WT* __restrict__ wv,
+    const WT* __restrict__ wb, uint16_t* __restrict__ h, uint32_t n, float eps,
+    float inv_sqrt_n, uint64_t kp, uint64_t vp, uint64_t hp) {
+    if (CH::on) r4d_chain_wait();
+    engram_gate_body<HC, WT>(key, val, mask, wk, wq, wv, wb, h, n, eps, inv_sqrt_n, kp, vp, hp);
+    if (CH::on) r4d_chain_done();
+}
+
 bool eg_bf16(const RadTensor* t) { return t && t->dtype == RAD_BF16; }
 bool eg_f32(const RadTensor* t) { return t && t->dtype == RAD_F32; }
 bool eg_i32(const RadTensor* t) { return t && t->dtype == RAD_I32; }
@@ -327,13 +366,17 @@ extern "C" int r4d_rad_engram_ids(const RadArgs* a, RadStream s) {
     p.sp = (uint64_t)st->stride[0];
     p.ip = (uint64_t)ids->stride[0];
     const uint32_t blocks = (uint32_t)((M * heads + 255) / 256);
-    int rc = ids->dtype == RAD_I64
-                 ? R4D_EMIT(s, engram_ids_kernel<true>, dim3(blocks), dim3(256), 0, p, ids->data,
-                            (int32_t*)mask->data)
-                 : R4D_EMIT(s, engram_ids_kernel<false>, dim3(blocks), dim3(256), 0, p, ids->data,
-                            (int32_t*)mask->data);
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;   /* decode heights */
+#define R4D_EGI_K(I_, C_) R4D_EMIT(s, (engram_ids_kernel<I_, C_>), dim3(blocks), dim3(256), 0, p, \
+                                   ids->data, (int32_t*)mask->data)
+    int rc = ch ? (ids->dtype == RAD_I64 ? R4D_EGI_K(true, r4dchain) : R4D_EGI_K(false, r4dchain))
+                : (ids->dtype == RAD_I64 ? R4D_EGI_K(true, R4dUnchained)
+                                         : R4D_EGI_K(false, R4dUnchained));
+#undef R4D_EGI_K
     if (rc != RAD_OK) return rc;
-    return R4D_EMIT(s, engram_state_kernel, dim3((uint32_t)((p.n_seq + 63) / 64)), dim3(64), 0, p);
+    const dim3 sg((uint32_t)((p.n_seq + 63) / 64));
+    return ch ? R4D_EMIT(s, (engram_state_kernel<r4dchain>), sg, dim3(64), 0, p)
+              : R4D_EMIT(s, (engram_state_kernel<R4dUnchained>), sg, dim3(64), 0, p);
 }
 
 extern "C" int r4d_rad_engram_norm(const RadArgs* a, RadStream s) {
@@ -349,13 +392,14 @@ extern "C" int r4d_rad_engram_norm(const RadArgs* a, RadStream s) {
     if (M < 1 || My != M || (M * H + 7) / 8 > INT32_MAX || r4d_numel(gain) != H * n)
         return R4D_NO(RAD_E_SHAPE);
     if (!r4d_contig(gain)) return R4D_NO(RAD_E_STRIDE);
-    if (eg_f32(gain))
-        return R4D_EMIT(s, engram_norm_kernel<float>, dim3((uint32_t)((M * H + 7) / 8)), dim3(256),
-                        0, (const uint16_t*)e->data, (const float*)gain->data, (uint16_t*)y->data,
-                        (uint32_t)M, (uint32_t)H, (uint32_t)n, eps, (uint64_t)ep, (uint64_t)yp);
-    return R4D_EMIT(s, engram_norm_kernel<uint16_t>, dim3((uint32_t)((M * H + 7) / 8)), dim3(256),
-                    0, (const uint16_t*)e->data, (const uint16_t*)gain->data, (uint16_t*)y->data,
-                    (uint32_t)M, (uint32_t)H, (uint32_t)n, eps, (uint64_t)ep, (uint64_t)yp);
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
+#define R4D_EGN_K(W_, C_)                                                                        \
+    R4D_EMIT(s, (engram_norm_kernel<W_, C_>), dim3((uint32_t)((M * H + 7) / 8)), dim3(256), 0,   \
+             (const uint16_t*)e->data, (const W_*)gain->data, (uint16_t*)y->data, (uint32_t)M,   \
+             (uint32_t)H, (uint32_t)n, eps, (uint64_t)ep, (uint64_t)yp)
+    if (eg_f32(gain)) return ch ? R4D_EGN_K(float, r4dchain) : R4D_EGN_K(float, R4dUnchained);
+    return ch ? R4D_EGN_K(uint16_t, r4dchain) : R4D_EGN_K(uint16_t, R4dUnchained);
+#undef R4D_EGN_K
 }
 
 extern "C" int r4d_rad_engram_gate(const RadArgs* a, RadStream s) {
@@ -385,13 +429,16 @@ extern "C" int r4d_rad_engram_gate(const RadArgs* a, RadStream s) {
         !r4d_contig(wb))
         return R4D_NO(RAD_E_STRIDE);
     const float inv_sqrt_n = (float)std::pow((double)n, -0.5);
-#define R4D_EGT(HC_, WT_)                                                                        \
-    return R4D_EMIT(s, (engram_gate_kernel<HC_, WT_>), dim3((uint32_t)M), dim3(kEgThreads), 0,   \
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
+#define R4D_EGT_K(HC_, WT_, C_)                                                                  \
+    R4D_EMIT(s, (engram_gate_kernel<HC_, WT_, C_>), dim3((uint32_t)M), dim3(kEgThreads), 0,      \
                     (const uint16_t*)key->data, (const uint16_t*)val->data,                      \
                     (const int32_t*)mask->data, (const WT_*)wk->data,                            \
                     (const WT_*)wq->data, (const WT_*)wv->data,                                  \
                     (const WT_*)wb->data, (uint16_t*)h->data, (uint32_t)n, eps, inv_sqrt_n,      \
                     (uint64_t)kp, (uint64_t)vp, (uint64_t)hp)
+#define R4D_EGT(HC_, WT_)                                                                        \
+    return ch ? R4D_EGT_K(HC_, WT_, r4dchain) : R4D_EGT_K(HC_, WT_, R4dUnchained)
 #define R4D_EG(HC_) do { if (wf32) R4D_EGT(HC_, float); R4D_EGT(HC_, uint16_t); } while (0)
     switch (hc) {
         case 1: R4D_EG(1);
@@ -405,4 +452,5 @@ extern "C" int r4d_rad_engram_gate(const RadArgs* a, RadStream s) {
     }
 #undef R4D_EG
 #undef R4D_EGT
+#undef R4D_EGT_K
 }

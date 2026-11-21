@@ -149,7 +149,7 @@ __global__ __launch_bounds__(kThreads) void ihc_junction_kernel(
 // h[j][i] = bf16(post[j] * y[i] + h[j][i]). The product is its own f32 rounding, as libref's.
 // Eight columns of every stream a thread when rows and pointers allow 16-byte accesses.
 template <bool VEC>
-__global__ __launch_bounds__(256) void ihc_post_kernel(
+__device__ __forceinline__ void ihc_post_body(
     const uint16_t* __restrict__ y, const float* __restrict__ post, uint16_t* __restrict__ h,
     uint32_t n, uint32_t hc, uint64_t yp, uint64_t pp, uint64_t hp) {
     const uint64_t row = blockIdx.y;
@@ -191,9 +191,20 @@ __global__ __launch_bounds__(256) void ihc_post_kernel(
     }
 }
 
+// CH `r4dchain`: the chained form (r4d_chain.h); the body keeps its early returns, the wrapper
+// brackets it so every block reaches the done.
+template <bool VEC, class CH>
+__global__ __launch_bounds__(256) void ihc_post_kernel(
+    const uint16_t* __restrict__ y, const float* __restrict__ post, uint16_t* __restrict__ h,
+    uint32_t n, uint32_t hc, uint64_t yp, uint64_t pp, uint64_t hp) {
+    if (CH::on) r4d_chain_wait();
+    ihc_post_body<VEC>(y, post, h, n, hc, yp, pp, hp);
+    if (CH::on) r4d_chain_done();
+}
+
 // y = bf16(a * sigmoid(g)).
 template <bool VEC>
-__global__ __launch_bounds__(256) void gate_mul_kernel(
+__device__ __forceinline__ void gate_mul_body(
     const uint16_t* __restrict__ a, const uint16_t* __restrict__ g, uint16_t* __restrict__ y,
     uint32_t n, uint64_t ap, uint64_t gp, uint64_t yp) {
     const uint64_t row = blockIdx.y;
@@ -217,6 +228,15 @@ __global__ __launch_bounds__(256) void gate_mul_kernel(
         y[row * yp + i] = f32_to_bf16(bf16_to_f32(a[row * ap + i]) *
                                       ihc_sigmoid(bf16_to_f32(g[row * gp + i])));
     }
+}
+
+template <bool VEC, class CH>
+__global__ __launch_bounds__(256) void gate_mul_kernel(
+    const uint16_t* __restrict__ a, const uint16_t* __restrict__ g, uint16_t* __restrict__ y,
+    uint32_t n, uint64_t ap, uint64_t gp, uint64_t yp) {
+    if (CH::on) r4d_chain_wait();
+    gate_mul_body<VEC>(a, g, y, n, ap, gp, yp);
+    if (CH::on) r4d_chain_done();
 }
 
 bool ihc_bf16(const RadTensor* t) { return t && t->dtype == RAD_BF16; }
@@ -311,12 +331,14 @@ extern "C" int r4d_rad_ihc_post(const RadArgs* a, RadStream s) {
     if (M < 1 || M > 65535 || My != M || Mp != M) return R4D_NO(RAD_E_SHAPE);
     const bool vec = n % 8 == 0 && ihc_vec(h->data, hp) && ihc_vec(y->data, yp);
     const dim3 grid(vec ? (uint32_t)((n / 8 + 255) / 256) : (uint32_t)((n + 255) / 256), (uint32_t)M);
-    return vec ? R4D_EMIT(s, ihc_post_kernel<true>, grid, dim3(256), 0, (const uint16_t*)y->data,
-                          (const float*)post->data, (uint16_t*)h->data, (uint32_t)n, (uint32_t)hc,
-                          (uint64_t)yp, (uint64_t)pp, (uint64_t)hp)
-               : R4D_EMIT(s, ihc_post_kernel<false>, grid, dim3(256), 0, (const uint16_t*)y->data,
-                          (const float*)post->data, (uint16_t*)h->data, (uint32_t)n, (uint32_t)hc,
-                          (uint64_t)yp, (uint64_t)pp, (uint64_t)hp);
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;   /* decode heights */
+#define R4D_IP_K(V_, C_)                                                                           \
+    R4D_EMIT(s, (ihc_post_kernel<V_, C_>), grid, dim3(256), 0, (const uint16_t*)y->data,            \
+             (const float*)post->data, (uint16_t*)h->data, (uint32_t)n, (uint32_t)hc,              \
+             (uint64_t)yp, (uint64_t)pp, (uint64_t)hp)
+    return ch ? (vec ? R4D_IP_K(true, r4dchain) : R4D_IP_K(false, r4dchain))
+              : (vec ? R4D_IP_K(true, R4dUnchained) : R4D_IP_K(false, R4dUnchained));
+#undef R4D_IP_K
 }
 
 extern "C" int r4d_rad_gate_mul(const RadArgs* a, RadStream s) {
@@ -334,12 +356,14 @@ extern "C" int r4d_rad_gate_mul(const RadArgs* a, RadStream s) {
     if (M < 1 || M > 65535 || Mg != M || My != M) return R4D_NO(RAD_E_SHAPE);
     const bool vec = n % 8 == 0 && ihc_vec(x->data, ap) && ihc_vec(g->data, gp) && ihc_vec(y->data, yp);
     const dim3 grid(vec ? (uint32_t)((n / 8 + 255) / 256) : (uint32_t)((n + 255) / 256), (uint32_t)M);
-    return vec ? R4D_EMIT(s, gate_mul_kernel<true>, grid, dim3(256), 0, (const uint16_t*)x->data,
-                          (const uint16_t*)g->data, (uint16_t*)y->data, (uint32_t)n, (uint64_t)ap,
-                          (uint64_t)gp, (uint64_t)yp)
-               : R4D_EMIT(s, gate_mul_kernel<false>, grid, dim3(256), 0, (const uint16_t*)x->data,
-                          (const uint16_t*)g->data, (uint16_t*)y->data, (uint32_t)n, (uint64_t)ap,
-                          (uint64_t)gp, (uint64_t)yp);
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
+#define R4D_GM_K(V_, C_)                                                                           \
+    R4D_EMIT(s, (gate_mul_kernel<V_, C_>), grid, dim3(256), 0, (const uint16_t*)x->data,            \
+             (const uint16_t*)g->data, (uint16_t*)y->data, (uint32_t)n, (uint64_t)ap,              \
+             (uint64_t)gp, (uint64_t)yp)
+    return ch ? (vec ? R4D_GM_K(true, r4dchain) : R4D_GM_K(false, r4dchain))
+              : (vec ? R4D_GM_K(true, R4dUnchained) : R4D_GM_K(false, R4dUnchained));
+#undef R4D_GM_K
 }
 
 /* ---- rmsnorm_ihc_junction. Operands (docs/OPS.md):

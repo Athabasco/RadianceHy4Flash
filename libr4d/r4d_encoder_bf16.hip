@@ -5,6 +5,7 @@
 // transcendentals use the accurate libm forms.
 #include "r4d.h"
 #include "r4d_args.h"
+#include "r4d_chain.h"
 #include "r4d_common.h"
 
 #include <algorithm>
@@ -405,13 +406,16 @@ __global__ __launch_bounds__(kThreads) void narrow_f16_kernel(
 
 // ---------------------------------------------------------------------------- cast f32 -> bf16
 // ref_cast: the value rounded to nearest even once.
+template <class CH>
 __global__ __launch_bounds__(kThreads) void narrow_bf16_kernel(
     const float* __restrict__ x, uint16_t* __restrict__ y, uint32_t n, uint32_t x_ld,
     uint32_t y_ld, uint32_t M) {
+    if (CH::on) r4d_chain_wait();
     const uint32_t i = blockIdx.x * kThreads + threadIdx.x;
-    if (i >= n) return;
-    for (uint32_t m = blockIdx.y; m < M; m += gridDim.y)
-        y[(size_t)m * y_ld + i] = f32_to_bf16(x[(size_t)m * x_ld + i]);
+    if (i < n)
+        for (uint32_t m = blockIdx.y; m < M; m += gridDim.y)
+            y[(size_t)m * y_ld + i] = f32_to_bf16(x[(size_t)m * x_ld + i]);
+    if (CH::on) r4d_chain_done();
 }
 
 // ---------------------------------------------------------------------------- the audio tower
@@ -983,15 +987,20 @@ extern "C" int r4d_narrow_bf16_f16(long x, long y, int M, int n, int x_ld, int y
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
-extern "C" int r4d_narrow_f32_bf16(long x, long y, int M, int n, int x_ld, int y_ld,
-                                   long stream) {
+static int narrow_f32_bf16_emit(long x, long y, int M, int n, int x_ld, int y_ld, long stream,
+                                bool chain) {
     if (!x || !y) return -1;
     if (M <= 0 || n <= 0) return -2;
-    hipLaunchKernelGGL(narrow_bf16_kernel,
+    hipLaunchKernelGGL(chain && M <= 64 ? narrow_bf16_kernel<r4dchain> : narrow_bf16_kernel<R4dUnchained>,
                        dim3((uint32_t)((n + kThreads - 1) / kThreads), grid_rows(M)),
                        dim3(kThreads), 0, (hipStream_t)stream, (const float*)x, (uint16_t*)y,
                        (uint32_t)n, (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)M);
     return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+extern "C" int r4d_narrow_f32_bf16(long x, long y, int M, int n, int x_ld, int y_ld,
+                                   long stream) {
+    return narrow_f32_bf16_emit(x, y, M, n, x_ld, y_ld, stream, false);
 }
 
 extern "C" int r4d_relu_bf16(long x, long y, int M, int n, int x_ld, int y_ld, long stream) {
@@ -1421,8 +1430,9 @@ extern "C" int r4d_rad_cast_bf16(const RadArgs* a, RadStream s) {
     const long long x_ld = r4d_rows_pitch(x, n, &Mx);
     if (y_ld < 0 || x_ld < 0) return R4D_NO(RAD_E_STRIDE);
     if (M <= 0 || Mx < M) return R4D_NO(RAD_E_SHAPE);
-    return enc_status(r4d_narrow_f32_bf16(r4d_addr(x), r4d_addr(y), (int)M, (int)n, (int)x_ld,
-                                          (int)y_ld, (long)(uintptr_t)s));
+    return enc_status(narrow_f32_bf16_emit(r4d_addr(x), r4d_addr(y), (int)M, (int)n, (int)x_ld,
+                                           (int)y_ld, (long)(uintptr_t)s,
+                                           r4d_geti_or(a, "chain", 0) != 0));
 }
 
 /* ------------------------------------------------------------------ the audio tower */

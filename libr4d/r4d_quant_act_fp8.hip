@@ -382,7 +382,7 @@ extern "C" int r4d_rad_quant_cols_fp8(const RadArgs* a, RadStream stream) {
 // waves a workgroup. Unused lanes hold zeros, which the amax ignores.
 namespace {
 
-__global__ __launch_bounds__(kThreads) void quant_act_fp8_grp_kernel(
+__device__ __forceinline__ void quant_act_fp8_grp_body(
     const uint16_t* __restrict__ x, uint8_t* __restrict__ q, float* __restrict__ s,
     uint32_t rows, uint32_t n, uint32_t g, uint32_t nkb) {
     const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
@@ -419,16 +419,27 @@ __global__ __launch_bounds__(kThreads) void quant_act_fp8_grp_kernel(
     }
 }
 
+// CH `r4dchain`: the chained forms of this pair (r4d_chain.h); the body keeps its early returns.
+template <class CH>
+__global__ __launch_bounds__(kThreads) void quant_act_fp8_grp_kernel(
+    const uint16_t* __restrict__ x, uint8_t* __restrict__ q, float* __restrict__ s,
+    uint32_t rows, uint32_t n, uint32_t g, uint32_t nkb) {
+    if (CH::on) r4d_chain_wait();
+    quant_act_fp8_grp_body(x, q, s, rows, n, g, nkb);
+    if (CH::on) r4d_chain_done();
+}
+
 // dequant over E4M3 (or int8, quant_act_i8g's) codes: y = bf16(code * scale), one f32 scale per
 // (row, group). The round trip's second half; exact up to the one rounding to bf16. Flat
 // contiguous rows as above.
 __device__ __forceinline__ float dq_code(uint8_t b, bool i8) {
     return i8 ? (float)(int8_t)b : r4d_fp8::e4m3(b);
 }
-template <bool I8>
+template <bool I8, class CH>
 __global__ __launch_bounds__(kThreads) void dequant_fp8_kernel(
     const uint8_t* __restrict__ q, const float* __restrict__ s, uint16_t* __restrict__ y,
     size_t total, uint32_t n, uint32_t g, uint32_t nkb) {
+    if (CH::on) r4d_chain_wait();
     for (size_t i = (size_t)blockIdx.x * kThreads + threadIdx.x; i < total;
          i += (size_t)gridDim.x * kThreads) {
         const size_t row = i / n;
@@ -436,6 +447,7 @@ __global__ __launch_bounds__(kThreads) void dequant_fp8_kernel(
         const float v = dq_code(q[i], I8) * s[row * nkb + c / g];
         y[i] = f32_to_bf16(v);
     }
+    if (CH::on) r4d_chain_done();
 }
 
 }  // namespace
@@ -458,7 +470,9 @@ extern "C" int r4d_rad_quant_act_fp8_grp(const RadArgs* a, RadStream stream) {
     const long long units = rows * nkb;
     const long long blocks = (units + kWaves - 1) / kWaves;
     if (blocks > 0x7fffffffLL) return R4D_NO(RAD_E_SHAPE);
-    hipLaunchKernelGGL(quant_act_fp8_grp_kernel, dim3((uint32_t)blocks), dim3(kThreads), 0,
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && rows <= 1024;   /* decode rows times heads */
+    hipLaunchKernelGGL(ch ? quant_act_fp8_grp_kernel<r4dchain> : quant_act_fp8_grp_kernel<R4dUnchained>,
+                       dim3((uint32_t)blocks), dim3(kThreads), 0,
                        (hipStream_t)stream, (const uint16_t*)x->data, (uint8_t*)q->data,
                        (float*)sc->data, (uint32_t)rows, (uint32_t)n, (uint32_t)g,
                        (uint32_t)nkb);
@@ -489,7 +503,10 @@ extern "C" int r4d_rad_dequant_fp8(const RadArgs* a, RadStream stream) {
     const size_t total = (size_t)rows * (size_t)n;
     const size_t want = (total + kThreads - 1) / kThreads;
     const uint32_t grid = (uint32_t)(want < 65536 ? want : 65536);
-    hipLaunchKernelGGL(q->dtype == RAD_I8 ? dequant_fp8_kernel<true> : dequant_fp8_kernel<false>,
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && rows <= 1024;
+    hipLaunchKernelGGL(q->dtype == RAD_I8
+                           ? (ch ? dequant_fp8_kernel<true, r4dchain> : dequant_fp8_kernel<true, R4dUnchained>)
+                           : (ch ? dequant_fp8_kernel<false, r4dchain> : dequant_fp8_kernel<false, R4dUnchained>),
                        dim3(grid), dim3(kThreads), 0, (hipStream_t)stream,
                        (const uint8_t*)q->data, (const float*)sc->data, (uint16_t*)y->data, total,
                        (uint32_t)n, (uint32_t)g, (uint32_t)ngrp);

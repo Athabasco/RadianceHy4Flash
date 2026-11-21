@@ -852,7 +852,8 @@ extern "C" int r4d_rad_ar_gather_2rank(const RadArgs* a, RadStream s) {
         r4d_ar_gather_2rank(in->peer_scratch[0], in->my_scratch, in->peer_flags[0], in->my_flags,
                             in->my_seq, in->slot16, c.inp, c.out, c.numel, in->dtype, in->rank,
                             (long)row, (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain,
-                            c.acq, (long)dpitch, (long)spitch, in->my_stage));
+                            c.acq, (long)dpitch, (long)spitch, in->my_stage,
+                            ar_chain(a, c.numel)));
     return RAD_OK;
 }
 

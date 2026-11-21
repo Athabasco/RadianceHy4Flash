@@ -118,6 +118,40 @@ __global__ __launch_bounds__(kThreads) void aql_copy2d16(const u32x4* __restrict
     }
 }
 
+/* aql_copy2d16 as a chained form (chain_kernel.h), launched where launches chain: the pass's
+ * card-side strided copies (a cast into a column slice, a state kept aside and put back) then cost
+ * no barrier on either side. Every block counts once; the row loops have no early return. */
+__global__ __launch_bounds__(kThreads) void r4dchain_copy2d16(const u32x4* __restrict__ src,
+                                                              u32x4* __restrict__ dst,
+                                                              uint64_t spitch16, uint64_t dpitch16,
+                                                              uint64_t w16, uint64_t height) {
+    rad_chain_wait();
+    const uint64_t cstride = (uint64_t)gridDim.x * kThreads;
+    for (uint64_t r = blockIdx.y; r < height; r += gridDim.y) {
+        const u32x4* s = src + r * spitch16;
+        u32x4* d = dst + r * dpitch16;
+        for (uint64_t c = (uint64_t)blockIdx.x * kThreads + threadIdx.x; c < w16; c += cstride)
+            d[c] = s[c];
+    }
+    rad_chain_done();
+}
+
+/* aql_copy2d1 as a chained form: the unaligned strided copies (i32 index rows, an odd-width tap). */
+__global__ __launch_bounds__(kThreads) void r4dchain_copy2d1(const unsigned char* __restrict__ src,
+                                                             unsigned char* __restrict__ dst,
+                                                             uint64_t spitch, uint64_t dpitch,
+                                                             uint64_t width, uint64_t height) {
+    rad_chain_wait();
+    const uint64_t cstride = (uint64_t)gridDim.x * kThreads;
+    for (uint64_t r = blockIdx.y; r < height; r += gridDim.y) {
+        const unsigned char* s = src + r * spitch;
+        unsigned char* d = dst + r * dpitch;
+        for (uint64_t c = (uint64_t)blockIdx.x * kThreads + threadIdx.x; c < width; c += cstride)
+            d[c] = s[c];
+    }
+    rad_chain_done();
+}
+
 __global__ __launch_bounds__(kThreads) void aql_copy2d1(const unsigned char* __restrict__ src,
                                                         unsigned char* __restrict__ dst,
                                                         uint64_t spitch, uint64_t dpitch,
@@ -230,12 +264,23 @@ extern "C" int rad_aql_blit_copy2d(void* dst, uint64_t dpitch, const void* src, 
     const unsigned by = (unsigned)(height < 65535 ? height : 65535);
     if (aligned16((uint64_t)(uintptr_t)dst | (uint64_t)(uintptr_t)src | dpitch | spitch | width)) {
         const uint64_t w16 = width / 16;
-        hipLaunchKernelGGL(aql_copy2d16, dim3(blocks_for(w16, kThreads), by), dim3(kThreads), 0, s,
-                           (const u32x4*)src, (u32x4*)dst, spitch / 16, dpitch / 16, w16, height);
+        if (rad_dev_chain_enabled())
+            hipLaunchKernelGGL(r4dchain_copy2d16, dim3(blocks_for(w16, kThreads), by),
+                               dim3(kThreads), 0, s, (const u32x4*)src, (u32x4*)dst, spitch / 16,
+                               dpitch / 16, w16, height);
+        else
+            hipLaunchKernelGGL(aql_copy2d16, dim3(blocks_for(w16, kThreads), by), dim3(kThreads),
+                               0, s, (const u32x4*)src, (u32x4*)dst, spitch / 16, dpitch / 16, w16,
+                               height);
     } else {
-        hipLaunchKernelGGL(aql_copy2d1, dim3(blocks_for(width, kThreads), by), dim3(kThreads), 0, s,
-                           (const unsigned char*)src, (unsigned char*)dst, spitch, dpitch, width,
-                           height);
+        if (rad_dev_chain_enabled())
+            hipLaunchKernelGGL(r4dchain_copy2d1, dim3(blocks_for(width, kThreads), by),
+                               dim3(kThreads), 0, s, (const unsigned char*)src,
+                               (unsigned char*)dst, spitch, dpitch, width, height);
+        else
+            hipLaunchKernelGGL(aql_copy2d1, dim3(blocks_for(width, kThreads), by), dim3(kThreads),
+                               0, s, (const unsigned char*)src, (unsigned char*)dst, spitch, dpitch,
+                               width, height);
     }
     return launched();
 }

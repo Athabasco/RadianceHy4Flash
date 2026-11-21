@@ -51,6 +51,7 @@
  * the law in the last place. */
 #include <hip/hip_runtime.h>
 #include "r4d_args.h"
+#include "r4d_chain.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
 #include "r4d_gdn_wmma.h"
@@ -143,7 +144,7 @@ __device__ __forceinline__ float sink_inv(float m, float d, float sink) {
 /* FUSED: the fused form (m.fused), its own instance so its accumulator's registers do not touch
  * the other forms' schedule. */
 template <int HG, bool WIDE, bool SEL, bool FUSED>
-__global__ __launch_bounds__(HG * 128) void mla_sink_rows(
+__device__ __forceinline__ void mla_sink_rows_body(
     const uint16_t* q, const uint16_t* qrot, const uint16_t* kv, const int* bt, const int* used,
     const int* cu, const int* len, const float* sinks, uint16_t* out, float* scratch, SinkMeta m) {
     constexpr int NT = HG * 128, LOADS = (kPieces + NT - 1) / NT;
@@ -439,8 +440,8 @@ __global__ __launch_bounds__(HG * 128) void mla_sink_rows(
  * loaded at once (no serial dependency between the loads), then the slots with a visible key folded
  * in ascending order (sink_fold, the fused form's rule) and the sink once. An empty slot (den 0)
  * wrote only its maximum and denominator; its values are not read. */
-__global__ __launch_bounds__(128) void merge_sink(const float* scratch, const float* sinks,
-                                                  uint16_t* out, SinkMeta m) {
+__device__ __forceinline__ void merge_sink_body(const float* scratch, const float* sinks,
+                                                uint16_t* out, SinkMeta m) {
     const int t = threadIdx.x, head = blockIdx.y, r = blockIdx.x;
     const float* src = scratch + ((long)r * m.heads + head) * m.splits * PART;
     float part_max[kMaxSplits], part_den[kMaxSplits];
@@ -478,6 +479,26 @@ __global__ __launch_bounds__(128) void merge_sink(const float* scratch, const fl
     o[1] = f32_to_bf16(value.y * inv);
     o[2] = f32_to_bf16(value.z * inv);
     o[3] = f32_to_bf16(value.w * inv);
+}
+
+/* CH `r4dchain`: the chained forms (r4d_chain.h) of both kernels of the launch. The bodies keep
+ * their early returns (!mine lanes, empty slots); the wrappers bracket them so every block counts
+ * once. The sinks, block table and cu_seqlens are scalar loads, which the wait's acquire covers. */
+template <int HG, bool WIDE, bool SEL, bool FUSED, class CH>
+__global__ __launch_bounds__(HG * 128) void mla_sink_rows(
+    const uint16_t* q, const uint16_t* qrot, const uint16_t* kv, const int* bt, const int* used,
+    const int* cu, const int* len, const float* sinks, uint16_t* out, float* scratch, SinkMeta m) {
+    if (CH::on) r4d_chain_wait();
+    mla_sink_rows_body<HG, WIDE, SEL, FUSED>(q, qrot, kv, bt, used, cu, len, sinks, out, scratch, m);
+    if (CH::on) r4d_chain_done();
+}
+
+template <class CH>
+__global__ __launch_bounds__(128) void merge_sink(const float* scratch, const float* sinks,
+                                                  uint16_t* out, SinkMeta m) {
+    if (CH::on) r4d_chain_wait();
+    merge_sink_body(scratch, sinks, out, m);
+    if (CH::on) r4d_chain_done();
 }
 
 int sink_shift(bool sel, long window) { return !sel && window > 0 ? kShiftWindow : kShiftFull; }
@@ -631,10 +652,13 @@ int sink_body(const RadArgs* a, RadStream stream) {
     const auto* sp = (const float*)sk.data;
     auto* op = (uint16_t*)o.data;
     auto* scr = (float*)a->scratch;
-#define SINK_EMIT2(HG, WD, FU)                                                                     \
-    R4D_EMIT(stream, (mla_sink_rows<HG, WD, SEL, FU>),                                             \
+    const bool chain = r4d_geti_or(a, "chain", 0) != 0 && rows <= 64;   /* decode heights */
+#define SINK_EMIT3(HG, WD, FU, CH)                                                                 \
+    R4D_EMIT(stream, (mla_sink_rows<HG, WD, SEL, FU, CH>),                                         \
              dim3((unsigned)rows, (unsigned)((heads + 16 * HG - 1) / (16 * HG)), (unsigned)splits), \
              dim3(HG * 128), 0, qp, rp, kp, bp, up, cp, lp, sp, op, scr, m)
+#define SINK_EMIT2(HG, WD, FU)                                                                     \
+    (chain ? SINK_EMIT3(HG, WD, FU, r4dchain) : SINK_EMIT3(HG, WD, FU, R4dUnchained))
 #define SINK_EMIT(HG, WD) (fused ? SINK_EMIT2(HG, WD, true) : SINK_EMIT2(HG, WD, false))
     int rc;
     if (hg == 4)
@@ -645,9 +669,13 @@ int sink_body(const RadArgs* a, RadStream stream) {
         rc = wide ? SINK_EMIT(1, true) : SINK_EMIT(1, false);
 #undef SINK_EMIT
 #undef SINK_EMIT2
+#undef SINK_EMIT3
     if (rc == RAD_OK && splits > 1)
-        rc = R4D_EMIT(stream, merge_sink, dim3((unsigned)rows, (unsigned)heads), dim3(128), 0,
-                      (const float*)scr, sp, op, m);
+        rc = chain ? R4D_EMIT(stream, (merge_sink<r4dchain>), dim3((unsigned)rows, (unsigned)heads),
+                              dim3(128), 0, (const float*)scr, sp, op, m)
+                   : R4D_EMIT(stream, (merge_sink<R4dUnchained>),
+                              dim3((unsigned)rows, (unsigned)heads), dim3(128), 0,
+                              (const float*)scr, sp, op, m);
     return rc;
 }
 

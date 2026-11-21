@@ -2546,6 +2546,19 @@ static int moe_scatter_body(const RadArgs* a, RadStream s, const RadTensor* inv)
     int32_t* ip = inv ? (int32_t*)inv->data : nullptr;
 
     if (T <= (long long)kScatterSmall) {
+        if (r4d_geti_or(a, "chain", 0) != 0) {
+            /* the chained form (r4d_chain.h), at the decode step's routed slots */
+            const int crc =
+                ip ? R4D_EMIT(s, (scatter_small_kernel<true, r4dchain>), dim3(1),
+                              dim3(kScatWaves * kWave), 0, idp, sp, op, cp, (uint32_t)T,
+                              (uint32_t)n_expert, (int32_t)base, prot, ip)
+                   : R4D_EMIT(s, (scatter_small_kernel<false, r4dchain>), dim3(1),
+                              dim3(kScatWaves * kWave), 0, idp, sp, op, cp, (uint32_t)T,
+                              (uint32_t)n_expert, (int32_t)base, prot, ip);
+            if (crc != RAD_OK) return crc;
+            R4D_MOE_CHK();
+            return RAD_OK;
+        }
         if (ip)
             hipLaunchKernelGGL(scatter_small_kernel<true>, dim3(1), dim3(kScatWaves * kWave), 0,
                                (hipStream_t)s, idp, sp, op, cp, (uint32_t)T, (uint32_t)n_expert,

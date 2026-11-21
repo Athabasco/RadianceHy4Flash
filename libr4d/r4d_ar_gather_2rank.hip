@@ -14,6 +14,7 @@
 //
 // `dtype` only converts n_elem to bytes.
 #include "r4d.h"
+#include "r4d_chain.h"
 #include "r4d_ar_seq.h"
 #include <cstdint>
 #include <stdexcept>
@@ -56,7 +57,7 @@ __device__ __forceinline__ int r4d_g_src(int k, int row16, int n16, int sp16) {
 
 // Block b owns words [start,end) of the 16B-word space and drives its own flag handshake; no
 // cross-block sync, as in the all-reduce.
-__global__ void r4d_ar_gather_2rank_kernel(
+__device__ __forceinline__ void r4d_ar_gather_2rank_body(
     const int4* __restrict__ in4, int4* peer_base, const int4* my_base, int4* __restrict__ out4,
     unsigned int* peer_flags, unsigned int* my_flags, unsigned int* seq_ctrs,
     int n16, int slot_stride16, int rank, int row16, int dp16, int sp16, int drain, int acq,
@@ -136,11 +137,32 @@ __global__ void r4d_ar_gather_2rank_kernel(
   }
 }
 
+// The plain kernel and its chained form (r4d_chain.h) wrap the body; no block returns early, and
+// the handshake's flags are the kernel's own, so the wait only orders the operands behind it.
+__global__ void r4d_ar_gather_2rank_kernel(
+    const int4* __restrict__ in4, int4* peer_base, const int4* my_base, int4* __restrict__ out4,
+    unsigned int* peer_flags, unsigned int* my_flags, unsigned int* seq_ctrs,
+    int n16, int slot_stride16, int rank, int row16, int dp16, int sp16, int drain, int acq,
+    unsigned int nbw, long stage) {
+  r4d_ar_gather_2rank_body(in4, peer_base, my_base, out4, peer_flags, my_flags, seq_ctrs, n16,
+                           slot_stride16, rank, row16, dp16, sp16, drain, acq, nbw, stage);
+}
+__global__ void r4dchain_ar_gather_2rank(
+    const int4* __restrict__ in4, int4* peer_base, const int4* my_base, int4* __restrict__ out4,
+    unsigned int* peer_flags, unsigned int* my_flags, unsigned int* seq_ctrs,
+    int n16, int slot_stride16, int rank, int row16, int dp16, int sp16, int drain, int acq,
+    unsigned int nbw, long stage) {
+  r4d_chain_wait();
+  r4d_ar_gather_2rank_body(in4, peer_base, my_base, out4, peer_flags, my_flags, seq_ctrs, n16,
+                           slot_stride16, rank, row16, dp16, sp16, drain, acq, nbw, stage);
+  r4d_chain_done();
+}
+
 void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                          long seq_ctrs, long slot_stride16, long inp, long out, long n_elem,
                          long dtype, long rank, long row_elems, long stream_i, long nblocks,
                          long nthreads, long drain, long acq, long dpitch, long spitch,
-                         long stage) {
+                         long stage, long chain) {
   hipStream_t st = (hipStream_t)stream_i;
   const int esize = (dtype == 2) ? 4 : 2;
   const long nbytes = (long)n_elem * esize;
@@ -178,7 +200,7 @@ void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, lo
   if (nt < 64) nt = 64;
   if (nt > 1024) nt = 1024;
   nt &= ~31;   // whole waves: the push check's wave sum reads all 32 lanes
-  r4d_ar_gather_2rank_kernel<<<nb, nt, 0, st>>>(
+  (chain ? r4dchain_ar_gather_2rank : r4d_ar_gather_2rank_kernel)<<<nb, nt, 0, st>>>(
       (const int4*)inp, (int4*)peer_scratch, (const int4*)my_scratch, (int4*)out,
       (unsigned*)peer_flags, (unsigned*)my_flags, (unsigned*)seq_ctrs, n16,
       (int)slot_stride16, (int)rank, row16, dp16, sp16, (int)drain, (int)acq, nbw, stage);

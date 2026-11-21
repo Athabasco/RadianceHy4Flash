@@ -17,6 +17,7 @@
 // thread of column 0. Columns of `out` at and past `blocks` are not touched.
 #include <hip/hip_runtime.h>
 #include "r4d_args.h"
+#include "r4d_chain.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
 #include <cstdint>
@@ -52,7 +53,7 @@ __device__ __forceinline__ int32_t df_seq_of(const int32_t* __restrict__ cu, int
     return lo;
 }
 
-__global__ __launch_bounds__(kDfThreads) void dfly_sel_kernel(DflySel p) {
+__device__ __forceinline__ void dfly_sel_body(DflySel p) {
     const int32_t r = (int32_t)blockIdx.x;
     const int32_t c = (int32_t)(blockIdx.y * kDfThreads + threadIdx.x);
     if (r >= p.M) return;
@@ -88,6 +89,14 @@ __global__ __launch_bounds__(kDfThreads) void dfly_sel_kernel(DflySel p) {
         p.len[r] = row ? (int32_t)(nrec * p.ratio + (ps - g0 * p.ratio) + 1) : 0;
         if (p.cnt) p.cnt[r] = row ? (int32_t)(nrec + e + 1) : 0;
     }
+}
+
+// CH `r4dchain`: the chained form (r4d_chain.h); the body's early return stays inside it.
+template <class CH>
+__global__ __launch_bounds__(kDfThreads) void dfly_sel_kernel(DflySel p) {
+    if (CH::on) r4d_chain_wait();
+    dfly_sel_body(p);
+    if (CH::on) r4d_chain_done();
 }
 
 bool df_i32(const RadTensor* t) { return t && t->dtype == RAD_I32; }
@@ -143,5 +152,9 @@ extern "C" int r4d_rad_dfly_sel(const RadArgs* a, RadStream s) {
     p.blocks_in = (int32_t)blocks_in;
     p.ratio = (int32_t)ratio;
     const uint32_t chunks = (uint32_t)((blocks + kDfThreads - 1) / kDfThreads);
-    return R4D_EMIT(s, dfly_sel_kernel, dim3((uint32_t)M, chunks), dim3(kDfThreads), 0, p);
+    return r4d_geti_or(a, "chain", 0) != 0
+               ? R4D_EMIT(s, (dfly_sel_kernel<r4dchain>), dim3((uint32_t)M, chunks),
+                          dim3(kDfThreads), 0, p)
+               : R4D_EMIT(s, (dfly_sel_kernel<R4dUnchained>), dim3((uint32_t)M, chunks),
+                          dim3(kDfThreads), 0, p);
 }

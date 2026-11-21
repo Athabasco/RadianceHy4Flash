@@ -13,6 +13,7 @@
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_emit.h"
+#include "r4d_chain.h"
 #include "r4d_common.h"
 #include "r4d_gdn_wmma.h"
 
@@ -269,11 +270,14 @@ __global__ __launch_bounds__(kThr) void grid_embed_sf_kernel(
 // TM x TN WMMA tiles per wave, eight waves as 2 x 4: BM = 2*TM*16, BN = 4*TN*16. ACT: 0 none,
 // 1 exact GELU, 2 tanh GELU. Serves grids under 32 blocks of 128 x 128 at TM 2, TN 1 (64 x 64);
 // larger grids take vit_gemm_wa_kernel below.
-template <int TM, int TN, int ACT, bool RES, bool BF32>
+// CH `r4dchain`: the chained form (r4d_chain.h), taken at decode heights (M <= 64: one row of
+// blocks); no block returns early.
+template <int TM, int TN, int ACT, bool RES, bool BF32, class CH = R4dUnchained>
 __global__ __launch_bounds__(256) void vit_gemm_kernel(
     const unsigned short* __restrict__ A, unsigned lda, const unsigned short* __restrict__ W,
     unsigned ldw_, const void* __restrict__ bias, const unsigned short* R, unsigned ldr,
     unsigned short* C, unsigned ldc, int M, int K, int N) {
+    if (CH::on) r4d_chain_wait();
     constexpr int BM = 2 * TM * 16, BN = 4 * TN * 16;
     constexpr int CPR = VB_BK / 8;                      // 16-byte chunks a staged row
     constexpr int AL = BM * CPR / 256, WL = BN * CPR / 256;
@@ -378,6 +382,7 @@ __global__ __launch_bounds__(256) void vit_gemm_kernel(
                 C[(size_t)m * ldc + n] = t;
             }
         }
+    if (CH::on) r4d_chain_done();
 }
 
 
@@ -852,10 +857,14 @@ extern "C" int r4d_rad_gemm_nt_bias(const RadArgs* a, RadStream stream) {
 #undef VB_L
     }
     const dim3 grid((unsigned)((N + 63) / 64), (unsigned)((M + 63) / 64)), block(256);
+    const bool vch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
 #define VB_L(AC, RS, BF)                                                                          \
-    return R4D_EMIT(stream, (vit_gemm_kernel<2, 1, AC, RS, BF>), grid, block, 0, Ap,             \
-                    (unsigned)lda, Wp, (unsigned)K, Bp, Rp, (unsigned)ldr, Cp, (unsigned)ldc,      \
-                    (int)M, (int)K, (int)N)
+    return vch ? R4D_EMIT(stream, (vit_gemm_kernel<2, 1, AC, RS, BF, r4dchain>), grid, block, 0,  \
+                          Ap, (unsigned)lda, Wp, (unsigned)K, Bp, Rp, (unsigned)ldr, Cp,         \
+                          (unsigned)ldc, (int)M, (int)K, (int)N)                                  \
+               : R4D_EMIT(stream, (vit_gemm_kernel<2, 1, AC, RS, BF>), grid, block, 0, Ap,       \
+                          (unsigned)lda, Wp, (unsigned)K, Bp, Rp, (unsigned)ldr, Cp, (unsigned)ldc, \
+                          (int)M, (int)K, (int)N)
 #define VB_ACT(RS, BF)                                                                            \
     do {                                                                                          \
         if (act == 1) VB_L(1, RS, BF);                                                            \
