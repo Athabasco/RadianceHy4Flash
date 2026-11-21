@@ -560,7 +560,7 @@ int ref_logits_gemm(const RadArgs* a, RadStream) {
  *
  * Every row read is multiplied by `factor`: embed_lookup's `mult`, embed_lookup_q's table scale. */
 static int embed_gather(const RadArgs* a, const RadTensor* tok, const RadTensor* wte,
-                        const RadTensor* x, float factor) {
+                        const RadTensor* x, float factor, const RadTensor* row_scale = nullptr) {
     const int64_t n_embd = p_int(a, "n_embd", wte->rank >= 2 ? wte->shape[wte->rank - 1] : 0);
     const int64_t n_vocab = p_int(a, "n_vocab", wte->rank >= 2 ? wte->shape[wte->rank - 2] : 0);
     const int64_t voff = p_int(a, "vocab_offset", 0);
@@ -583,8 +583,10 @@ static int embed_gather(const RadArgs* a, const RadTensor* tok, const RadTensor*
         const int64_t id = ld_int(tok->dtype, tok->data, offlin(tok, m)) - voff;
         const int64_t xb = rowoff(x, m, n_embd), xs = laststride(x);
         const bool have_row = id >= 0 && id < n_vocab;
+        /* A scale a row (Engram's table): the row's own, in f32, before the one rounding. */
+        const float f = have_row && row_scale ? ldt(row_scale, offlin(row_scale, id)) : factor;
         for (int64_t i = 0; i < n_embd; ++i)
-            stt(x, xb + i * xs, have_row ? ldt(wte, id * ws + i * wc) * factor : 0.0f);
+            stt(x, xb + i * xs, have_row ? ldt(wte, id * ws + i * wc) * f : 0.0f);
     }
     return RAD_OK;
 }
@@ -612,5 +614,11 @@ int ref_embed_lookup_q(const RadArgs* a, RadStream) {
     /* An absent scale is 1, so a plain bf16 n-gram embedding read in place from a container takes
      * the same op and host path, keeping a table too large for any device pool on the mapped tier. */
     const float scale = sc->data && numel(sc) >= 1 ? ldt(sc, 0) : 1.0f;
-    return embed_gather(a, &a->t[0], &a->t[1], &a->t[3], scale);
+    /* With one entry per table row (`n_vocab` of them) the scale is per row: x[m] =
+     * decode(wte[id]) * scale[id - vocab_offset], the product in f32 rounded once. One entry keeps
+     * today's meaning. */
+    const int64_t n_vocab = p_int(a, "n_vocab", 0);
+    const bool per_row = sc->data && n_vocab > 1 && numel(sc) == n_vocab;
+    if (sc->data && numel(sc) > 1 && !per_row) return RAD_E_SHAPE;
+    return embed_gather(a, &a->t[0], &a->t[1], &a->t[3], scale, per_row ? sc : nullptr);
 }

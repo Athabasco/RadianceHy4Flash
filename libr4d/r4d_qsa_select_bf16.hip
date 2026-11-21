@@ -1270,6 +1270,9 @@ extern "C" int r4d_rad_qsa_select(const RadArgs* a, RadStream stream) {
     const long long sgn   = r4d_geti_or(a, "signed", 0);
     if (topk <= 0 || ratio <= 0) return R4D_NO(RAD_E_INVAL);
     if (sgn != 0 && sgn != 1) return R4D_NO(RAD_E_INVAL);
+    /* `own` (the query's own block always appended, never a candidate) is in the schema and in
+     * libref; this kernel does not serve it yet, and a refusal beats a different model. */
+    if (r4d_geti_or(a, "own", 0) != 0) return R4D_NO(RAD_E_UNSUPPORTED);
     /* nb = min of the two widths, as in r4d_qsa_score_bf16.hip. */
     const long long M = sc->shape[0];
     const long long nb = bt->shape[1] < sc->shape[1] ? bt->shape[1] : sc->shape[1];

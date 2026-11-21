@@ -2827,6 +2827,14 @@ The table must be a weight operand for the host site to be reachable at all: `ga
 plain input and would never be placed there. The host kernel lives in a production plugin (libavx)
 because `rad_gate_reference_kernels` refuses to serve on libref.
 
+**A scale a row.** When `scale` has `n_vocab` entries (and `n_vocab > 1`) it is per row:
+`x[m] = round(decode_e4m3(wte[id]) * scale[id - vocab_offset])`, the product in f32 and rounded
+once to `x`'s dtype. Hy4-flash's Engram table is stored so (E4M3 codes, one bf16 scale a row). One
+entry keeps the table-wide meaning above; any other count is `RAD_E_SHAPE`. This is not bit-equal to
+the reference port's bf16 division (`engram_fp8_embedding`), which rounds the row and the scale
+separately: a container with no Engram recipe, read through the plain bf16 gather, is the exact
+reference.
+
 ### `ngram_ids`
 
 Qwen4-Exp's Per-Layer Embedding gives one layer a second embedding table addressed by a hash of the
@@ -3155,7 +3163,7 @@ order, not a slow one.
 | `mla_attn_paged` | `M`(range) `heads` `latent_dim` `rope_dim` `block_size` `scale`:f64 `dtype` | `q`, `q_rope`?, `kv`, `block_table`, `seqused`, `cu_seqlens`, `gate`? → `out` |
 | `mla_project` | `M`(range) `heads` `head_dim` `latent_dim` `mode` `dtype` | `a`, `b`w → `y` |
 | `qsa_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` | `q`, `bk`, `bt`, `cu`, `nc` → `score` |
-| `qsa_select` | `M`(range) `blocks` `topk` `ratio` `seqs` `signed`/opt | `score`, `bt`, `nc`, `pos`, `cu` → `sel`, `nsel`, `seqused` |
+| `qsa_select` | `M`(range) `blocks` `topk` `ratio` `seqs` `signed`/opt `own`/opt | `score`, `bt`, `nc`, `pos`, `cu` → `sel`, `nsel`, `seqused` |
 | `kv_resolve` | `M`(range) `blocks` `slots` `sel_pitch` `block_bytes` | `sel`:inout, `nsel`, `res`:inout, `slot_block`:inout, `slot_state`:inout, `ctl`:inout, `host`, `kv_cache`:inout |
 | `qsa_tail_store` | `M`(range) `n` `ratio` `ring` `seqs` `dtype` | `k`, `pos`, `cu`, `state`:inout, `sidx` |
 | `qsa_work` | `M`(range) `n` `ratio` `ring` `seqs` `work` `dtype` | `k`, `pos`, `cu`, `state`, `sidx`, `bt`, `rope`? → `stage`, `page`, `bpos`, `nc` |
@@ -3278,6 +3286,14 @@ with the partial page appended.
   score is negative, so an architecture states the one its indexer needs. libr4d's
   `qsa_select_bf16` serves both; the signed ranking keys a score by its float's total order over
   all 32 bits.
+- **`own` is Hy4-flash's indexer rule.** Absent or `0`, the block holding the query competes in the
+  top-k when it is complete, which is the query on a block boundary, `(pos + 1) % ratio == 0`, and
+  nothing is appended: one query in `ratio`. `1`: the block holding the query, `bt[pos / ratio]`, is
+  never a candidate (`n = min(nc, pos / ratio, width)`) and is always appended last, complete or
+  not, as Hugging Face's indexer does (`group_ids >= query_group_index` masked, the own group
+  concatenated). `seqused` then covers the own block whole. The two agree on every other query.
+  libr4d's `qsa_select_i32` does not serve `own` yet and refuses it (`RAD_E_UNSUPPORTED`), so a
+  graph that needs it falls back to libref rather than ranking a different model.
 - **`seqused` is why QSA needs no new attention kernel.** `attn_paged` takes its block table and
   per-sequence length as ordinary operands, so the sparse attention is that op issued with `sel` in
   place of the sequence's table and this number in place of its length. The KV it walks is `nsel`
@@ -3706,6 +3722,203 @@ whichever the graph picks, and no per-op oracle can tell them apart. The empiric
 a head wired correctly accepts most of what it proposes, and one wired wrongly proposes noise while
 the model's own output stays correct. The head declares the grouped reading (`ngroup = hc`), and the
 parameter makes a flat reading (`ngroup = 1`) one declaration away rather than a different kernel.
+
+## Hy4-flash
+
+Tencent Hy4-flash's trunk (`arch/hyv4flash`) in ops. The reference is Hugging Face transformers at
+commit c2ec8505 (`HYV4Flash*`); the numerics below are its, with three deliberate departures that
+hold for every op in this section: scores and softmax are f32 (HF rounds each score to bf16 first),
+cos and sin are f32 (HF rounds them to bf16), and an op rounds its output once where HF rounds
+every intermediate of a bf16 model. In an f32 model (the harness's parity mode) the departures
+vanish. Every op below has a libref implementation (`libref/ref_hy4.cpp`); a library without one
+refuses the graph rather than resolving a similar op.
+
+| op | params | operands |
+|---|---|---|
+| `ihc_pre` | `M`(range) `n` `hc` `rows` `eps`:f64 `hc_eps`:f64 `post_mag`:f64/opt `dtype` | `h`, `fn`w, `scale`w, `base`w → `x`, `post`? |
+| `ihc_post` | `M`(range) `n` `hc` `dtype` | `y`, `post`, `h`:inout |
+| `mla_project_kv` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `mode` `dtype` | `a`, `b`w → `y` |
+| `mla_attn_paged_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `block_size` `window` `scale`:f64 `dtype` | `q`, `q_rope`, `kv`, `block_table`, `seqused`, `cu_seqlens`, `sinks`w → `out` |
+| `mla_attn_sel_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `blocks` `block_size` `scale`:f64 `dtype` | `q`, `q_rope`, `kv`, `bt`, `length`, `sinks`w → `out` |
+| `mla_kv_split` | `M`(range) `heads` `k_dim` `v_dim` `rope_dim` `dtype` | `kvb`, `k_rope` → `k`, `v` |
+| `attn_kv_sink` | `M`(range) `N` `heads` `head_dim` `window` `scale`:f64 `dtype` | `q`, `k`, `v`, `cu_q`, `cu_k`, `sinks`w → `out` |
+| `gate_mul` | `M`(range) `n` `dtype` | `a`, `g` → `y` |
+| `idx_pool_gated` | `M`(range) `n` `ratio` `rotary_dim` `eps`:f64 `theta`:f64 `mode` `sections`/opt `block_size`/opt `dtype` | `k`, `wv`w, `wg`w, `ape`w, `gain`w, `pos`, `page`?, `cache`:inout? → `out`? |
+| `idx_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` | `q`, `gate`, `k`, `bt`, `cu`, `nc` → `score` |
+| `engram_ids` | `M`(range) `heads` `ngram` `pad` `map_size` `image`/opt `video`/opt | `tok`, `state`:inout, `cu`, `pos`, `token_map`w, `mult`w, `vocab_sizes`w, `offsets`w, `num_accepted`?, `cache_idx`? → `ids`, `mask` |
+| `engram_norm` | `M`(range) `heads` `n` `eps`:f64 `dtype` | `e`, `gain`w → `y` |
+| `engram_gate` | `M`(range) `n` `hc` `eps`:f64 `dtype` | `key`, `val`, `mask`, `w_key`w, `w_query`w, `w_val`w, `w_branch`w, `h`:inout |
+
+`embed_lookup_q` with a scale a row (Engram's table) and `qsa_select`'s `own` are described in their
+own sections; the rotary mode `imrope_gptj` lives in `idx_pool_gated` for now (below), and the
+`rope` op's mode comes with the vision package.
+
+### `ihc_pre`, `ihc_post`
+
+Independent hyper-connections: the DeepSeek-V4 form with no mixing matrix and no Sinkhorn, so
+neither `mhc_pre` (always mixes) nor `hc_read` fits. `h` is the `[M, hc*n]` stream buffer.
+
+```
+f        = f32(h)
+r        = rsqrt( sum(f^2) / (hc*n) + eps )          the sum in f64, then f32; ONE scalar a row
+c[j]     = ( sum_i fn[j][i] * f[i] ) * r             i ascending, f32
+pre[j]   = sigmoid(c[j] * scale[0] + base[j]) + hc_eps                      j < hc
+x[i]     = round( sum_{j<hc} pre[j] * f[j*n + i] )                          j ascending
+post[j]  = post_mag * sigmoid(c[hc+j] * scale[1] + base[hc+j]) + hc_eps     with `post`
+```
+
+- `rows` is `2*hc` with `post` (the layer's connection; `scale` has two entries, `post_mag` is
+  required, 2 in the model) or `hc` without (the head's collapse, `hc_head_*`; `scale` has one).
+  Any other combination is `RAD_E_SHAPE`.
+- **`post` carries `+ hc_eps`**: a saturated-low gate gives `hc_eps`, not 0. The stream is never
+  normalised; only the scalar `r` sees its size.
+- `fn`, `scale`, `base` and `post` are f32; `h` and `x` take the activation dtype.
+- `ihc_post`: `h[j*n + i] = round( post[j] * f32(y[i]) + f32(h[j*n + i]) )`, in place, the product
+  rounded to f32 before the add. No stream reads another, so in place is safe.
+
+### `mla_project_kv`
+
+`mla_project` with unequal key and value widths. The weight `[heads * (k_dim + v_dim), latent]` is
+the checkpoint's `kv_b`: head `h`'s rows start at `h * (k_dim + v_dim)`, its `k_dim` key rows first
+and then its `v_dim` value rows. `absorb`: `y[m,h,j] = sum_{c<k_dim} a[m,h,c] * b[h*(kd+vd) + c][j]`,
+`[M, heads, k_dim] -> [M, heads, latent]`. `expand`: `y[m,h,c] = sum_{j<latent} a[m,h,j] *
+b[h*(kd+vd) + kd + c][j]`, `[M, heads, latent] -> [M, heads, v_dim]`. f32 accumulation, `c` / `j`
+ascending, one rounding.
+
+### `mla_attn_paged_sink`, `mla_attn_sel_sink`, `attn_kv_sink`
+
+Attention with Hy4-flash's learned sink: a per-head logit, in the same scale as the scores, that
+joins the softmax denominator ONCE and carries no value.
+
+```
+s_j = scale * (q . k_j [+ q_rope . rope_j])          f32, scale = 256^-0.5 in both paths
+out = sum_j exp(s_j) v_j / ( sum_j exp(s_j) + exp(sink[h]) )
+```
+
+`sinks` is an f32 weight `[heads]` (the rank's slice), natural-log domain. A call whose range has no
+visible (mapped) key gives zero, with or without a sink. The result is independent of where the
+maximum is taken (libref shifts by the maximum of the scores and the sink).
+
+- **`mla_attn_paged_sink`** is `mla_attn_paged` (latent cache rows `[latent | rotated key]`,
+  value = the latent) plus `window` and `sinks`; `q_rope` is required, there is no `gate` (Hy4's
+  gate acts after the expansion: `gate_mul`). Sequence `s` owns rows `[cu[s], cu[s+1])`; row `i`
+  sits at `p = seqused[s] - qlen + i` and sees keys `[max(0, p - window + 1), p]`, **the window
+  counting the row's own token** (512 means the own token and the 511 before it; `window 0` is all
+  of `0..p`). A page id < 0 or >= the pool contributes nothing.
+- **`mla_attn_sel_sink`** is `mla_attn`'s form: row `r` reads tokens `[0, length[r])` through its
+  own table row `bt[r]` (page `bt[r][t / block_size]`, slot `t % block_size`); `length` is clamped to
+  `blocks * block_size`. With a table that lists a sequence's pages in order it equals
+  `mla_attn_paged_sink` at `window 0` (a test pins it), so a sequence crossing the dense limit has
+  no seam.
+- **`attn_kv_sink`** is dense attention over separate keys and values (the non-absorbed prefill).
+  `cu_q`, `cu_k` hold absolute offsets into `q` and into `k` / `v`; sequence `s` has `m_s` query
+  rows and `n_s >= m_s` key rows (otherwise `RAD_E_SHAPE`), query `i` sits at key index
+  `p = n_s - m_s + i` and sees `j <= p` with `p - j < window` (`window 0`: all). The value width may
+  differ from the key width; `out` has the value's.
+- **`mla_kv_split`** reorders the `kv_b` GEMM output `[N, heads*(k_dim+v_dim)]` and the rotated key
+  part `[N, rope_dim]` into `k [N, heads, k_dim + rope_dim]` (the rope part the same for every head)
+  and `v [N, heads, v_dim]`. A copy, converted to the outputs' dtype.
+
+### `gate_mul`
+
+`y = round(f32(a) * sigmoid(f32(g)))`, one rounding: HF's `attn_output * sigmoid(gate_states)`.
+`act_mul` with `act` = `sigmoid` was considered and does not fit: it rounds the sigmoid to `y`'s
+dtype before the product (the unfused pair), which is a different bf16 result, so the op exists.
+
+### `idx_pool_gated`, `idx_score`
+
+The compressed indexer (`HYV4FlashCompressedIndexer`): every `ratio` (4) consecutive tokens pool
+into one key, and a query scores the keys of the groups that closed before it.
+
+**`idx_pool_gated`** takes the raw token keys of `M` closed groups (`k [M*ratio, n]`, from
+`qsa_work`'s stage) and writes each group's rotated key. For group `w`, slot `s`, channel `c`, all
+f32 with no FMA, sums over `j` ascending:
+
+```
+val_s[c] = sum_j wv[c][j] * x_s[j]          gat_s[c] = sum_j wg[c][j] * x_s[j] + ape[s][c]
+p_s[c]   = exp(gat_s[c] - max_s gat) / sum_s exp(gat_s[c] - max_s gat)      s ascending
+y[c]     = sum_s val_s[c] * p_s[c]
+z[c]     = round_k( gain[c] * (y[c] * rsqrt(mean(y^2) + eps)) )             the mean's sum in f64
+```
+
+then the last `rotary_dim` channels of `z`, adjacent pairs, at the group's FIRST token position
+`pos[w]`: `ang = pos * theta^(-2i/rotary_dim)` (f32), `z[2i] = round_k(a cos - b sin)`,
+`z[2i+1] = round_k(b cos + a sin)`. `round_k` is a rounding to `k`'s dtype (HF rounds to the token
+keys' dtype twice, after the norm and after the rotation; an f32 model rounds nothing). `mode` is
+`gptj` (`pos [M]`) or `imrope_gptj` (`pos [3, M]`, `sections "t h w"` summing to `rotary_dim / 2`:
+pair `j` turns by the h position when `j % 3 == 1` and `j < 3h`, by the w position when `j % 3 == 2`
+and `j < 3w`, else by t; with equal components it is `gptj`). The result goes to
+`cache[page[w]]` (`[pages, 1, 4, n/4]`, a page's `n` elements contiguous, a page < 0 or out of
+range skipped, two groups naming one page `RAD_E_INVAL`) and/or `out[w]`.
+
+**`idx_score`**: `q [M, heads, n]` is already rotated at the query's position, `gate [M, heads]` is
+`index_head`'s output, `k` the indexer cache (`[pages, 1, 4, n/4]`, or flat `[G, n]`), `bt [seqs,
+blocks]`, `cu`, `nc [seqs]`.
+
+```
+w_h      = f32(gate[m][h]) * (heads^-0.5 * n^-0.5)
+d_h      = sum_c f32(q[m][h][c]) * f32(key[c])                       f32, c ascending
+score[m][b] = ( sum_{h < heads/2} w_h * max(d_h, 0) ) + ( sum_{h >= heads/2} w_h * max(d_h, 0) )
+```
+
+each half summed ascending (the order a WMMA kernel produces them in). A block `b >= nc[seq]`, with
+a page < 0 or >= the pool, or past `bt`'s width: `-inf`. The op does no causal work: that is
+`qsa_select`'s, with **`own` 1** (above). The group-boundary rule the indexer needs is therefore
+`qsa_select(topk = group_topk - 1, ratio, signed = 1, own = 1)`; with it a query on a boundary
+(`(p + 1) % 4 == 0`) keeps its complete own group out of the ranking and attends it whole, as HF
+does, where the default would let it compete.
+
+### `engram_ids`, `engram_norm`, `engram_gate`
+
+Engram (`HYV4FlashEngramLayer`): a hashed n-gram lookup added to the hc streams in front of a layer.
+The row gather between `engram_ids` and `engram_norm` is `embed_lookup_q` with a scale a row,
+over the flattened `ids`.
+
+**`engram_ids`**. For row `m` and shift `k = 0..ngram-1` (`k = 0` is the row's own token):
+
+```
+t_k   = the token k places back in the sequence;  `pad` when pos[m] < k (before the document start)
+c_k   = map[t_k]  if 0 <= t_k < map_size  else  map[pad]          ids past the map read as pad
+x_k   = c_k * mult[k]                                              int64, wrapping like torch
+mix_g = x_0 ^ x_1 ^ .. ^ x_{g-1}                                   g = 2 .. ngram
+ids[m][i] = floor_mod(mix_g, vocab_sizes[i]) + offsets[i]          head i of order g
+mask[m]   = tok[m] != pad && tok[m] != image && tok[m] != video
+```
+
+The `heads` are `ngram - 1` equal blocks, block `b` using the `(b+2)`-gram (the bigram's heads
+first). `floor_mod` is Python's. `pad` must index the map (`RAD_E_INVAL` otherwise). The caller
+supplies `pos`, the position within the document, so the cold state of a new sequence is never read
+(no `has_init`). `state [slots, W]` is `ngram_ids`' window of the committed ids before the step
+(`ngram - 1 + n_spec` deep), read at `num_accepted - 1`, rewritten in `ple_conv`'s layouts (a decode
+step when `num_accepted` is present, the prefill layout otherwise); `cache_idx` picks the slot of
+each sequence (the sequence index when absent). It is optional and sits after `num_accepted`, so
+the operands the design note lists keep their positions. One issue serves one Engram layer (the
+multipliers, sizes and offsets differ a layer); the history is shared, so only the first issue of a
+step may advance it. `ids` is i32 or i64, `mask` i32.
+
+**`engram_norm`**: `y[m][i] = round( gain[i] * x[m][i] * rsqrt(mean_head(x^2) + eps) )`, one rms a
+head of `n` (96) channels, the sum in f64. **`eps` is a parameter and an open decision**: HF's port
+builds these norms as `nn.RMSNorm(dim)` with no eps, which resolves to `finfo(dtype).eps`:
+0.0078125 in bf16, 1.19e-7 in f32 (vLLM uses the latter). Tests state which they use.
+
+**`engram_gate`**: `key [M, hc*n]` and `val [M, n]` are the two projections of the normed rows,
+`mask [M]` i32, `w_key`, `w_query`, `w_branch` `[hc*n]` (the `hc` per-stream gains joined),
+`w_val [n]` (`unified_pre_gamma`); `h [M, hc*n]` is the streams, in place. With `mask[m] != 0`:
+
+```
+main[i]  = w_val[i] * val[i] * rsqrt(mean(val^2) + eps)                       no gain in this norm
+for stream c:
+  kn[i]  = w_key[c][i]   * key_c[i] * rsqrt(mean(key_c^2) + eps)
+  qn[i]  = w_query[c][i] * h_c[i]   * rsqrt(mean(h_c^2)   + eps)              h before this add
+  d      = ( sum_i kn[i] * qn[i] ) * n^-0.5                                   the sum in f64
+  g      = sigmoid( sign(d) * sqrt(max(|d|, 1e-6)) )                          sign(0) = 0
+  h_c[i] = round( f32(h_c[i]) + round( g * main[i] + w_branch[c][i] * main[i] ) )
+```
+
+Rows with `mask == 0` are untouched. Both roundings are to `h`'s dtype: HF forms the residual in the
+model dtype and adds it to the stream. HF runs every step in bf16 tensors (each intermediate
+rounded, the 3072-term dot summed in bf16); the op computes in f32 and rounds where stated, which is
+why Engram layers get their own row in the parity report.
 
 ---
 

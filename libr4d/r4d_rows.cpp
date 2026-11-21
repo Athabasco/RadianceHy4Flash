@@ -1423,6 +1423,9 @@ static const RadParamSpec pQsaSelect[] = {
      * indexer's scores being sums of relus; 1 ranks signed finite scores, nonfinite ones dead, for
      * indexers whose head weights can be negative. */
     { "signed", RAD_P_INT, RAD_OPTIONAL },
+    /* 1: the block holding the query is never a candidate and is always appended last, complete or
+     * not (Hy4-flash's indexer). libr4d's kernel does not serve it yet and refuses it. */
+    { "own",    RAD_P_INT, RAD_OPTIONAL },
 };
 static const RadOperandSpec oQsaSelect[] = {
     { "score",   RAD_OPD_IN,  0 },
@@ -3859,7 +3862,8 @@ static const RadOpSchema kSchemas[] = {
            "candidate: last is what makes the attention's own causal bound mask inside it and "
            "nowhere else, so the effective query position is (nsel-1)*ratio + pos%ratio. Ties "
            "break to the LOWER block index through a prefix count, never through atomic order. "
-           "`signed` 1 ranks signed finite scores; absent or 0 ranks max(score, 0)."),
+           "`signed` 1 ranks signed finite scores; absent or 0 ranks max(score, 0). `own` 1 keeps the "
+           "query's own block out of the candidates and appends it, complete or not."),
     SCHEMA("kv_resolve", pKvResolve, oKvResolve,
            "make every block the selections name resident and rewrite them as ring slots: bump "
            "the epoch, take a hit or make a single claim (-1 -> -2) per distinct block, compact "

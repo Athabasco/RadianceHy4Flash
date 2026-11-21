@@ -979,6 +979,225 @@ int ref_mla_attn_paged_shape(const RadParam* p, int n_p, int operand, RadOpdDesc
     o.t(dtype, { M, H, L });                          /* out */
     return o.finish("mla_attn_paged", operand, out);
 }
+/* ---- Hy4-flash ------------------------------------------------------------------------------ */
+int ref_ihc_pre_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), hc = gi(p, n_p, "hc", 0),
+                  rows = gi(p, n_p, "rows", 0);
+    if (M <= 0 || n <= 0 || hc < 1 || hc > 16 || (rows != 2 * hc && rows != hc))
+        return RAD_E_UNSUPPORTED;
+    const bool post = rows == 2 * hc;
+    Opd o;
+    o.t(D, { M, hc * n });                            /* h */
+    o.t((uint32_t)RAD_F32, { rows, hc * n });         /* fn */
+    o.t((uint32_t)RAD_F32, { post ? 2 : 1 });         /* scale */
+    o.t((uint32_t)RAD_F32, { rows });                 /* base */
+    o.t(D, { M, n });                                 /* x */
+    if (post) o.t((uint32_t)RAD_F32, { M, hc });      /* post */
+    else o.skip();
+    return o.finish("ihc_pre", operand, out);
+}
+
+int ref_ihc_post_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), hc = gi(p, n_p, "hc", 0);
+    if (M <= 0 || n <= 0 || hc < 1 || hc > 16) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, { M, n });                                 /* y */
+    o.t((uint32_t)RAD_F32, { M, hc });                /* post */
+    o.t(D, { M, hc * n });                            /* h, INOUT */
+    return o.finish("ihc_post", operand, out);
+}
+
+int ref_mla_project_kv_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), h = gi(p, n_p, "heads", 0), kd = gi(p, n_p, "k_dim", 0),
+                  vd = gi(p, n_p, "v_dim", 0), l = gi(p, n_p, "latent_dim", 0);
+    const char* mode = gs(p, n_p, "mode");
+    const bool absorb = mode && !std::strcmp(mode, "absorb"),
+               expand = mode && !std::strcmp(mode, "expand");
+    if (M < 1 || h < 1 || kd < 1 || vd < 1 || l < 1 || (!absorb && !expand)) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(RAD_BF16, { M, h, absorb ? kd : l });
+    o.t(RAD_BF16, { h * (kd + vd), l });
+    o.t(RAD_BF16, { M, h, absorb ? l : vd });
+    return o.finish("mla_project_kv", operand, out);
+}
+
+/* One sequence whose context is its query (a prefill chunk), as mla_attn_paged describes itself;
+ * `ctx` gives a deeper history. The sinks are an ordinary f32 weight. */
+int ref_mla_attn_paged_sink_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), L = gi(p, n_p, "latent_dim", 0),
+                  R = gi(p, n_p, "rope_dim", 0), H = gi(p, n_p, "heads", 0),
+                  bs = gi(p, n_p, "block_size", 0);
+    if (M < 1 || L < 1 || L > 2048 || R < 1 || H < 1 || bs < 1) return RAD_E_UNSUPPORTED;
+    int64_t ctx = gi(p, n_p, "ctx", 0);
+    if (ctx < M) ctx = M;
+    const int64_t blocks = (ctx + bs - 1) / bs;
+    const uint32_t dtype = act_dt(p, n_p);
+    Opd o;
+    o.t(dtype, { M, H, L });
+    o.t(dtype, { M, H, R });
+    o.t(dtype, { blocks, 1, bs, L + R });
+    o.t_idx({ 1, blocks }, blocks, -1, 0);
+    o.t_idx({ 1 }, 0, ctx, 0);
+    o.t_idx({ 2 }, M, -1, (uint32_t)RAD_OPD_F_IDX_CU);
+    o.t((uint32_t)RAD_F32, { H });                    /* sinks */
+    o.t(dtype, { M, H, L });
+    return o.finish("mla_attn_paged_sink", operand, out);
+}
+
+int ref_mla_attn_sel_sink_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), L = gi(p, n_p, "latent_dim", 0),
+                  R = gi(p, n_p, "rope_dim", 0), H = gi(p, n_p, "heads", 0);
+    const int64_t B = gi(p, n_p, "blocks", 0), bs = gi(p, n_p, "block_size", 0),
+                  pages = std::max((int64_t)2, B * M);
+    if (M < 1 || L < 1 || L > 2048 || R < 1 || H < 1 || B < 1 || bs < 1) return RAD_E_UNSUPPORTED;
+    const uint32_t dtype = act_dt(p, n_p);
+    Opd o;
+    o.t(dtype, { M, H, L });
+    o.t(dtype, { M, H, R });
+    o.t(dtype, { pages, 1, bs, L + R });
+    o.t_idx({ M, B }, pages, -1, 0);
+    o.t_idx({ M }, 0, B * bs, 0);
+    o.t((uint32_t)RAD_F32, { H });
+    o.t(dtype, { M, H, L });
+    return o.finish("mla_attn_sel_sink", operand, out);
+}
+
+int ref_mla_kv_split_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), h = gi(p, n_p, "heads", 0), kd = gi(p, n_p, "k_dim", 0),
+                  vd = gi(p, n_p, "v_dim", 0), r = gi(p, n_p, "rope_dim", 0);
+    if (M < 1 || h < 1 || kd < 1 || vd < 1 || r < 1) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, { M, h * (kd + vd) });
+    o.t(D, { M, r });
+    o.t(D, { M, h, kd + r });
+    o.t(D, { M, h, vd });
+    return o.finish("mla_kv_split", operand, out);
+}
+
+/* One sequence of M query rows over N >= M keys (a prefill chunk after a prefix). */
+int ref_attn_kv_sink_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), N = gi(p, n_p, "N", 0), h = gi(p, n_p, "heads", 0),
+                  d = gi(p, n_p, "head_dim", 0);
+    if (M < 1 || h < 1 || d < 1 || N < M) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, { M, h, d });
+    o.t(D, { N, h, d });
+    o.t(D, { N, h, d });
+    o.t_idx({ 2 }, M, -1, (uint32_t)RAD_OPD_F_IDX_CU);
+    o.t_idx({ 2 }, N, -1, (uint32_t)RAD_OPD_F_IDX_CU);
+    o.t((uint32_t)RAD_F32, { h });
+    o.t(D, { M, h, d });
+    return o.finish("attn_kv_sink", operand, out);
+}
+
+int ref_gate_mul_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    if (M < 1 || n < 1) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, { M, n });
+    o.t(D, { M, n });
+    o.t(D, { M, n });
+    return o.finish("gate_mul", operand, out);
+}
+
+/* W groups of `ratio` token keys; `pos` is the first token of each group (a plane [3, W] for
+ * imrope_gptj). The cache and its page list are optional and not drawn. */
+int ref_idx_pool_gated_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), ratio = gi(p, n_p, "ratio", 0),
+                  rd = gi(p, n_p, "rotary_dim", 0);
+    const char* mode = gs(p, n_p, "mode");
+    const bool imrope = mode && !std::strcmp(mode, "imrope_gptj");
+    if (M < 1 || n < 1 || ratio < 1 || ratio > 16 || rd < 2 || rd > n || (rd & 1) ||
+        (!imrope && !(mode && !std::strcmp(mode, "gptj"))))
+        return RAD_E_UNSUPPORTED;
+    if (imrope && !gs(p, n_p, "sections")) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, { M * ratio, n });                         /* k */
+    o.t((uint32_t)RAD_F32, { n, n });                 /* wv */
+    o.t((uint32_t)RAD_F32, { n, n });                 /* wg */
+    o.t((uint32_t)RAD_F32, { ratio, n });             /* ape */
+    o.t((uint32_t)RAD_F32, { n });                    /* gain */
+    if (imrope) o.t_idx({ 3, M }, 4096, -1, 0);       /* pos */
+    else o.t_idx({ M }, 4096, -1, 0);
+    o.skip();                                         /* page */
+    o.skip();                                         /* cache */
+    o.t(D, { M, n });                                 /* out */
+    return o.finish("idx_pool_gated", operand, out);
+}
+
+int ref_idx_score_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), H = gi(p, n_p, "heads", 0);
+    const int64_t B = gi(p, n_p, "blocks", 0), S = gi(p, n_p, "seqs", 0), pages = S * B;
+    if (M < 1 || n < 4 || n % 4 || H < 1 || B < 1 || S < 1 || S > M) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, { M, H, n });                              /* q */
+    o.t(D, { M, H });                                 /* gate */
+    o.t(D, { pages, 1, 4, n / 4 });                   /* k */
+    o.t_idx({ S, B }, pages, -1, 0);                  /* bt */
+    o.t_idx({ S + 1 }, M, -1, (uint32_t)RAD_OPD_F_IDX_CU);
+    o.t_idx({ S }, 0, B, 0);                          /* nc */
+    o.t((uint32_t)RAD_F32, { M, B });                 /* score */
+    return o.finish("idx_score", operand, out);
+}
+
+/* One sequence, a decode step as for ngram_ids: warm state read at the deepest offset. The token
+ * ids are drawn below `map_size`; the multipliers are the constant 1 so a draw cannot wrap. */
+int ref_engram_ids_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), heads = gi(p, n_p, "heads", 0),
+                  ngram = gi(p, n_p, "ngram", 0), msize = gi(p, n_p, "map_size", 0);
+    const int64_t ctx = ngram > 0 ? ngram - 1 : 0;
+    if (M < 1 || heads < 1 || ngram < 2 || ngram > 8 || heads % (ngram - 1) || msize < 1)
+        return RAD_E_UNSUPPORTED;
+    const int64_t S = 1, depth = ctx - 1 + M;
+    Opd o;
+    o.t_idx({ M }, msize, -1, 0);                                    /* tok */
+    o.t_idx({ S, depth }, msize, -1, 0);                             /* state, INOUT */
+    o.t_idx({ S + 1 }, M, -1, (uint32_t)RAD_OPD_F_IDX_CU);           /* cu */
+    o.t_idx({ M }, 0, 1 << 20, 0);                                   /* pos: a document's offset */
+    o.t_idx({ msize }, 1000, -1, 0);                                 /* token_map */
+    o.t_idx_dt((uint32_t)RAD_I64, { ngram }, 0, 1000003, 0);         /* mult */
+    o.t_idx_dt((uint32_t)RAD_I64, { heads }, 0, 997, 0);             /* vocab_sizes */
+    o.t_idx_dt((uint32_t)RAD_I64, { heads }, 0, -1, 0);              /* offsets */
+    o.t_idx({ S }, 0, M, 0);                                         /* num_accepted */
+    o.skip();                                                        /* cache_idx */
+    o.t((uint32_t)RAD_I32, { M, heads });                            /* ids */
+    o.t((uint32_t)RAD_I32, { M });                                   /* mask */
+    return o.finish("engram_ids", operand, out);
+}
+
+int ref_engram_norm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), H = gi(p, n_p, "heads", 0), n = gi(p, n_p, "n", 0);
+    if (M < 1 || H < 1 || n < 1) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, { M, H * n });
+    o.t(D, { H * n });
+    o.t(D, { M, H * n });
+    return o.finish("engram_norm", operand, out);
+}
+
+int ref_engram_gate_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), hc = gi(p, n_p, "hc", 0);
+    if (M < 1 || n < 1 || hc < 1) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, { M, hc * n });                            /* key */
+    o.t(D, { M, n });                                 /* val */
+    o.t_idx({ M }, 0, 1, 0);                          /* mask: every row live */
+    o.t(D, { hc * n });                               /* w_key */
+    o.t(D, { hc * n });                               /* w_query */
+    o.t(D, { n });                                    /* w_val */
+    o.t(D, { hc * n });                               /* w_branch */
+    o.t(D, { M, hc * n });                            /* h, INOUT */
+    return o.finish("engram_gate", operand, out);
+}
 int ref_silu_mul_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
