@@ -35,7 +35,8 @@
  * by name: other worlds, a trunk linear in another form, a quantised embedding, kv_b (DECISIONS U2),
  * Engram projection or f32 parameter. Pictures and video through the tower
  * (hyv4flash_vision.h; the trunk then rotates at M-RoPE positions, `imrope_gptj`). DFly2 is
- * served at one rank as a block drafter (hyv4flash_dfly.h) when the deployment speculates
+ * served at one, two or four ranks (split as the sparse layers) as a block drafter (hyv4flash_dfly.h)
+ * when the deployment speculates
  * (--num-speculative-tokens 1..5; the probe states no depth, so speculation stays off unless
  * asked for); elsewhere it is declared as the checkpoint holds it, and says why it is not
  * served.
@@ -292,6 +293,10 @@ struct Decl {
     /* Where a single-plane weight's handle is recorded, by declared name (the drafter's ops read
      * them); null records nothing. */
     std::map<std::string, rad_weight>* rec = nullptr;
+    /* The ranks a RAD_SHARD_ROW / RAD_SHARD_COL weight splits over (the drafter at TP,
+     * kernels/dfly2.md §3.6). At one rank every weight is declared whole and unsharded, as the
+     * container holds it. */
+    int world = 1;
 
     /* The checkpoint's extents of `name` where the model behind the builder has it, else the
      * config's (`dflt`): a builder with no model (a test's) answers nothing. */
@@ -304,13 +309,14 @@ struct Decl {
         return shape[dim];
     }
     /* A matrix: bf16 as the checkpoint ships it, or whatever a recipe made of it. */
-    int mat(const char* name, std::initializer_list<int64_t> shape) {
-        return put(name, RAD_BF16, shape, grp_layer(layer));
+    int mat(const char* name, std::initializer_list<int64_t> shape, int shard = RAD_SHARD_NONE,
+            std::initializer_list<int64_t> parts = {}) {
+        return put(name, RAD_BF16, shape, grp_layer(layer), 0, shard, parts);
     }
     /* A gain, a bias a norm adds, a hyper-connection table: f32, widened from bf16 at load where
      * the checkpoint has it so (the norms and the HC arithmetic run in f32). */
-    int f32(const char* name, std::initializer_list<int64_t> shape) {
-        return put(name, RAD_F32, shape, grp_layer(layer));
+    int f32(const char* name, std::initializer_list<int64_t> shape, int shard = RAD_SHARD_NONE) {
+        return put(name, RAD_F32, shape, grp_layer(layer), 0, shard);
     }
     /* One stored weight, at the encoding the model behind the builder holds it in.
      *
@@ -321,9 +327,15 @@ struct Decl {
      * dtype and extents, the codes under the weight's name and the others as `<stem>.<role>`
      * (`blk.3.ffn_down_exps.7.scale` beside `.weight`, the spelling rad_block_moe_fp8.h uses).
      * Every view takes the weight's movement group. The block that will serve the weight declares
-     * the views its ops take; these only keep the manifest whole. */
+     * the views its ops take; these only keep the manifest whole.
+     *
+     * `shape` is the stored (whole) extent. A plain weight declared RAD_SHARD_ROW or _COL at more
+     * than one rank takes this rank's share of dim 0 or dim 1 (and of each stacked row part);
+     * a quantised one stays whole and unsharded (nothing serves it, kernels/dfly2.md §3.4). */
     int put(const char* name, uint32_t want, std::initializer_list<int64_t> shape,
-            RadWeightGroup g, int optional = 0) {
+            RadWeightGroup g, int optional = 0, int shard = RAD_SHARD_NONE,
+            std::initializer_list<int64_t> parts = {}) {
+        if (world <= 1) shard = RAD_SHARD_NONE;
         ++m.n_weights;
         RadEncoding e{};
         const bool known = weight_enc(b, name, &e) && e.n_planes > 0;
@@ -334,7 +346,19 @@ struct Decl {
                 const bool widens = want == RAD_F32 && (have == RAD_BF16 || have == RAD_F16);
                 if (!widens) dt = have;
             }
-            const rad_weight h = decl_w(b, name, dt, shape, access, RAD_SHARD_NONE, g, optional);
+            std::vector<int64_t> dims(shape), rp(parts);
+            if (shard == RAD_SHARD_ROW) {
+                dims[0] /= world;
+                for (int64_t& r : rp) r /= world;
+            } else if (shard == RAD_SHARD_COL && dims.size() > 1) {
+                dims[1] /= world;
+            }
+            if (shard != RAD_SHARD_ROW) rp.clear();   /* parts only say how rows split */
+            RadWeightDecl wd = weight_decl(dt, {}, access, shard, g, rp.data(), (int)rp.size());
+            wd.rank = (uint32_t)dims.size();
+            for (size_t i = 0; i < dims.size(); ++i) wd.shape[i] = dims[i];
+            wd.optional = optional;
+            const rad_weight h = rad_decl_weight(b, name, &wd);
             if (h && rec) (*rec)[name] = h;
             return h ? RAD_OK : RAD_E_INVAL;
         }
@@ -392,12 +416,14 @@ static int attention(Decl& d, Names& nm, const Shape& s, const AttnGeom& a, cons
     RAD_ARCH_TRY(map_copy(b, sinks, nm.ckpt("%s.learnable_sink_param", ap)));
     RAD_ARCH_TRY(d.mat(q_a, { s.q_lora, s.n_embd }));
     RAD_ARCH_TRY(d.f32(q_an, { s.q_lora }));
-    RAD_ARCH_TRY(d.mat(q_b, { a.q_width(), s.q_lora }));
+    /* Whole heads a rank at TP (as the trunk's sparse layers): q_b, kv_b and the gate by rows, the
+     * sinks by entry, the output projection by columns; the rest replicated. */
+    RAD_ARCH_TRY(d.mat(q_b, { a.q_width(), s.q_lora }, RAD_SHARD_ROW));
     RAD_ARCH_TRY(d.mat(kv_a, { s.kv_lora + a.qk_rope, s.n_embd }));
     RAD_ARCH_TRY(d.f32(kv_an, { s.kv_lora }));
-    RAD_ARCH_TRY(d.mat(kv_b, { a.kv_width(), s.kv_lora }));
-    RAD_ARCH_TRY(d.mat(gate, { a.v_width(), s.n_embd }));
-    RAD_ARCH_TRY(d.mat(out, { s.n_embd, a.v_width() }));
+    RAD_ARCH_TRY(d.mat(kv_b, { a.kv_width(), s.kv_lora }, RAD_SHARD_ROW));
+    RAD_ARCH_TRY(d.mat(gate, { a.v_width(), s.n_embd }, RAD_SHARD_ROW));
+    RAD_ARCH_TRY(d.mat(out, { s.n_embd, a.v_width() }, RAD_SHARD_COL));
     /* post_proj_norm is optional in vLLM's draft (present iff the checkpoint has it): a model
      * that has q_a and lacks it is declared without; a builder with no model declares it. */
     {
@@ -407,7 +433,7 @@ static int attention(Decl& d, Names& nm, const Shape& s, const AttnGeom& a, cons
         if (has_post) *has_post = post_on;
         if (post_on) RAD_ARCH_TRY(d.f32(post, { s.n_embd }));
     }
-    RAD_ARCH_TRY(d.f32(sinks, { a.heads }));
+    RAD_ARCH_TRY(d.f32(sinks, { a.heads }, RAD_SHARD_ROW));
     return RAD_OK;
 }
 
@@ -423,8 +449,11 @@ static int mlp(Decl& d, Names& nm, const Shape& s, const char* scope, const char
                                      nm.ckpt("%s.up_proj.weight", mp) }));
     RAD_ARCH_TRY(map_copy(b, dn, nm.ckpt("%s.down_proj.weight", mp)));
     if (ff <= 0) ff = d.extent(dn, 1, ff_dflt);
-    RAD_ARCH_TRY(d.mat(gu, { 2 * ff, s.n_embd }));
-    RAD_ARCH_TRY(d.mat(dn, { s.n_embd, ff }));
+    /* At TP each rank a share of the width: gate_up's rows of each half, down's columns. A width
+     * that does not divide is declared whole (drafter() then declines the drafter). */
+    const int shard = d.world > 1 && ff % d.world == 0 ? 1 : 0;
+    RAD_ARCH_TRY(d.mat(gu, { 2 * ff, s.n_embd }, shard ? RAD_SHARD_ROW : RAD_SHARD_NONE, { ff, ff }));
+    RAD_ARCH_TRY(d.mat(dn, { s.n_embd, ff }, shard ? RAD_SHARD_COL : RAD_SHARD_NONE));
     return RAD_OK;
 }
 
@@ -446,7 +475,7 @@ static int drafter(RadBuilder* b, Model& m) {
     m.df.w.clear();
     for (int64_t i = 0; i < s.dfly_layers; ++i) {
         const int grp = (int)(s.n_layer + i);
-        Decl d{ b, m, grp, access, &m.df.w };
+        Decl d{ b, m, grp, access, &m.df.w, s.world };
         const char* pre = nm.ckpt("%s.%lld", dp, (long long)i);
         const char* scope = nm.f("dfly.blk.%lld", (long long)i);
         const char* an = nm.f("%s.attn_norm.weight", scope);
@@ -461,7 +490,11 @@ static int drafter(RadBuilder* b, Model& m) {
         /* The config does not state the drafter's MLP width; the checkpoint's down projection
          * does (9216, three times the hidden size, in the release). */
         RAD_ARCH_TRY(mlp(d, nm, s, scope, nm.ckpt("%s.mlp", pre), 0, false, 3 * s.n_embd));
-        if (i == 0) m.df.ff = d.extent(nm.f("%s.ffn_down.weight", scope), 1, 3 * s.n_embd);
+        const int64_t ff = d.extent(nm.f("%s.ffn_down.weight", scope), 1, 3 * s.n_embd);
+        if (i == 0) m.df.ff = ff;
+        if (ff != m.df.ff || ff % s.world)
+            m.df.refuse(ff != m.df.ff ? "the draft layers' MLP widths differ"
+                                      : "the draft MLP's width does not split evenly over the ranks");
     }
     Decl d{ b, m, (int)(s.n_layer + s.dfly_layers), access, &m.df.w };
     const int64_t E = s.n_embd;

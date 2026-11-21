@@ -1102,8 +1102,8 @@ namespace {
  * group_topk * ratio. `two` is mini6d2's shape on mini's trunk: two draft layers, both over layer
  * 2 for the selection and layers 2 and 0 for the cache (0 is refused, so `two` uses 2 twice for
  * the selection and the test that wants distinct caches edits the keys). */
-MetaKV dfly_meta(int layers = 1) {
-    MetaKV k = mini_meta();
+MetaKV dfly_meta(int layers = 1, bool wide = false) {
+    MetaKV k = mini_meta(wide);
     k.set("dfly_num_hidden_layers", std::to_string(layers).c_str());
     k.set("dfly_target_kv_layers", layers == 1 ? "2" : "2 2");
     k.set("dfly_target_index_layer", layers == 1 ? "2" : "2 2");
@@ -1316,7 +1316,6 @@ TEST(dfly2_configurations_it_cannot_serve_are_refused_by_name) {
         { "dfly_target_index_topk", "2048", "group_topk * ratio", 5, 1 },
         { "dfly_context_local_window", "4", "local window", 5, 1 },
         { nullptr, nullptr, "trained at 5 proposals", 6, 1 },
-        { nullptr, nullptr, "one rank", 5, 2 },
     };
     for (const Case& cs : cases) {
         MetaKV m = dfly_meta();
@@ -1329,6 +1328,25 @@ TEST(dfly2_configurations_it_cannot_serve_are_refused_by_name) {
         CHECK_EQ(count_op(d.b, "dfly_sel"), 0);
         CHECK(find_w(d.b, "dfly.fusion.weight") != nullptr);
     }
+    /* TP: a draft MLP width that does not split over the ranks (the checkpoint's, 191 here). */
+    {
+        MetaKV m = dfly_meta();
+        RadBuilder b;
+        bf16_encs(&b);
+        b.encs.push_back({ "dfly.blk.0.ffn_down", rad_enc_plain(RAD_BF16) });
+        b.shapes["dfly.blk.0.ffn_down.weight"] = { 128, 191 };
+        RadBuildCtx ctx = spec_ctx(0, 2, 5);
+        int rc = 0;
+        const std::string err = stderr_of([&] { rc = hyv4flash::declare(&b, m.meta(), &ctx); });
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK(err.find("does not split evenly over the ranks") != std::string::npos);
+        CHECK_EQ(b.drafter.kind, (int)RAD_DRAFT_NONE);
+        CHECK_EQ(count_op(b, "dfly_sel"), 0);
+        const RecWeight* dn = find_w(b, "dfly.blk.0.ffn_down.weight");
+        REQUIRE(dn != nullptr);
+        CHECK_EQ(dn->d.shard, (int)RAD_SHARD_NONE);   /* declared whole */
+        CHECK_EQ(dn->d.shape[1], (int64_t)191);
+    }
     /* Two draft layers over one cache layer: duplicate Lkv. */
     MetaKV two = dfly_meta(2);
     DeclDfly d(5, two);
@@ -1339,6 +1357,118 @@ TEST(dfly2_configurations_it_cannot_serve_are_refused_by_name) {
     DeclDfly off;
     unsetenv("RADIANCE_HY4_DFLY");
     CHECK_EQ(off.b.drafter.kind, (int)RAD_DRAFT_NONE);
+}
+
+/* §3.6 (WP13.6): at 2 and 4 ranks the draft splits as the trunk's sparse layers -- whole heads a
+ * rank in q_b, kv_b, the gate and the sinks (rows) and the output projection (columns), the MLP's
+ * width (gate_up's rows of each half, down's columns), everything else whole -- its ops run this
+ * rank's heads and width, each layer reduces twice (o_proj, the MLP) exactly before the norm or
+ * residual that reads the sum, and each chain step ranks this rank's vocabulary shard (global ids,
+ * the pair plane), gathers every rank's pairs and merges; one engine step lint clean on every rank.
+ * At one rank none of the three TP ops is declared and the weights are whole and unsharded. */
+TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
+    struct Want { const char* name; int shard; int dim; };
+    const Want wants[] = {
+        { "dfly.blk.0.attn_q_b.weight", RAD_SHARD_ROW, 0 },
+        { "dfly.blk.0.attn_kv_b.weight", RAD_SHARD_ROW, 0 },
+        { "dfly.blk.0.attn_gate.weight", RAD_SHARD_ROW, 0 },
+        { "dfly.blk.0.attn_sinks.weight", RAD_SHARD_ROW, 0 },
+        { "dfly.blk.0.attn_output.weight", RAD_SHARD_COL, 1 },
+        { "dfly.blk.0.ffn_gate_up.weight", RAD_SHARD_ROW, 0 },
+        { "dfly.blk.0.ffn_down.weight", RAD_SHARD_COL, 1 },
+        { "dfly.blk.0.attn_q_a.weight", RAD_SHARD_NONE, -1 },
+        { "dfly.blk.0.attn_kv_a.weight", RAD_SHARD_NONE, -1 },
+        { "dfly.blk.0.attn_norm.weight", RAD_SHARD_NONE, -1 },
+        { "dfly.fusion.weight", RAD_SHARD_NONE, -1 },
+        { "dfly.correct_gate.weight", RAD_SHARD_NONE, -1 },
+        { "dfly.correct_down.weight", RAD_SHARD_NONE, -1 },
+    };
+    for (const bool wide : { false, true }) {
+        DeclDfly one(5, dfly_meta(1, wide));
+        REQUIRE_EQ(one.rc, RAD_OK);
+        REQUIRE_EQ(one.b.drafter.kind, (int)RAD_DRAFT_BLOCK);
+        CHECK_EQ(count_op(one.b, "all_gather"), 0);
+        CHECK_EQ(count_op(one.b, "row_topk_merge"), 0);
+        std::map<std::string, RadWeightDecl> whole;
+        for (const auto& w : one.b.weights)
+            if (w.name.rfind("dfly.", 0) == 0) {
+                whole[w.name] = w.d;
+                CHECK_EQ(w.d.shard, (int)RAD_SHARD_NONE);
+                CHECK_EQ(w.d.n_row_parts, 0);
+            }
+        const int64_t H = wide ? 4 : 2, ff = one.df().ff;
+        CHECK(one.df().op_ar_o == 0 && one.df().op_ar_y == 0);
+        for (int world : { 2, 4 }) {
+            if (!wide && world == 4) continue;   /* mini's 2 sparse heads */
+            for (int rank = 0; rank < world; ++rank) {
+                DeclDfly d(5, dfly_meta(1, wide), world, rank);
+                REQUIRE_EQ(d.rc, RAD_OK);
+                if (!d.df().served) fprintf(stderr, "world %d: %s\n", world, d.df().why.c_str());
+                REQUIRE_EQ(d.b.drafter.kind, (int)RAD_DRAFT_BLOCK);
+                RadBuilder& b = d.b;
+                for (const Want& wt : wants) {
+                    const RecWeight* w = find_w(b, wt.name);
+                    REQUIRE(w != nullptr);
+                    const RadWeightDecl& o = whole[wt.name];
+                    CHECK_EQ(w->d.shard, wt.shard);
+                    CHECK_EQ(w->d.access, (int)RAD_ACCESS_PER_TOKEN);
+                    for (uint32_t k = 0; k < o.rank; ++k)
+                        CHECK_EQ(w->d.shape[k], (int)k == wt.dim ? o.shape[k] / world : o.shape[k]);
+                }
+                const RecWeight* gu = find_w(b, "dfly.blk.0.ffn_gate_up.weight");
+                CHECK_EQ(gu->d.n_row_parts, 2);
+                CHECK_EQ(gu->d.row_parts[0], ff / world);
+                CHECK_EQ(gu->d.row_parts[1], ff / world);
+                const auto& df = d.df();
+                const auto& L = df.lay[0];
+                CHECK_EQ(pint(b.op_of(L.op_attn), "heads"), H / world);
+                CHECK_EQ(pint(b.op_of(L.op_qb), "N"), H / world * 32);
+                CHECK_EQ(pint(b.op_of(L.op_gu), "N"), 2 * ff / world);
+                CHECK_EQ(pint(b.op_of(L.op_down), "K"), ff / world);
+                CHECK_EQ(pint(b.op_of(df.steps[0].op_head), "n_vocab"), 320 / world);
+                CHECK_EQ(pint(b.op_of(df.steps[0].op_topk), "vocab_off"), 320 / world * rank);
+                for (const auto& st : df.steps) CHECK(st.op_gather != 0 && st.op_merge != 0);
+                CHECK(df.op_ar_o != 0 && df.op_ar_y != 0 && df.op_ar_o != df.op_ar_y);
+                /* One engine step: the trunk step, the empty context pass, the query pass. */
+                auto trunk = kit(b, std::vector<int>(2, 6), {});
+                trunk->b.positions_h = trunk->pos.data();
+                auto ctxp = context_pass(b, *trunk);
+                Query qp(b, 2, 6, 5);
+                auto ps = run_passes(b, hyv4flash::step, { trunk.get(), ctxp.get(), qp.k.get() }, rank,
+                                     world);
+                CHECK_PASSES(b, ps);
+                CHECK_EQ(ps[1]->issues.size(), (size_t)0);
+                int ar = 0, ga = 0, me = 0, tk = 0;
+                size_t i_out = SIZE_MAX, i_ar = SIZE_MAX, i_post = SIZE_MAX, i_down = SIZE_MAX,
+                       i_ar2 = SIZE_MAX, i_add2 = SIZE_MAX;
+                const auto& is = ps[2]->issues;
+                for (size_t i = 0; i < is.size(); ++i) {
+                    const rad_op op = is[i].op;
+                    if (op == df.op_ar_o || op == df.op_ar_y) ++ar;
+                    for (const auto& st : df.steps) {
+                        ga += op == st.op_gather;
+                        me += op == st.op_merge;
+                    }
+                    if (op == df.steps[0].op_topk) ++tk;
+                    if (op == L.op_out) i_out = i;
+                    if (op == df.op_ar_o) i_ar = i;
+                    if (op == L.op_post || (op == L.op_add1 && i_post == SIZE_MAX)) i_post = std::min(i_post, i);
+                    if (op == L.op_down) i_down = i;
+                    if (op == df.op_ar_y) i_ar2 = i;
+                    if (op == L.op_add2) i_add2 = i;
+                }
+                CHECK_EQ(ar, 2);
+                CHECK_EQ(ga, 5);
+                CHECK_EQ(me, 5);
+                CHECK_EQ(tk, 1);
+                CHECK(i_out < i_ar && i_ar < i_post);
+                CHECK(i_down < i_ar2 && i_ar2 < i_add2);
+                /* Exact reductions, in place over the draft's own buffers. */
+                for (rad_op op : { df.op_ar_o, df.op_ar_y })
+                    CHECK_EQ(pint(b.op_of(op), "exact"), 1);
+            }
+        }
+    }
 }
 
 /* The core records draft passes too: their ops do not depend on the context, so the key is fixed

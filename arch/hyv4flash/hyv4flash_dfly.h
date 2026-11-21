@@ -26,7 +26,15 @@
  * every one before any row reads it, and nothing else of the trunk's state (no indexer key, tail,
  * Engram history); the next trunk step rewrites whatever positions it carries before reading them.
  *
- * Served: one rank (TP is WP13.6), bf16 draft linears (int8 is WP13.9), depth 1..5, greedy
+ * Tensor parallelism (kernels/dfly2.md §3.6): as the trunk's sparse layers, whole heads a rank
+ * (q_b, kv_b, the gate and the sinks by rows, the output projection by columns) and the MLP's width
+ * evenly (gate_up's rows of each half, down's columns), each followed by an exact all_reduce before
+ * the norm or residual that reads it; q_a, kv_a, the norms, fusion, correction, the embedding and
+ * dfly_sel replicated, as is the latent cache (every rank stores the same rows). The chain's logits
+ * are the trunk head's vocabulary shard: row_topk (global ids, the pair plane), all_gather,
+ * row_topk_merge, so every rank proposes the same tokens (ties to the lower id in both stages).
+ *
+ * Served: 1, 2 or 4 ranks, bf16 draft linears (int8 is WP13.9), depth 1..5, greedy
  * proposals (exact at every temperature under the engine's verify; vLLM's `probabilistic` draft
  * sampling is not modelled, coupling is WP13.8), no local window (dfly_context_local_window > 0 is
  * refused), the confidence head declared and not read. Anything else declares the manifest only,
@@ -61,6 +69,11 @@ struct Dfly {
      * step that does not select. Each must be caught by the parity check; neither changes text. */
     bool break_store_late = false, break_nsel_keep = false;
     std::string why;                /* why a declared drafter is not served */
+    /* Declines the drafter (the first reason stands). After configure, from the manifest. */
+    void refuse(const char* r) {
+        if (why.empty()) why = r;
+        served = false;
+    }
     std::map<std::string, rad_weight> w;   /* the manifest's single-plane handles, by name */
 
     /* Reads the drafter's config (top level, kernels/dfly2.md §1.1) and decides whether to serve.
@@ -104,13 +117,19 @@ struct Dfly {
         };
         if (e && !std::strcmp(e, "0")) no("RADIANCE_HY4_DFLY=0");
         if (b && !rad_op_declared(b, "dfly_sel"))
-            no("no loaded kernel library serves dfly_sel (libref does; libavx and libr4d come with "
-               "WP13.5)");
+            no("no loaded kernel library serves dfly_sel (libref, libavx and libr4d do)");
         if (depth > 5)
             no("--num-speculative-tokens %d: DFly2 was trained at 5 proposals and serves 1 to 5",
                (int)depth);
-        if (s.world > 1) no("tensor parallelism (%d ranks): the draft is served at one rank (WP13.6)",
-                            s.world);
+        /* The draft's heads are the sparse layers' (split_ranks splits those too); its MLP width
+         * is the checkpoint's and is checked in the manifest (hyv4flash.cpp drafter()). */
+        if (s.world > 1 && s.sparse.heads % s.world)
+            no("the draft's %lld attention heads do not split evenly over %d ranks",
+               (long long)s.sparse.heads, s.world);
+        if (s.world > 1 && b && (!rad_op_declared(b, "all_gather") ||
+                                 !rad_op_declared(b, "row_topk_merge")))
+            no("tensor parallelism (%d ranks) needs all_gather and row_topk_merge for the draft "
+               "head's vocabulary shards", s.world);
         if (mask < 0 || mask >= s.n_vocab)
             no("dfly_mask_token_id %d is outside the vocabulary (%lld)", (int)mask,
                (long long)s.n_vocab);
@@ -213,11 +232,12 @@ struct Dfly {
         rad_op op_rowk = 0, op_zk = 0, op_pe = 0, op_hn = 0, op_en = 0, op_g = 0, op_u = 0,
                op_silu = 0, op_down = 0, op_add = 0, op_head = 0, op_lcast = 0, op_topk = 0,
                op_tok = 0, op_prev = 0;
+        rad_op op_gather = 0, op_merge = 0;   /* TP: the vocabulary shards' merge; 0 at one rank */
         Tap t_corr{}, t_logits{}, t_idx{}, t_val{};
     };
     Shape s{};
     Geom g{};
-    int64_t Md = 0, W = 0, R = 8, E = 0, H = 0, L = 0, RO = 0, N = 0, VD = 0, Q = 0;
+    int64_t Md = 0, W = 0, R = 8, E = 0, H = 0, L = 0, RO = 0, N = 0, VD = 0, Q = 0, F = 0;
     rad_kvgroup kvg = 0;
     rad_weight token = 0, head = 0, fusion = 0, f_enorm = 0, f_hnorm = 0, f_gate = 0, c_hnorm = 0,
                c_enorm = 0, c_gate = 0, c_up = 0, c_down = 0, out_norm = 0;
@@ -227,6 +247,8 @@ struct Dfly {
     rad_buf row0 = 0, ea = 0, th = 0, cat = 0, fu = 0;
     rad_buf zk = 0, pe = 0, ccat = 0, cgu = 0, cff = 0, cd = 0, zc = 0, logits = 0, lbf = 0,
             cidx = 0, cval = 0, prev = 0, tokens = 0;
+    rad_buf pairs = 0, gath = 0;   /* TP: this rank's top-R as (id, value) pairs, every rank's */
+    rad_op op_ar_o = 0, op_ar_y = 0;   /* TP: the layers' two reductions; 0 at one rank */
     rad_buf ident = 0;   /* taps: [max_seqs, P] the identity table */
     int64_t ident_w = 0;
     rad_op op_embed = 0, op_xcopy = 0, op_row0 = 0, op_ea = 0, op_th = 0, op_fen = 0, op_fhn = 0,
@@ -257,8 +279,9 @@ struct Dfly {
         s = shape;
         g = geom;
         E = s.n_embd;
-        const AttnGeom& a = s.sparse;   /* one rank: the whole geometry */
+        const AttnGeom& a = s.sparse_r;   /* this rank's heads */
         H = a.heads;
+        F = ff / s.world;                 /* this rank's MLP width (drafter() checked it divides) */
         L = s.kv_lora;
         RO = a.qk_rope;
         N = a.qk_nope;
@@ -336,8 +359,8 @@ struct Dfly {
         x = bf("x", { Md, E });
         xn = bf("xn", { Md, E });
         y = bf("y", { Md, E });
-        ffgu = bf("ffn_gate_up", { Md, 2 * ff });
-        ffo = bf("ffn_act", { Md, ff });
+        ffgu = bf("ffn_gate_up", { Md, 2 * F });
+        ffo = bf("ffn_act", { Md, F });
         qa = bf("q_a", { Md, s.q_lora });
         q = bf("q", { Md, H, Q });
         q_nope = bf("q_nope", { Md, H * N });
@@ -367,6 +390,11 @@ struct Dfly {
         cidx = i32("cand_idx", { S, R });
         cval = bf("cand_val", { S, R });
         prev = i32("prev", { S });
+        if (s.world > 1) {
+            pairs = decl_b(b, nm.f("dfly.cand_pairs"), RAD_F32, { S, R, 2 });
+            gath = decl_b(b, nm.f("dfly.cand_gathered"), RAD_F32, { S, s.world * R, 2 });
+            if (!pairs || !gath) return RAD_E_INVAL;
+        }
         if (!tokens || !emb || !x || !xn || !y || !ffgu || !ffo || !qa || !q || !q_nope ||
             !q_rope || !row || !q_lat || !lat || !ao || !gt || !ag || !o || !z || !row0 || !ea ||
             !th || !cat || !fu || !zk || !pe || !ccat || !cgu || !cff || !cd || !zc || !logits ||
@@ -432,6 +460,15 @@ struct Dfly {
         HY4_NEED(op_scatter, "scatter_rows");
         RAD_ARCH_TRY(t_fused.declare(b, nm, S, "dfly.fused", -1, RAD_BF16, E, ea));
 
+        /* TP: the two exact reductions a layer, the output projection's and the MLP's partial sums
+         * (one op each, shared by the layers), before the post norm and the residual add. */
+        {
+            int rc = RAD_OK;
+            op_ar_o = decl_all_reduce(b, g, E, o, &rc);
+            RAD_ARCH_TRY(rc);
+            op_ar_y = decl_all_reduce(b, g, E, y, &rc);
+            RAD_ARCH_TRY(rc);
+        }
         /* C, D: the layers, each with its table. */
         const double scale = 1.0 / std::sqrt((double)Q);
         const int64_t half = (L + RO) / 2;
@@ -505,10 +542,10 @@ struct Dfly {
             RAD_ARCH_TRY(d.t_mid.declare(b, nm, Md, "dfly.resid_mid", li, RAD_BF16, E, x));
             d.op_ffn_norm = decl_rmsnorm(b, Md, E, s.eps, d.ffn_norm, x, xn);
             RAD_ARCH_TRY(d.t_ffn_in.declare(b, nm, Md, "dfly.ffn_in_norm", li, RAD_BF16, E, xn));
-            d.op_gu = gemm(Md, 2 * ff, E, d.gu, xn, ffgu);
-            d.op_silu = mk(b, "silu_mul", { RAD_RANGE("M", 1, Md), RAD_INT("n", ff), RAD_STR("dtype", "bf16") },
+            d.op_gu = gemm(Md, 2 * F, E, d.gu, xn, ffgu);
+            d.op_silu = mk(b, "silu_mul", { RAD_RANGE("M", 1, Md), RAD_INT("n", F), RAD_STR("dtype", "bf16") },
                            {}, { ffgu }, { ffo });
-            d.op_down = gemm(Md, E, ff, d.down, ffo, y);
+            d.op_down = gemm(Md, E, F, d.down, ffo, y);
             RAD_ARCH_TRY(d.t_mlp.declare(b, nm, Md, "dfly.mlp_out", li, RAD_BF16, E, y));
             d.op_add2 = add(Md, x, y, x);
             RAD_ARCH_TRY(d.t_resid.declare(b, nm, Md, "dfly.resid", li, RAD_BF16, E, x));
@@ -587,10 +624,34 @@ struct Dfly {
                              { RAD_RANGE("M", 1, S), RAD_INT("n", Vr), RAD_STR("from", "f32"),
                                RAD_STR("to", "bf16") },
                              {}, { logits }, { lbf });
-            st.op_topk = mk(b, "row_topk",
-                            { RAD_RANGE("M", 1, S), RAD_INT("N", Vr), RAD_INT("R", R),
-                              RAD_STR("dtype", "bf16") },
-                            {}, { lbf }, { cidx, cval });
+            /* Sharded, row_topk ranks this rank's columns, reports global ids and writes the pair
+             * plane; the merge below overwrites cidx / cval with the global top-R. Whole, no
+             * `vocab_off` (an optional parameter present at 0 is another declaration). */
+            if (s.world > 1)
+                st.op_topk = mk(b, "row_topk",
+                                { RAD_RANGE("M", 1, S), RAD_INT("N", Vr), RAD_INT("R", R),
+                                  RAD_INT("vocab_off", g.vocab_off), RAD_STR("dtype", "bf16") },
+                                {}, { lbf }, { cidx, cval, pairs });
+            else
+                st.op_topk = mk(b, "row_topk",
+                                { RAD_RANGE("M", 1, S), RAD_INT("N", Vr), RAD_INT("R", R),
+                                  RAD_STR("dtype", "bf16") },
+                                {}, { lbf }, { cidx, cval });
+            if (s.world > 1) {
+                /* Row-interleaved, so a row's pairs from every rank are adjacent, as
+                 * row_topk_merge reads them. A pair of ops a step (each step's buffers live
+                 * between its own ops). */
+                st.op_gather = mk(b, "all_gather",
+                                  { RAD_INT("world_size", s.world), RAD_INT("numel", S * R * 2),
+                                    RAD_STR("dtype", "f32"), RAD_INT("row", R * 2) },
+                                  {}, { pairs }, { gath });
+                st.op_merge = mk(b, "row_topk_merge",
+                                 { RAD_RANGE("M", 1, S), RAD_INT("R", R),
+                                   RAD_INT("world_size", s.world), RAD_STR("dtype", "bf16") },
+                                 {}, { gath }, { cidx, cval });
+                HY4_NEED(st.op_gather, "all_gather (f32 pairs)");
+                HY4_NEED(st.op_merge, "row_topk_merge");
+            }
             RAD_ARCH_TRY(st.t_idx.declare(b, nm, S, "dfly.cand_idx", ki, RAD_I32, R, cidx));
             RAD_ARCH_TRY(st.t_val.declare(b, nm, S, "dfly.cand_val", ki, RAD_BF16, R, cval));
             st.op_tok = decl_copy(b, S, 1, RAD_I32, cidx, tokens);
@@ -753,6 +814,7 @@ struct Dfly {
             RAD_ISSUE_N(c, d.op_expand, M, brows(lat, M), RAD_W(d.kv_b), brows(ao, M));
             RAD_ISSUE_N(c, d.op_gmul, M, brows(ao, M), brows(gt, M), brows(ag, M));
             RAD_ISSUE_N(c, d.op_out, M, brows(ag, M), RAD_W(d.out), brows(o, M));
+            issue_all_reduce(c, op_ar_o, o, M, E);
             d.t_oproj.step(c, brows(o, M), M);
             const rad_buf ab = d.post ? y : o;
             if (d.post) RAD_ISSUE_N(c, d.op_post, M, brows(o, M), RAD_W(d.post_norm), brows(y, M));
@@ -765,6 +827,7 @@ struct Dfly {
             RAD_ISSUE_N(c, d.op_gu, M, brows(xn, M), RAD_W(d.gu), brows(ffgu, M));
             RAD_ISSUE_N(c, d.op_silu, M, brows(ffgu, M), brows(ffo, M));
             RAD_ISSUE_N(c, d.op_down, M, brows(ffo, M), RAD_W(d.down), brows(y, M));
+            issue_all_reduce(c, op_ar_y, y, M, E);
             d.t_mlp.step(c, brows(y, M), M);
             RAD_ISSUE_N(c, d.op_add2, M, brows(x, M), brows(y, M), brows(x, M));
             d.t_resid.step(c, brows(x, M), M);
@@ -792,7 +855,15 @@ struct Dfly {
             RAD_ISSUE_N(c, st.op_head, n, brows(zc, n), RAD_W(head), brows(logits, n));
             st.t_logits.step(c, brows(logits, n), n);
             RAD_ISSUE_N(c, st.op_lcast, n, brows(logits, n), brows(lbf, n));
-            RAD_ISSUE_N(c, st.op_topk, n, brows(lbf, n), brows(cidx, n), brows(cval, n), RAD_NONE);
+            if (st.op_merge) {
+                RAD_ISSUE_N(c, st.op_topk, n, brows(lbf, n), brows(cidx, n), brows(cval, n),
+                            brows(pairs, n));
+                RAD_ISSUE(c, st.op_gather, RAD_B(pairs), RAD_B(gath));
+                RAD_ISSUE_N(c, st.op_merge, n, brows(gath, n), brows(cidx, n), brows(cval, n));
+            } else {
+                RAD_ISSUE_N(c, st.op_topk, n, brows(lbf, n), brows(cidx, n), brows(cval, n),
+                            RAD_NONE);
+            }
             st.t_idx.step(c, brows(cidx, n), n);
             st.t_val.step(c, brows(cval, n), n);
             RAD_ISSUE_N(c, st.op_tok, n, bcol(cidx, 0, 1, n), bcol(tokens, k, 1, n));
