@@ -421,5 +421,108 @@ struct Trunk {
     rad_buf y = 0;        /* [T, n] the block's normed output */
 };
 
+/* ------------------------------------------------------------------ the iHC junction (WP16.2)
+ * Between two blocks the graph runs `[add] -> [all_reduce] -> rmsnorm(block's post norm) ->
+ * ihc_post -> ihc_pre(next connection) -> rmsnorm(next block's input norm)`, five to seven short
+ * dependent launches. rmsnorm_ihc_junction is the chain in one (byte-identical to it, docs/OPS.md),
+ * ar_rmsnorm_ihc_junction the same behind the exact all-reduce (two ranks at every height, four at
+ * decode and verify heights). `tail` false stops behind ihc_post (an Engram sits in front of the
+ * next layer and writes h between); `next` the head's collapse makes the last one end in the final
+ * norm. y and x are stored only for the debug taps.
+ *
+ * RADIANCE_HY4_JUNCTION=0 keeps the unfused chain; so does a calibration run (its hooks read
+ * between the ops). Where the fused all-reduce is not served (a library without it, four ranks
+ * above decode heights) the step issues [add,] the standalone exact all_reduce and the plain row. */
+inline bool junction_on() {
+    const char* e = std::getenv("RADIANCE_HY4_JUNCTION");
+    return !(e && *e && std::strcmp(e, "0") == 0);
+}
+
+struct Junction {
+    rad_op op = 0, op_ar = 0;           /* the plain row, the all-reduce twin */
+    rad_op op_add = 0, op_reduce = 0;   /* the chain's add and all_reduce, for the fallback */
+    int64_t ar_rows = 0, n = 0;
+    int world = 1;
+    bool tail = true;
+    rad_buf a = 0, b = 0, post = 0, h = 0, xn = 0, y = 0, x = 0;
+    rad_weight w_post = 0, fn = 0, scale = 0, base = 0, w_next = 0;
+    explicit operator bool() const { return op != 0; }
+
+    /* `a` the block's output (`b` the addend in front, 0 for none), `w_post` its sandwich norm's
+     * gain; `next` the next connection (0 for tail 0) and `w_next` the next block's input norm,
+     * whose output is `xn`. `op_add` / `op_reduce` are the chain's own ops (0 where absent). Leaves
+     * `op` 0 (the chain runs) where no library serves the row. */
+    int declare(RadBuilder* bl, const Shape& s, const Geom& g, int64_t T, const Trunk& tr,
+                rad_buf a_, rad_buf b_, rad_weight w_post_, const Hyper* next, rad_weight w_next_,
+                rad_buf xn_, rad_op add_, rad_op reduce_) {
+        *this = Junction{};
+        if (!junction_on() || calib_dir() != nullptr) return RAD_OK;
+        if (s.n_embd % 8) return RAD_OK;
+        n = s.n_embd;
+        world = g.world;
+        tail = next != nullptr;
+        a = a_; b = b_; post = tr.post; h = tr.h;
+        w_post = w_post_;
+        if (tail) { fn = next->fn; scale = next->scale; base = next->base; w_next = w_next_; xn = xn_; }
+        if (taps_on()) { y = tr.y; x = tail ? tr.x : 0; }
+        op_add = add_;
+        op_reduce = reduce_;
+        const int64_t rows = tail && next->head ? s.hc : 2 * s.hc;
+        std::vector<RadParam> ps = { RAD_RANGE("M", 1, T), RAD_INT("n", n), RAD_INT("hc", s.hc),
+                                     RAD_INT("rows", rows), RAD_F64("eps", s.eps),
+                                     RAD_F64("ihc_eps", s.eps), RAD_F64("hc_eps", s.hc_eps),
+                                     RAD_INT("tail", tail ? 1 : 0), RAD_STR("dtype", "bf16") };
+        if (tail && rows == 2 * s.hc) ps.push_back(RAD_F64("post_mag", s.hc_mag));
+        std::vector<rad_weight> ws = { w_post };
+        if (tail) ws.insert(ws.end(), { fn, scale, base, w_next });
+        std::vector<rad_buf> rd = { a, post, h }, wr = { a, post, h };
+        if (b) rd.push_back(b);
+        if (xn) wr.push_back(xn);
+        if (y) wr.push_back(y);
+        if (x) wr.push_back(x);
+        /* An op no loaded library declares (the twin on a host-only deployment) is not declared at
+         * all: an undeclared op name stops the startup. */
+        auto decl = [&](const char* name, const std::vector<RadParam>& p) -> rad_op {
+            if (!rad_op_declared(bl, name)) return 0;
+            const rad_op o = rad_decl_op(bl, name, p.data(), (int)p.size(), ws.data(), (int)ws.size());
+            if (!o) return o;
+            rad_op_reads(bl, o, rd.data(), (int)rd.size());
+            rad_op_writes(bl, o, wr.data(), (int)wr.size());
+            return o;
+        };
+        /* The twin first: at more ranks the plain row is the fallback behind the standalone
+         * reduction. Two ranks at every height, four at decode and verify heights. */
+        if (world == 2 || world == 4) {
+            ar_rows = world == 2 ? g.max_tok : ar_wide_write_rows(g);
+            std::vector<RadParam> pa = ps;
+            pa[0] = RAD_RANGE("M", 1, ar_rows);
+            pa.push_back(RAD_INT("world_size", world));
+            op_ar = decl("ar_rmsnorm_ihc_junction", pa);
+        }
+        op = decl("rmsnorm_ihc_junction", ps);
+        if (!op) op_ar = 0;   /* one served without the other: keep the chain whole */
+        if (world > 1 && !op_ar && !op_reduce) op = 0;
+        return RAD_OK;
+    }
+    void step(RadCtx* c, int64_t T) const {
+        const RadOperand B = b ? brows(b, T) : RAD_NONE;
+        auto issue = [&](rad_op o, RadOperand bb) {
+            RAD_ISSUE_N(c, o, T, brows(a, T), bb, RAD_W(w_post), brows(post, T), brows(h, T),
+                        tail ? RAD_W(fn) : RAD_NONE, tail ? RAD_W(scale) : RAD_NONE,
+                        tail ? RAD_W(base) : RAD_NONE, tail ? RAD_W(w_next) : RAD_NONE,
+                        xn ? brows(xn, T) : RAD_NONE, y ? brows(y, T) : RAD_NONE,
+                        x ? brows(x, T) : RAD_NONE);
+        };
+        if (op_ar && T <= ar_rows) { issue(op_ar, B); return; }
+        if (world > 1) {
+            if (b) RAD_ISSUE_N(c, op_add, T, brows(a, T), brows(b, T), brows(a, T));
+            issue_all_reduce(c, op_reduce, a, T, n);
+            issue(op, RAD_NONE);
+            return;
+        }
+        issue(op, B);
+    }
+};
+
 }  // namespace hyv4flash
 #endif

@@ -77,6 +77,9 @@ struct Layer {
     Ffn ffn{};
     Tap t_stream_in{}, t_attn_x{}, t_attn_post{}, t_mid{}, t_ffn_x{}, t_ffn_post{}, t_ffn_in{},
         t_resid{};
+    /* The iHC junctions (WP16.2): attention -> feed-forward, and the feed-forward -> the next
+     * layer's attention (or the head; tail 0 when an Engram opens the next layer). */
+    Junction j_mid{}, j_end{};
 };
 
 struct Model {
@@ -625,6 +628,14 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
     if (!lay.attn_gain) return RAD_E_INVAL;
     lay.op_attn_norm = decl_rmsnorm(b, T, E, s.eps, lay.attn_gain, m.tr.x, m.tr.xn);
     HY4_NEED(lay.op_attn_norm, "rmsnorm");
+    /* The previous layer's junction into this connection (one with an Engram in front of it
+     * declared its tail 0 form behind the previous layer). */
+    if (l > 0 && lay.engram < 0) {
+        Layer& pv = m.layers[(size_t)l - 1];
+        RAD_ARCH_TRY(pv.j_end.declare(b, s, g, T, m.tr, pv.ffn.junction_a(), pv.ffn.junction_b(),
+                                      pv.ffn.post_gain, &lay.hc_attn, lay.attn_gain, m.tr.xn,
+                                      pv.ffn.op_join, pv.ffn.op_ar));
+    }
 
     /* The layer's latent group, declared before its first store; a sparse layer's indexer
      * groups before the first pool. */
@@ -689,10 +700,18 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
     if (!lay.ffn_gain) return RAD_E_INVAL;
     lay.op_ffn_norm = decl_rmsnorm(b, T, E, s.eps, lay.ffn_gain, m.tr.x, m.tr.xn);
     HY4_NEED(lay.op_ffn_norm, "rmsnorm");
+    RAD_ARCH_TRY(lay.j_mid.declare(b, s, g, T, m.tr, lay.attn.w.o, 0, lay.attn.post_gain,
+                                   &lay.hc_ffn, lay.ffn_gain, m.tr.xn, 0, lay.attn.op_ar));
     RAD_ARCH_TRY(lay.t_ffn_in.declare(b, nm, T, "ffn_in_norm", l, RAD_BF16, E, m.tr.xn));
     RAD_ARCH_TRY(lay.ffn.declare(b, nm, s, g, l, m.tr.xn, m.tr.y, m.mw, m.dense_gu, m.dense_ff,
                                  m.dense_out, msrc));
     RAD_ARCH_TRY(lay.hc_ffn.declare_post(b, s, T, m.tr.h, m.tr.post, m.tr.y));
+    /* An Engram opens the next layer: the junction stops behind the write (tail 0). */
+    for (int e : s.engram_layers)
+        if (e == l + 1)
+            RAD_ARCH_TRY(lay.j_end.declare(b, s, g, T, m.tr, lay.ffn.junction_a(),
+                                           lay.ffn.junction_b(), lay.ffn.post_gain, nullptr, 0, 0,
+                                           lay.ffn.op_join, lay.ffn.op_ar));
     RAD_ARCH_TRY(lay.t_resid.declare(b, nm, T, "resid", l, RAD_BF16, s.hc * E, m.tr.h));
     RAD_ARCH_TRY(m.calib.layer(b, g, s, l, m.tr.xn, lay.attn, !lay.sliding, lay.ffn,
                                lay.engram >= 0 ? &m.engrams[(size_t)lay.engram] : nullptr));
@@ -896,6 +915,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                    grp_model(), true, m.tr.h, m.tr.x, 0));
     RAD_ARCH_TRY(m.t_hc_head.declare(b, nm, T, "hc_head_out", -1, RAD_BF16, E, m.tr.x));
     m.op_norm = decl_rmsnorm(b, T, E, s.eps, m.final_gain, m.tr.x, m.final_hidden);
+    if (m.op_norm && !m.layers.empty()) {
+        Layer& lt = m.layers.back();
+        RAD_ARCH_TRY(lt.j_end.declare(b, s, g, T, m.tr, lt.ffn.junction_a(), lt.ffn.junction_b(),
+                                      lt.ffn.post_gain, &m.hc_head, m.final_gain, m.final_hidden,
+                                      lt.ffn.op_join, lt.ffn.op_ar));
+    }
     RAD_ARCH_TRY(m.t_final.declare(b, nm, T, "final_hidden", -1, RAD_BF16, E, m.final_hidden));
     m.op_gather = mk(b, "gather_rows",
                      { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", E),
@@ -1035,6 +1060,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
     for (int64_t j = 0; j < s.hc; ++j)
         RAD_ISSUE_N(c, m.op_stream, T, brows(m.x0, T), bcol(m.tr.h, j * E, E, T));
 
+    /* A junction (WP16.2) runs the chain from a block's reduction to the next block's input norm
+     * in one launch; the taps behind it read what the chain would have left. */
+    bool entered = false;   /* the previous junction ran this layer's connection and input norm */
     for (size_t i = 0; i < m.layers.size(); ++i) {
         const Layer& l = m.layers[i];
         if (l.engram >= 0) {
@@ -1042,10 +1070,11 @@ static void step(RadCtx* c, const RadBatch* batch) {
             m.calib.after_engram(c, (int)i, T);
         }
         l.t_stream_in.step(c, brows(m.tr.h, T), T);
-        l.hc_attn.pre(c, m.tr.h, m.tr.x, m.tr.post, T);
+        if (!entered) l.hc_attn.pre(c, m.tr.h, m.tr.x, m.tr.post, T);
         l.t_attn_x.step(c, brows(m.tr.x, T), T);
         l.t_attn_post.step(c, brows(m.tr.post, T), T);
-        RAD_ISSUE_N(c, l.op_attn_norm, T, brows(m.tr.x, T), RAD_W(l.attn_gain), brows(m.tr.xn, T));
+        if (!entered)
+            RAD_ISSUE_N(c, l.op_attn_norm, T, brows(m.tr.x, T), RAD_W(l.attn_gain), brows(m.tr.xn, T));
         if (!l.attn.front(c, batch)) return;
         m.calib.after_front(c, (int)i, l.attn, T);
         /* A pass on a streamed group's ring attends through the selection at every context
@@ -1054,25 +1083,38 @@ static void step(RadCtx* c, const RadBatch* batch) {
         if (!l.sliding && !lp.select && l.attn.ring_bound(c, batch)) lp.select = true;
         if (!l.sliding && !l.ix.step(c, batch, lp)) return;
         if (!l.sliding) m.df.snap_step(c, (int)i, m.iw, T, lp.select);
-        l.attn.core(c, batch, lp, m.iw.sel, m.iw.len, m.iw.nsel);
+        const bool jm = (bool)l.j_mid;
+        l.attn.core(c, batch, lp, m.iw.sel, m.iw.len, m.iw.nsel, jm);
+        if (jm) {
+            l.j_mid.step(c, T);
+            l.attn.tail_taps(c, T);
+        }
         m.calib.after_attn(c, (int)i, T);
-        l.hc_attn.post_add(c, m.tr.y, m.tr.post, m.tr.h, T);
+        if (!jm) l.hc_attn.post_add(c, m.tr.y, m.tr.post, m.tr.h, T);
         l.t_mid.step(c, brows(m.tr.h, T), T);
 
-        l.hc_ffn.pre(c, m.tr.h, m.tr.x, m.tr.post, T);
+        if (!jm) l.hc_ffn.pre(c, m.tr.h, m.tr.x, m.tr.post, T);
         l.t_ffn_x.step(c, brows(m.tr.x, T), T);
         l.t_ffn_post.step(c, brows(m.tr.post, T), T);
-        RAD_ISSUE_N(c, l.op_ffn_norm, T, brows(m.tr.x, T), RAD_W(l.ffn_gain), brows(m.tr.xn, T));
+        if (!jm)
+            RAD_ISSUE_N(c, l.op_ffn_norm, T, brows(m.tr.x, T), RAD_W(l.ffn_gain), brows(m.tr.xn, T));
         l.t_ffn_in.step(c, brows(m.tr.xn, T), T);
         m.calib.after_ffn_norm(c, (int)i, T);
-        if (!l.ffn.step(c, batch)) return;
+        const bool je = (bool)l.j_end;
+        if (!l.ffn.step(c, batch, je)) return;
+        if (je) {
+            l.j_end.step(c, T);
+            l.ffn.tail_taps(c, T);
+        }
         m.calib.after_ffn(c, (int)i, T);
-        l.hc_ffn.post_add(c, m.tr.y, m.tr.post, m.tr.h, T);
+        if (!je) l.hc_ffn.post_add(c, m.tr.y, m.tr.post, m.tr.h, T);
         l.t_resid.step(c, brows(m.tr.h, T), T);
+        entered = je && l.j_end.tail;
     }
-    m.hc_head.pre(c, m.tr.h, m.tr.x, 0, T);
+    if (!entered) m.hc_head.pre(c, m.tr.h, m.tr.x, 0, T);
     m.t_hc_head.step(c, brows(m.tr.x, T), T);
-    RAD_ISSUE_N(c, m.op_norm, T, brows(m.tr.x, T), RAD_W(m.final_gain), brows(m.final_hidden, T));
+    if (!entered)
+        RAD_ISSUE_N(c, m.op_norm, T, brows(m.tr.x, T), RAD_W(m.final_gain), brows(m.final_hidden, T));
     m.t_final.step(c, brows(m.final_hidden, T), T);
     if (batch->n_out > 0) {
         RAD_ISSUE_N(c, m.op_gather, batch->n_out, brows(m.final_hidden, T),

@@ -303,7 +303,13 @@ struct Ffn {
         return RAD_OK;
     }
 
-    bool step(RadCtx* c, const RadBatch* batch) const {
+    /* The junction's operands: the reduction's message and the addend in front of it. */
+    rad_buf junction_a() const { return moe_layer ? w.routed : mo; }
+    rad_buf junction_b() const { return moe_layer ? w.sout : 0; }
+    /* `fused_tail`: stop in front of the join; the layer's Junction runs it, the reduction and
+     * the sandwich norm (and tail_taps() the tap behind them). */
+    void tail_taps(RadCtx* c, int64_t T) const { t_out.step(c, brows(yf, T), T); }
+    bool step(RadCtx* c, const RadBatch* batch, bool fused_tail = false) const {
         const int64_t T = batch->n_tok;
         auto act = [](rad_buf v) {
             ActFP8 a{};
@@ -313,6 +319,7 @@ struct Ffn {
         rad_buf sum = mo;
         if (!moe_layer) {
             mlp.step(c, xf, mo, T);
+            if (fused_tail) return true;
         } else {
             lat_in.step(c, act(xf), w.lat.x, T);
             t_routed_in.step(c, brows(w.lat.x, T), T);
@@ -325,6 +332,7 @@ struct Ffn {
             t_routed_out.step(c, brows(w.routed, T), T);
             shared.step(c, xf, w.sout, T);
             t_shared.step(c, brows(w.sout, T), T);
+            if (fused_tail) return true;
             RAD_ISSUE_N(c, op_join, T, brows(w.routed, T), brows(w.sout, T), brows(w.routed, T));
             sum = w.routed;
         }

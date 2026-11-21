@@ -460,9 +460,11 @@ struct Attn {
     }
 
     /* The attention proper and everything after it. `sel`/`len`: the indexer's table, issued
-     * already (sparse layers on a selecting step); `nsel` its entry count. */
+     * already (sparse layers on a selecting step); `nsel` its entry count. `fused_tail`: stop
+     * behind o_proj; the layer's Junction runs the reduction and the sandwich norm (and
+     * tail_taps() the two taps behind them). */
     void core(RadCtx* c, const RadBatch* batch, const StepPlan& p, rad_buf sel, rad_buf len,
-              rad_buf nsel) const {
+              rad_buf nsel, bool fused_tail = false) const {
         const int64_t T = p.T;
         const auto* kb = kv_batch(batch, kv);
         auto act = [](rad_buf x) {
@@ -509,12 +511,17 @@ struct Attn {
                         brow_slice(w.gate, g0, T - g0, vw), brow_slice(w.ag, g0, T - g0, vw));
         }
         out.step(c, act(w.ag), w.o, T);
+        if (fused_tail) return;
         issue_all_reduce(c, op_ar, w.o, T, s.n_embd);
         t_o_proj.step(c, brows(w.o, T), T);
         RAD_ISSUE_N(c, op_post_norm, T, brows(w.o, T), RAD_W(post_gain), brows(ya, T));
         t_out.step(c, brows(ya, T), T);
         /* After every attention launch of this layer (core/kvstream/stage.h). */
         if (kb && kb->stream) kv_stage_next(c, kv, layer);
+    }
+    void tail_taps(RadCtx* c, int64_t T) const {
+        t_o_proj.step(c, brows(w.o, T), T);
+        t_out.step(c, brows(ya, T), T);
     }
 };
 
