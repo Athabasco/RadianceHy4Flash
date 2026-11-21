@@ -802,6 +802,42 @@ extern "C" int r4d_shape_mla_attn_paged(const RadParam* p, int n_p, int operand,
                                 opd((uint32_t)RAD_BF16, M, h, L) };
     R4D_PICK(list);
 }
+/* mla_attn_paged_sink: mla_attn_paged's operands (one sequence whose context is its query, or
+ * `ctx`) with the sinks, an f32 weight, in the gate's place. */
+extern "C" int r4d_shape_mla_attn_paged_sink(const RadParam* p, int n_p, int operand,
+                                             RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), h = pi(p, n_p, "heads"), L = pi(p, n_p, "latent_dim"),
+                  R = pi(p, n_p, "rope_dim"), bs = pi(p, n_p, "block_size");
+    if (M <= 0 || h <= 0 || L <= 0 || R <= 0 || bs <= 0) return RAD_E_UNSUPPORTED;
+    int64_t ctx = pi(p, n_p, "ctx", 0);
+    if (ctx < M) ctx = M;
+    const int64_t blocks = (ctx + bs - 1) / bs;
+    const RadOpdDesc list[] = { opd((uint32_t)RAD_BF16, M, h, L),
+                                opd((uint32_t)RAD_BF16, M, h, R),
+                                opd((uint32_t)RAD_BF16, blocks, 1, bs, L + R),
+                                opd_idx(1, blocks, blocks),
+                                opd_idx(1, 0, 0, ctx),
+                                opd_idx(2, 0, M + 1, -1, (uint32_t)RAD_OPD_F_IDX_CU),
+                                opd((uint32_t)RAD_F32, h),
+                                opd((uint32_t)RAD_BF16, M, h, L) };
+    R4D_PICK(list);
+}
+/* mla_attn_sel_sink: mla_attn's per-row tables with the rotary query and the sinks. */
+extern "C" int r4d_shape_mla_attn_sel_sink(const RadParam* p, int n_p, int operand,
+                                           RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), h = pi(p, n_p, "heads"), L = pi(p, n_p, "latent_dim"),
+                  R = pi(p, n_p, "rope_dim"), B = pi(p, n_p, "blocks"),
+                  bs = pi(p, n_p, "block_size"), pages = std::max((int64_t)2, B * M);
+    if (M <= 0 || h <= 0 || L <= 0 || R <= 0 || B <= 0 || bs <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = { opd((uint32_t)RAD_BF16, M, h, L),
+                                opd((uint32_t)RAD_BF16, M, h, R),
+                                opd((uint32_t)RAD_BF16, pages, 1, bs, L + R),
+                                opd_idx(M, B, pages),
+                                opd_idx(M, 0, 0, B * bs),
+                                opd((uint32_t)RAD_F32, h),
+                                opd((uint32_t)RAD_BF16, M, h, L) };
+    R4D_PICK(list);
+}
 extern "C" int r4d_shape_dsa_score(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), H = pi(p, n_p, "heads");
     const int64_t B = pi(p, n_p, "blocks"), S = pi(p, n_p, "seqs"), pages = S * B;

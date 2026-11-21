@@ -130,6 +130,8 @@ set(R4D_UNITS
   "r4d_glm|"
   "r4d_dsa|"
   "r4d_mla|"
+  # Hy4-flash: absorbed MLA with a per-head sink (paged with a window, and over a selection).
+  "r4d_mla_sink|"
   "r4d_kda|"
   # Mamba-2's selective state update (Nemotron-H), the KDA kernel's register layout.
   "r4d_ssd|"

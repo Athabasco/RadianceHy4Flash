@@ -2026,6 +2026,31 @@ static const RadOperandSpec oMlaAttnPaged[] = { { "q", RAD_OPD_IN, 0 },
                                                 { "cu_seqlens", RAD_OPD_IN, 0 },
                                                 { "gate", RAD_OPD_IN, 1 },
                                                 { "out", RAD_OPD_OUT, 0 } };
+/* Hy4-flash's absorbed attention with a sink: libref's schemas (ref_registry.cpp), parameter for
+ * parameter. The sinks are an f32 weight [heads]. */
+static const RadParamSpec pMlaAttnPagedSink[] = { P_INT("M"),          P_INT("heads"),
+                                                  P_INT("latent_dim"), P_INT("rope_dim"),
+                                                  P_INT("block_size"), P_INT("window"),
+                                                  P_F64("scale"),      P_STR("dtype") };
+static const RadOperandSpec oMlaAttnPagedSink[] = { { "q", RAD_OPD_IN, 0 },
+                                                    { "q_rope", RAD_OPD_IN, 0 },
+                                                    { "kv", RAD_OPD_IN, 0 },
+                                                    { "block_table", RAD_OPD_IN, 0 },
+                                                    { "seqused", RAD_OPD_IN, 0 },
+                                                    { "cu_seqlens", RAD_OPD_IN, 0 },
+                                                    { "sinks", RAD_OPD_WEIGHT, 0 },
+                                                    { "out", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pMlaAttnSelSink[] = { P_INT("M"),          P_INT("heads"),
+                                                P_INT("latent_dim"), P_INT("rope_dim"),
+                                                P_INT("blocks"),     P_INT("block_size"),
+                                                P_F64("scale"),      P_STR("dtype") };
+static const RadOperandSpec oMlaAttnSelSink[] = { { "q", RAD_OPD_IN, 0 },
+                                                  { "q_rope", RAD_OPD_IN, 0 },
+                                                  { "kv", RAD_OPD_IN, 0 },
+                                                  { "bt", RAD_OPD_IN, 0 },
+                                                  { "length", RAD_OPD_IN, 0 },
+                                                  { "sinks", RAD_OPD_WEIGHT, 0 },
+                                                  { "out", RAD_OPD_OUT, 0 } };
 static const RadOperandSpec oMlaAttn[] = { { "q", RAD_OPD_IN, 0 },
                                            { "kv", RAD_OPD_IN, 0 },
                                            { "bt", RAD_OPD_IN, 0 },
@@ -3290,6 +3315,14 @@ static const RadOpSchema kSchemas[] = {
            "Dense causal latent attention over a paged cache whose token row is the latent then the "
            "rotated key part: score = scale * (q . latent + q_rope . rope), value = the latent; "
            "sequences as in attn_paged. With `gate`, out = bf16(bf16(out) * bf16(sigmoid(gate[head])))."),
+    SCHEMA("mla_attn_paged_sink", pMlaAttnPagedSink, oMlaAttnPagedSink,
+           "mla_attn_paged with a window and a sink. A row at position p sees keys [max(0, p-window+1), p] "
+           "(window 0: all), the window counting the row's own token. s_j = scale*(q.latent_j + "
+           "q_rope.rope_j); out = sum exp(s_j) latent_j / (sum exp(s_j) + exp(sink[h])): the sink joins the "
+           "softmax once and carries no value. No visible key gives zero."),
+    SCHEMA("mla_attn_sel_sink", pMlaAttnSelSink, oMlaAttnSelSink,
+           "mla_attn's per-query page table and visible length with a rotary part and a sink: tokens "
+           "[0, length[r]) of table row bt[r]. The score and the sink are mla_attn_paged_sink's."),
     SCHEMA("mla_project", pMlaProject, oGemmNt,
            "Per-head query absorption or value expansion through the shared [head,(K|V),latent] BF16 matrix."),
     SCHEMA("dsa_score", pDsaScore, oDsaScore,
@@ -5169,6 +5202,18 @@ static const RadConstraint cMlaAttnPaged[] = {
     C_GE("heads", 1),   C_LE("heads", 64),    C_GE("block_size", 1),   C_LE("block_size", 256),
     C_IN("dtype", "bf16")
 };
+/* r4d_mla_sink.hip compiles latent 512, rope 64 and sixteen-head groups (heads % 16 == 8 leaves the
+ * last group's upper half idle); the block size is a runtime power of two. */
+static const RadConstraint cMlaAttnPagedSink[] = {
+    C_GE("M", 1),       C_LE("M", 65535),      C_EQ("latent_dim", 512), C_EQ("rope_dim", 64),
+    C_GE("heads", 8),   C_LE("heads", 64),     C_DIV("heads", 8),
+    C_IN("block_size", "1 2 4 8 16 32 64 128 256"), C_GE("window", 0), C_IN("dtype", "bf16")
+};
+static const RadConstraint cMlaAttnSelSink[] = {
+    C_GE("M", 1),       C_LE("M", 65535),      C_EQ("latent_dim", 512), C_EQ("rope_dim", 64),
+    C_GE("heads", 8),   C_LE("heads", 64),     C_DIV("heads", 8),       C_GE("blocks", 1),
+    C_IN("block_size", "1 2 4 8 16 32 64 128 256"), C_IN("dtype", "bf16")
+};
 static const RadConstraint cMlaProject[] = { C_GE("M", 1),
                                              C_LE("M", 65535),
                                              C_GE("heads", 1),
@@ -6935,6 +6980,25 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaAttnPaged), NOTUNE,
   nullptr, nullptr, r4d_rad_mla_attn_paged, r4d_rad_mla_attn_paged_scratch, nullptr, nullptr,
   r4d_shape_mla_attn_paged },
+{ "mla_attn_paged_sink_bf16", "mla_attn_paged_sink", "attn",
+  "absorbed latent attention with a window and a sink: a workgroup a row and 16 or 32 heads, WMMA "
+  "scores over latent and rotary columns, split history (2 splits with a window, 8 without) and a "
+  "merge that applies the sink once",
+  "latent_dim=512, rope_dim=64, heads 8..64 a multiple of 8, block_size a power of two <=256; one page table a "
+  "sequence; split at M<=64",
+  "bf16 Q/rotary/cache/output, f32 sinks, softmax and partials; P as bf16 high plus low part",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaAttnPagedSink), NOTUNE,
+  nullptr, nullptr, r4d_rad_mla_attn_paged_sink, r4d_rad_mla_attn_paged_sink_scratch, nullptr,
+  nullptr, r4d_shape_mla_attn_paged_sink },
+{ "mla_attn_sel_sink_bf16", "mla_attn_sel_sink", "attn",
+  "mla_attn_paged_sink_bf16's kernel over a per-row table and length (the indexer's selection), "
+  "8 splits",
+  "latent_dim=512, rope_dim=64, heads 8..64 a multiple of 8, block_size a power of two <=256; split at "
+  "M<=64",
+  "bf16 Q/rotary/cache/output, f32 sinks, softmax and partials; P as bf16 high plus low part",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaAttnSelSink), NOTUNE,
+  nullptr, nullptr, r4d_rad_mla_attn_sel_sink, r4d_rad_mla_attn_sel_sink_scratch, nullptr,
+  nullptr, r4d_shape_mla_attn_sel_sink },
 { "mla_project_bf16", "mla_project", "attn", "per-head absorbed MLA projections",
   "head_dim 128 or 256, latent_dim=512; pitched tensors", "bf16 input, weights and output; fp32 arithmetic",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaProject), NOTUNE,

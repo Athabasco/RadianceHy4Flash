@@ -603,6 +603,7 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
                 ${R4D_DIR}/r4d_qsa_select_bf16.hip ${R4D_DIR}/r4d_lora_bf16.hip ${R4D_DIR}/r4d_glm.hip
                 ${R4D_DIR}/r4d_mhc.hip ${R4D_DIR}/r4d_kda.hip
                 ${R4D_DIR}/r4d_mla.hip ${R4D_DIR}/r4d_quant_act_fp8.hip
+                ${R4D_DIR}/r4d_mla_sink.hip
                 ${R4D_DIR}/r4d_kv_resolve.hip ${R4D_DIR}/r4d_dsa.hip
                 ${R4D_DIR}/r4d_keyed.hip ${R4D_DIR}/r4d_lili.hip
                 ${R4D_DIR}/r4d_vit_muse.hip)
@@ -611,7 +612,7 @@ list(APPEND R4D_EMU_HIP ${R4D_DIR}/r4d_ihc_bf16.hip ${R4D_DIR}/r4d_engram_bf16.h
                         ${R4D_DIR}/r4d_mla_kv_bf16.hip)
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc kda mla moefuse kvres
                   dsa lili vit)
-list(APPEND R4D_EMU_TESTS attn_kv_sink hy4)
+list(APPEND R4D_EMU_TESTS attn_kv_sink hy4 mla_sink)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -654,7 +655,7 @@ else()
                 ${R4D_EMU}/test_moefuse.cpp ${R4D_EMU}/test_kvres.cpp
                 ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_lili.cpp
                 ${R4D_EMU}/test_vit.cpp ${R4D_EMU}/test_attn_kv_sink.cpp
-                ${R4D_EMU}/test_hy4.cpp)
+                ${R4D_EMU}/test_hy4.cpp ${R4D_EMU}/test_mla_sink.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -691,7 +692,7 @@ else()
   endif()
 endif()
 if(R4D_EMU_BUILT)
-  foreach(t pick norm escale qsa lora f32 mhc kda mla moefuse kvres dsa lili vit hy4)
+  foreach(t pick norm escale qsa lora f32 mhc kda mla moefuse kvres dsa lili vit hy4 mla_sink)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # Hy4-flash's non-absorbed prefill (attn_kv_sink_h256): about 4 s.
@@ -705,7 +706,7 @@ if(R4D_EMU_BUILT)
   endforeach()
   set_tests_properties(r4d_emu_attn_shard0 r4d_emu_attn_shard1 r4d_emu_attn_shard2 r4d_emu_pick
                        r4d_emu_norm r4d_emu_escale r4d_emu_qsa r4d_emu_lora r4d_emu_mla r4d_emu_moefuse
-                       r4d_emu_dsa r4d_emu_lili
+                       r4d_emu_dsa r4d_emu_lili r4d_emu_mla_sink
                        PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The LoRA pair has a libref oracle, and the test holds the emulated kernels to it when it can
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within

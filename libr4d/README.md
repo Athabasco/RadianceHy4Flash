@@ -58,6 +58,7 @@ The table lists a selection; `r4d_rows.cpp` and `r4d.h` hold the full set.
 | `gemm_mxfp4a8_decode_shortk` | the decode kernel at 33..64 rows of a wide, short weight (N ≥ 8192, K ≤ 2560), above `gemm_mxfp4a8_gemv_wide`, which loses there |
 | `gemm_mxfp4a8_tiled` | the prefill sibling: the activation re-tiled into fragment order in the op's scratch and read straight into registers, the weight unpacked once per K slab for a 256-row block |
 | `attn_decode_h128_gqa4_i8` / `..._bf16kv` | head_dim 128, 4 queries per KV head, sliding window: a block-diffusion drafter's geometry, and LFM3's. The decode band (up to 16 query rows); past it `attn_window_h128_gqa4_i8kv` / `..._bf16kv` serve this geometry |
+| `mla_attn_paged_sink_bf16` / `mla_attn_sel_sink_bf16` | Hy4-flash's absorbed latent attention (latent 512 + rope 64) with a per-head sink logit: paged with a sliding window counting the row's own token (or none), and over the indexer's per-row selection. A workgroup a row and 16/32/64 heads, WMMA scores, split history with a merge that applies the sink once; the split count depends on the op and window only, so a verify row's bytes are its decode's |
 | `rowtopk_bf16` / `rowtopk_bf16_chunks` | exact per-row top-K over a bf16 matrix, two-stage |
 | `dflash_conv_t2_g16_bf16` | the drafter's causal conv, two taps, 16 groups |
 | `dflash_select_bf16` | the drafter's candidate selector: edge scores and the greedy path walk |
