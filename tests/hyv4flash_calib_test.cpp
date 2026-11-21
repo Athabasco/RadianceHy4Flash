@@ -233,6 +233,10 @@ TEST(calib_layers_and_no_calibration) {
         for (const auto& [stem, lin] : sites_of(d.model())) CHECK(stem.compare(0, 6, "blk.1.") == 0);
         CHECK(!sites_of(d.model()).empty());
         CHECK_EQ(std::string(std::getenv("RADIANCE_CALIB_LAYERS")), std::string("1-1"));
+        /* The experts' tap only inside the window: layer 1's, not layer 2's. */
+        CHECK(find_b(d.b, "blk.1.gram_dn_experts") != nullptr);
+        CHECK(find_b(d.b, "blk.2.gram_gu") == nullptr);
+        CHECK(find_b(d.b, "blk.2.gram_dn_experts") == nullptr);
     }
     clean_env();
     {
@@ -241,6 +245,8 @@ TEST(calib_layers_and_no_calibration) {
         CHECK(sites_of(d.model()).count("output.input") == 1);
         CHECK(sites_of(d.model()).count("blk.2.attn_q_a.input") == 1);
         CHECK(sites_of(d.model()).count("blk.1.attn_q_a.input") == 0);
+        CHECK(find_b(d.b, "blk.2.gram_dn_experts") != nullptr);
+        CHECK(find_b(d.b, "blk.1.gram_gu") == nullptr);
     }
     clean_env();
     {

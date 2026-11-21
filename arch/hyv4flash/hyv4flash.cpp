@@ -776,6 +776,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(map_cli_to_env(ctx));   /* before the first block reads RADIANCE_CALIB_* */
     RAD_ARCH_TRY(read_shape(s, meta));
     RAD_ARCH_TRY(split_ranks(s, ctx->world_size ? ctx->world_size : 1, ctx->rank));
+    s.calib_lo = ctx->calib_layer_lo;
+    s.calib_hi = ctx->calib_layer_hi;
     RAD_ARCH_TRY(geom_from(g, meta, ctx, "bf16", RAD_BF16));
     m.df.configure(b, meta, s, ctx);   /* before the trunk: the snapshots follow its indexers */
     /* The producers write bf16 planes only: a bf16 trunk linear reads them, an int8 one quantises

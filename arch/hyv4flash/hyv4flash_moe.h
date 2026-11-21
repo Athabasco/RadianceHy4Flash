@@ -147,7 +147,11 @@ struct Ffn {
         c.swiglu_limit = s.swiglu_limit;
         c.router_k = s.n_embd;
         c.no_reduce = 1;
-        c.calib = calib_dir() != nullptr ? 1 : 0;
+        /* Only a layer inside --calib-layers taps, as the trunk's CalibFull::records; without it,
+         * RADIANCE_CALIB_LAYERS decides (calib_layer_on). A layer outside keeps no per-expert Grams on
+         * the host (128 experts x 4.7 MB a layer and rank at TP4). */
+        const bool in_window = s.calib_hi > 0 ? l >= s.calib_lo && l < s.calib_hi : calib_layer_on(l);
+        c.calib = calib_dir() != nullptr && in_window ? 1 : 0;
         /* The first expert this rank maps (whole experts; the probe reads its format). */
         c.probed_expert = (int64_t)s.rank * (s.n_expert / s.world);
         src->norm = nullptr;          /* the input is the latent, prepared here */

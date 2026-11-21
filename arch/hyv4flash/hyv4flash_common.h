@@ -78,6 +78,8 @@ struct Shape {
      * width (n_ff_exp_r, the quantised serving form). Everything else is replicated. The geometry
      * above stays the model's: the drafter and the tower are declared whole. */
     int world = 1, rank = 0;
+    /* --calib-layers (RadBuildCtx::calib_layer_lo .. calib_layer_hi, hi exclusive; both 0: every layer). */
+    int calib_lo = 0, calib_hi = 0;
     AttnGeom sparse_r{}, sliding_r{};
     int64_t n_ff_r = 0, n_ff_shared_r = 0, n_expert_r = 0, expert_base = 0, n_ff_exp_r = 0;
     bool experts_whole = true;
