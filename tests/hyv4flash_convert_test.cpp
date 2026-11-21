@@ -426,6 +426,51 @@ TEST(serving_the_drafter_leaves_its_stored_tensors_as_the_manifest_declared_them
     CHECK(fd.find("dfly.token_embd.weight") == nullptr);   /* the release shares the trunk's */
 }
 
+/* WP13.9: a recipe over the drafter's linears (rotated int8, at the fixture's 128-wide hidden size the
+ * ones whose K and rows fit) is stored as codes and scales, and the drafter is still served: no
+ * "declared and not served", every `dfly.*` entry read by a declared weight (a linear left to its Lin
+ * is not declared twice nor dropped). The unquantised ones stay as shipped. */
+TEST(a_recipe_over_the_drafters_linears_stores_them_int8_and_still_serves_the_drafter) {
+    const Fixture& d = fixture_dfly();
+    REQUIRE(d.ok);
+    const std::string recipe = d.dir / "dfly-i8.recipe";
+    {
+        std::ofstream o(recipe);
+        for (const char* n : { "dfly.blk.*.attn_q_a.weight", "dfly.blk.*.attn_gate.weight",
+                               "dfly.blk.*.ffn_gate_up.weight", "dfly.fusion.weight",
+                               "dfly.correct_gate.weight", "dfly.correct_up.weight",
+                               "dfly.correct_down.weight" })
+            o << n << " rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search\n";
+    }
+    std::string log;
+    const std::string out = d.dir / "dfly-i8.rad";
+    REQUIRE_EQ(d.convert(out, { "--recipe", recipe }, &log), 0);
+    CHECK(log.find("DFly2 is declared and not served") == std::string::npos);
+    CHECK(log.find("are read by no declared weight") == std::string::npos);
+    RadFile f;
+    REQUIRE_EQ(f.open(out.c_str()), RAD_OK);
+    for (const char* n : { "dfly.blk.0.attn_q_a.weight", "dfly.blk.0.attn_gate.weight",
+                           "dfly.blk.0.ffn_gate_up.weight", "dfly.fusion.weight",
+                           "dfly.correct_gate.weight", "dfly.correct_up.weight",
+                           "dfly.correct_down.weight" }) {
+        const RadFileEntry* en = f.find(n);
+        REQUIRE(en != nullptr);
+        CHECK_EQ(en->n_planes, (uint32_t)2);
+        CHECK_EQ(f.encoding(*en).plane[0].dtype, (uint32_t)RAD_I8);
+    }
+    CHECK_EQ(f.find("dfly.blk.0.attn_kv_b.weight")->n_planes, (uint32_t)1);
+    CHECK_EQ(f.find("dfly.blk.0.attn_q_b.weight")->n_planes, (uint32_t)1);
+    /* kv_b is read bf16 only: a recipe over it declines the drafter and keeps the manifest whole. */
+    {
+        const std::string r2 = d.dir / "dfly-kvb.recipe";
+        std::ofstream(r2) << "dfly.blk.*.attn_kv_b.weight rtn codes=i8 group=128 scale=bf16 clamp=sym rule=search\n";
+        std::string l2;
+        const std::string o2 = d.dir / "dfly-kvb.rad";
+        const int rc = d.convert(o2, { "--recipe", r2 }, &l2);
+        if (rc == 0) CHECK(l2.find("DFly2 is declared and not served") != std::string::npos);
+    }
+}
+
 TEST(the_bf16_recipe_stores_the_engram_table_as_e4m3_rows) {
     const Fixture& fx = fixture();
     REQUIRE(fx.ok);

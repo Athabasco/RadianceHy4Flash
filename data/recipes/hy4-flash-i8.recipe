@@ -12,7 +12,7 @@
 # host -- measured on gpu-mini, WP8; 3.4 MiB a layer at real size), kv_b (DECISIONS U2: the absorbed attention reads its per-head blocks;
 # the plugin refuses a quantised one), the indexer's projections (its top-k is a hard choice), the
 # router, the hyper-connections, sinks, norms and the Engram's projections (the plugin refuses a
-# recipe over those), the token embedding, DFly2 and the tower (declared, not served).
+# recipe over those), the token embedding, DFly2 (a recipe of its own, hy4-flash-dfly-i8.recipe) and the tower (declared, not served).
 #
 # Each int8 trunk linear quantises its own input (had_quant_act_i8g, or quant_act_i8g for the head)
 # from the bf16 plane its producer writes. Every K here is a whole number of 128 blocks on every

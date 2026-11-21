@@ -1175,9 +1175,10 @@ struct DeclDfly {
     RadBuildCtx ctx;
     int rc = 0;
     std::string err;
-    explicit DeclDfly(int depth = 5, MetaKV m = dfly_meta(), int world = 1, int rank = 0)
+    explicit DeclDfly(int depth = 5, MetaKV m = dfly_meta(), int world = 1, int rank = 0,
+                      void (*encs)(RadBuilder*) = bf16_encs)
         : mk(std::move(m)) {
-        bf16_encs(&b);
+        encs(&b);
         ctx = spec_ctx(rank, world, depth);
         err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
         if (rc != RAD_OK && std::getenv("HY4_TEST_STDERR")) fputs(err.c_str(), stderr);
@@ -1303,6 +1304,93 @@ TEST(an_engine_step_with_dfly2_is_lint_clean_and_the_query_pass_touches_no_trunk
         int snap = 0;
         for (const auto& is : ps[0]->issues) snap += is.op == df.snap[0].op_sel;
         CHECK_EQ(snap, 1);
+    }
+}
+
+/* WP13.9: the drafter's linears stored quantised (IQ8R, rotated int8, ...) are read as the trunk's
+ * are (Lin): each its own input quantised into the rank's code pair, then gemm_nt_q; this rank's
+ * slice at TP; every other tensor as before. A form no Lin reads, or a quantised kv_b / embedding,
+ * declines the drafter by name and leaves the manifest whole. */
+namespace {
+void dfly_i8_encs(RadBuilder* b) {
+    bf16_encs(b);
+    std::vector<std::pair<std::string, RadEncoding>> q;
+    /* mini's widths take int8 in these (q_b's K is 64, kv_a's 40 rows, and the output projection's
+     * and the MLP down's K split below 128 at TP2); the rest stay bf16, a mix being served too. */
+    for (const char* n : { "attn_q_a", "attn_gate", "ffn_gate_up" })
+        q.push_back({ std::string("dfly.blk.0.") + n + ".weight", enc_i8(true) });
+    for (const char* n : { "fusion", "correct_gate", "correct_up", "correct_down" })
+        q.push_back({ std::string("dfly.") + n + ".weight", enc_i8(n[0] == 'f' ? false : true) });
+    b->encs.insert(b->encs.begin(), q.begin(), q.end());
+}
+void dfly_kvb_encs(RadBuilder* b) {
+    dfly_i8_encs(b);
+    b->encs.insert(b->encs.begin(), { "dfly.blk.0.attn_kv_b.weight", enc_i8(true) });
+}
+void dfly_trellis_encs(RadBuilder* b) {
+    dfly_i8_encs(b);
+    b->encs.insert(b->encs.begin(), { "dfly.blk.0.attn_q_a.weight", enc_nl64(4) });
+}
+}  // namespace
+TEST(dfly2_reads_quantised_linears_as_the_trunk_does) {
+    const char* lin[] = { "attn_q_a", "attn_gate", "ffn_gate_up" };
+    for (const int world : { 1, 2 }) {
+        for (int rank = 0; rank < world; ++rank) {
+            DeclDfly d(5, dfly_meta(1, true), world, rank, dfly_i8_encs);
+            REQUIRE_EQ(d.rc, RAD_OK);
+            if (!d.df().served) fprintf(stderr, "%s\n", d.df().why.c_str());
+            REQUIRE(d.df().served);
+            CHECK_EQ(d.b.drafter.kind, (int)RAD_DRAFT_BLOCK);
+            CHECK_EQ(d.df().n_quant, 3 + 4);
+            RadBuilder& b = d.b;
+            /* Seven linears: int8 GEMMs over rotated codes; the rest, the gains and the head as before. */
+            int q = 0;
+            for (const auto& o : b.ops)
+                if (o.op == "gemm_nt_q" && o.w.size() >= 1) ++q;
+            CHECK(q >= 3 + 4);
+            for (const char* n : lin) {
+                const std::string nm = std::string("dfly.blk.0.") + n;
+                const RecWeight* w = find_w(b, (nm + ".weight").c_str());
+                REQUIRE(w != nullptr);
+                CHECK_EQ(w->d.dtype, RAD_I8);
+                CHECK(find_w(b, (nm + ".scale").c_str()) != nullptr);
+            }
+            /* This rank's slice at TP (the same shapes the bf16 manifest slices). */
+            const RecWeight* ga = find_w(b, "dfly.blk.0.attn_gate.weight");
+            const RecWeight* gu = find_w(b, "dfly.blk.0.ffn_gate_up.weight");
+            CHECK_EQ(ga->d.shard, world > 1 ? (int)RAD_SHARD_ROW : (int)RAD_SHARD_NONE);
+            CHECK_EQ(ga->d.shape[0], (int64_t)(4 * 32 / world));
+            if (world > 1) {
+                CHECK_EQ(gu->d.n_row_parts, 2);
+                CHECK_EQ(gu->d.row_parts[0], d.df().ff / world);
+            }
+            CHECK(find_w(b, "dfly.blk.0.attn_kv_b.weight")->d.dtype == RAD_BF16);
+            CHECK(find_w(b, "dfly.blk.0.attn_q_a.weight") != nullptr);
+            /* One engine step, lint clean, the query pass issuing the int8 chain. */
+            auto trunk = kit(b, std::vector<int>(2, 6), {});
+            trunk->b.positions_h = trunk->pos.data();
+            auto ctxp = context_pass(b, *trunk);
+            Query qp(b, 2, 6, 5);
+            auto ps = run_passes(b, hyv4flash::step, { trunk.get(), ctxp.get(), qp.k.get() }, rank,
+                                 world);
+            CHECK_PASSES(b, ps);
+            const auto is = issued_ops(b, *ps[2]);
+            CHECK(std::count(is.begin(), is.end(), std::string("gemm_nt_q")) >= 3 + 3 * 5 + 1);
+        }
+    }
+    /* A form no draft linear reads, and a quantised kv_b: declined by name, the manifest whole. */
+    for (auto encs : { +dfly_trellis_encs, +dfly_kvb_encs }) {
+        DeclDfly d(5, dfly_meta(), 1, 0, encs);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        CHECK(!d.df().served);
+        CHECK_EQ(d.b.drafter.kind, (int)RAD_DRAFT_NONE);
+        CHECK_EQ(count_op(d.b, "dfly_sel"), 0);
+        CHECK(d.err.find("DFly2 is declared and not served") != std::string::npos);
+        CHECK(d.err.find("quantised") != std::string::npos || d.err.find("does not read") != std::string::npos);
+        const RecWeight* w = find_w(d.b, "dfly.blk.0.attn_q_a.weight");
+        REQUIRE(w != nullptr);   /* kept as its planes' views */
+        CHECK(find_w(d.b, "dfly.blk.0.attn_q_a.scale") != nullptr);
+        CHECK(find_w(d.b, "dfly.blk.0.attn_gate.scale") != nullptr);
     }
 }
 
@@ -1497,9 +1585,9 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
                 const auto& df = d.df();
                 const auto& L = df.lay[0];
                 CHECK_EQ(pint(b.op_of(L.op_attn), "heads"), H / world);
-                CHECK_EQ(pint(b.op_of(L.op_qb), "N"), H / world * 32);
-                CHECK_EQ(pint(b.op_of(L.op_gu), "N"), 2 * ff / world);
-                CHECK_EQ(pint(b.op_of(L.op_down), "K"), ff / world);
+                CHECK_EQ(pint(b.op_of(L.p_qb.op), "N"), H / world * 32);
+                CHECK_EQ(pint(b.op_of(L.p_gu.op), "N"), 2 * ff / world);
+                CHECK_EQ(pint(b.op_of(L.p_down.op), "K"), ff / world);
                 CHECK_EQ(pint(b.op_of(df.steps[0].op_head), "n_vocab"), 320 / world);
                 CHECK_EQ(pint(b.op_of(df.steps[0].op_topk), "vocab_off"), 320 / world * rank);
                 for (const auto& st : df.steps) CHECK(st.op_gather != 0 && st.op_merge != 0);
@@ -1525,10 +1613,10 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
                         me += op == st.op_merge;
                     }
                     if (op == df.steps[0].op_topk) ++tk;
-                    if (op == L.op_out) i_out = i;
+                    if (op == L.p_out.op) i_out = i;
                     if (op == df.op_ar_o) i_ar = i;
                     if (op == L.op_post || (op == L.op_add1 && i_post == SIZE_MAX)) i_post = std::min(i_post, i);
-                    if (op == L.op_down) i_down = i;
+                    if (op == L.p_down.op) i_down = i;
                     if (op == df.op_ar_y) i_ar2 = i;
                     if (op == L.op_add2) i_add2 = i;
                 }

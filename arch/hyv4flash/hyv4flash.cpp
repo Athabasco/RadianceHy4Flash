@@ -60,6 +60,7 @@
 
 #include "chat.h"
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -300,6 +301,10 @@ struct Decl {
      * kernels/dfly2.md §3.6). At one rank every weight is declared whole and unsharded, as the
      * container holds it. */
     int world = 1;
+    /* A drafter linear stored quantised in a form the trunk's `Lin` reads is not declared here: the
+     * drafter's own declare takes it over (hyv4flash_dfly.h proj), sliced at TP. Until the drafter
+     * is known to be served, the planes are kept to declare as views after all (`defer`). */
+    std::vector<std::function<int()>>* defer = nullptr;
 
     /* The checkpoint's extents of `name` where the model behind the builder has it, else the
      * config's (`dflt`): a builder with no model (a test's) answers nothing. */
@@ -312,13 +317,35 @@ struct Decl {
         return shape[dim];
     }
     /* A matrix: bf16 as the checkpoint ships it, or whatever a recipe made of it. */
-    int mat(const char* name, std::initializer_list<int64_t> shape, int shard = RAD_SHARD_NONE,
-            std::initializer_list<int64_t> parts = {}) {
+    int mat(const char* name, const std::vector<int64_t>& shape, int shard = RAD_SHARD_NONE,
+            const std::vector<int64_t>& parts = {}) {
         return put(name, RAD_BF16, shape, grp_layer(layer), 0, shard, parts);
+    }
+    /* A drafter linear: bf16 as `mat`, or (quantised and read by Lin) left to the drafter. */
+    int linear(const char* name, const std::vector<int64_t>& shape, int shard = RAD_SHARD_NONE,
+               const std::vector<int64_t>& parts = {}) {
+        RadEncoding e{};
+        if (defer && m.df.served && weight_enc(b, name, &e) && e.n_planes > 1) {
+            if (Dfly::lin_reads(e)) {
+                ++m.df.n_quant;
+                Decl self = *this;
+                defer->push_back([self, name, shape, shard, parts]() mutable {
+                    return self.mat(name, shape, shard, parts);
+                });
+                return RAD_OK;
+            }
+            char en[256];
+            rad_enc_format(&e, en, sizeof en);
+            m.df.why_buf = std::string("'") + name + "' is " + en +
+                           ", which a draft linear does not read (bf16, int8 i8*bf16[1x128] "
+                           "optionally /fwht128, IQ8R, or a form the rotated int8 GEMM decodes)";
+            m.df.refuse(m.df.why_buf.c_str());
+        }
+        return mat(name, shape, shard, parts);
     }
     /* A gain, a bias a norm adds, a hyper-connection table: f32, widened from bf16 at load where
      * the checkpoint has it so (the norms and the HC arithmetic run in f32). */
-    int f32(const char* name, std::initializer_list<int64_t> shape, int shard = RAD_SHARD_NONE) {
+    int f32(const char* name, const std::vector<int64_t>& shape, int shard = RAD_SHARD_NONE) {
         return put(name, RAD_F32, shape, grp_layer(layer), 0, shard);
     }
     /* One stored weight, at the encoding the model behind the builder holds it in.
@@ -334,10 +361,11 @@ struct Decl {
      *
      * `shape` is the stored (whole) extent. A plain weight declared RAD_SHARD_ROW or _COL at more
      * than one rank takes this rank's share of dim 0 or dim 1 (and of each stacked row part);
-     * a quantised one stays whole and unsharded (nothing serves it, kernels/dfly2.md §3.4). */
-    int put(const char* name, uint32_t want, std::initializer_list<int64_t> shape,
+     * a quantised one stays whole and unsharded: only the views of a declined drafter's weights come
+     * through here; a served drafter's quantised linears are declared by its Lin, sliced (`linear`). */
+    int put(const char* name, uint32_t want, const std::vector<int64_t>& shape,
             RadWeightGroup g, int optional = 0, int shard = RAD_SHARD_NONE,
-            std::initializer_list<int64_t> parts = {}) {
+            const std::vector<int64_t>& parts = {}) {
         if (world <= 1) shard = RAD_SHARD_NONE;
         ++m.n_weights;
         RadEncoding e{};
@@ -417,16 +445,16 @@ static int attention(Decl& d, Names& nm, const Shape& s, const AttnGeom& a, cons
     RAD_ARCH_TRY(map_copy(b, out, nm.ckpt("%s.o_proj.weight", ap)));
     RAD_ARCH_TRY(map_copy(b, post, nm.ckpt("%s.post_proj_norm.weight", ap)));
     RAD_ARCH_TRY(map_copy(b, sinks, nm.ckpt("%s.learnable_sink_param", ap)));
-    RAD_ARCH_TRY(d.mat(q_a, { s.q_lora, s.n_embd }));
+    RAD_ARCH_TRY(d.linear(q_a, { s.q_lora, s.n_embd }));
     RAD_ARCH_TRY(d.f32(q_an, { s.q_lora }));
     /* Whole heads a rank at TP (as the trunk's sparse layers): q_b, kv_b and the gate by rows, the
      * sinks by entry, the output projection by columns; the rest replicated. */
-    RAD_ARCH_TRY(d.mat(q_b, { a.q_width(), s.q_lora }, RAD_SHARD_ROW));
-    RAD_ARCH_TRY(d.mat(kv_a, { s.kv_lora + a.qk_rope, s.n_embd }));
+    RAD_ARCH_TRY(d.linear(q_b, { a.q_width(), s.q_lora }, RAD_SHARD_ROW));
+    RAD_ARCH_TRY(d.linear(kv_a, { s.kv_lora + a.qk_rope, s.n_embd }));
     RAD_ARCH_TRY(d.f32(kv_an, { s.kv_lora }));
     RAD_ARCH_TRY(d.mat(kv_b, { a.kv_width(), s.kv_lora }, RAD_SHARD_ROW));
-    RAD_ARCH_TRY(d.mat(gate, { a.v_width(), s.n_embd }, RAD_SHARD_ROW));
-    RAD_ARCH_TRY(d.mat(out, { s.n_embd, a.v_width() }, RAD_SHARD_COL));
+    RAD_ARCH_TRY(d.linear(gate, { a.v_width(), s.n_embd }, RAD_SHARD_ROW));
+    RAD_ARCH_TRY(d.linear(out, { s.n_embd, a.v_width() }, RAD_SHARD_COL));
     /* post_proj_norm is optional in vLLM's draft (present iff the checkpoint has it): a model
      * that has q_a and lacks it is declared without; a builder with no model declares it. */
     {
@@ -455,8 +483,8 @@ static int mlp(Decl& d, Names& nm, const Shape& s, const char* scope, const char
     /* At TP each rank a share of the width: gate_up's rows of each half, down's columns. A width
      * that does not divide is declared whole (drafter() then declines the drafter). */
     const int shard = d.world > 1 && ff % d.world == 0 ? 1 : 0;
-    RAD_ARCH_TRY(d.mat(gu, { 2 * ff, s.n_embd }, shard ? RAD_SHARD_ROW : RAD_SHARD_NONE, { ff, ff }));
-    RAD_ARCH_TRY(d.mat(dn, { s.n_embd, ff }, shard ? RAD_SHARD_COL : RAD_SHARD_NONE));
+    RAD_ARCH_TRY(d.linear(gu, { 2 * ff, s.n_embd }, shard ? RAD_SHARD_ROW : RAD_SHARD_NONE, { ff, ff }));
+    RAD_ARCH_TRY(d.linear(dn, { s.n_embd, ff }, shard ? RAD_SHARD_COL : RAD_SHARD_NONE));
     return RAD_OK;
 }
 
@@ -476,9 +504,12 @@ static int drafter(RadBuilder* b, Model& m) {
     const int access = m.df.served ? RAD_ACCESS_PER_TOKEN : RAD_ACCESS_RARE;
     m.df.post.clear();
     m.df.w.clear();
+    m.df.n_quant = 0;
+    auto& defer = m.df.defer;
+    defer.clear();
     for (int64_t i = 0; i < s.dfly_layers; ++i) {
         const int grp = (int)(s.n_layer + i);
-        Decl d{ b, m, grp, access, &m.df.w, s.world };
+        Decl d{ b, m, grp, access, &m.df.w, s.world, &defer };
         const char* pre = nm.ckpt("%s.%lld", dp, (long long)i);
         const char* scope = nm.f("dfly.blk.%lld", (long long)i);
         const char* an = nm.f("%s.attn_norm.weight", scope);
@@ -499,18 +530,18 @@ static int drafter(RadBuilder* b, Model& m) {
             m.df.refuse(ff != m.df.ff ? "the draft layers' MLP widths differ"
                                       : "the draft MLP's width does not split evenly over the ranks");
     }
-    Decl d{ b, m, (int)(s.n_layer + s.dfly_layers), access, &m.df.w };
+    Decl d{ b, m, (int)(s.n_layer + s.dfly_layers), access, &m.df.w, 1, &defer };
     const int64_t E = s.n_embd;
-    struct { const char* name; const char* src; bool gain; int64_t rows, cols; } one[] = {
-        { "dfly.fusion.weight", "mtp_fusion.eh_proj.weight", false, E, 2 * E },
+    struct { const char* name; const char* src; bool gain; int64_t rows, cols; bool linear; } one[] = {
+        { "dfly.fusion.weight", "mtp_fusion.eh_proj.weight", false, E, 2 * E, true },
         { "dfly.fusion_embed_norm.weight", "mtp_fusion.enorm.weight", true, E, 0 },
         { "dfly.fusion_hidden_norm.weight", "mtp_fusion.hnorm.weight", true, E, 0 },
         { "dfly.fusion_gate", "mtp_fusion.gate", true, E, 0 },
         { "dfly.correct_embed_norm.weight", "hidden_correction.embed_norm.weight", true, E, 0 },
         { "dfly.correct_hidden_norm.weight", "hidden_correction.hidden_norm.weight", true, E, 0 },
-        { "dfly.correct_gate.weight", "hidden_correction.gate_proj.weight", false, E, 2 * E },
-        { "dfly.correct_up.weight", "hidden_correction.up_proj.weight", false, E, 2 * E },
-        { "dfly.correct_down.weight", "hidden_correction.down_proj.weight", false, E, E },
+        { "dfly.correct_gate.weight", "hidden_correction.gate_proj.weight", false, E, 2 * E, true },
+        { "dfly.correct_up.weight", "hidden_correction.up_proj.weight", false, E, 2 * E, true },
+        { "dfly.correct_down.weight", "hidden_correction.down_proj.weight", false, E, E, true },
         { "dfly.output_norm.weight", "final_norm.weight", true, E, 0 },
         { "dfly.confidence.weight", "confidence_head.proj.weight", false, 1, E },
         { "dfly.confidence.bias", "confidence_head.proj.bias", true, 1, 0 },
@@ -519,7 +550,7 @@ static int drafter(RadBuilder* b, Model& m) {
         const char* name = nm.f("%s", w.name);
         RAD_ARCH_TRY(map_copy(b, name, nm.ckpt("%s.%s", dp, w.src)));
         if (w.gain) RAD_ARCH_TRY(d.f32(name, { w.rows }));
-        else RAD_ARCH_TRY(d.mat(name, { w.rows, w.cols }));
+        else RAD_ARCH_TRY(w.linear ? d.linear(name, { w.rows, w.cols }) : d.mat(name, { w.rows, w.cols }));
     }
     /* A draft-owned embedding (vLLM loads `dfly_layers.embed_tokens` where the checkpoint has
      * one, else shares the target's). Declared only where the model has it. */
@@ -529,6 +560,12 @@ static int drafter(RadBuilder* b, Model& m) {
         RadEncoding e{};
         m.df.own_embed = weight_enc(b, name, &e);
         if (m.df.own_embed) RAD_ARCH_TRY(d.mat(name, { s.n_vocab, s.n_embd }));
+    }
+    /* A linear left to the drafter's own declare while it looked served: if it is not after all,
+     * keep the planes as views, so the manifest stays whole. */
+    if (!m.df.served) {
+        for (auto& f : defer) RAD_ARCH_TRY(f());
+        defer.clear();
     }
     return RAD_OK;
 }
@@ -952,6 +989,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (dfly) RAD_ARCH_TRY(drafter(b, m));
     if (dfly && m.df.served)
         RAD_ARCH_TRY(m.df.declare(b, nm, s, g, m.token, m.head, m.final_hidden, m.kv_sparse, m.iw));
+    if (dfly && !m.df.served) {
+        /* Declined after the manifest (its declare found a handle it could not read): the linears
+         * left to it are declared as their planes' views after all. */
+        for (auto& f : m.df.defer) RAD_ARCH_TRY(f());
+        m.df.defer.clear();
+    }
     if (dfly && !m.df.served && ctx->rank == 0)
         fprintf(stderr, "radiance: hyv4flash: DFly2 is declared and not served: %s; speculation "
                         "falls back to prompt lookup\n", m.df.why.c_str());
@@ -976,9 +1019,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              s.engram_layers.empty() ? 0.0 : engram_eps(),
              !dfly         ? "left out"
              : m.df.served ? nm.f("served (depth %lld, block %lld, %lld layer(s) over trunk layers "
-                                  "%s, greedy proposals)",
+                                  "%s, greedy proposals, %s)",
                                   (long long)m.df.depth, (long long)m.df.block,
-                                  (long long)m.df.layers, dfly_layers_str(m.df).c_str())
+                                  (long long)m.df.layers, dfly_layers_str(m.df).c_str(),
+                                  m.df.n_quant ? nm.f("%d of its linears int8", m.df.n_quant)
+                                               : "bf16 linears")
                            : "declared (not served)",
              vit ? "served" : vit_weights ? "declared (not served)" : "left out",
              s.world, s.rank, (long long)s.sparse_r.heads, (long long)s.sparse.heads,

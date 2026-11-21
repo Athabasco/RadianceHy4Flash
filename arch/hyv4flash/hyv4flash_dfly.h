@@ -34,7 +34,9 @@
  * are the trunk head's vocabulary shard: row_topk (global ids, the pair plane), all_gather,
  * row_topk_merge, so every rank proposes the same tokens (ties to the lower id in both stages).
  *
- * Served: 1, 2 or 4 ranks, bf16 draft linears (int8 is WP13.9), depth 1..5, greedy
+ * Served: 1, 2 or 4 ranks, draft linears bf16 or quantised as the trunk's Lin reads them (int8,
+ * IQ8R, rotated forms; WP13.9, sliced at TP like the bf16 ones; kv_b and the embedding stay bf16),
+ * depth 1..5, greedy
  * proposals (exact at every temperature under the engine's verify; vLLM's `probabilistic` draft
  * sampling is not modelled, coupling is WP13.8), no local window (dfly_context_local_window > 0 is
  * refused), the confidence head declared and not read. Anything else declares the manifest only,
@@ -46,6 +48,7 @@
 
 #include "hyv4flash_indexer.h"
 
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -69,6 +72,9 @@ struct Dfly {
      * step that does not select. Each must be caught by the parity check; neither changes text. */
     bool break_store_late = false, break_nsel_keep = false;
     std::string why;                /* why a declared drafter is not served */
+    std::string why_buf;            /* storage for a reason built from an encoding (the manifest) */
+    std::vector<std::function<int()>> defer;   /* quantised linears' manifest entries, kept until served is known */
+    int n_quant = 0;                /* linears stored quantised (read by Lin) */
     /* Declines the drafter (the first reason stands). After configure, from the manifest. */
     void refuse(const char* r) {
         if (why.empty()) why = r;
@@ -210,6 +216,22 @@ struct Dfly {
     }
 
     /* ---------------------------------------------------------------- the query pass */
+    /* A linear of the draft: a bf16 weight is one `gemm_nt` over the manifest's handle (as ever);
+     * a quantised one (IQ8R, int8, the rotated forms the trunk's `Lin` reads, hyv4flash_common.h)
+     * is a Lin that quantises its own input into the rank's code pair and runs the int8 GEMM. The
+     * encoding is the container's, nothing here chooses it. */
+    struct Proj {
+        Lin lin{};
+        bool q = false;
+        rad_op op = 0;
+        rad_weight w = 0;
+        /* A private code pair (the chain's: its ops are issued once a step, so the planner, which
+         * places a buffer by where its ops are declared, must not share the trunk's pair with
+         * whatever is declared after them); empty = the rank's shared pair. */
+        rad_buf q8 = 0, s8 = 0;
+        int64_t g8 = 0;
+        bool ok() const { return q || op; }
+    };
     struct Layer {
         int kvl = 0, ixl = 0;
         bool post = true;
@@ -217,11 +239,12 @@ struct Dfly {
                    kv_norm = 0, kv_b = 0, gate = 0, out = 0, post_norm = 0, sinks = 0, gu = 0,
                    down = 0;
         rad_buf tab = 0, len = 0, cnt = 0;
-        rad_op op_tab = 0, op_attn_norm = 0, op_qa = 0, op_qa_norm = 0, op_qb = 0, op_qn = 0,
-               op_qr = 0, op_q_rope = 0, op_kva = 0, op_kv_norm = 0, op_k_rope = 0, op_store = 0,
-               op_store_stream = 0, op_resolve = 0, op_gate = 0, op_absorb = 0, op_attn = 0,
-               op_expand = 0, op_gmul = 0, op_out = 0, op_post = 0, op_add1 = 0, op_ffn_norm = 0,
-               op_gu = 0, op_silu = 0, op_down = 0, op_add2 = 0;
+        Proj p_qa, p_qb, p_kva, p_gate, p_out, p_gu, p_down;
+        rad_op op_tab = 0, op_attn_norm = 0, op_qa_norm = 0, op_qn = 0,
+               op_qr = 0, op_q_rope = 0, op_kv_norm = 0, op_k_rope = 0, op_store = 0,
+               op_store_stream = 0, op_resolve = 0, op_absorb = 0, op_attn = 0,
+               op_expand = 0, op_gmul = 0, op_post = 0, op_add1 = 0, op_ffn_norm = 0,
+               op_silu = 0, op_add2 = 0;
         rad_op op_tap_tab = 0;
         Tap t_in{}, t_qres{}, t_row{}, t_gate{}, t_oproj{}, t_out{}, t_mid{}, t_ffn_in{}, t_mlp{},
             t_resid{}, t_len{};
@@ -229,8 +252,8 @@ struct Dfly {
     };
     struct Step {
         rad_buf rowk = 0;
-        rad_op op_rowk = 0, op_zk = 0, op_pe = 0, op_hn = 0, op_en = 0, op_g = 0, op_u = 0,
-               op_silu = 0, op_down = 0, op_add = 0, op_head = 0, op_lcast = 0, op_topk = 0,
+        rad_op op_rowk = 0, op_zk = 0, op_pe = 0, op_hn = 0, op_en = 0,
+               op_silu = 0, op_add = 0, op_head = 0, op_lcast = 0, op_topk = 0,
                op_tok = 0, op_prev = 0, op_gcp = 0, op_ucp = 0;
         rad_op op_gather = 0, op_merge = 0;   /* TP: the vocabulary shards' merge; 0 at one rank */
         Tap t_corr{}, t_logits{}, t_idx{}, t_val{};
@@ -251,8 +274,11 @@ struct Dfly {
     rad_op op_ar_o = 0, op_ar_y = 0;   /* TP: the layers' two reductions; 0 at one rank */
     rad_buf ident = 0;   /* taps: [max_seqs, P] the identity table */
     int64_t ident_w = 0;
+    struct ChainCodes { int64_t k = 0, g8 = 0; rad_buf q8 = 0, s8 = 0; };
+    std::vector<ChainCodes> chain_codes;
+    Proj p_fuse, c_g, c_u, c_d;   /* the fusion and the correction's three linears */
     rad_op op_embed = 0, op_xcopy = 0, op_row0 = 0, op_ea = 0, op_th = 0, op_fen = 0, op_fhn = 0,
-           op_fuse = 0, op_fgate = 0, op_fadd = 0, op_scatter = 0, op_final = 0, op_sabotage = 0;
+           op_fgate = 0, op_fadd = 0, op_scatter = 0, op_final = 0, op_sabotage = 0;
     rad_op op_ident = 0;
     std::vector<Layer> lay;
     std::vector<Step> steps;
@@ -264,6 +290,15 @@ struct Dfly {
                   { RAD_RANGE("M", 1, rows), RAD_INT("n", 1), RAD_STR("from", "i32"),
                     RAD_STR("to", "i32") },
                   {}, {}, { out });
+    }
+    /* A weight stored as several planes (codes and a scale, ...): a quantised one. */
+    static bool quantised(RadBuilder* b, const char* name) {
+        RadEncoding e{};
+        return b && weight_enc(b, name, &e) && e.n_planes > 1;
+    }
+    /* The encodings a draft linear is read in: the trunk's (Lin). */
+    static bool lin_reads(const RadEncoding& e) {
+        return linear_is_w8(e) || (linear_is_w8h(e) && linear_w8h_form(e) == W8hForm::I8);
     }
     rad_weight wt(const char* name) const {
         auto it = w.find(name);
@@ -294,24 +329,29 @@ struct Dfly {
         const int64_t S = g.max_seqs;
         Md = std::min<int64_t>(g.max_tok, S * block);
         /* The handles, all or nothing. */
-        auto need = [&](const char* name, rad_weight& h) {
-            h = wt(nm.f("%s", name));
-            if (!h && why.empty()) {
-                why = std::string("'") + name +
-                      "' is not a plain bf16 or f32 tensor (a quantised draft linear is WP13.9)";
-            }
+        /* A linear stored quantised has no manifest handle: its Lin declares it (proj_declare);
+         * drafter() already declined the encodings none can read. */
+        auto need_full = [&](const char* full, rad_weight& h, bool linear = false) {
+            h = wt(full);
+            if (!h && !(linear && quantised(b, full)) && why.empty())
+                why = std::string("'") + full + "' is stored " + (linear ? "in a form no draft "
+                      "linear reads" : "quantised, and only a draft linear may be") +
+                      " (bf16 or f32 here)";
+        };
+        auto need = [&](const char* name, rad_weight& h, bool linear = false) {
+            need_full(nm.f("%s", name), h, linear);
         };
         token = tok_w;
         if (own_embed) need("dfly.token_embd.weight", token);
-        need("dfly.fusion.weight", fusion);
+        need("dfly.fusion.weight", fusion, true);
         need("dfly.fusion_embed_norm.weight", f_enorm);
         need("dfly.fusion_hidden_norm.weight", f_hnorm);
         need("dfly.fusion_gate", f_gate);
         need("dfly.correct_hidden_norm.weight", c_hnorm);
         need("dfly.correct_embed_norm.weight", c_enorm);
-        need("dfly.correct_gate.weight", c_gate);
-        need("dfly.correct_up.weight", c_up);
-        need("dfly.correct_down.weight", c_down);
+        need("dfly.correct_gate.weight", c_gate, true);
+        need("dfly.correct_up.weight", c_up, true);
+        need("dfly.correct_down.weight", c_down, true);
         need("dfly.output_norm.weight", out_norm);
         lay.assign((size_t)layers, Layer{});
         for (int64_t i = 0; i < layers; ++i) {
@@ -320,27 +360,23 @@ struct Dfly {
             d.ixl = idx[(size_t)i];
             d.post = post.size() > (size_t)i ? post[(size_t)i] != 0 : true;
             auto n = [&](const char* leaf) { return nm.f("dfly.blk.%lld.%s", (long long)i, leaf); };
-            auto get = [&](const char* leaf, rad_weight& h) {
-                const char* full = n(leaf);
-                h = wt(full);
-                if (!h && why.empty())
-                    why = std::string("'") + full + "' is not a plain bf16 or f32 tensor "
-                                                    "(a quantised draft linear is WP13.9)";
+            auto get = [&](const char* leaf, rad_weight& h, bool linear = false) {
+                need_full(n(leaf), h, linear);
             };
             get("attn_norm.weight", d.attn_norm);
             get("ffn_norm.weight", d.ffn_norm);
-            get("attn_q_a.weight", d.q_a);
+            get("attn_q_a.weight", d.q_a, true);
             get("attn_q_a_norm.weight", d.qa_norm);
-            get("attn_q_b.weight", d.q_b);
-            get("attn_kv_a.weight", d.kv_a);
+            get("attn_q_b.weight", d.q_b, true);
+            get("attn_kv_a.weight", d.kv_a, true);
             get("attn_kv_a_norm.weight", d.kv_norm);
             get("attn_kv_b.weight", d.kv_b);
-            get("attn_gate.weight", d.gate);
-            get("attn_output.weight", d.out);
+            get("attn_gate.weight", d.gate, true);
+            get("attn_output.weight", d.out, true);
             if (d.post) get("attn_post_norm.weight", d.post_norm);
             get("attn_sinks.weight", d.sinks);
-            get("ffn_gate_up.weight", d.gu);
-            get("ffn_down.weight", d.down);
+            get("ffn_gate_up.weight", d.gu, true);
+            get("ffn_down.weight", d.down, true);
         }
         if (!why.empty()) {
             served = false;
@@ -420,6 +456,55 @@ struct Dfly {
                         RAD_STR("dtype", "bf16") },
                       { wgt }, { in }, { out });
         };
+        /* One draft linear: a bf16 weight is the manifest's handle under gemm_nt; a quantised one a
+         * Lin over the container's own encoding (this rank's slice at TP, as the trunk's). */
+        auto linear = [&](Proj& p, const std::string& base, int grp, int64_t rows, int64_t n_out,
+                        int64_t n_in, rad_weight plain_w, rad_buf in, rad_buf out, int shard,
+                        std::initializer_list<int64_t> parts, bool persist = false) -> int {
+            const std::string wn = base + ".weight";
+            const char* wnc = nm.f("%s", wn.c_str());
+            if (!quantised(b, wnc)) {
+                p.w = plain_w;
+                p.op = gemm(rows, n_out, n_in, plain_w, in, out);
+                return p.op ? RAD_OK : RAD_E_INVAL;
+            }
+            p.q = true;
+            p.lin.mapped = true;   /* the manifest made the name map */
+            if (s.world <= 1) { shard = RAD_SHARD_NONE; parts = {}; }
+            ActFP8 a{};
+            a.x = in;
+            if (persist) {
+                RadEncoding e{};
+                weight_enc(b, wnc, &e);
+                const int64_t g8 = linear_w8h_group(e);
+                bool have = false;
+                for (const auto& c : chain_codes)
+                    if (c.k == n_in && c.g8 == g8) {
+                        p.q8 = c.q8;
+                        p.s8 = c.s8;
+                        have = true;
+                    }
+                if (!have) {
+                    ChainCodes c;
+                    c.k = n_in;
+                    c.g8 = g8;
+                    c.q8 = decl_b(b, nm.f("dfly.chain_codes.%lld.%lld.q8", (long long)n_in, (long long)g8),
+                                  RAD_I8, { rows, n_in }, RAD_BUF_PERSIST);
+                    c.s8 = decl_b(b, nm.f("dfly.chain_codes.%lld.%lld.s8", (long long)n_in, (long long)g8),
+                                  RAD_F32, { rows, (n_in + g8 - 1) / g8 }, RAD_BUF_PERSIST);
+                    if (!c.q8 || !c.s8) return RAD_E_INVAL;
+                    chain_codes.push_back(c);
+                    p.q8 = c.q8;
+                    p.s8 = c.s8;
+                }
+                p.g8 = g8;
+                a.q8 = p.q8;
+                a.s8 = p.s8;
+                a.g8 = g8;
+            }
+            return p.lin.declare(b, nm, g, nm.f("%s", base.c_str()), n_out, n_in, shard,
+                                 grp_layer(grp), { wnc }, a, out, rows, parts);
+        };
         auto add = [&](int64_t rows, rad_buf a1, rad_buf a2, rad_buf out) {
             return mk(b, "add", { RAD_RANGE("M", 1, rows), RAD_INT("n", E), RAD_STR("dtype", "bf16") },
                       {}, { a1, a2 }, { out });
@@ -451,7 +536,8 @@ struct Dfly {
         op_th = gather(S, final_hidden, 0, th);
         op_fen = decl_rmsnorm(b, S, E, s.eps, f_enorm, ea, cat);
         op_fhn = decl_rmsnorm(b, S, E, s.eps, f_hnorm, th, cat);
-        op_fuse = gemm(S, E, 2 * E, fusion, cat, fu);
+        const int gtop = (int)(s.n_layer + layers);   /* the drafter's model-level weights' group */
+        RAD_ARCH_TRY(linear(p_fuse, "dfly.fusion", gtop, S, E, 2 * E, fusion, cat, fu, RAD_SHARD_NONE, {}));
         op_fgate = mk(b, "mul_weight", { RAD_RANGE("M", 1, S), RAD_INT("n", E), RAD_STR("dtype", "bf16") },
                       { f_gate }, { fu }, { fu });
         op_fadd = add(S, ea, fu, ea);
@@ -461,7 +547,7 @@ struct Dfly {
         HY4_NEED(op_row0, "iota");
         HY4_NEED(op_ea && op_th, "gather_rows");
         HY4_NEED(op_fen && op_fhn, "rmsnorm");
-        HY4_NEED(op_fuse && op_fgate && op_fadd, "gemm_nt / mul_weight / add");
+        HY4_NEED(p_fuse.ok() && op_fgate && op_fadd, "gemm_nt / mul_weight / add");
         HY4_NEED(op_scatter, "scatter_rows");
         RAD_ARCH_TRY(t_fused.declare(b, nm, S, "dfly.fused", -1, RAD_BF16, E, ea));
 
@@ -490,10 +576,12 @@ struct Dfly {
             HY4_NEED(d.op_tab, "dfly_sel");
             d.op_attn_norm = decl_rmsnorm(b, Md, E, s.eps, d.attn_norm, x, xn);
             RAD_ARCH_TRY(d.t_in.declare(b, nm, Md, "dfly.attn_in_norm", li, RAD_BF16, E, xn));
-            d.op_qa = gemm(Md, s.q_lora, E, d.q_a, xn, qa);
+            const std::string ln = nm.f("dfly.blk.%lld", (long long)i);
+            const int gi = (int)(s.n_layer + i);
+            RAD_ARCH_TRY(linear(d.p_qa, ln + ".attn_q_a", gi, Md, s.q_lora, E, d.q_a, xn, qa, RAD_SHARD_NONE, {}));
             d.op_qa_norm = decl_rmsnorm(b, Md, s.q_lora, s.eps, d.qa_norm, qa, qa);
             RAD_ARCH_TRY(d.t_qres.declare(b, nm, Md, "dfly.attn_q_resid", li, RAD_BF16, s.q_lora, qa));
-            d.op_qb = gemm(Md, H * Q, s.q_lora, d.q_b, qa, q);
+            RAD_ARCH_TRY(linear(d.p_qb, ln + ".attn_q_b", gi, Md, H * Q, s.q_lora, d.q_b, qa, q, RAD_SHARD_ROW, {}));
             /* q_b stays one tensor (the manifest is the checkpoint's): its output is split a head
              * at a time into the nope and rope parts. */
             d.op_qn = decl_copy(b, Md, H * N, RAD_BF16, q, q_nope);
@@ -503,7 +591,7 @@ struct Dfly {
              * offset to its index, as it does for decode rows). */
             const char* sec = s.mrope ? s.mrope_sparse.c_str() : nullptr;
             d.op_q_rope = decl_rope_gptj(b, Md, H, RO, s.theta_sparse, q_rope, sec);
-            d.op_kva = gemm(Md, L + RO, E, d.kv_a, xn, row);
+            RAD_ARCH_TRY(linear(d.p_kva, ln + ".attn_kv_a", gi, Md, L + RO, E, d.kv_a, xn, row, RAD_SHARD_NONE, {}));
             d.op_kv_norm = decl_rmsnorm(b, Md, L, s.eps, d.kv_norm, row, row);
             d.op_k_rope = decl_rope_gptj(b, Md, 1, RO, s.theta_sparse, row, sec);
             RAD_ARCH_TRY(d.t_row.declare(b, nm, Md, "dfly.attn_kv_row", li, RAD_BF16, L + RO, row));
@@ -518,7 +606,7 @@ struct Dfly {
                                          RAD_INT("n_head_kv", 1), RAD_INT("block_size", s.ix_pool),
                                          RAD_STR("kv_dtype", "bf16") },
                                        {}, { row }, {});
-            d.op_gate = gemm(Md, H * VD, E, d.gate, xn, gt);
+            RAD_ARCH_TRY(linear(d.p_gate, ln + ".attn_gate", gi, Md, H * VD, E, d.gate, xn, gt, RAD_SHARD_ROW, {}));
             RAD_ARCH_TRY(d.t_gate.declare(b, nm, Md, "dfly.attn_gate_logits", li, RAD_BF16, H * VD, gt));
             auto proj = [&](const char* mode, rad_buf in_, rad_buf out_) {
                 return mk(b, "mla_project_kv",
@@ -539,7 +627,7 @@ struct Dfly {
             d.op_gmul = mk(b, "gate_mul",
                            { RAD_RANGE("M", 1, Md), RAD_INT("n", H * VD), RAD_STR("dtype", "bf16") },
                            {}, { ao, gt }, { ag });
-            d.op_out = gemm(Md, E, H * VD, d.out, ag, o);
+            RAD_ARCH_TRY(linear(d.p_out, ln + ".attn_output", gi, Md, E, H * VD, d.out, ag, o, RAD_SHARD_COL, {}));
             RAD_ARCH_TRY(d.t_oproj.declare(b, nm, Md, "dfly.attn_o_proj", li, RAD_BF16, E, o));
             if (d.post) d.op_post = decl_rmsnorm(b, Md, E, s.eps, d.post_norm, o, y);
             RAD_ARCH_TRY(d.t_out.declare(b, nm, Md, "dfly.attn_out", li, RAD_BF16, E, d.post ? y : o));
@@ -547,17 +635,18 @@ struct Dfly {
             RAD_ARCH_TRY(d.t_mid.declare(b, nm, Md, "dfly.resid_mid", li, RAD_BF16, E, x));
             d.op_ffn_norm = decl_rmsnorm(b, Md, E, s.eps, d.ffn_norm, x, xn);
             RAD_ARCH_TRY(d.t_ffn_in.declare(b, nm, Md, "dfly.ffn_in_norm", li, RAD_BF16, E, xn));
-            d.op_gu = gemm(Md, 2 * F, E, d.gu, xn, ffgu);
+            RAD_ARCH_TRY(linear(d.p_gu, ln + ".ffn_gate_up", gi, Md, 2 * F, E, d.gu, xn, ffgu, RAD_SHARD_ROW, { F, F }));
             d.op_silu = mk(b, "silu_mul", { RAD_RANGE("M", 1, Md), RAD_INT("n", F), RAD_STR("dtype", "bf16") },
                            {}, { ffgu }, { ffo });
-            d.op_down = gemm(Md, E, F, d.down, ffo, y);
+            RAD_ARCH_TRY(linear(d.p_down, ln + ".ffn_down", gi, Md, E, F, d.down, ffo, y, RAD_SHARD_COL, {}));
             RAD_ARCH_TRY(d.t_mlp.declare(b, nm, Md, "dfly.mlp_out", li, RAD_BF16, E, y));
             d.op_add2 = add(Md, x, y, x);
             RAD_ARCH_TRY(d.t_resid.declare(b, nm, Md, "dfly.resid", li, RAD_BF16, E, x));
             HY4_NEED(d.op_attn_norm && d.op_qa_norm && d.op_kv_norm && d.op_ffn_norm &&
                          (!d.post || d.op_post),
                      "rmsnorm");
-            HY4_NEED(d.op_qa && d.op_qb && d.op_kva && d.op_gate && d.op_out && d.op_gu && d.op_down,
+            HY4_NEED(d.p_qa.ok() && d.p_qb.ok() && d.p_kva.ok() && d.p_gate.ok() && d.p_out.ok() &&
+                         d.p_gu.ok() && d.p_down.ok(),
                      "gemm_nt (bf16)");
             HY4_NEED(d.op_qn && d.op_qr, "cast");
             HY4_NEED(d.op_q_rope && d.op_k_rope, "rope (gptj)");
@@ -597,6 +686,10 @@ struct Dfly {
 
         /* F: the chain, one step a proposal. */
         steps.assign((size_t)depth, Step{});
+        /* The correction's linears once, their ops issued by every step. */
+        RAD_ARCH_TRY(linear(c_g, "dfly.correct_gate", gtop, S, E, 2 * E, c_gate, ccat, cg, RAD_SHARD_NONE, {}, true));
+        RAD_ARCH_TRY(linear(c_u, "dfly.correct_up", gtop, S, E, 2 * E, c_up, ccat, cup, RAD_SHARD_NONE, {}, true));
+        RAD_ARCH_TRY(linear(c_d, "dfly.correct_down", gtop, S, E, E, c_down, cff, cd, RAD_SHARD_NONE, {}, true));
         for (int64_t k = 0; k < depth; ++k) {
             Step& st = steps[(size_t)k];
             const int ki = (int)k;
@@ -613,13 +706,10 @@ struct Dfly {
                               { token }, { prev }, { pe });
             st.op_hn = decl_rmsnorm(b, S, E, s.eps, c_hnorm, zk, ccat);
             st.op_en = decl_rmsnorm(b, S, E, s.eps, c_enorm, pe, ccat);
-            st.op_g = gemm(S, E, 2 * E, c_gate, ccat, cg);
-            st.op_u = gemm(S, E, 2 * E, c_up, ccat, cup);
             st.op_gcp = decl_copy(b, S, E, RAD_BF16, cg, cgu);
             st.op_ucp = decl_copy(b, S, E, RAD_BF16, cup, cgu);
             st.op_silu = mk(b, "silu_mul", { RAD_RANGE("M", 1, S), RAD_INT("n", E), RAD_STR("dtype", "bf16") },
                             {}, { cgu }, { cff });
-            st.op_down = gemm(S, E, E, c_down, cff, cd);
             st.op_add = add(S, zk, cd, zc);
             RAD_ARCH_TRY(st.t_corr.declare(b, nm, S, "dfly.corrected", ki, RAD_BF16, E, zc));
             st.op_head = mk(b, "logits_gemm",
@@ -666,7 +756,7 @@ struct Dfly {
             HY4_NEED(st.op_rowk, "iota");
             HY4_NEED(st.op_zk && st.op_pe, "gather_rows / embed_lookup");
             HY4_NEED(st.op_hn && st.op_en, "rmsnorm");
-            HY4_NEED(st.op_g && st.op_u && st.op_down && st.op_add && st.op_silu,
+            HY4_NEED(c_g.ok() && c_u.ok() && c_d.ok() && st.op_add && st.op_silu,
                      "gemm_nt / silu_mul / add");
             HY4_NEED(st.op_head, "logits_gemm");
             HY4_NEED(st.op_lcast && st.op_tok && st.op_prev && st.op_gcp && st.op_ucp, "cast");
@@ -711,6 +801,20 @@ struct Dfly {
         return RAD_OK;
     }
 
+    /* A draft linear's step over `n` rows of `in` into `out`. */
+    static void run(RadCtx* c, const Proj& p, rad_buf in, rad_buf out, int64_t n) {
+        if (p.q) {
+            ActFP8 a{};
+            a.x = in;
+            a.q8 = p.q8;
+            a.s8 = p.s8;
+            if (p.q8) a.g8 = p.g8;
+            p.lin.step(c, a, out, n);
+        } else {
+            RAD_ISSUE_N(c, p.op, n, brows(in, n), RAD_W(p.w), brows(out, n));
+        }
+    }
+
     /* The query pass (draft_pass 1). */
     void query(RadCtx* c, const RadBatch* batch) const {
         const int64_t n = batch->n_seq, M = batch->n_tok;
@@ -744,7 +848,7 @@ struct Dfly {
         RAD_ISSUE_N(c, op_th, n, RAD_B(final_hidden), src, brows(th, n));
         RAD_ISSUE_N(c, op_fen, n, brows(ea, n), RAD_W(f_enorm), bcol(cat, 0, E, n));
         RAD_ISSUE_N(c, op_fhn, n, brows(th, n), RAD_W(f_hnorm), bcol(cat, E, E, n));
-        RAD_ISSUE_N(c, op_fuse, n, brows(cat, n), RAD_W(fusion), brows(fu, n));
+        run(c, p_fuse, cat, fu, n);
         RAD_ISSUE_N(c, op_fgate, n, brows(fu, n), RAD_W(f_gate), brows(fu, n));
         RAD_ISSUE_N(c, op_fadd, n, brows(ea, n), brows(fu, n), brows(ea, n));
         t_fused.step(c, brows(ea, n), n);
@@ -763,10 +867,10 @@ struct Dfly {
             }
             RAD_ISSUE_N(c, d.op_attn_norm, M, brows(x, M), RAD_W(d.attn_norm), brows(xn, M));
             d.t_in.step(c, brows(xn, M), M);
-            RAD_ISSUE_N(c, d.op_qa, M, brows(xn, M), RAD_W(d.q_a), brows(qa, M));
+            run(c, d.p_qa, xn, qa, M);
             RAD_ISSUE_N(c, d.op_qa_norm, M, brows(qa, M), RAD_W(d.qa_norm), brows(qa, M));
             d.t_qres.step(c, brows(qa, M), M);
-            RAD_ISSUE_N(c, d.op_qb, M, brows(qa, M), RAD_W(d.q_b), brows(q, M));
+            run(c, d.p_qb, qa, q, M);
             RadOperand qn = brows(q, M), qr = qn;
             qn.cols = N;
             qr.offset = N;
@@ -774,7 +878,7 @@ struct Dfly {
             RAD_ISSUE_N(c, d.op_qn, M, qn, brows(q_nope, M));
             RAD_ISSUE_N(c, d.op_qr, M, qr, brows(q_rope, M));
             RAD_ISSUE_N(c, d.op_q_rope, M, brows(q_rope, M), rpos);
-            RAD_ISSUE_N(c, d.op_kva, M, brows(xn, M), RAD_W(d.kv_a), brows(row, M));
+            run(c, d.p_kva, xn, row, M);
             RAD_ISSUE_N(c, d.op_kv_norm, M, bcol(row, 0, L, M), RAD_W(d.kv_norm), bcol(row, 0, L, M));
             RAD_ISSUE_N(c, d.op_k_rope, M, bcol(row, L, RO, M), rpos);
             d.t_row.step(c, brows(row, M), M);
@@ -800,7 +904,7 @@ struct Dfly {
                     RAD_ISSUE_N(c, d.op_store, M, bcol(row, 0, half, M), bcol(row, half, half, M),
                                 slots, kv_cache(kvg, d.kvl));
             }
-            RAD_ISSUE_N(c, d.op_gate, M, brows(xn, M), RAD_W(d.gate), brows(gt, M));
+            run(c, d.p_gate, xn, gt, M);
             d.t_gate.step(c, brows(gt, M), M);
             RAD_ISSUE_N(c, d.op_absorb, M, brows(q_nope, M), RAD_W(d.kv_b), brows(q_lat, M));
             if (kb->stream && !kv_stage_layer(c, kvg, kb, d.kvl)) {
@@ -820,7 +924,7 @@ struct Dfly {
                             kv_cache(kvg, d.kvl));
             RAD_ISSUE_N(c, d.op_expand, M, brows(lat, M), RAD_W(d.kv_b), brows(ao, M));
             RAD_ISSUE_N(c, d.op_gmul, M, brows(ao, M), brows(gt, M), brows(ag, M));
-            RAD_ISSUE_N(c, d.op_out, M, brows(ag, M), RAD_W(d.out), brows(o, M));
+            run(c, d.p_out, ag, o, M);
             issue_all_reduce(c, op_ar_o, o, M, E);
             d.t_oproj.step(c, brows(o, M), M);
             const rad_buf ab = d.post ? y : o;
@@ -831,9 +935,9 @@ struct Dfly {
             if (kb->stream) kv_stage_next(c, kvg, d.kvl);
             RAD_ISSUE_N(c, d.op_ffn_norm, M, brows(x, M), RAD_W(d.ffn_norm), brows(xn, M));
             d.t_ffn_in.step(c, brows(xn, M), M);
-            RAD_ISSUE_N(c, d.op_gu, M, brows(xn, M), RAD_W(d.gu), brows(ffgu, M));
+            run(c, d.p_gu, xn, ffgu, M);
             RAD_ISSUE_N(c, d.op_silu, M, brows(ffgu, M), brows(ffo, M));
-            RAD_ISSUE_N(c, d.op_down, M, brows(ffo, M), RAD_W(d.down), brows(y, M));
+            run(c, d.p_down, ffo, y, M);
             issue_all_reduce(c, op_ar_y, y, M, E);
             d.t_mlp.step(c, brows(y, M), M);
             RAD_ISSUE_N(c, d.op_add2, M, brows(x, M), brows(y, M), brows(x, M));
@@ -853,12 +957,12 @@ struct Dfly {
                 RAD_ISSUE_N(c, st.op_pe, n, brows(prev, n), RAD_W(token), brows(pe, n));
             RAD_ISSUE_N(c, st.op_hn, n, brows(zk, n), RAD_W(c_hnorm), bcol(ccat, 0, E, n));
             RAD_ISSUE_N(c, st.op_en, n, brows(pe, n), RAD_W(c_enorm), bcol(ccat, E, E, n));
-            RAD_ISSUE_N(c, st.op_g, n, brows(ccat, n), RAD_W(c_gate), brows(cg, n));
-            RAD_ISSUE_N(c, st.op_u, n, brows(ccat, n), RAD_W(c_up), brows(cup, n));
+            run(c, c_g, ccat, cg, n);
+            run(c, c_u, ccat, cup, n);
             RAD_ISSUE_N(c, st.op_gcp, n, brows(cg, n), bcol(cgu, 0, E, n));
             RAD_ISSUE_N(c, st.op_ucp, n, brows(cup, n), bcol(cgu, E, E, n));
             RAD_ISSUE_N(c, st.op_silu, n, brows(cgu, n), brows(cff, n));
-            RAD_ISSUE_N(c, st.op_down, n, brows(cff, n), RAD_W(c_down), brows(cd, n));
+            run(c, c_d, cff, cd, n);
             RAD_ISSUE_N(c, st.op_add, n, brows(zk, n), brows(cd, n), brows(zc, n));
             st.t_corr.step(c, brows(zc, n), n);
             RAD_ISSUE_N(c, st.op_head, n, brows(zc, n), RAD_W(head), brows(logits, n));
