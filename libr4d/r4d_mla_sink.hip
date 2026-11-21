@@ -84,7 +84,10 @@ struct SinkMeta {
      * scratch as merge_sink folds the partials). */
     int rows, heads, seqs, blocks, bs, bs_shift, pages, splits, law, sc_shift, fused, window;
     float scale;
+    int pad = 0; /* no tail padding: a recorded pass's audit compares the argument's bytes */
 };
+static_assert(sizeof(SinkMeta) == 12 * 8 + 12 * 4 + 4 + 4, "SinkMeta is a kernel argument by value "
+              "and carries no padding");
 
 /* r4d_mla_sink_pin_form: 0 the launcher's rule, 1 sixteen heads a workgroup, 2 thirty-two, 3 the
  * element-wise key load, 4 unsplit (not the law), 5 sixty-four heads a workgroup, 6 the fused
