@@ -3649,8 +3649,9 @@ Notes that are not in the commands:
   (`RADIANCE_HY4_TAPS=1`, `RADIANCE_DUMP_BUF`) at TP1 to 2e-8 (f32 accumulation), and `X^T X` of the
   transformers f32 activations to 0.3% to 1.6% relative Frobenius (bf16 rounding of the activations
   themselves; the layers' parity budget, PLAN 3.1).
-- **gpu-mini on a card** does not start yet: the Engram's E4M3 round trip has no device kernel
-  (`quant_act_fp8` at group 96, `dequant`), a WP5/WP6 matter.
+- **On the cards** the same run takes a few seconds on gpu-mini (TP1, `--kernels libr4d,libavx`,
+  6 x 1024 tokens: 29 Hessians of 4 layers in 3.6 s wall), and `hy4-flash-iqr-gptq.recipe` converts
+  against those Grams (see "gpu-mini on the cards" below).
 
 Tests: `hyv4flash_calib_test` (the site table against the declared weights, `--calib-layers`, the
 environment mapping, one Gram a site per step, `calib_st2gram.py`'s output).
@@ -3699,6 +3700,47 @@ and a perturbation as small as int8 rounding in the layers before them flips a s
 moves every later position of that prompt (the `indexer` prompt and, on `mini6` with its five
 sparse layers, every prompt past the dense limit). bf16 against itself is 2.7e-7. No real weight
 has been through any of these recipes.
+
+## gpu-mini on the cards
+
+`gpu-mini` (the harness's preset: the real per-head attention, latent, window, indexer and Engram
+geometry at n 512, four layers) runs end to end on the two R9700 with `--kernels libr4d,libavx`, no
+reference kernel, at TP1 and TP2 (the harness's `--gpu`; `data/kernels_hy4.rkb` holds the ops at
+the real stream width and the TP2 / TP4 head shares for `rad-kbench`). Against HF f32 conditioned on
+radiance's own indexer and router choices (ref/README.md, WP4's tolerances), all seven prompts
+(511 to 3000 tokens, `oov_pad`):
+
+| | TP1 | TP2 |
+|---|---|---|
+| one-shot prefill (non-absorbed below the dense limit) | 275 comparisons, 0 FAIL; logits KL 1.9e-4 to 2.2e-4, tie-aware top-1 1.0 | 275, 0 FAIL; KL 2.1e-4 to 2.3e-4 |
+| chunked prefill (512, the chunks after the first absorbed) | 275, 0 FAIL | 275, 0 FAIL |
+| prefill then 32 greedy decode steps | 282, 0 FAIL; greedy tokens = HF argmax but where HF's margin is under 0.004 nats | 282, 0 FAIL (misses under 0.03 nats) |
+| prefill forced absorbed (`RADIANCE_HY4_PREFILL=absorbed`) | 268, 0 FAIL | |
+
+Each tensor sits at 0.7 to 0.9 x HF's own bf16-vs-f32 distance, the same as the host's libref run
+of gpu-mini (also 275 / 0 FAIL); libr4d against libref directly is two independent bf16 roundings
+(layer 0: `attn_out` 2.7e-3, `mlp_out` 6.7e-3 relative L2, 0.3 to 0.65 of the bf16 floor), and from
+the first MoE layer on 1 to 5 % of router rows flip on these random weights' near ties, which then
+dominate. The absorbed and non-absorbed prefill agree to 4.7e-3 at layer 0's `attn_out`.
+A verify of up to 8 rows (`--spec-ngram 7 --debug-draft-oracle`, drafts accepted and rejected at
+every depth) gives the plain greedy run's text and logprobs bit for bit at TP1 and TP2.
+
+Quantised containers on the cards (KL of the logits against the bf16 container with the same E4M3
+Engram rows, the seven prompts, 9230 positions; mean / median KL in nats, top-1):
+
+| container | TP1 | TP2 |
+|---|---|---|
+| `hy4-flash-w4nl64-rtn` | 5.4e-2 / 2.4e-2, 0.75 | 5.4e-2 / 2.4e-2, 0.75 |
+| `hy4-flash-w5nl64-rtn` | 2.7e-2 / 7.6e-3, 0.84 | |
+| `hy4-flash-w6nl64-rtn` | 1.8e-2 / 3.7e-3, 0.88 | 1.7e-2 / 3.7e-3, 0.88 |
+| `hy4-flash-i8` | 2.2e-2 / 1.9e-3, 0.90 | 2.2e-2 / 1.9e-3, 0.90 |
+| `hy4-flash-iqr-gptq` (Grams of a TP1 calibration run on the cards, 6 x 1024 tokens) | 6.4e-2 / 1.9e-2, 0.75 | 9.0e-2 / 4.4e-2, 0.68 |
+
+TP2 against TP1 of the same container (median KL, top-1): bf16 2.6e-4 / 0.96, `i8` 1.1e-3 / 0.92,
+`w6nl64-rtn` 2.4e-3 / 0.90, `iqr-gptq` 1.9e-2 / 0.77 -- the IQR container moves about eight times
+more between the ranks than the other forms, which is not explained yet (WP8 report).
+The host (libavx, TP1) gives the same for the forms it reads: `w4nl64-rtn` 5.3e-2 / 2.4e-2, 0.75;
+`i8` 2.2e-2 / 1.9e-3, 0.90. The IQR trellis has no host kernel.
 
 ## What serving needs
 
