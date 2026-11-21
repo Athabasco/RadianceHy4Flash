@@ -369,3 +369,129 @@ extern "C" int r4d_rad_quant_cols_fp8(const RadArgs* a, RadStream stream) {
                        (const float*)a->scratch, (uint8_t*)y->data, (int)yl, (float*)sc->data);
     return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
 }
+
+// ============================================================== quant_act_fp8 at a narrow group
+// The same quantiser as above (scale amax/448 in f32, 1 for an all-zero group, codes of
+// clamp(x * (1/scale), +-448) to nearest even) for a group narrower than the weight block: a
+// group of codes that feeds no GEMM. Hy4-flash's Engram rows go through an E4M3 round trip one
+// head (96 values) a group, as the checkpoint's FP8 table was trained to read them. The rows are
+// the FLAT groups of contiguous tensors: x read as [rows, n] whatever its declared rank ([T,
+// heads * hd] against q's [T * heads, hd]), so one group never straddles two rows.
+//
+// A wave a (row, group), a lane four consecutive columns (group <= 128, a multiple of 4), eight
+// waves a workgroup. Unused lanes hold zeros, which the amax ignores.
+namespace {
+
+__global__ __launch_bounds__(kThreads) void quant_act_fp8_grp_kernel(
+    const uint16_t* __restrict__ x, uint8_t* __restrict__ q, float* __restrict__ s,
+    uint32_t rows, uint32_t n, uint32_t g, uint32_t nkb) {
+    const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
+    const size_t unit = (size_t)blockIdx.x * kWaves + wave;
+    if (unit >= (size_t)rows * nkb) return;          // a whole wave leaves together
+    const uint32_t row = (uint32_t)(unit / nkb), kb = (uint32_t)(unit % nkb);
+    const uint32_t k0 = kb * g, k1 = min(k0 + g, n);
+    const uint32_t c0 = k0 + lane * 4u;
+    const bool mine = lane * 4u < g && c0 < k1;
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t c = c0 + (uint32_t)j;
+        v[j] = mine && c < k1 ? __uint_as_float((uint32_t)x[(size_t)row * n + c] << 16) : 0.0f;
+    }
+    float m = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) m = fmaxf(m, fabsf(v[j]));
+    m = r4d_wave_max(m);
+    const float sc = m > 0.0f ? m * (1.0f / 448.0f) : 1.0f;
+    if (lane == 0) s[(size_t)row * nkb + kb] = sc;
+    const float inv = 1.0f / sc;
+    if (!mine) return;
+    int pk = 0;
+    pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(v[0] * inv, -448.0f), 448.0f),
+                                         fminf(fmaxf(v[1] * inv, -448.0f), 448.0f), pk, false);
+    pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(v[2] * inv, -448.0f), 448.0f),
+                                         fminf(fmaxf(v[3] * inv, -448.0f), 448.0f), pk, true);
+    uint8_t* qr = q + (size_t)row * n;
+    if (c0 + 4u <= k1) {
+        *(uint32_t*)(qr + c0) = (uint32_t)pk;         // n % 4 == 0: the dword is aligned
+    } else {
+        for (uint32_t j = 0; c0 + j < k1; ++j) qr[c0 + j] = (uint8_t)((uint32_t)pk >> (8 * j));
+    }
+}
+
+// dequant over E4M3 (or int8, quant_act_i8g's) codes: y = bf16(code * scale), one f32 scale per
+// (row, group). The round trip's second half; exact up to the one rounding to bf16. Flat
+// contiguous rows as above.
+__device__ __forceinline__ float dq_code(uint8_t b, bool i8) {
+    return i8 ? (float)(int8_t)b : r4d_fp8::e4m3(b);
+}
+template <bool I8>
+__global__ __launch_bounds__(kThreads) void dequant_fp8_kernel(
+    const uint8_t* __restrict__ q, const float* __restrict__ s, uint16_t* __restrict__ y,
+    size_t total, uint32_t n, uint32_t g, uint32_t nkb) {
+    for (size_t i = (size_t)blockIdx.x * kThreads + threadIdx.x; i < total;
+         i += (size_t)gridDim.x * kThreads) {
+        const size_t row = i / n;
+        const uint32_t c = (uint32_t)(i % n);
+        const float v = dq_code(q[i], I8) * s[row * nkb + c / g];
+        y[i] = f32_to_bf16(v);
+    }
+}
+
+}  // namespace
+
+/* `n` is the group's row (rows = numel(q) / n); x, q and scale contiguous. */
+extern "C" int r4d_rad_quant_act_fp8_grp(const RadArgs* a, RadStream stream) {
+    const RadTensor* x  = r4d_opt(a, QF_X);
+    const RadTensor* q  = r4d_opt(a, QF_Q);
+    const RadTensor* sc = r4d_opt(a, QF_S);
+    if (!x || !q || !sc) return R4D_NO(RAD_E_INVAL);
+    if (x->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if (q->dtype != RAD_F8E4M3) return R4D_NO(RAD_E_DTYPE);
+    if (sc->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(x) || !r4d_contig(q) || !r4d_contig(sc)) return R4D_NO(RAD_E_STRIDE);
+    const long long n = r4d_geti_or(a, "n", 0), g = r4d_geti_or(a, "group", 0);
+    if (n <= 0 || n % 4 || g <= 0 || g % 4 || g > (long long)kGroup) return R4D_NO(RAD_E_SHAPE);
+    const long long rows = r4d_numel(q) / n, nkb = (n + g - 1) / g;
+    if (rows <= 0 || r4d_numel(x) < rows * n || r4d_numel(sc) < rows * nkb)
+        return R4D_NO(RAD_E_SHAPE);
+    const long long units = rows * nkb;
+    const long long blocks = (units + kWaves - 1) / kWaves;
+    if (blocks > 0x7fffffffLL) return R4D_NO(RAD_E_SHAPE);
+    hipLaunchKernelGGL(quant_act_fp8_grp_kernel, dim3((uint32_t)blocks), dim3(kThreads), 0,
+                       (hipStream_t)stream, (const uint16_t*)x->data, (uint8_t*)q->data,
+                       (float*)sc->data, (uint32_t)rows, (uint32_t)n, (uint32_t)g,
+                       (uint32_t)nkb);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+enum { DQ_Q = 0, DQ_S = 1, DQ_Y = 2 };
+
+extern "C" int r4d_rad_dequant_fp8(const RadArgs* a, RadStream stream) {
+    const RadTensor* q  = r4d_opt(a, DQ_Q);
+    const RadTensor* sc = r4d_opt(a, DQ_S);
+    const RadTensor* y  = r4d_opt(a, DQ_Y);
+    if (!q || !sc || !y) return R4D_NO(RAD_E_INVAL);
+    if (q->dtype != RAD_F8E4M3 && q->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
+    if (sc->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    if (y->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(q) || !r4d_contig(sc) || !r4d_contig(y)) return R4D_NO(RAD_E_STRIDE);
+    const long long n = r4d_geti_or(a, "n", 0);
+    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
+    /* libref's rule: the rows are y's, the group count the scale's extent a row; `group` 0
+     * derives the group from it. */
+    const long long rows = r4d_numel(y) / n;
+    if (rows <= 0 || r4d_numel(q) < rows * n) return R4D_NO(RAD_E_SHAPE);
+    const long long ngrp = r4d_numel(sc) / rows > 0 ? r4d_numel(sc) / rows : 1;
+    long long g = r4d_geti_or(a, "group", 0);
+    if (g <= 0) g = (n + ngrp - 1) / ngrp;
+    if ((n + g - 1) / g != ngrp) return R4D_NO(RAD_E_SHAPE);
+    const size_t total = (size_t)rows * (size_t)n;
+    const size_t want = (total + kThreads - 1) / kThreads;
+    const uint32_t grid = (uint32_t)(want < 65536 ? want : 65536);
+    hipLaunchKernelGGL(q->dtype == RAD_I8 ? dequant_fp8_kernel<true> : dequant_fp8_kernel<false>,
+                       dim3(grid), dim3(kThreads), 0, (hipStream_t)stream,
+                       (const uint8_t*)q->data, (const float*)sc->data, (uint16_t*)y->data, total,
+                       (uint32_t)n, (uint32_t)g, (uint32_t)ngrp);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}

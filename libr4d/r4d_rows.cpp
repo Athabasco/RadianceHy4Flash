@@ -1336,6 +1336,21 @@ static const RadOperandSpec oQuantActFp8[] = {
     { "scale", RAD_OPD_OUT, 0 },
 };
 
+/* `dequant`, libref's schema copied field for field (docs/OPS.md, "Quantisation and rotation"):
+ * activation-shaped, q and its scale in, y out. libr4d serves the E4M3 codes (Hy4-flash's Engram
+ * round trip), not the int8 ones libref also reads. */
+static const RadParamSpec pDequant[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    { "group", RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oDequant[] = {
+    { "q",     RAD_OPD_IN,  0 },
+    { "scale", RAD_OPD_IN,  0 },
+    { "y",     RAD_OPD_OUT, 0 },
+};
+
 /* `gram_accum`, a new op whose schema this plugin fixes: GPTQ's calibration half, `h += x^T x`
  * over an E4M3 activation, accumulated across every launch of a corpus.
  *
@@ -3987,6 +4002,8 @@ static const RadOpSchema kSchemas[] = {
            "PLAIN ROW-MAJOR order rather than quant_act_i8's fragment order. The scale is "
            "amax/448 -- a DEQUANT multiplier, the same sense as the checkpoint's "
            "weight_scale_inv, so the fp8 GEMMs multiply both scales and never divide."),
+    SCHEMA("dequant", pDequant, oDequant,
+           "y = q * scale, the inverse of quant_act_i8g. It does NOT undo a rotation."),
     SCHEMA("quant_act_i8g", pQuantActFp8, oQuantActFp8,
            "quant_act_fp8 at INT8 codes: per-(row, `group`-column) symmetric int8, PLAIN ROW-MAJOR, "
            "the scale amax/127 and a code the value over it rounded to nearest-even. What the int8 "
@@ -4830,6 +4847,10 @@ static const RadConstraint cAttnLocalRel[] = {
 static const RadConstraint cCastF32[] = {
     C_IN("from", "f32"), C_IN("to", "f32"),
 };
+/* `cast` at i32 -> i32: the same byte copy, for index and id taps. */
+static const RadConstraint cCastI32[] = {
+    C_IN("from", "i32"), C_IN("to", "i32"),
+};
 static const RadConstraint cCastWiden[] = {
     C_IN("from", "bf16"), C_IN("to", "f32"),
 };
@@ -5527,6 +5548,15 @@ static const RadConstraint cGemmNtIqrTiled[] = {
 static const RadConstraint cQuantActFp8[] = {
     C_DIV("n", 4), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
 };
+/* The narrow-group quantiser (no GEMM reads it): groups of 4 to 124 columns, so it never meets
+ * the weight-block row above at 128. */
+static const RadConstraint cQuantActFp8Grp[] = {
+    C_DIV("n", 4), C_DIV("group", 4), C_LE("group", R4D_FP8_BLOCK - 1), C_IN("dtype", "bf16"),
+};
+/* dequant over E4M3 codes into bf16. */
+static const RadConstraint cDequantFp8[] = {
+    C_GE("group", 1), C_IN("dtype", "bf16"),
+};
 /* The rotated form needs n divisible by the group, not just by 4: a rotation block cannot
  * straddle the end of a row (a zero-padded ragged tail would mix real values and padding in one
  * butterfly, matching no rotated weight block). */
@@ -6151,6 +6181,7 @@ static const RadTunable tRmsQ8[] = {
  * power-of-two padding. */
 static const RadConstraint cBf16Row[]   = { C_IN("dtype", "bf16") };
 static const RadConstraint cF32Row[]    = { C_IN("dtype", "f32") };
+static const RadConstraint cI32Row[]    = { C_IN("dtype", "i32") };
 static const RadConstraint cEncoderNorm[] = { C_IN("dtype", "f32"), C_GE("n", 1), C_LE("n", 4096) };
 static const RadConstraint cEncoderAttn[] = { C_IN("dtype", "f32"), C_EQ("head_dim", 64),
     C_EQ("gqa", 1), C_EQ("causal", 1), C_GE("M", 1), C_LE("M", 512) };
@@ -6504,6 +6535,15 @@ static const RadKernelInfo kKernels[] = {
   "f32 in, f32 out, byte-for-byte",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cCastF32), NOTUNE,
+  nullptr, nullptr, r4d_rad_cast, nullptr, nullptr, nullptr,
+  r4d_shape_cast },
+
+{ "cast_i32_i32", "cast", "elem",
+  "y = x, i32 to i32 -- a strided row copy through libr4d's 2D copy (index and id taps)",
+  "any M and n; both row pitches are read off the operands",
+  "i32 in, i32 out, byte-for-byte",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cCastI32), NOTUNE,
   nullptr, nullptr, r4d_rad_cast, nullptr, nullptr, nullptr,
   r4d_shape_cast },
 
@@ -6894,6 +6934,15 @@ static const RadKernelInfo kKernels[] = {
   "f32 out, the value exactly",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cF32Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_fill, nullptr, nullptr, nullptr,
+  r4d_shape_fill },
+
+{ "fill_i32", "fill", "elem",
+  "constant fill, a row a workgroup",
+  "any M, n; a row pitch is honoured",
+  "i32 out; the value rounds to nearest even and saturates as libref's integer store",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cI32Row), NOTUNE,
   nullptr, nullptr, r4d_rad_fill, nullptr, nullptr, nullptr,
   r4d_shape_fill },
 
@@ -9474,6 +9523,31 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cQuantActFp8), NOTUNE,
   nullptr, nullptr, r4d_rad_quant_act_fp8, nullptr, nullptr, nullptr,
   r4d_shape_quant_act_fp8 },
+
+/* A group narrower than the weight block, for codes no GEMM reads: Hy4-flash's Engram rows, one
+ * head (96 columns) a group, through an E4M3 round trip (quant_act_fp8 then dequant). */
+{ "quant_act_fp8_grp", "quant_act_fp8", "quant",
+  "per-(row, `group`-column) symmetric E4M3 quantisation of a bf16 activation at a group under 128, "
+  "a wave a group",
+  "contiguous operands read as flat rows of n; n and group multiples of 4, group 4..124; a "
+  "ragged last group gets its own scale",
+  "bf16 in, E4M3 out row-major, f32 scale per (row, group); quant_act_fp8's formula, byte-equal "
+  "to libref",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQuantActFp8Grp), NOTUNE,
+  nullptr, nullptr, r4d_rad_quant_act_fp8_grp, nullptr, nullptr, nullptr,
+  r4d_shape_quant_act_fp8_grp },
+
+{ "dequant_fp8_bf16", "dequant", "quant",
+  "E4M3 (or int8) codes times their per-(row, group) f32 scale, into bf16",
+  "contiguous operands read as flat rows of n (rows = y's elements / n); the group from `group`, "
+  "or from the scale's extent when 0",
+  "E4M3 or int8 codes and an f32 scale in, bf16 out, the product rounded once to nearest even; "
+  "byte-equal to libref",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cDequantFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_dequant_fp8, nullptr, nullptr, nullptr,
+  r4d_shape_dequant_fp8 },
 
 /* The rotated twin, for the four-bit expert weight only. At E4M3 a rotation is slightly worse
  * (four exponent bits already carry the outliers it removes); at four bits, sixteen levels spent

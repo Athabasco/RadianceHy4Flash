@@ -1314,6 +1314,24 @@ extern "C" int r4d_fill_f32(long y, int M, int n, int y_ld, float value, long st
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
+// The value as libref stores it into an i32 (ref_common.h st_dt): rounded to nearest even,
+// saturated to the type's range, NaN as 0.
+extern "C" int r4d_fill_i32(long y, int M, int n, int y_ld, float value, long stream) {
+    if (!y) return -1;
+    if (M <= 0 || n <= 0) return -2;
+    if (!y_ld) y_ld = n;
+    int32_t iv = 0;
+    if (value == value) {
+        const float r = std::nearbyintf(value);
+        iv = r >= 2147483648.0f ? INT32_MAX : (r < -2147483648.0f ? INT32_MIN : (int32_t)r);
+    }
+    uint32_t bits;
+    std::memcpy(&bits, &iv, sizeof bits);
+    hipLaunchKernelGGL(fill_kernel<uint32_t>, dim3((uint32_t)M), dim3(kThreads), 0,
+                       (hipStream_t)stream, (uint32_t*)y, (uint32_t)n, (uint32_t)y_ld, bits);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
 /* `chain`: the chained form (the plugin entry, where the row resolved with `chain`). */
 static int logit_softcap_bf16_emit(long x, long y, int M, int n, float cap,
                                    int x_ld, int y_ld, long stream, bool chain) {
@@ -1936,17 +1954,41 @@ extern "C" int r4d_rad_cast(const RadArgs* a, RadStream s) {
     const RadTensor* x = r4d_opt(a, CS_X);
     const RadTensor* y = r4d_opt(a, CS_Y);
     if (!x || !y) return R4D_NO(RAD_E_INVAL);
-    /* A copy at the dtype both sides share: bf16, or f32 (a latent kept aside and put back). */
-    if (x->dtype != y->dtype || (x->dtype != RAD_BF16 && x->dtype != RAD_F32))
+    /* A copy at the dtype both sides share: bf16, f32 (a latent kept aside and put back) or i32
+     * (an index or id tap: Hy4-flash's router picks, Engram hash ids, the indexer's selection). */
+    if (x->dtype != y->dtype ||
+        (x->dtype != RAD_BF16 && x->dtype != RAD_F32 && x->dtype != RAD_I32))
         return R4D_NO(RAD_E_DTYPE);
-    const long long es = x->dtype == RAD_F32 ? 4 : 2;
+    const long long es = x->dtype == RAD_BF16 ? 2 : 4;
 
-    const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
+    long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
     if (n <= 0) return R4D_NO(RAD_E_SHAPE);
     long long M = 0, Mx = 0;
-    const long long y_ld = r4d_rows_pitch(y, n, &M);
-    const long long x_ld = r4d_rows_pitch(x, n, &Mx);
-    if (y_ld < 0 || x_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    long long y_ld = r4d_rows_pitch(y, n, &M);
+    long long x_ld = r4d_rows_pitch(x, n, &Mx);
+    if (y_ld < 0 || x_ld < 0) {
+        /* A row of n that is not one run of memory: heads side by side inside a wider head
+         * ([T, H, nope + rope] written per part, Hy4-flash's non-absorbed query). Copy the inner
+         * rows instead, the last axis of the strided side, when both sides collapse to one pitch
+         * at that width. */
+        const RadTensor* t = y_ld < 0 ? y : x;
+        const long long w = r4d_dim(t, (int)t->rank - 1);
+        if (w <= 0 || n % w) return R4D_NO(RAD_E_STRIDE);
+        auto inner = [&](const RadTensor* u, long long* rows) -> long long {
+            const long long nel = rad_tensor_numel(u);
+            if (nel % w) return -1;
+            *rows = nel / w;
+            if (rad_tensor_is_contiguous(u)) return w;
+            if (u->rank < 2 || u->shape[u->rank - 1] != w || u->stride[u->rank - 1] != 1) return -1;
+            for (int i = (int)u->rank - 2; i >= 1; --i)
+                if (u->stride[i - 1] != u->shape[i] * u->stride[i]) return -1;
+            return u->stride[u->rank - 2];
+        };
+        y_ld = inner(y, &M);
+        x_ld = inner(x, &Mx);
+        if (y_ld < 0 || x_ld < 0) return R4D_NO(RAD_E_STRIDE);
+        n = w;
+    }
     /* The row count is the destination's: a tap's destination is sized for the step's ceiling
      * while the source holds the live rows, so the source need only have at least as many. */
     if (M <= 0 || Mx < M) return R4D_NO(RAD_E_SHAPE);
@@ -2270,7 +2312,8 @@ extern "C" int r4d_rad_sigmoid(const RadArgs* a, RadStream s) {
 extern "C" int r4d_rad_fill(const RadArgs* a, RadStream s) {
     const RadTensor* y = r4d_opt(a, 0);
     if (!y) return R4D_NO(RAD_E_INVAL);
-    if (y->dtype != RAD_BF16 && y->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    if (y->dtype != RAD_BF16 && y->dtype != RAD_F32 && y->dtype != RAD_I32)
+        return R4D_NO(RAD_E_DTYPE);
     const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
     if (n <= 0) return R4D_NO(RAD_E_SHAPE);
     long long M = 0;
@@ -2278,8 +2321,10 @@ extern "C" int r4d_rad_fill(const RadArgs* a, RadStream s) {
     if (y_ld < 0) return R4D_NO(RAD_E_STRIDE);
     if (M <= 0) return R4D_NO(RAD_E_SHAPE);
     const double v = r4d_getf(a, "value", 0.0);
-    const int e = (y->dtype == RAD_F32 ? r4d_fill_f32 : r4d_fill_bf16)(
-        r4d_addr(y), (int)M, (int)n, (int)y_ld, (float)v, (long)(uintptr_t)s);
+    const int e = y->dtype == RAD_I32
+        ? r4d_fill_i32(r4d_addr(y), (int)M, (int)n, (int)y_ld, (float)v, (long)(uintptr_t)s)
+        : (y->dtype == RAD_F32 ? r4d_fill_f32 : r4d_fill_bf16)(
+              r4d_addr(y), (int)M, (int)n, (int)y_ld, (float)v, (long)(uintptr_t)s);
     return e == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 

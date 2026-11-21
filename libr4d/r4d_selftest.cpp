@@ -33665,6 +33665,120 @@ static void hy4_gate_mul_case(const Plugin& pl) {
     }
 }
 
+/* The rows Hy4-flash's graph needs beside its own ops (WP8): the i32 copy and fill of its debug
+ * taps, and the Engram rows' E4M3 round trip at one head (96 columns) a group. All byte-equal to
+ * libref. */
+static void hy4_misc_case(const Plugin& pl) {
+    if (sel("cast_i32_i32")) {
+        struct G { int64_t M, n, pad; };
+        for (const G& g : { G{ 1, 1, 0 }, G{ 512, 16, 0 }, G{ 37, 512, 5 }, G{ 9, 4, 3 } }) {
+            Hy4Rng rng((uint32_t)(g.M * 7 + g.n));
+            std::vector<Hy4Opd> ops;
+            ops.push_back(hy_opd(RAD_I32, { g.M, g.n }, g.pad ? g.n + g.pad : 0));
+            hy_fill(ops[0], [&](int64_t) { return (double)((int32_t)rng.r(4000000) - 2000000); });
+            ops.push_back(hy_opd(RAD_I32, { g.M, g.n }, g.pad ? g.n + 2 * g.pad : 0));
+            ops[1].out = true;
+            std::vector<RadParam> ps = { PI("M", g.M), PI("n", g.n), PS("from", "i32"), PS("to", "i32") };
+            hy_check(pl, "cast_i32_i32", fmt("cast i32 vs libref: M %lld n %lld%s", (long long)g.M,
+                     (long long)g.n, g.pad ? ", pitched rows" : ""), ps, ops);
+        }
+    }
+    /* The head-slice copy: [M, H * w] contiguous into [M, H, w] parts of a wider [M, H, W] row
+     * (Hy4-flash's non-absorbed query, nope then rope), and back out. */
+    if (sel("cast_bf16_bf16")) {
+        const RadKernelInfo* row = find(pl, "cast_bf16_bf16");
+        const int64_t M = 37, H = 32, W = 256;
+        for (const int64_t off : { (int64_t)0, (int64_t)192 }) {
+            const int64_t w = off ? 64 : 192;
+            std::vector<uint16_t> src((size_t)(M * H * w)), dst((size_t)(M * H * W), 0x7e7e);
+            Hy4Rng rng((uint32_t)(w + 5));
+            for (auto& v : src) v = h_to_bf16(rng.n());
+            void* ds = dalloc(src.size() * 2);
+            void* dd = dalloc(dst.size() * 2);
+            st_memcpy(ds, src.data(), src.size() * 2, hipMemcpyHostToDevice);
+            st_memcpy(dd, dst.data(), dst.size() * 2, hipMemcpyHostToDevice);
+            RadTensor x = T(ds, RAD_BF16, { M, H * w });
+            RadTensor y = T((uint16_t*)dd + off, RAD_BF16, { M, H, w });
+            y.stride[0] = H * W; y.stride[1] = W; y.stride[2] = 1;
+            std::vector<RadTensor> ts = { x, y };
+            std::vector<RadParam> ps = { PI("M", M), PI("n", H * w), PS("from", "bf16"), PS("to", "bf16") };
+            RadArgs ad{};
+            ad.t = ts.data(); ad.n_t = 2; ad.p = ps.data(); ad.n_p = (int)ps.size(); ad.world_size = 1;
+            const int rc = row ? row->launch(&ad, nullptr) : RAD_E_INVAL;
+            st_stream_sync(nullptr);
+            std::vector<uint16_t> got(dst.size());
+            st_memcpy(got.data(), dd, got.size() * 2, hipMemcpyDeviceToHost);
+            bool same = rc == RAD_OK;
+            for (int64_t m = 0; m < M && same; ++m)
+                for (int64_t h = 0; h < H; ++h)
+                    for (int64_t c = 0; c < W; ++c) {
+                        const bool in = c >= off && c < off + w;
+                        const uint16_t want = in ? src[(size_t)((m * H + h) * w + c - off)] : (uint16_t)0x7e7e;
+                        if (got[(size_t)((m * H + h) * W + c)] != want) same = false;
+                    }
+            ok(fmt("cast_bf16_bf16 into head slices [M, H, %lld] of [M, H, %lld] at column %lld, byte for byte",
+                   (long long)w, (long long)W, (long long)off).c_str(), same,
+               "rc=" + std::to_string(rc));
+
+        }
+    }
+    if (sel("fill_i32")) {
+        struct G { int64_t M, n, pad; double v; };
+        for (const G& g : { G{ 512, 1, 0, 0.0 }, G{ 7, 33, 4, -1.0 }, G{ 3, 300, 0, 2.5 },
+                            G{ 2, 8, 0, 3.5 }, G{ 1, 5, 0, 1e12 }, G{ 1, 5, 0, -1e12 } }) {
+            std::vector<Hy4Opd> ops;
+            ops.push_back(hy_opd(RAD_I32, { g.M, g.n }, g.pad ? g.n + g.pad : 0));
+            ops[0].out = true;
+            std::vector<RadParam> ps = { PI("M", g.M), PI("n", g.n), PS("dtype", "i32"), PF("value", g.v) };
+            hy_check(pl, "fill_i32", fmt("fill i32 vs libref: M %lld n %lld value %g%s", (long long)g.M,
+                     (long long)g.n, g.v, g.pad ? ", pitched rows" : ""), ps, ops);
+        }
+    }
+    /* quant_act_fp8 at a narrow group: the Engram shape ([T, 16 * 96] read as [T * 16, 96]),
+     * a ragged last group, an all-zero group (scale 1) and a saturating value. */
+    if (sel("quant_act_fp8_grp")) {
+        struct G { int64_t rows, n, g; };
+        for (const G& g : { G{ 16, 96, 96 }, G{ 8192, 96, 96 }, G{ 33, 100, 48 }, G{ 5, 8, 4 },
+                            G{ 3, 256, 64 } }) {
+            Hy4Rng rng((uint32_t)(g.rows * 3 + g.n + g.g));
+            std::vector<Hy4Opd> ops;
+            const int64_t heads = g.n == 96 ? 16 : 1, T = g.rows / heads;
+            ops.push_back(hy_opd(RAD_BF16, { T, heads * g.n }));
+            hy_fill(ops[0], [&](int64_t i) {
+                const int64_t c = i % g.n;
+                if (i / g.n == 1 && c < g.g) return 0.0;           /* row 1's first group: zeros */
+                return (double)rng.n() * (c % 7 == 0 ? 30.0 : 1.0);
+            });
+            ops.push_back(hy_opd(RAD_F8E4M3, { g.rows, g.n }));
+            ops[1].out = true;
+            ops.push_back(hy_opd(RAD_F32, { g.rows, (g.n + g.g - 1) / g.g }));
+            ops[2].out = true;
+            std::vector<RadParam> ps = { PI("M", g.rows), PI("n", g.n), PI("group", g.g), PS("dtype", "bf16") };
+            hy_check(pl, "quant_act_fp8_grp", fmt("quant_act_fp8 narrow group vs libref: rows %lld n %lld group %lld",
+                     (long long)g.rows, (long long)g.n, (long long)g.g), ps, ops);
+        }
+    }
+    if (sel("dequant_fp8_bf16")) {
+        struct G { int64_t rows, n, g; };
+        for (const uint32_t cdt : { (uint32_t)RAD_F8E4M3, (uint32_t)RAD_I8 })
+        for (const G& g : { G{ 16, 96, 96 }, G{ 8192, 96, 96 }, G{ 33, 100, 48 }, G{ 7, 256, 128 } }) {
+            Hy4Rng rng((uint32_t)(g.rows * 5 + g.n + g.g));
+            const int64_t heads = g.n == 96 ? 16 : 1, T = g.rows / heads, ng = (g.n + g.g - 1) / g.g;
+            std::vector<Hy4Opd> ops;
+            ops.push_back(hy_opd(cdt, { g.rows, g.n }));
+            hy_fill(ops[0], [&](int64_t) { uint32_t b = rng.r(256); if ((b & 0x7f) == 0x7f) b ^= 1; return (double)b; });
+            ops.push_back(hy_opd(RAD_F32, { g.rows, ng }));
+            hy_fill(ops[1], [&](int64_t) { return 0.001 + rng.u() * rng.u() * 0.1; });
+            ops.push_back(hy_opd(RAD_BF16, { T, heads * g.n }));
+            ops[2].out = true;
+            std::vector<RadParam> ps = { PI("M", g.rows), PI("n", g.n), PI("group", g.g), PS("dtype", "bf16") };
+            hy_check(pl, "dequant_fp8_bf16", fmt("dequant %s vs libref: rows %lld n %lld group %lld",
+                     cdt == RAD_I8 ? "int8" : "E4M3",
+                     (long long)g.rows, (long long)g.n, (long long)g.g), ps, ops);
+        }
+    }
+}
+
 /* mla_project_kv through the checkpoint's kv_b, both modes, 8 to 64 heads, M across the group sizes. */
 static void hy4_mla_project_kv_case(const Plugin& pl) {
     if (!sel("mla_project_kv_bf16")) return;
@@ -33821,20 +33935,22 @@ static void hy4_engram_norm_case(const Plugin& pl) {
     struct G { int64_t M, heads, n, pad; double eps; };
     const G gs[] = { { 1, 16, 96, 0, 0.0078125 }, { 33, 16, 96, 0, 1.19e-7 }, { 5, 16, 96, 7, 0.0078125 },
                      { 3, 4, 37, 0, 1e-6 } };
+    for (const uint32_t wdt : { (uint32_t)RAD_BF16, (uint32_t)RAD_F32 })   /* f32: the plugin's gain */
     for (const G& g : gs) {
         Hy4Rng rng((uint32_t)(g.M + g.n));
         const int64_t W = g.heads * g.n;
         std::vector<Hy4Opd> ops;
         ops.push_back(hy_opd(RAD_BF16, { g.M, W }, g.pad ? W + g.pad : 0));
         hy_fill(ops[0], [&](int64_t) { return rng.n() * 3.0; });
-        ops.push_back(hy_opd(RAD_BF16, { W }));
+        ops.push_back(hy_opd(wdt, { W }));
         hy_fill(ops[1], [&](int64_t) { return 1.0 + rng.n() * 0.3; });
         ops.push_back(hy_opd(RAD_BF16, { g.M, W }, g.pad ? W + g.pad : 0));
         ops[2].out = true; ops[2].rtol = 0.0079; ops[2].atol = 1e-30;
         std::vector<RadParam> ps = { PI("M", g.M), PI("heads", g.heads), PI("n", g.n), PF("eps", g.eps),
                                      PS("dtype", "bf16") };
-        hy_check(pl, "engram_norm_bf16", fmt("engram_norm vs libref: M %lld heads %lld n %lld eps %g%s",
-                 (long long)g.M, (long long)g.heads, (long long)g.n, g.eps, g.pad ? ", pitched" : ""),
+        hy_check(pl, "engram_norm_bf16", fmt("engram_norm vs libref: M %lld heads %lld n %lld eps %g%s%s",
+                 (long long)g.M, (long long)g.heads, (long long)g.n, g.eps, g.pad ? ", pitched" : "",
+                 wdt == RAD_F32 ? ", f32 gain" : ""),
                  ps, ops);
     }
 }
@@ -33846,6 +33962,7 @@ static void hy4_engram_gate_case(const Plugin& pl) {
     struct G { int64_t M, hc, n, pad; double eps; };
     const G gs[] = { { 1, 4, 3072, 0, 0.0078125 }, { 6, 4, 3072, 8, 1.19e-7 }, { 9, 4, 768, 0, 0.0078125 },
                      { 5, 2, 96, 0, 0.0078125 }, { 3, 1, 131, 0, 1e-6 }, { 4, 8, 64, 0, 0.0078125 } };
+    for (const uint32_t wdt : { (uint32_t)RAD_BF16, (uint32_t)RAD_F32 })   /* f32: the plugin's weights */
     for (const G& g : gs) {
         Hy4Rng rng((uint32_t)(g.M * 3 + g.n));
         const int64_t W = g.hc * g.n;
@@ -33857,7 +33974,7 @@ static void hy4_engram_gate_case(const Plugin& pl) {
         ops.push_back(hy_opd(RAD_I32, { g.M }));                                   /* mask */
         hy_fill(ops[2], [&](int64_t i) { return (i % 3 == 2) ? 0.0 : 1.0; });
         for (int k = 0; k < 4; ++k) {                                              /* w_key w_query w_val w_branch */
-            ops.push_back(hy_opd(RAD_BF16, { k == 2 ? g.n : W }));
+            ops.push_back(hy_opd(wdt, { k == 2 ? g.n : W }));
             hy_fill(ops.back(), [&](int64_t) { return 1.0 + rng.n() * 0.2; });
         }
         ops.push_back(hy_opd(RAD_BF16, { g.M, W }, g.pad ? W + g.pad : 0));       /* h */
@@ -33865,8 +33982,9 @@ static void hy4_engram_gate_case(const Plugin& pl) {
         ops[7].out = true; ops[7].rtol = 0.0079 * 2; ops[7].atol = 0.016;
         std::vector<RadParam> ps = { PI("M", g.M), PI("n", g.n), PI("hc", g.hc), PF("eps", g.eps),
                                      PS("dtype", "bf16") };
-        hy_check(pl, "engram_gate_bf16", fmt("engram_gate vs libref: M %lld hc %lld n %lld eps %g%s",
-                 (long long)g.M, (long long)g.hc, (long long)g.n, g.eps, g.pad ? ", pitched" : ""),
+        hy_check(pl, "engram_gate_bf16", fmt("engram_gate vs libref: M %lld hc %lld n %lld eps %g%s%s",
+                 (long long)g.M, (long long)g.hc, (long long)g.n, g.eps, g.pad ? ", pitched" : "",
+                 wdt == RAD_F32 ? ", f32 weights" : ""),
                  ps, ops);
     }
 }
@@ -33941,6 +34059,7 @@ static void device_phase(const Plugin& pl) {
     hy4_ihc_pre_case(pl);
     hy4_ihc_post_case(pl);
     hy4_gate_mul_case(pl);
+    hy4_misc_case(pl);
     hy4_mla_project_kv_case(pl);
     hy4_mla_kv_split_case(pl);
     hy4_engram_ids_case(pl);

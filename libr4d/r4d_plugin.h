@@ -675,6 +675,8 @@ int r4d_rad_quant_act_i8g(const RadArgs*, RadStream);
 int r4d_rad_had_quant_act_i8g(const RadArgs*, RadStream);
 int r4d_rad_had_quant_act_fp8(const RadArgs*, RadStream);
 int r4d_rad_quant_act_fp8   (const RadArgs*, RadStream);
+int r4d_rad_quant_act_fp8_grp(const RadArgs*, RadStream);
+int r4d_rad_dequant_fp8     (const RadArgs*, RadStream);
 int r4d_rad_had_quant_act_fp8 (const RadArgs*, RadStream);
 int r4d_rad_givens_rotate (const RadArgs*, RadStream);
 int r4d_rad_rmsnorm_quant_fp8(const RadArgs*, RadStream);
@@ -1069,6 +1071,8 @@ int r4d_shape_gated_had_quant_i8 (const RadParam*, int, int operand, RadOpdDesc*
 int r4d_shape_gdn_gated_norm_had_quant_i8(const RadParam*, int, int operand,
                                           RadOpdDesc*);
 int r4d_shape_quant_act_fp8      (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_quant_act_fp8_grp  (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_dequant_fp8        (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_rmsnorm_quant_fp8  (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_gated_quant_fp8    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_rmsnorm_had_quant_i8g (const RadParam*, int, int operand, RadOpdDesc*);

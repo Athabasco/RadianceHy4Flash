@@ -320,7 +320,9 @@ extern "C" int r4d_shape_cast(const RadParam* p, int n_p, int operand,
      * and f32 -> bf16, and the shims refuse any other pair, so another pair is declined here. */
     const uint32_t f = dt_par(p, n_p, "from"), t = dt_par(p, n_p, "to");
     const uint32_t bf = (uint32_t)RAD_BF16, f32 = (uint32_t)RAD_F32, f16 = (uint32_t)RAD_F16;
-    if (!(f == bf && (t == bf || t == f32 || t == f16)) && !(f == f32 && (t == bf || t == f32)))
+    const uint32_t i32 = (uint32_t)RAD_I32;
+    if (!(f == bf && (t == bf || t == f32 || t == f16)) && !(f == f32 && (t == bf || t == f32)) &&
+        !(f == i32 && t == i32))
         return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = { opd(f, M, n), opd(t, M, n) };
     R4D_PICK(l);
@@ -2060,6 +2062,37 @@ extern "C" int r4d_shape_quant_act_fp8(const RadParam* p, int n_p, int operand,
         opd(D, M, n),
         opd((uint32_t)RAD_F8E4M3, M, n),
         opd((uint32_t)RAD_F32, M, (n + g - 1) / g),
+    };
+    R4D_PICK(l);
+}
+
+/* The narrow-group form: the same three operands at any group of 4..124. */
+extern "C" int r4d_shape_quant_act_fp8_grp(const RadParam* p, int n_p, int operand,
+                                           RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const int64_t g = pi(p, n_p, "group", 0);
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    if (g <= 0 || g >= R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd(D, M, n),
+        opd((uint32_t)RAD_F8E4M3, M, n),
+        opd((uint32_t)RAD_F32, M, (n + g - 1) / g),
+    };
+    R4D_PICK(l);
+}
+
+/* dequant at E4M3 codes (libref's hook describes int8 codes). */
+extern "C" int r4d_shape_dequant_fp8(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const int64_t g = pi(p, n_p, "group", 0);
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    if (g <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_F8E4M3, M, n),
+        opd((uint32_t)RAD_F32, M, (n + g - 1) / g),
+        opd(D, M, n),
     };
     R4D_PICK(l);
 }
