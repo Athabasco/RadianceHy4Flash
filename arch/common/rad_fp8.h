@@ -618,16 +618,20 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
         return op_q ? RAD_OK : RAD_E_INVAL;
     }
     if (clipped) {
-        /* The clamp writes the bf16 plane and a quantiser reads it: E4M3, plain int8, or the
+        /* The clamp writes the bf16 plane and a quantiser reads it: E4M3, plain int8, the
          * rotated int8 codes an i8a8h consumer reads (had_quant_act_i8g at that consumer's
-         * group, the quantiser the rotated trunk's other inputs use). Against the unclamped
-         * gated_had_quant_i8g that is one launch more, in the clamped layers only. No clamp
-         * with `silu_only`, and none into a rotated E4M3 consumer (`rot`). */
-        if (!gate_up || !a.x || n <= 0 || rot || silu_only || std::strcmp(act_name, "silu"))
+         * group, the quantiser the rotated trunk's other inputs use), or with `rot` the rotated
+         * E4M3 codes a codebook expert (w4nl64a8h, w5nl64a8h, w6nl64a8h) reads
+         * (had_quant_act_fp8, the chain the unclamped rotated form falls back to): clamp, then
+         * quantise. Against the unclamped gated quantiser that is one launch more, in the
+         * clamped layers only. No clamp with `silu_only`, and none into rotated codes the
+         * producer is fed as int8 (`rot` with `q8_fed`: that is `q8_rot`'s). */
+        if (!gate_up || !a.x || n <= 0 || (rot && a.q8_fed) || silu_only ||
+            std::strcmp(act_name, "silu"))
             return RAD_E_INVAL;
         const bool hi8 = a.q8_fed && a.q8_rot;
         const int64_t rows = max_rows > 0 ? max_rows : g.max_tok;
-        if (fuse_clamped && !step && !bf16 && !a.q8_fed && a.cq() && a.cs() &&
+        if (fuse_clamped && !rot && !step && !bf16 && !a.q8_fed && a.cq() && a.cs() &&
             rad_op_declared(b, "swiglu_clamped_quant_fp8")) {
             op =
                 RAD_OP(b, "swiglu_clamped_quant_fp8",
@@ -652,7 +656,7 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
         if (!bf16) {
             if (!a.cq() || !a.cs()) return RAD_E_INVAL;
             const char* qn = hi8 ? "had_quant_act_i8g" : a.q8_fed ? "quant_act_i8g"
-                                                                  : "quant_act_fp8";
+                           : rot ? "had_quant_act_fp8" : "quant_act_fp8";
             op_quant =
                 rw(b,
                    RAD_OP(b, qn,
