@@ -1042,3 +1042,79 @@ AVX_KERNEL(engram_gate) {
     }
     return RAD_OK;
 }
+
+/* ================================================================== DFly2 */
+
+/* dfly_sel: libref/ref_dfly.cpp's draft table, the same rule and the same failure rows. A row gets
+ * the source row's recalled pages (sel[src][0, nsel-1), or bt[0, g0) for a densely attended source),
+ * then bt[g0] .. bt[pos/ratio], -1 to `blocks`; len and the optional entry count. Integer only:
+ * two copies and a fill a row. */
+AVX_KERNEL(dfly_sel) {
+    if (!a || a->n_t < 8) return RAD_E_INVAL;
+    for (int i = 0; i < 8; ++i)
+        if (!rad_arg_in(a, i)) return RAD_E_INVAL;
+    const RadTensor &sel = a->t[0], &nsel = a->t[1], &src = a->t[2], &bt = a->t[3], &pos = a->t[4],
+                    &cu = a->t[5], &out = a->t[6], &len = a->t[7];
+    const RadTensor* cnt = rad_arg_in(a, 8);
+    const int64_t ratio = p_int(a, "ratio", 0), blocks = p_int(a, "blocks", 0),
+                  blocks_in = p_int(a, "blocks_in", 0);
+    if (ratio <= 0 || blocks <= 0 || blocks_in <= 0) return RAD_E_SHAPE;
+    if (sel.rank != 2 || bt.rank != 2 || out.rank != 2) return RAD_E_SHAPE;
+    const int64_t M = out.shape[0], R = sel.shape[0], pitch = bt.shape[1];
+    const int64_t n_seq = numel(&cu) - 1;
+    if (M <= 0 || n_seq <= 0) return RAD_E_SHAPE;
+    if (out.shape[1] < blocks || sel.shape[1] < blocks_in) return RAD_E_SHAPE;
+    if (numel(&pos) < M || numel(&len) < M || numel(&src) < n_seq || bt.shape[0] < n_seq ||
+        numel(&nsel) < R || (cnt && numel(cnt) < M))
+        return RAD_E_SHAPE;
+    const int64_t o_rs = out.stride[0], o_cs = out.stride[1];
+    const int64_t s_rs = sel.stride[0], s_cs = sel.stride[1];
+    const int64_t b_rs = bt.stride[0], b_cs = bt.stride[1];
+    auto put = [&](const RadTensor& t, int64_t off, int64_t v) { st_int_dt(t.dtype, t.data, off, v); };
+    /* Rows no sequence holds stay empty. */
+    for (int64_t r = 0; r < M; ++r) {
+        for (int64_t c = 0; c < blocks; ++c) put(out, r * o_rs + c * o_cs, -1);
+        put(len, offlin(&len, r), 0);
+        if (cnt) put(*cnt, offlin(cnt, r), 0);
+    }
+    bool overflow = false;
+    for (int64_t s = 0; s < n_seq; ++s) {
+        const int64_t r0 = std::max<int64_t>(0, cuv(&cu, s)), r1 = std::min(M, cuv(&cu, s + 1));
+        if (r0 >= r1) continue;
+        const int64_t anc = ldi(&pos, offlin(&pos, r0));
+        const int64_t g0 = anc > 0 ? (anc - 1) / ratio : 0;
+        const int64_t k = ldi(&src, offlin(&src, s));
+        bool ok = k >= 0 && k < R && anc >= 0;
+        const int64_t n = ok ? ldi(&nsel, offlin(&nsel, k)) : 0;
+        const int64_t nrec = n > 0 ? n - 1 : g0;
+        if (ok && n > 0 && nrec > blocks_in) {
+            ok = false;
+            overflow = true;
+        }
+        for (int64_t r = r0; r < r1; ++r) {
+            const int64_t p = ldi(&pos, offlin(&pos, r));
+            const int64_t e = p / ratio - g0;
+            bool row = ok && p >= anc && e >= 0;
+            if (row && (nrec + e + 1 > blocks || g0 + e >= pitch || (n <= 0 && nrec > pitch))) {
+                row = false;
+                overflow = true;
+            }
+            if (!row) continue;
+            int64_t c = 0;
+            if (n > 0)
+                for (; c < nrec; ++c) put(out, r * o_rs + c * o_cs, ldi(&sel, k * s_rs + c * s_cs));
+            else
+                for (; c < nrec; ++c) put(out, r * o_rs + c * o_cs, ldi(&bt, s * b_rs + c * b_cs));
+            for (int64_t j = 0; j <= e; ++j, ++c)
+                put(out, r * o_rs + c * o_cs, ldi(&bt, s * b_rs + (g0 + j) * b_cs));
+            put(len, offlin(&len, r), nrec * ratio + (p - g0 * ratio) + 1);
+            if (cnt) put(*cnt, offlin(cnt, r), nrec + e + 1);
+        }
+    }
+#ifndef NDEBUG
+    if (overflow) return RAD_E_SHAPE;
+#else
+    (void)overflow;
+#endif
+    return RAD_OK;
+}

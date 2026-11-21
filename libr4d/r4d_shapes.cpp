@@ -540,6 +540,26 @@ extern "C" int r4d_shape_mla_kv_split(const RadParam* p, int n_p, int operand, R
         opd(D, M, h, vd) };
     R4D_PICK(l);
 }
+/* libref's description (ref_dfly_sel_shape): pos below 2 * ratio, so a drawn table never needs more
+ * than blocks_in + 1 entries; `count` described. */
+extern "C" int r4d_shape_dfly_sel(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), blocks = pi(p, n_p, "blocks"), bin = pi(p, n_p, "blocks_in"),
+                  ratio = pi(p, n_p, "ratio");
+    if (M <= 0 || blocks <= 0 || bin <= 0 || ratio <= 0 || blocks < bin + 2) return RAD_E_UNSUPPORTED;
+    const int64_t S = std::max<int64_t>(1, std::min<int64_t>(pi(p, n_p, "seqs", 1), M));
+    const RadOpdDesc l[] = {
+        opd_idx(M, bin, S * blocks),                  /* sel -- page ids, by trunk row */
+        opd_idx(M, 0, bin + 1),                       /* nsel -- 0 .. blocks_in */
+        opd_idx(S, 0, M),                             /* src -- trunk rows */
+        opd_idx(S, blocks, S * blocks),               /* bt -- page ids */
+        opd_idx(M, 0, 2 * ratio),                     /* pos */
+        opd_idx(S + 1, 0, 0, -1, RAD_OPD_F_IDX_CU),   /* cu */
+        opd((uint32_t)RAD_I32, M, blocks),
+        opd((uint32_t)RAD_I32, M),
+        opd((uint32_t)RAD_I32, M),
+    };
+    R4D_PICK(l);
+}
 /* One sequence, a decode step as for ngram_ids: warm state read at the deepest offset. Token ids are
  * drawn below `map_size`; the multipliers are the constant 1000003 so a draw cannot wrap. */
 extern "C" int r4d_shape_engram_ids(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

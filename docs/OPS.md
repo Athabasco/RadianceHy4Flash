@@ -4001,7 +4001,9 @@ the latent group streams (the table's entries are block ids until it rewrites th
 `blocks >= blocks_in + 1 + (rows - 1)/ratio` (Hy4-flash: `group_topk + 2`, 514 at real size). The
 dense branch is exact because a trunk step writes `nsel` 0 only when every sequence ends at or below
 `group_topk*ratio` keys, so `g0 <= group_topk - 1` and every closed page is recalled. Integer
-only: libavx and libr4d (WP13.5) must give the same bytes.
+only: libavx (`avx_hy4.cpp`) and libr4d (`r4d_dfly.hip`, one workgroup a row and 64 columns) give
+libref's bytes (avx_check, r4d_emu_hy4 and r4d_selftest hold them to it on the golden cases and
+seeded random geometries, `tests/hy4_dfly_cases.h`).
 
 ## Adding an op
 

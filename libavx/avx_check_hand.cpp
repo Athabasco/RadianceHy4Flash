@@ -27,6 +27,8 @@
 
 #include <deque>
 
+#include "../tests/hy4_dfly_cases.h"   /* dfly_sel: the golden cases, random geometries */
+
 namespace {
 
 struct Hand {
@@ -5331,6 +5333,64 @@ static void hy4_cases(std::vector<Hand>& hs) {
     }
 }
 
+
+/* ---- dfly_sel: the golden cases and random geometries (tests/hy4_dfly_cases.h) ---------------
+ * The 210 cases of ref/test_dfly_ref.py check (c) laid out as tests/ref_hy4_ops_test.cpp lays them
+ * out, each alone and all of one G in one call, then seeded random geometries (sources -1 and past
+ * the snapshot, unheld rows, empty sequences, tables wider than needed). libavx byte-equal to
+ * libref, `count` included (absent in every other case). */
+static Hand dfly_call(const hy4dfly::Case& c, const char* name, bool with_count) {
+    auto from = [](const std::vector<int64_t>& v) {
+        return [&v](int64_t i) { return (float)v[(size_t)i]; };
+    };
+    Hand h(name, "dfly_sel", 0.0);
+    h.dense(RAD_I32, { c.R, c.G }, from(c.sel))
+     .dense(RAD_I32, { c.R }, from(c.nsel))
+     .dense(RAD_I32, { c.S }, from(c.src))
+     .dense(RAD_I32, { c.S, c.pitch }, from(c.bt))
+     .dense(RAD_I32, { c.M }, from(c.pos))
+     .dense(RAD_I32, { c.S + 1 }, from(c.cu))
+     .dense(RAD_I32, { c.M, c.blocks }, [](int64_t) { return 5.0f; }, true)
+     .dense(RAD_I32, { c.M }, [](int64_t) { return 5.0f; }, true);
+    if (with_count) h.dense(RAD_I32, { c.M }, [](int64_t) { return 5.0f; }, true);
+    else h.none();
+    h.pi("M", c.M).pi("blocks_in", c.G).pi("blocks", c.blocks).pi("ratio", c.ratio).pi("seqs", c.S);
+    return h;
+}
+
+static void dfly_cases(std::vector<Hand>& hs) {
+    for (int c = 0; c < kDflyCases; ++c)
+        hs.push_back(dfly_call(hy4dfly::golden({ c }, 1000 + (uint64_t)c), "a golden case, one sequence",
+                               (c & 1) == 0));
+    for (const int64_t G : { 4, 512 })
+        hs.push_back(dfly_call(hy4dfly::golden(hy4dfly::golden_of_g(G), 77),
+                               G == 4 ? "every G 4 golden case in one call"
+                                      : "every G 512 golden case in one call", true));
+    for (uint64_t seed = 1; seed <= 200; ++seed)
+        hs.push_back(dfly_call(hy4dfly::random(seed), "a random geometry", (seed & 1) != 0));
+    {
+        /* The worked case of ref_hy4_ops_test (a = 9, nrec 2): a source of -1, an out-of-range
+         * source, rows before cu[0] and past cu[S], and `out` a column slice of a wider plane. */
+        for (const int64_t srcrow : { 1, 0, -1, 5 }) {
+            Hand h("worked case: a source row, dense, -1, past the snapshot; unheld rows; a sliced out",
+                   "dfly_sel", 0.0);
+            h.dense(RAD_I32, { 2, 4 }, [](int64_t i) { static const float v[8] = { 0, 0, 0, 0, 50, 10, 30, -1 };
+                                                     return v[i]; })
+             .idx({ 0, 3 })
+             .idx({ srcrow })
+             .dense(RAD_I32, { 1, 6 }, [](int64_t i) { static const float v[6] = { 10, 50, 30, 60, 70, 80 };
+                                                     return v[i]; })
+             .idx({ 3, 9, 10, 11, 4 })
+             .idx({ 1, 4 })
+             .view(RAD_I32, { 5, 4 }, { 7, 1 }, 35, [](int64_t) { return 5.0f; }, true)
+             .dense(RAD_I32, { 5 }, [](int64_t) { return 5.0f; }, true)
+             .dense(RAD_I32, { 5 }, [](int64_t) { return 5.0f; }, true)
+             .pi("M", 5).pi("blocks_in", 4).pi("blocks", 4).pi("ratio", 4).pi("seqs", 1);
+            hs.push_back(std::move(h));
+        }
+    }
+}
+
 bool hand_cases(const Check& ck) {
     std::vector<Hand> hs;
     shape_cases(hs);
@@ -5343,6 +5403,7 @@ bool hand_cases(const Check& ck) {
     vsa_cases(hs);
     qsa_cases(hs);
     hy4_cases(hs);
+    dfly_cases(hs);
     kv_cases(hs);
     kvstream_cases(hs);
     encoder_cases(hs);

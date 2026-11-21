@@ -46,6 +46,7 @@
 #include "rad_philox.h"
 #include "rad_sample.h"
 #include "rad_yarn.h"
+#include "../tests/hy4_dfly_cases.h"   /* dfly_sel: golden cases, random geometries */
 
 #include <dlfcn.h>
 #include <spawn.h>
@@ -34192,6 +34193,55 @@ static void hy4_engram_ids_case(const Plugin& pl) {
     }
 }
 
+/* dfly_sel (r4d_dfly.hip): the golden cases of ref/test_dfly_ref.py (c) ten a call within one G,
+ * all of one G in one call (G 512: blocks 514, the real table width), and seeded random geometries
+ * (sources -1 and past the snapshot, unheld rows, empty sequences, wide tables, tables past
+ * `blocks`), with and without `count`, a pitched `out`. Integers: byte for byte. */
+static void hy4_dfly_sel_case(const Plugin& pl) {
+    if (!sel("dfly_sel_i32")) return;
+    auto run = [&](const hy4dfly::Case& c, bool with_count, int64_t pad, const std::string& what) {
+        std::vector<Hy4Opd> ops;
+        auto put = [&](std::vector<int64_t> shape, const std::vector<int64_t>& v) {
+            ops.push_back(hy_opd(RAD_I32, std::move(shape)));
+            hy_fill(ops.back(), [&](int64_t i) { return (double)v[(size_t)i]; });
+        };
+        put({ c.R, c.G }, c.sel);
+        put({ c.R }, c.nsel);
+        put({ c.S }, c.src);
+        put({ c.S, c.pitch }, c.bt);
+        put({ c.M }, c.pos);
+        put({ c.S + 1 }, c.cu);
+        ops.push_back(hy_opd(RAD_I32, { c.M, c.blocks }, pad ? c.blocks + pad : 0));
+        ops.push_back(hy_opd(RAD_I32, { c.M }));
+        ops.push_back(with_count ? hy_opd(RAD_I32, { c.M }) : hy_absent());
+        ops[6].out = ops[7].out = ops[8].out = true;
+        std::vector<RadParam> ps = { PI("M", c.M), PI("blocks_in", c.G), PI("blocks", c.blocks),
+                                     PI("ratio", c.ratio), PI("seqs", c.S) };
+        hy_check(pl, "dfly_sel_i32", what, ps, ops);
+    };
+    for (const int64_t G : { 4, 512 }) {
+        const std::vector<int> all = hy4dfly::golden_of_g(G);
+        for (size_t i = 0; i < all.size(); i += 10) {
+            const std::vector<int> part(all.begin() + (long)i, all.begin() + (long)std::min(all.size(), i + 10));
+            run(hy4dfly::golden(part, 1000 + i), (i / 10) & 1, (i / 10) % 3 == 0 ? 3 : 0,
+                fmt("dfly_sel vs libref, to the bit: golden cases %zu..%zu of G %lld", i, i + part.size() - 1,
+                    (long long)G));
+        }
+        run(hy4dfly::golden(all, 77), true, 0,
+            fmt("dfly_sel vs libref, to the bit: every golden case of G %lld in one call", (long long)G));
+    }
+    /* A debug libref reports a table past `blocks` (RAD_E_SHAPE); those draws need a release one. */
+#ifdef NDEBUG
+    const uint64_t past = 16;
+#else
+    const uint64_t past = 24;
+#endif
+    for (uint64_t seed = 1; seed <= 24; ++seed)
+        run(hy4dfly::random(seed, seed > past), seed & 1, seed % 4 == 0 ? 2 : 0,
+            fmt("dfly_sel vs libref, to the bit: random geometry %llu%s", (unsigned long long)seed,
+                seed > past ? ", tables past blocks" : ""));
+}
+
 static void hy4_engram_norm_case(const Plugin& pl) {
     if (!sel("engram_norm_bf16")) return;
     struct G { int64_t M, heads, n, pad; double eps; };
@@ -34325,6 +34375,7 @@ static void device_phase(const Plugin& pl) {
     hy4_mla_project_kv_case(pl);
     hy4_mla_kv_split_case(pl);
     hy4_engram_ids_case(pl);
+    hy4_dfly_sel_case(pl);
     hy4_engram_norm_case(pl);
     hy4_engram_gate_case(pl);
     lora_case(pl);

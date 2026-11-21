@@ -1,4 +1,5 @@
-/* tests/r4d_emu: Hy4-flash's small ops (r4d_ihc_bf16.hip, r4d_engram_bf16.hip, r4d_mla_kv_bf16.hip)
+/* tests/r4d_emu: Hy4-flash's small ops (r4d_ihc_bf16.hip, r4d_engram_bf16.hip, r4d_mla_kv_bf16.hip,
+ * r4d_dfly.hip)
  * on the host SIMT emulator, each held to libref's op (libref/ref_hy4.cpp) on the same bytes.
  * ihc_post, mla_kv_split and Engram's ids, mask and window compare byte for byte; the others within
  * the bound their kernels state (one bf16 ulp of a differently ordered or fused sum). Row padding of
@@ -7,6 +8,7 @@
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
 #include "ref_host.h"
+#include "../hy4_dfly_cases.h"
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -130,6 +132,9 @@ static RadParam pf(const char* k, double v) { RadParam p{}; p.key = k; p.kind = 
 static RadParam ps(const char* k, const char* v) { RadParam p{}; p.key = k; p.kind = RAD_P_STR; p.sval = v; return p; }
 
 static int g_fails = 0, g_cases = 0;
+/* g_quiet: no line for a passing case. g_ref_shape: libref's RAD_E_SHAPE still compares (dfly_sel's
+ * failed rows, which a debug libref also reports; the outputs are written either way). */
+static bool g_quiet = false, g_ref_shape = false;
 
 static void check(const char* op, RadLaunchFn kernel, const std::string& what, std::vector<RadParam> p,
                   std::vector<Opd>& ops) {
@@ -152,7 +157,7 @@ static void check(const char* op, RadLaunchFn kernel, const std::string& what, s
     ar.t = ta.data(); ar.n_t = (int)n; ar.p = p.data(); ar.n_p = (int)p.size(); ar.world_size = 1;
     ak.t = tb.data(); ak.n_t = (int)n; ak.p = p.data(); ak.n_p = (int)p.size(); ak.world_size = 1;
     const int rr = ref->launch(&ar, nullptr), rk = kernel(&ak, nullptr);
-    if (rr != RAD_OK || rk != RAD_OK) {
+    if ((rr != RAD_OK && !(g_ref_shape && rr == RAD_E_SHAPE)) || rk != RAD_OK) {
         std::printf("FAIL %s: libref rc=%d kernel rc=%d\n", what.c_str(), rr, rk);
         ++g_fails;
         return;
@@ -182,7 +187,7 @@ static void check(const char* op, RadLaunchFn kernel, const std::string& what, s
                     (long long)total, padding ? "" : ", padding or an input written");
         ++g_fails;
     } else {
-        std::printf("ok   %s (%lld values)\n", what.c_str(), (long long)total);
+        if (!g_quiet) std::printf("ok   %s (%lld values)\n", what.c_str(), (long long)total);
     }
 }
 
@@ -401,6 +406,51 @@ static void engram_norm_gate() {
     }
 }
 
+/* dfly_sel (r4d_dfly.hip): every golden case alone and all of one G in one call, then 1000 seeded
+ * random geometries (sources -1 and past the snapshot, unheld rows, empty sequences, wide tables);
+ * then 100 with tables past `blocks` (the rows fail to -1, len 0). Byte for byte, with
+ * and without `count`; a pitched `out` keeps its padding and its columns past `blocks`. */
+static void dfly_sel_case(const hy4dfly::Case& c, bool with_count, int64_t out_pad, const char* what) {
+    std::vector<Opd> ops;
+    auto put = [&](std::vector<int64_t> shape, const std::vector<int64_t>& v) {
+        ops.push_back(opd(RAD_I32, std::move(shape)));
+        fill(ops.back(), [&](int64_t i) { return (double)v[(size_t)i]; });
+    };
+    put({ c.R, c.G }, c.sel);
+    put({ c.R }, c.nsel);
+    put({ c.S }, c.src);
+    put({ c.S, c.pitch }, c.bt);
+    put({ c.M }, c.pos);
+    put({ c.S + 1 }, c.cu);
+    ops.push_back(opd(RAD_I32, { c.M, c.blocks }, out_pad ? c.blocks + out_pad : 0));
+    ops.push_back(opd(RAD_I32, { c.M }));
+    ops.push_back(with_count ? opd(RAD_I32, { c.M }) : absent());
+    ops[6].out = ops[7].out = ops[8].out = true;
+    std::vector<RadParam> p = { pi("M", c.M), pi("blocks_in", c.G), pi("blocks", c.blocks),
+                                pi("ratio", c.ratio), pi("seqs", c.S) };
+    check("dfly_sel", r4d_rad_dfly_sel, what, p, ops);
+}
+
+static void dfly_sel() {
+    const int before = g_fails, cases = g_cases;
+    g_quiet = true;
+    for (int i = 0; i < kDflyCases; ++i)
+        dfly_sel_case(hy4dfly::golden({ i }, 1000 + (uint64_t)i), i & 1, (i % 3) == 0 ? 3 : 0,
+                      "dfly_sel golden case, one sequence");
+    for (const int64_t G : { 4, 512 })
+        dfly_sel_case(hy4dfly::golden(hy4dfly::golden_of_g(G), 77), true, 0,
+                      G == 4 ? "dfly_sel every G 4 golden case in one call"
+                             : "dfly_sel every G 512 golden case in one call");
+    for (uint64_t seed = 1; seed <= 1000; ++seed)
+        dfly_sel_case(hy4dfly::random(seed), seed & 1, (seed % 4) == 0 ? 2 : 0, "dfly_sel random geometry");
+    g_ref_shape = true;
+    for (uint64_t seed = 1; seed <= 100; ++seed)
+        dfly_sel_case(hy4dfly::random(5000 + seed, true), true, 0, "dfly_sel random geometry, tables past blocks");
+    g_ref_shape = false;
+    g_quiet = false;
+    std::printf("dfly_sel: %d case(s), %d failure(s)\n", g_cases - cases, g_fails - before);
+}
+
 int main() {
     ihc_pre();
     ihc_post();
@@ -408,6 +458,7 @@ int main() {
     mla_kv();
     engram_ids();
     engram_norm_gate();
+    dfly_sel();
     std::printf("%d case(s), %d failure(s)\n", g_cases, g_fails);
     return g_fails ? 1 : 0;
 }

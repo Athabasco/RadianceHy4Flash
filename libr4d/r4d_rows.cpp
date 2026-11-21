@@ -1520,8 +1520,7 @@ static const RadOperandSpec oQsaSelect[] = {
     { "seqused", RAD_OPD_OUT, 0 },
 };
 
-/* `dfly_sel`, DFly2's draft table (libref/ref_dfly.cpp, docs/OPS.md). The schema is fixed here so
- * every library agrees; libr4d has no kernel for it yet (WP13.5), so a card resolves it elsewhere. */
+/* `dfly_sel`, DFly2's draft table (libref/ref_dfly.cpp, docs/OPS.md; kernel r4d_dfly.hip). */
 static const RadParamSpec pDflySel[] = {
     { "M",         RAD_P_INT, RAD_REQUIRED },
     { "blocks_in", RAD_P_INT, RAD_REQUIRED },
@@ -5267,6 +5266,8 @@ static const RadConstraint cMlaKvSplit[] = {
     C_GE("M", 1), C_GE("heads", 1), C_GE("k_dim", 1), C_GE("v_dim", 1), C_GE("rope_dim", 1),
     C_IN("dtype", "bf16"),
 };
+static const RadConstraint cDflySel[] = { C_GE("M", 1), C_GE("blocks_in", 1), C_GE("blocks", 1),
+                                          C_GE("ratio", 1), C_GE("seqs", 1) };
 static const RadConstraint cEngramIds[] = { C_GE("M", 1), C_GE("ngram", 2), C_LE("ngram", 8),
                                             C_GE("heads", 1) };
 static const RadConstraint cEngramNorm[] = { C_GE("M", 1), C_GE("heads", 1), C_GE("n", 1),
@@ -8621,6 +8622,14 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaKvSplit), NOTUNE,
   nullptr, nullptr, r4d_rad_mla_kv_split, nullptr, nullptr, nullptr,
   r4d_shape_mla_kv_split },
+/* DFly2's draft table: integer only, byte-equal to libref; one workgroup a (row, 64 columns). */
+{ "dfly_sel_i32", "dfly_sel", "attn",
+  "DFly2's draft page table: the source row's recalled pages, then the block's own pages, -1 after",
+  "any M, blocks, blocks_in, ratio; i32 operands with unit column strides",
+  "i32 in and out; `count` optional",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDflySel), NOTUNE,
+  nullptr, nullptr, r4d_rad_dfly_sel, nullptr, nullptr, nullptr,
+  r4d_shape_dfly_sel },
 { "engram_ids_i32", "engram_ids", "vocab", "Engram's hash ids and mask, one thread a (row, head)",
   "ngram 2..8, heads a multiple of ngram-1; ids i32 or i64",
   "i32 tokens, positions, map, state and mask; i64 multipliers, vocabulary sizes and offsets",

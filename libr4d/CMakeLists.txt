@@ -127,6 +127,8 @@ set(R4D_UNITS
   "r4d_ihc_bf16|"
   "r4d_mla_kv_bf16|"
   "r4d_engram_bf16|"
+  # DFly2's draft page table (kernels/dfly2.md §4).
+  "r4d_dfly|"
   "r4d_glm|"
   "r4d_dsa|"
   "r4d_mla|"

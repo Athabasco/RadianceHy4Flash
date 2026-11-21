@@ -278,6 +278,9 @@ std::vector<Case> build_cases() {
                         HI("map_size", 300), HI("image", 5), HI("video", 7) });
     add("engram_ids", { HI("M", 5), HI("heads", 9), HI("ngram", 4), HI("pad", 0),
                         HI("map_size", 40) });
+    add("dfly_sel", { HI("M", 12), HI("blocks_in", 4), HI("blocks", 6), HI("ratio", 4), HI("seqs", 2) });
+    add("dfly_sel", { HI("M", 7), HI("blocks_in", 9), HI("blocks", 11), HI("ratio", 2), HI("seqs", 3) });
+    add("dfly_sel", { HI("M", 1), HI("blocks_in", 1), HI("blocks", 3), HI("ratio", 4), HI("seqs", 1) });
 
     for (const char* order : { "token", "sorted" })
         add("moe_gemm_q",

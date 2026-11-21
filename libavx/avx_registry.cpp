@@ -525,6 +525,13 @@ static const RadOperandSpec oQsaWork[] = { OPD("k"), OPD("pos"), OPD("cu"), OPD(
                                            OPD("sidx"), OPD("bt"), OPD_O("rope"), OUT("stage"),
                                            OUT("page"), OUT("bpos"), OUT("nc") };
 
+/* dfly_sel: DFly2's draft table (libref/ref_dfly.cpp). `count` is optional. */
+static const RadParamSpec pDflySel[] = { P_INT("M"), P_INT("blocks_in"), P_INT("blocks"),
+                                         P_INT("ratio"), P_INT("seqs") };
+static const RadOperandSpec oDflySel[] = { OPD("sel"), OPD("nsel"), OPD("src"), OPD("bt"),
+                                           OPD("pos"), OPD("cu"), OUT("out"), OUT("len"),
+                                           OUT_O("count") };
+
 static const RadParamSpec pQkNormRope[]   = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
                                               P_INT("n_head_kv"), P_F64("theta"), P_F64("eps"),
                                               P_F64O("scale"), P_STRO("mode"),
@@ -1358,6 +1365,11 @@ static const RadOpSchema kSchemas[] = {
   "the topk highest-scoring complete blocks as page ids, libref's order exactly: the blocks above "
   "the threshold in block order, then its ties in block order, then the partial page, then -1 to "
   "topk + 1; a radix select, linear in the blocks." },
+{ "dfly_sel", ARR(pDflySel), ARR(oDflySel),
+  "DFly2's draft table: for each query row of a sequence whose first row sits at position a, the "
+  "source row src[s]'s recalled pages (sel[src][0, nsel-1), or bt[0, g0) when nsel is 0, g0 = "
+  "(a-1)/ratio), then bt[g0] .. bt[pos/ratio], -1 to `blocks`; len = ratio*nrec + pos - ratio*g0 + "
+  "1, count = the entries. A source of -1 or a table past `blocks` gives the row -1 and len 0." },
 { "qsa_tail_store", ARR(pQsaTailStore), ARR(oQsaTailStore),
   "state[sidx[s][0]][pos[t] % ring] = k[t] for the last `ring` tokens of each sequence; the other "
   "rows of the tail keep what they held." },
@@ -2073,6 +2085,8 @@ SIMPLE("avx_qk_norm_rope", "qk_norm_rope", "attn", "per-head QK norm then rotary
        DT_FLOAT, L(qk_norm_rope)),
 SIMPLE("avx_qsa_score", "qsa_score", "attn",
        "QSA block scores: per-head relu dots summed over the heads", DT_FLOAT, L(qsa_score)),
+SIMPLE("avx_dfly_sel", "dfly_sel", "attn", "DFly2's draft page table, two copies and a fill a row",
+       DT_ANY, L(dfly_sel)),
 SIMPLE("avx_qsa_select", "qsa_select", "attn",
        "QSA selection: the top-k blocks as a page-id table, partial page last",
        "f32 scores, i32 tables", L(qsa_select)),
