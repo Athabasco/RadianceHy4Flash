@@ -265,6 +265,8 @@ def main():
     ap.add_argument("--ready-timeout", type=int, default=900)
     ap.add_argument("--work", default=None)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--dfly-extra", default="", help="extra server flags of the dfly modes, e.g. "
+                    "'--draft-coupling on --draft-verify traversal --draft-depth adaptive' (WP13.8)")
     a = ap.parse_args()
     a.kernels = a.kernels or ("libr4d,libavx" if a.gpu else "libref")
     a.work = a.work or os.path.join(a.build, "rollback_gate")
@@ -332,7 +334,7 @@ def main():
         open(oracle, "w").write(" ".join(map(str, g0)))
         for mode in modes:
             if mode in DFLY_MODES:
-                extra = ["--num-speculative-tokens", a.depth]
+                extra = ["--num-speculative-tokens", a.depth] + a.dfly_extra.split()
                 envm = dict(env_ring, **({"RADIANCE_HY4_DFLY_SABOTAGE": "1"} if mode == "dfly-sabotage" else {}))
             else:
                 extra = ["--spec-ngram", a.depth, "--debug-draft-oracle", oracle]

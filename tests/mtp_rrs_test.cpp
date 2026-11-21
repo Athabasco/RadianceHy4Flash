@@ -2071,8 +2071,71 @@ struct BlockBooks {
 /* One block of `steps` positions drafted by the real coupled walk after the committed prefix h0
  * (whose last token is `anchor`). The tree is the chain of the walk's tokens; node l's state is
  * position l's (round l + 1). */
+/* DFly2's chain (hyv4flash, kernels/dfly2.md §8.2) in place of DFlash2's walk: no lattice, the law
+ * of step k exists only once x_{k-1} is drawn (the correction reads it), so each step is ONE
+ * mtp_couple_propose over every drafting row (round k + 1, the plugin's state plane
+ * [steps, rows]), its shortlist the head's top 8 with the values bf16-rounded as the plugin's
+ * cand_val and widened to f32, and x_k (column 0 afterwards) the next step's predecessor. Row i's
+ * draw names card i, as the engine stages it in the query pass's order. The toy head is the
+ * noisy target at the drafted prefix (a law at the node x_0..x_{k-1}, the property the exactness
+ * argument uses). */
+bool g_dfly = false;
+
+float bf16_round(float x) {
+    uint32_t u;
+    std::memcpy(&u, &x, 4);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    u &= 0xffff0000u;
+    std::memcpy(&x, &u, 4);
+    return x;
+}
+
+void draft_dfly(Tree* const* t, int n, const uint64_t* seed, const uint64_t* base, int steps,
+                double noise, const uint64_t* h0) {
+    std::vector<int32_t> idx((size_t)n * 8), card((size_t)n);
+    std::vector<float> val((size_t)n * 8);
+    std::vector<RadMtpCoupleDraw> draws((size_t)n);
+    std::vector<RadMtpCoupleState> st((size_t)steps * (size_t)n);
+    std::vector<uint64_t> h(h0, h0 + n);
+    for (int i = 0; i < n; ++i) {
+        draws[(size_t)i] = make_draw(seed[i], base[i]);
+        draws[(size_t)i].card = i;
+        card[(size_t)i] = i;
+        t[i]->hash[0] = h0[i];
+    }
+    for (int k = 0; k < steps; ++k) {
+        for (int i = 0; i < n; ++i) {
+            const Law L = law_at(h[(size_t)i], noise);
+            for (int c = 0; c < 8; ++c) {
+                idx[(size_t)i * 8 + (size_t)c] = L.qid[c];
+                val[(size_t)i * 8 + (size_t)c] = bf16_round(L.qval[c]);
+            }
+        }
+        RadMtpCoupleProposeCall c{};
+        c.idx = idx.data(); c.val = val.data(); c.card = card.data();
+        c.draw = reinterpret_cast<const uint32_t*>(draws.data());
+        c.state = reinterpret_cast<uint32_t*>(st.data());
+        c.M = n; c.vocab = 1000;
+        c.ld_idx = 8; c.ld_val = 8; c.ld_draw = RAD_MTP_COUPLE_DRAW_WORDS;
+        c.st_round = (int64_t)n * RAD_MTP_COUPLE_STATE_WORDS; c.st_row = RAD_MTP_COUPLE_STATE_WORDS;
+        c.round = k + 1;
+        for (int64_t r = 0; r < c.M; ++r) rad_mtp_couple_propose_row(c, r);
+        for (int i = 0; i < n; ++i) {
+            const int32_t x = idx[(size_t)i * 8];
+            Tree& tr = *t[i];
+            tr.tok[k + 1] = x;
+            tr.par[k + 1] = k;
+            tr.hash[k + 1] = child_hash(tr.hash[k], x);
+            tr.st[k] = st[(size_t)k * (size_t)n + (size_t)i];
+            h[(size_t)i] = tr.hash[k + 1];
+        }
+    }
+    for (int i = 0; i < n; ++i) t[i]->n = steps;
+}
+
 void draft_block(Tree* t, uint64_t seed, uint64_t base, int steps, double noise, uint64_t h0,
                  int32_t anchor, float q_temp = 0.8f) {
+    if (g_dfly) { draft_dfly(&t, 1, &seed, &base, steps, noise, &h0); return; }
     static const BlockBooks bb;
     int32_t cand[8 * 8], tok[8];
     float   un[8 * 8];
@@ -2259,8 +2322,18 @@ LoadRun run_block_load(const DraftDepthCfg& cfg0, BlockVerify how, int trials, d
             if (n == 0) break;
             Tree t[3];
             DraftDepthRow row[3];
+            if (g_dfly) {
+                /* the step's drafting rows in one chain, as the plugin's query pass runs them */
+                Tree* tp[3];
+                uint64_t sd[3], bs[3], hh[3];
+                for (int i = 0; i < n; ++i) {
+                    tp[i] = &t[i]; sd[i] = seed[act[i]]; bs[i] = (uint64_t)len[act[i]]; hh[i] = h[act[i]];
+                }
+                draft_dfly(tp, n, sd, bs, steps, noise, hh);
+            }
             for (int i = 0; i < n; ++i) {
-                draft_block(&t[i], seed[act[i]], (uint64_t)len[act[i]], steps, noise, h[act[i]], anchor[act[i]]);
+                if (!g_dfly)
+                    draft_block(&t[i], seed[act[i]], (uint64_t)len[act[i]], steps, noise, h[act[i]], anchor[act[i]]);
                 draft_depth_begin(cfg, &row[i], false);
                 for (int l = 1; l <= steps; ++l) {
                     const double st = draft_depth_stat(t[i].st[l - 1], l, n > 1 ? DRAFT_DEPTH_TOP : cfg.stat);
@@ -2446,6 +2519,86 @@ TEST(suffix_steps_in_place_of_a_coupled_block_emit_the_target_law) {
             CHECK(r.share[0] > 0.3);
         }
     g_sharp = 1.0;
+}
+
+/* WP13.8: the same verifies, prefixes, controls and suffix steps over DFly2's chain (draft_dfly):
+ * five drafts a step, as the plugin serves. */
+TEST(dfly_coupled_chain_emits_the_target_law_under_every_verify) {
+    g_sharp = 2.0; g_dfly = true;
+    const DraftDepthCfg off{};
+    for (BlockVerify how : { BV_ROW, BV_TRAV, BV_BLOCK }) {
+        const DepthRun r = run_block(off, how, 250000, 0.6, 5);
+        std::printf("  dfly chain of 5, %-9s: z3=%.2f z1=%.2f acc=%.3f\n", bv_name(how), r.z3, r.z1, r.mean_acc);
+        CHECK(r.z3 < 4.5); CHECK(r.z1 < 4.5);
+        CHECK(r.mean_acc > 0.3);
+    }
+    g_sharp = 1.0; g_dfly = false;
+}
+
+TEST(dfly_adaptive_prefix_keeps_the_target_law) {
+    g_sharp = 2.0; g_dfly = true;
+    struct C { int stat; double stop; int min; const char* name; };
+    /* the toy's top masses are flatter over five drafts than over DFlash2's four: lower stops */
+    const C cs[] = { { DRAFT_DEPTH_TOP, 0.12, 1, "top" }, { DRAFT_DEPTH_PATH, 0.20, 1, "path" },
+                     { DRAFT_DEPTH_TOP, 0.08, 2, "top min2" } };
+    for (const C& c : cs) {
+        DraftDepthCfg cfg = depth_cfg(5, 0, c.stat, c.stop, c.min);
+        cfg.lawless = 5;
+        for (BlockVerify how : { BV_ROW, BV_TRAV }) {
+            const DepthRun r = run_block(cfg, how, 200000, 0.6, 5);
+            std::printf("  dfly adaptive %-8s stop %.2f %-9s: z3=%.2f z1=%.2f acc=%.3f depth %.2f\n",
+                        c.name, c.stop, bv_name(how), r.z3, r.z1, r.mean_acc, r.mean_depth);
+            CHECK(r.z3 < 4.5); CHECK(r.z1 < 4.5);
+            int used = 0;
+            for (int d = 1; d <= 5; ++d) used += r.share[d] > 0.05;
+            CHECK(used >= 2);
+        }
+    }
+    g_sharp = 1.0; g_dfly = false;
+}
+
+TEST(dfly_load_aware_prefix_keeps_the_target_law) {
+    g_sharp = 2.0; g_dfly = true;
+    for (int online = 0; online < 2; ++online)
+        for (BlockVerify how : { BV_ROW, BV_TRAV }) {
+            DraftDepthCfg cfg = depth_cfg_load(5, 0, 0.40, 0.20, 0.6);
+            cfg.lawless = 5;
+            const LoadRun r = run_block_load(cfg, how, 120000, 0.6, 5, 2, online);
+            std::printf("  dfly load-aware (%s, %s): z3 %.2f %.2f %.2f z1 %.2f %.2f %.2f acc=%.3f depth %.2f\n",
+                        online ? "online" : "static", bv_name(how), r.z3[0], r.z3[1], r.z3[2], r.z1[0],
+                        r.z1[1], r.z1[2], r.mean_acc, r.mean_depth);
+            for (int q = 0; q < 3; ++q) { CHECK(r.z3[q] < 4.5); CHECK(r.z1[q] < 4.5); }
+        }
+    g_sharp = 1.0; g_dfly = false;
+}
+
+TEST(dfly_prefix_controls_that_read_past_the_draft_or_its_own_mass_are_not_exact) {
+    g_sharp = 2.0; g_dfly = true;
+    const DraftDepthCfg cfg = depth_cfg(5, 0, DRAFT_DEPTH_TOP, 0.0);
+    for (BlockVerify how : { BV_ROW, BV_TRAV }) {
+        const DepthRun next = run_block(cfg, how, 100000, 0.6, 5, 1, 0.70);
+        const DepthRun own  = run_block(cfg, how, 100000, 0.6, 5, 2, 0.30);
+        std::printf("  dfly controls (%s): Q_{j+1} z3=%.1f z1=%.1f | own mass z3=%.1f z1=%.1f\n",
+                    bv_name(how), next.z3, next.z1, own.z3, own.z1);
+        CHECK(next.z3 > 8.0 || next.z1 > 8.0);
+        CHECK(own.z3 > 8.0 || own.z1 > 8.0);
+    }
+    g_sharp = 1.0; g_dfly = false;
+}
+
+TEST(dfly_suffix_steps_in_place_of_the_chain_emit_the_target_law) {
+    g_sharp = 2.0; g_dfly = true;
+    g_suffix_visible = false;
+    DraftDepthCfg cfg = depth_cfg(5, 0, DRAFT_DEPTH_TOP, 0.30);
+    cfg.lawless = 5;
+    for (BlockVerify how : { BV_ROW, BV_TRAV }) {
+        const DepthRun r = run_block(cfg, how, 150000, 0.6, 5, 0, 0, 50);
+        std::printf("  dfly suffix beside an adaptive chain (%s): z3=%.2f z1=%.2f suffix share %.2f\n",
+                    bv_name(how), r.z3, r.z1, r.share[0]);
+        CHECK(r.z3 < 4.5); CHECK(r.z1 < 4.5);
+        CHECK(r.share[0] > 0.3);
+    }
+    g_sharp = 1.0; g_dfly = false;
 }
 
 RAD_TEST_MAIN()

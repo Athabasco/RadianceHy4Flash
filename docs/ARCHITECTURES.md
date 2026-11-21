@@ -3595,7 +3595,8 @@ rewrites them before reading (the rollback gate, below, checks exactly that).
 drafter on at N proposals (a block of N + 1 rows a sequence). Depth 5 is what the drafter was trained
 at; 1 to 4 propose a prefix of the same chain. The container carries the drafter unless
 `rad-convert --max-spec 0` left it out. At startup the log says `DFly2 served (depth N, block N+1, ...
-greedy proposals, bf16 linears | k of its linears int8)` or `DFly2 is declared and not served: <why>`.
+greedy proposals | coupled proposals (...), bf16 linears | k of its linears int8)` (in the program's
+notes; the engine's own line under coupling is `block drafter 'dfly2' coupled LIVE: N position(s)`) or `DFly2 is declared and not served: <why>`.
 Auto depth stays off until a real-weight acceptance has been measured (below, "Costs").
 
 **What it declines** (the container loads, the reason is printed once, speculation falls back to
@@ -3636,9 +3637,25 @@ id in both stages). Taps at TP are rank 0's.
 **With the other speculation levers** (GUIDE.md, "SuffixDecoding", "Adaptive window"):
 `--draft-window adaptive` is the core's and applies to any block drafter; `--draft-suffix on` runs
 beside DFly2 (a suffix chain is cut to `num-speculative-tokens`, with a warning: the probe states the
-depth fixed when the container has the drafter); `--draft-depth adaptive` and `--draft-depth-load on`
-are refused ("--draft-coupling on, but the architecture declared no coupled MTP planes"): DFly2 is
-uncoupled (the coupled walk, WP13.8, is not built). `--spec-ngram` is refused beside a declared
+depth fixed when the container has the drafter).
+
+**Coupled proposals** (`--draft-coupling on`, WP13.8; kernels/dfly2.md §8.2). DFly2 has no candidate
+lattice (its predecessor dependence is the correction head plus the lm_head), so the coupled draw is
+the serial heads' op, once a chain step: step k widens its merged top-8 shortlist (bf16-rounded
+logits, global ids, identical on every rank) to f32 and runs `mtp_couple_propose` (round k + 1 of
+`max_rounds` = depth): `Q_k` = the FP64 softmax at temperature 1 of those eight, `x_k ~ Q_k` at the
+draw the engine staged for the row (the same on every rank, so TP needs nothing more), `x_k` into
+column 0 (the proposal and the next step's predecessor) and `Q_k` into `mtp_couple_state[k][row]`.
+The plugin declares the planes the engine binds by name, `mtp_couple_draws [seqs, 8 words]` and
+`mtp_couple_state [depth, seqs, 42 words]`. A greedy request (draw mode 0) keeps the argmax, so
+greedy text is byte-equal to the uncoupled drafter's. The spechub kernels must be loaded
+(`--kernels ...,spechub`, or the default list); without them the drafter is declined by name and the
+engine refuses the flag. With coupling on, `--draft-verify traversal` / `block`, `--draft-depth
+adaptive` (the verified prefix of the block: draft j while the product of the laws' statistic up to j
+is >= `--draft-depth-stop`, `--draft-depth-min` always; `lag` plays no part) and `--draft-depth-load
+on` work as for any coupled block drafter (`--draft-depth adaptive` still excludes `--draft-window
+adaptive`). Sabotaged and coupled (`RADIANCE_HY4_DFLY_SABOTAGE=1`), the shortlist's ids are replaced by
+eight ids next to the mask id before the draw, so the states stay valid laws the target rejects. `--spec-ngram` is refused beside a declared
 drafter (`RADIANCE_HY4_DFLY=0` gives prompt lookup alone).
 
 **Long prefills (`prefill-span`, `busy-prefill-chunk`).** The routed block runs one pass over the whole
