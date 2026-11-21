@@ -3814,7 +3814,10 @@ maximum is taken (libref shifts by the maximum of the scores and the sink).
   `cu_q`, `cu_k` hold absolute offsets into `q` and into `k` / `v`; sequence `s` has `m_s` query
   rows and `n_s >= m_s` key rows (otherwise `RAD_E_SHAPE`), query `i` sits at key index
   `p = n_s - m_s + i` and sees `j <= p` with `p - j < window` (`window 0`: all). The value width may
-  differ from the key width; `out` has the value's.
+  differ from the key width; `out` has the value's. libr4d's `attn_kv_sink_h256` serves keys and
+  values of 256, bf16, any window and up to 65535 heads (bf16 Q.K, f16 P.V, the sink added to the
+  denominator at the store); a sequence with `n_s < m_s` cannot be refused on the device and
+  gets zero rows.
 - **`mla_kv_split`** reorders the `kv_b` GEMM output `[N, heads*(k_dim+v_dim)]` and the rotated key
   part `[N, rope_dim]` into `k [N, heads, k_dim + rope_dim]` (the rope part the same for every head)
   and `v [N, heads, v_dim]`. A copy, converted to the outputs' dtype.

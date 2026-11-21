@@ -171,6 +171,8 @@ int     r4d_rad_attn_window_sink_h128_gqa8_bf16 (const RadArgs*, RadStream);
 int     r4d_rad_attn_window_sink_h128_gqa8_i8  (const RadArgs*, RadStream);
 int     r4d_rad_attn_window_sink_h128_gqa16_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_window_sink_h128_gqa16_i8 (const RadArgs*, RadStream);
+/* attn_kv_sink at head_dim 256 (Hy4-flash's non-absorbed prefill, r4d_attn_kv_sink_h256.hip) */
+int     r4d_rad_attn_kv_sink_h256(const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h256_gqa1_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h256_gqa1_i8 (const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h256_gqa2_bf16(const RadArgs*, RadStream);
@@ -993,6 +995,7 @@ int r4d_shape_sample_chain     (const RadParam*, int, int operand, RadOpdDesc*);
 
 int r4d_shape_attn_paged        (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_attn_paged_sink   (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_attn_kv_sink      (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_attn_paged_gate_quant(const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qk_norm_rope_gate (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qk_norm_rope_gate_kv_store(const RadParam*, int, int operand, RadOpdDesc*);

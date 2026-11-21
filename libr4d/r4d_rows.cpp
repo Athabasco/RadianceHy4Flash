@@ -2736,6 +2736,16 @@ static const RadOperandSpec oLoraExpand[] = {
     { "y",      RAD_OPD_INOUT, 0 },
 };
 
+/* attn_kv_sink: libref's spelling (libref/ref_registry.cpp pAttnKvSink, oAttnKvSink). */
+static const RadParamSpec pAttnKvSink[] = { P_INT("M"), P_INT("N"), P_INT("heads"),
+                                            P_INT("head_dim"), P_INT("window"), P_F64("scale"),
+                                            P_STR("dtype") };
+static const RadOperandSpec oAttnKvSink[] = { { "q", RAD_OPD_IN, 0 },     { "k", RAD_OPD_IN, 0 },
+                                              { "v", RAD_OPD_IN, 0 },     { "cu_q", RAD_OPD_IN, 0 },
+                                              { "cu_k", RAD_OPD_IN, 0 },
+                                              { "sinks", RAD_OPD_WEIGHT, 0 },
+                                              { "out", RAD_OPD_OUT, 0 } };
+
 #define SCHEMA(op, p, o, doc) { (op), ROW(p), ROW(o), (doc) }
 
 /* ---- image generation (r4d_gen.hip, r4d_attn_gen.hip) -------------------------------------
@@ -4273,6 +4283,11 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("quant_cols_fp8", pQuantCols, oQuantCols,
            "E4M3 codes with one scale per column over all M rows: scale = amax(|x[:, c]|) / 448 "
            "(1 for an all-zero column), y = e4m3(clamp(x / scale, +-448)), round to nearest even."),
+    SCHEMA("attn_kv_sink", pAttnKvSink, oAttnKvSink,
+           "Dense causal attention with a key prefix, a window and a sink. Sequence s has m_s "
+           "query rows and n_s >= m_s key rows (cu_q, cu_k); query i sits at key index p = n_s - "
+           "m_s + i and sees j <= p with p - j < window (window 0: all). out = sum exp(s_j) v_j / "
+           "(sum exp(s_j) + exp(sink[h]))."),
 };
 
 /* ================================================================================ constraints
@@ -4432,6 +4447,11 @@ static const RadConstraint cAttnPrefillH64G4Bf16[] = {
  * legs above. At h256/gqa2 these rows overlap the sliding leg's bands and rank below it
  * (R4D_PRIO_ATTN_WINDOW), as they do below the h128/gqa4 decode leg; every other geometry here
  * is theirs alone. */
+/* attn_kv_sink_h256 (r4d_attn_kv_sink_h256.hip) */
+static const RadConstraint cAttnKvSink[] = {
+    C_GE("M", 1), C_GE("N", 1), C_GE("heads", 1), C_LE("heads", 65535), C_EQ("head_dim", 256),
+    C_GE("window", 0), C_IN("dtype", "bf16"),
+};
 #define R4D_WIN_C(NAME, HD, G, KV, WMIN)                                                           \
     static const RadConstraint NAME[] = {                                                          \
         C_EQ("head_dim", HD), C_EQ("gqa", G), C_EQ("block_size", 16), C_GE("causal", 0),           \
@@ -7549,6 +7569,17 @@ R4D_WINSINK_ROW(128, 8, i8kv, i8, cWinH128G8I8, "int8 (an f16 scale of K and of 
 R4D_WINSINK_ROW(128, 16, bf16kv, bf16, cWinH128G16Bf16, "bf16")
 R4D_WINSINK_ROW(128, 16, i8kv, i8, cWinH128G16I8, "int8 (an f16 scale of K and of V per token and head)")
 #undef R4D_WINSINK_ROW
+
+/* attn_kv_sink: Hy4-flash's non-absorbed prefill over kv_b-expanded keys and values
+ * (r4d_attn_kv_sink_h256.hip). head_dim 256 for keys and values alike, any window, any heads up to
+ * the grid's 65535. */
+{ "attn_kv_sink_h256", "attn_kv_sink", "attn",
+  "dense causal WMMA attention over separate key and value rows, a window and a sink a head",
+  "head_dim=256 (keys and values), heads<=65535, any window, ragged cu_q/cu_k, 128 query rows a workgroup",
+  "bf16 q/k/v/out (16-byte aligned rows), f32 sinks; bf16 Q.K, f16 P.V, f32 softmax",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cAttnKvSink), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_kv_sink_h256, nullptr, nullptr, nullptr,
+  r4d_shape_attn_kv_sink },
 
 /* DSpark's shared-anchor mask is intentionally a distinct op/kernel family, not an accepted
  * `window` variation of attn_paged's per-query visibility. Its base/upper key bounds are tied to

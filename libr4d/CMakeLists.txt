@@ -79,6 +79,9 @@ set(R4D_UNITS
   "r4d_attn_dense_bf16|"
   # Unlimited-OCR's SAM tower: windowed attention with decomposed relative position.
   "r4d_sam_attn_bf16|"
+  # Hy4-flash's non-absorbed prefill: dense attention over kv_b-expanded keys and values at
+  # head_dim 256, a window and a sink logit a head (attn_kv_sink).
+  "r4d_attn_kv_sink_h256|"
   "r4d_encoder_bf16|"
   "r4d_nemotron_bf16|"
   # The image generator: attention over a paged prefix plus the pass's own rows, the causal

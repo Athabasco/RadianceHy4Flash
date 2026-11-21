@@ -1106,6 +1106,23 @@ extern "C" int r4d_shape_attn_paged_sink(const RadParam* p, int n_p, int operand
     R4D_PICK(l);
 }
 
+/* attn_kv_sink -- one sequence of M query rows over N >= M keys, as libref describes it. */
+extern "C" int r4d_shape_attn_kv_sink(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), h = pi(p, n_p, "heads"),
+                  d = pi(p, n_p, "head_dim");
+    if (M <= 0 || h <= 0 || d <= 0 || N < M) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, M, h, d),
+        opd((uint32_t)RAD_BF16, N, h, d),
+        opd((uint32_t)RAD_BF16, N, h, d),
+        opd_idx(2, 0, M, -1, (uint32_t)RAD_OPD_F_IDX_CU),
+        opd_idx(2, 0, N, -1, (uint32_t)RAD_OPD_F_IDX_CU),
+        opd((uint32_t)RAD_F32, h),
+        opd((uint32_t)RAD_BF16, M, h, d),
+    };
+    R4D_PICK(l);
+}
+
 /* attn_paged_gate_quant -- attn_paged's operands, then gate_quant_fp8's gate, codes and scales,
  * flat as gate_quant_fp8 describes them: one row per (token, head) pair, `head_dim` columns. */
 extern "C" int r4d_shape_attn_paged_gate_quant(const RadParam* p, int n_p, int operand,
