@@ -57,7 +57,10 @@
       "absmax | mx (OCP shared exponent) | fixed | search (least squared error, imatrix-"        \
       "weighted when the converter has one)" },                                                 \
     { "scale_value", RAD_P_F64, nullptr, "the scale every block takes under rule=fixed" },     \
-    { "clamp", RAD_P_STR, "full", "a signed code's range: full or sym" }
+    { "clamp", RAD_P_STR, "full", "a signed code's range: full or sym" },                     \
+    { "divide", RAD_P_INT, "0",                                                                \
+      "1: a float code is round(x / scale) in f32 rather than x * (1 / scale), the arithmetic "  \
+      "of transformers' fp8 round trips (Hy4-flash's Engram); rule=absmax, an f32 scale" }
 
 /* The calibration option every calibrated quantiser takes. */
 #define LQ_CALIB_OPTION(WITHOUT)                                                                 \

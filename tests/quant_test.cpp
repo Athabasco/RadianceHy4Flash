@@ -58,6 +58,29 @@ TEST(block_fp8_is_the_bf16_of_amax_over_448_and_codes_against_it) {
     CHECK(rel_err(w, d) < 0.04);
 }
 
+/* divide=1: the codes of x / scale in f32 at an f32 scale a row (transformers' fp8 round trip,
+ * Hy4-flash's Engram), not x * (1 / scale), whose rounding differs at a code's midpoint: the
+ * row (-0.10107421875, 1.077..) from the mini's table, where x / s is exactly -42 (code -40,
+ * ties to even) and x * (1 / s) lands above it (-44). Other grids refuse the option. */
+TEST(divide_takes_the_codes_of_the_quotient) {
+    NEED_LIBQUANT();
+    const int64_t R = 1, C = 2;
+    const float amax = 0.0024065289180725813f * 448.0f;
+    const std::vector<float> w = { -0.10107421875f, amax };
+    Opts o;
+    o.s("codes", "fp8_e4m3").s("block", "1x*").s("scale", "f32").s("rule", "absmax").i("divide", 1);
+    Quantised q = quantise(quantizer("rtn"), o, "t", R, C, w);
+    REQUIRE_EQ(q.status, RAD_OK);
+    float sc;
+    std::memcpy(&sc, q.planes[1].data(), 4);
+    CHECK_EQ(sc, amax / 448.0f);
+    CHECK_EQ((int)q.planes[0][0], (int)rad_f32_to_fp8e4m3(w[0] / sc));
+    CHECK_EQ((int)q.planes[0][1], (int)rad_f32_to_fp8e4m3(448.0f));
+    Opts bad;
+    bad.s("codes", "fp8_e4m3").s("block", "1x*").s("scale", "bf16").i("divide", 1);
+    CHECK(quantise(quantizer("rtn"), bad, "t", R, C, w).status < 0);
+}
+
 TEST(a_rotated_int4_group_decodes_back_through_the_hadamard) {
     NEED_LIBQUANT();
     const int64_t R = 32, C = 512;
