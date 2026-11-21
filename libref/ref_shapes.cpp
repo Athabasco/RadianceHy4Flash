@@ -2187,7 +2187,9 @@ int ref_dfly_sel_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     o.t_idx({ M }, bin + 1, -1, 0);                              /* nsel -- 0 .. blocks_in */
     o.t_idx({ S }, M, -1, 0);                                    /* src -- trunk rows */
     o.t_idx({ S, pitch }, S * pitch, -1, 0);                     /* bt -- page ids */
-    o.t_idx({ M }, (bin - 1) * ratio, -1, 0);                    /* pos */
+    /* pos: below 2 * ratio, so a drawn table never needs more than blocks_in + 1 entries and stays
+     * inside `blocks` whatever the other draws (the description's rows are not a real block). */
+    o.t_idx({ M }, 2 * ratio, -1, 0);                            /* pos */
     o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);       /* cu */
     o.t((uint32_t)RAD_I32, { M, blocks });                       /* out */
     o.t((uint32_t)RAD_I32, { M });                               /* len */
