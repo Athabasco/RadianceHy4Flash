@@ -18,12 +18,16 @@
  * same scores. P goes to the value product as bf16 high part plus bf16 remainder. The next chunk's
  * keys are fetched into registers while the current one is multiplied; two barriers a chunk.
  *
- * The stable law (WP16 perf.md 3.4.1): chunks are the absolute 16-token groups [16c, 16c + 16) of
- * the sequence (paged) or of the row's table order (selection), masked at both ends of the visible
- * range, and a split is an absolute super-chunk of 64 tokens with a window and of 128 at window 0
- * and in the selection form. Slot j of a row is super-chunk floor(lo / SC) + j; the law has
- * sink_law() slots (9 at a window of 512, kMaxSplits at window 0 and in the selection form), the
- * last one taking whatever lies past it. The slots holding a visible key fold in ascending order
+ * The stable law (WP16 perf.md 3.4.1, anchored at the row's first visible key): a row's range
+ * [lo, hi) is cut into slots of 64 tokens with a window and of 128 at window 0 and in the selection
+ * form, slot j = [lo + SC j, lo + SC (j + 1)), each walked in 16-token chunks from its start. The
+ * law has sink_law() slots (8 at a window of 512, kMaxSplits at window 0 and in the selection form),
+ * the last one taking whatever lies past it. At window 0 and in the selection form lo is 0, so the
+ * grid is absolute there. (perf.md's absolute grid for a window -- slots at multiples of 64 of the
+ * sequence -- was built and measured: on the card under the engine a verify row then did not give
+ * the decode row's bytes, although the emulator and r4d_selftest found the launch row-exact; the
+ * lo-anchored grid does, and is the old split's at a full window. See notes/wp16s.md.)
+ * The slots holding a visible key fold in ascending order
  * (the first copied, each later one acc * exp(acc_m - m') + part * exp(part_m - m')), then the sink
  * joins once. So a row's bytes are a function of its own operands, the cache it sees and the op's
  * parameters: not of M, the launch's other rows, HG, the form, the slots a launch needs (the
@@ -36,15 +40,15 @@
  * (more rows, `stable 1`): one workgroup walks the row's chunks as the unsplit pass does and at
  * each super-chunk boundary folds the slot's state into an accumulator a row in the scratch with
  * the merge's arithmetic (sink_fold, explicit fmaf), so the bytes are the split form's without its
- * partials' traffic (9 or 20 of them a row and head). The order of the vLLM-style merge (every
+ * partials' traffic (8 or 20 of them a row and head). The order of the vLLM-style merge (every
  * maximum first) is not used: it cannot be computed in one pass.
  *
  * `stable 1` (the plugin's decode-class instance) always runs the law and refuses a launch whose
  * scratch does not hold the fused form's accumulator (RAD_E_SCRATCH); the scratch hook sizes the
  * split form's partials up to the cap and the accumulator for every row of the declared M.
  * `stable 0` (default; prefill rows) runs the split form up to the cap when the scratch holds it,
- * and unsplit (one pass over the absolute chunks, one running maximum) past that, which differs
- * from the law in the last place. */
+ * and unsplit (one pass over the row's chunks, one running maximum) past that, which differs from
+ * the law in the last place. */
 #include <hip/hip_runtime.h>
 #include "r4d_args.h"
 #include "r4d_common.h"
@@ -154,9 +158,9 @@ __global__ __launch_bounds__(HG * 128) void mla_sink_rows(
     sink_range<SEL>(used, cu, len, m, r, lo, hi, trow);
     int begin = lo, end = hi;
     if (m.splits > 1) {
-        /* Slot `split` is the absolute super-chunk floor(lo / SC) + split; the law's last slot
-         * takes the rest of the range. */
-        const long sc = ((long)(lo >> m.sc_shift) + split) << m.sc_shift,
+        /* Slot `split` is the super-chunk [lo + SC split, lo + SC (split + 1)); the law's last
+         * slot takes the rest of the range. */
+        const long sc = (long)lo + ((long)split << m.sc_shift),
                    sc_end = sc + (1L << m.sc_shift);
         begin = sc < lo ? lo : sc < hi ? (int)sc : hi;
         if (split + 1 < m.law) end = sc_end < begin ? begin : sc_end < hi ? (int)sc_end : hi;
@@ -170,9 +174,10 @@ __global__ __launch_bounds__(HG * 128) void mla_sink_rows(
         }
         return;
     }
-    /* The absolute 16-token chunks covering [begin, end); tokens outside it are masked. */
-    const int first = begin & ~15, c0 = lo >> m.sc_shift;
-    auto slot_of = [&](int token) { return min((token >> m.sc_shift) - c0, m.law - 1); };
+    /* The 16-token chunks from the slot's first key; a slot is a whole number of them, so the
+     * fused form's walk from `lo` meets every slot boundary at a chunk boundary. */
+    const int first = begin;
+    auto slot_of = [&](int token) { return min((token - lo) >> m.sc_shift, m.law - 1); };
     /* Query fragments: eight latent k-steps of the wave's quarter, one rotary. */
     v8bf query[9];
     {
@@ -312,7 +317,7 @@ __global__ __launch_bounds__(HG * 128) void mla_sink_rows(
     }
     __syncthreads();
     int buf = 0;
-    for (int start = first; start < end; start += 16) {
+    for (int start = first; begin < end && start < end; start += 16) {
         if (FUSED && slot_of(start) != slot) {
             fold();
             slot = slot_of(start);
@@ -473,13 +478,13 @@ __global__ __launch_bounds__(128) void merge_sink(const float* scratch, const fl
 }
 
 int sink_shift(bool sel, long window) { return !sel && window > 0 ? kShiftWindow : kShiftFull; }
-/* The law's slots: the super-chunks a window's range can touch, (window - 1) / SC rounded up plus
- * one (9 at 512), at most kMaxSplits; kMaxSplits at window 0 and in the selection form. A function
- * of the op and the window alone. */
+/* The law's slots: a window's range in super-chunks, window / SC rounded up (8 at 512), at most
+ * kMaxSplits; kMaxSplits at window 0 and in the selection form. A function of the op and the
+ * window alone. */
 int sink_law(bool sel, long window) {
     if (sel || window <= 0) return kMaxSplits;
     const long sc = 1L << kShiftWindow;
-    return (int)std::min<long>(kMaxSplits, (window - 1 + sc - 1) / sc + 1);
+    return (int)std::min<long>(kMaxSplits, (window + sc - 1) / sc);
 }
 /* The slots a launch needs: no visible token lies at or past the table's capacity, so a slot past
  * it is empty in every row. Moves no bits (empty slots are skipped). */
@@ -555,7 +560,11 @@ int sink_body(const RadArgs* a, RadStream stream) {
      * the row's slots and folds them as the merge does, an accumulator a row in the scratch) and
      * refuses a launch without even that scratch rather than change a bit; `stable 0` runs
      * unsplit. */
-    int splits = sink_slots(SEL, window, bt.shape[1] * bs), fused = 0;
+    /* The launch's slots: the selection's by its table width (the op's `blocks`); the paged form
+     * always the law's count, because its table is the batch's block table, whose pitch can differ
+     * between a recorded pass and its replay (a launch sized at a narrower table would drop the
+     * keys of a later, longer context). */
+    int splits = SEL ? sink_slots(true, 0, bt.shape[1] * bs) : sink_law(false, window), fused = 0;
     if (splits > 1) {
         const int64_t have = a->scratch ? a->scratch_bytes : 0;
         const bool split_fits = have >= rows * heads * splits * PART * 4,
@@ -581,9 +590,6 @@ int sink_body(const RadArgs* a, RadStream stream) {
             hg = g;
             break;
         }
-    /* Thirty-two heads a workgroup just past one round of 64 (four rows of a window's 9 slots at
-     * 64 heads: 72) take two rounds; sixty-four heads take one (measured: 25.6 against 22.5 us). */
-    if (hg == 2 && heads > 32 && rows * splits * ((heads + 31) / 32) <= 80) hg = 4;
     if (form == 1) hg = 1;
     if (form == 2 && heads > 16) hg = 2;
     if (form == 5 && heads > 32) hg = 4;
@@ -666,7 +672,7 @@ extern "C" int r4d_rad_mla_attn_paged_sink(const RadArgs* a, RadStream stream) {
 extern "C" int r4d_rad_mla_attn_sel_sink(const RadArgs* a, RadStream stream) {
     return sink_body<true>(a, stream);
 }
-/* Per row: 9 slots at a window of 512 and 64 heads 1.19 MiB (stable 0: 16 rows, 19.0 MiB); 20
+/* Per row: 8 slots at a window of 512 and 64 heads 1.06 MiB (stable 0: 16 rows, 16.9 MiB); 20
  * slots at window 0 and 32 heads 1.32 MiB (stable 0: 32 rows, 42.3 MiB); the selection at blocks
  * x block_size 2048 has 16 slots (1.06 MiB a row at 32 heads). */
 extern "C" int64_t r4d_rad_mla_attn_paged_sink_scratch(const RadArgs* a) {

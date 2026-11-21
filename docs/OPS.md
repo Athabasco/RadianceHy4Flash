@@ -3877,9 +3877,9 @@ maximum is taken (libref shifts by the maximum of the scores and the sink).
   sees and the op's parameters, not of `M`, the launch's other rows or the number of sequences, so
   a verify row equals the single-row decode at its position at any stream count. libref and
   libavx compute every row on its own already and ignore it; the value both forms approximate is
-  libref's. libr4d sums an absolute grid (16-token chunks, splits at absolute 64-token super-chunks
-  with a window and 128-token ones at window 0 and in the selection form, merged in ascending
-  order with the sink once), at every `M` under `stable 1`, sizing its scratch for every row of
+  libref's. libr4d sums a grid anchored at the row's first visible key (16-token chunks, splits of
+  64 tokens with a window and of 128 at window 0 and in the selection form, folded in ascending
+  order, the sink once), at every `M` under `stable 1`, sizing its scratch for every row of
   the declared `M` and refusing a launch whose scratch is short (`RAD_E_SCRATCH`); under `stable
   0` it runs that law up to 16 rows (window) / 32 rows (window 0, selection) and one unsplit pass
   past them, which may differ in the last place. Hy4-flash declares its decode-class rows with

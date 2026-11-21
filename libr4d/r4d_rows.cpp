@@ -7181,8 +7181,8 @@ static const RadKernelInfo kKernels[] = {
   r4d_shape_mla_attn_paged },
 { "mla_attn_paged_sink_bf16", "mla_attn_paged_sink", "attn",
   "absorbed latent attention with a window and a sink: a workgroup a row and 16, 32 or 64 heads, "
-  "WMMA scores over latent and rotary columns, the stable law (absolute 16-token chunks, splits at "
-  "absolute 64-token super-chunks with a window, 128 without) and a merge that applies the sink once",
+  "WMMA scores over latent and rotary columns, the stable law (64-token slots from the row's first "
+  "visible key with a window, 128 without, 16-token chunks) and a merge that applies the sink once",
   "latent_dim=512, rope_dim=64, heads 8..64 a multiple of 8, block_size a power of two <=256; one page table a "
   "sequence; stable 1 splits at every M (scratch for every row), stable 0 at M<=16 (window) / 32",
   "bf16 Q/rotary/cache/output, f32 sinks, softmax and partials; P as bf16 high plus low part",

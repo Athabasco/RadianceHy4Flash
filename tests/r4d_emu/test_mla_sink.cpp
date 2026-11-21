@@ -442,6 +442,21 @@ void stable_suite(std::mt19937& rng, bool quick) {
         make_paged(p, { 6, 6, 6 }, { 600, 530, 1100 }, heads, 4, heads == 32 ? 0 : 512, true, rng);
         check_stable("stable H" + std::to_string(heads) + " 3 streams x 6", p);
     }
+    /* gpu-mini's geometry: a verify of 8 rows of one sequence past the window's edge, the table as
+     * wide as the context bound (3072 tokens), 64 heads at block 16 (sliding) and 32 at block 4
+     * (dense sparse layer), stable 0 and 1 */
+    for (int sliding : { 1, 0 }) {
+        Problem p;
+        const int bs = sliding ? 16 : 4;
+        make_paged(p, { 8 }, { 554 }, sliding ? 64 : 32, bs, sliding ? 512 : 0, false, rng);
+        const int wide = 3072 / bs;
+        std::vector<int> t((size_t)wide, -1);
+        std::copy(p.bt.begin(), p.bt.end(), t.begin());
+        p.bt = t;
+        p.blocks = wide;
+        check_stable(std::string("gpu-mini ") + (sliding ? "sliding" : "dense") + " verify 8 at 554", p);
+        check_verify(std::string("gpu-mini ") + (sliding ? "sliding" : "dense") + " stable 0 verify 8 at 554", p);
+    }
     /* stable 0 equals stable 1 below its row cap; the table's width (the slots a launch needs)
      * moves no bit; a short scratch is refused at stable 1 and unsplit at stable 0. */
     {
