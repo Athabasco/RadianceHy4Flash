@@ -73,7 +73,7 @@ struct RecMap {
     std::vector<int>         src_index;   /* RadNameMap::src_index, one per source */
 };
 struct RecKV    { std::string name; RadKVGroupDecl d{}; bool zero = false; bool replicated = false;
-                  bool dense = false; };
+                  bool dense = false; size_t at = 0; /* ops declared before it */ };
 struct RecIssue {
     rad_op                  op = 0;
     std::vector<RadOperand> opd;
@@ -110,6 +110,10 @@ struct RadBuilder {
         return vocab ? vocab->count(op) != 0 : undeclared.count(op) == 0;
     }
     int64_t kv_block = 16;
+    /* Each paged group's block from its consumer, as the real builder finds it
+     * (rad_builder.cpp find_kv_consumer): the first op declared after the group that carries
+     * `block_size` and no earlier group claimed. Off: every group is `kv_block`. */
+    bool kv_block_by_consumer = false;
 
     /* The buffer the plugin named as this step's logits (rad_declare_logits), or as its pooled
      * output (rad_declare_pooled). */
@@ -278,18 +282,40 @@ extern "C" int rad_op_declared(RadBuilder* b, const char* op) {
 
 extern "C" rad_kvgroup rad_decl_kv_group(RadBuilder* b, const char* name,
                                          const RadKVGroupDecl* d) {
-    b->kv_groups.push_back({name, *d, false});
+    RecKV k{name, *d, false};
+    k.at = b->ops.size();
+    b->kv_groups.push_back(k);
     return (rad_kvgroup)b->kv_groups.size();
 }
 
-extern "C" int64_t rad_kv_block_size(RadBuilder* b, rad_kvgroup g) { (void)g; return b->kv_block; }
+static int64_t fake_kv_block(const RadBuilder* b, rad_kvgroup g) {
+    if (!b->kv_block_by_consumer || !g || g > b->kv_groups.size()) return b->kv_block;
+    std::vector<bool> claimed(b->ops.size(), false);
+    for (size_t gi = 0; gi < g; ++gi) {
+        const int kind = b->kv_groups[gi].d.kind;
+        if (kind != RAD_KV_FULL && kind != RAD_KV_WINDOW && kind != RAD_KV_RING) continue;
+        for (size_t i = b->kv_groups[gi].at; i < b->ops.size(); ++i) {
+            if (claimed[i]) continue;
+            int64_t bs = 0;
+            for (const auto& p : b->ops[i].p)
+                if (p.key == "block_size") bs = p.ival;
+            if (bs <= 0) continue;
+            claimed[i] = true;
+            if (gi + 1 == g) return bs;
+            break;
+        }
+    }
+    return 0;
+}
+
+extern "C" int64_t rad_kv_block_size(RadBuilder* b, rad_kvgroup g) { return fake_kv_block(b, g); }
 
 extern "C" int64_t rad_kv_layer_bytes(RadBuilder* b, rad_kvgroup g) {
     if (!b || !g || g > b->kv_groups.size()) return 0;
     const RadKVGroupDecl& d = b->kv_groups[g - 1].d;
     if (d.kind != RAD_KV_FULL && d.kind != RAD_KV_WINDOW) return 0;
     const int64_t nh = d.n_head_kv > 0 ? d.n_head_kv : 1;
-    return rad_dtype_bytes(d.dtype, 2 * b->kv_block * nh * d.head_dim);
+    return rad_dtype_bytes(d.dtype, 2 * fake_kv_block(b, g) * nh * d.head_dim);
 }
 
 extern "C" int rad_bind_layer_kv(RadBuilder* b, int layer, rad_kvgroup g) {
@@ -1106,7 +1132,7 @@ std::unique_ptr<Kit> kit(const RadBuilder& bld, const std::vector<int>& dq,
         gb.seqused = k->used.data();
         gb.state_index = k->sidx.data();
         gb.state_index_pitch = 1;
-        gb.block_size = bld.kv_block;
+        gb.block_size = fake_kv_block(&bld, (rad_kvgroup)(g + 1));
         gb.max_blocks = pitch;
         k->kv.push_back(gb);
     }
