@@ -19,7 +19,18 @@
  * cached rows back into a contiguous key block is not built (no op serves the paged read).
  *
  * The sparse layers' indexer (hyv4flash_indexer.h) runs between the cache store and the
- * attention. */
+ * attention.
+ *
+ * Streamed KV (docs/KV-STREAMING.md, --kv-resident): the sparse latent group may stream, as GLM's
+ * MLA does (rad_block_glm_mla.h). Its store writes the host mirror always and the ring slot where
+ * the block is resident (kv_store_streamed), and on a pass bound to the ring (a decode or verify
+ * pass) the selection is resolved between qsa_select and the attention (kv_resolve: misses copied
+ * in from the mirror, `sel` rewritten from block ids to ring slots). Such a pass always attends
+ * through the selection, also at or below the dense limit: there every closed group is selected
+ * (kernels/indexer.md §1), which is the dense result, and the dense kernel would read block ids as
+ * ring slots. A pass on the stage (prefill, mixed) reads block ids as the resident path does. The
+ * sliding group is a window and never streams; the indexer's key cache is read whole every step
+ * and stays resident (rad_kv_group_dense_read). */
 #ifndef HYV4FLASH_ATTN_H
 #define HYV4FLASH_ATTN_H
 
@@ -97,6 +108,7 @@ struct Attn {
     Lin q_a{}, q_nope{}, q_rope{}, kv_a{}, gate{}, out{};
     rad_weight qa_gain = 0, kv_gain = 0, post_gain = 0, kv_b = 0, sinks = 0;
     rad_op op_qa_norm = 0, op_kv_norm = 0, op_q_rope = 0, op_k_rope = 0, op_store = 0;
+    rad_op op_store_stream = 0, op_resolve = 0;   /* a streamed sparse group (--kv-resident) */
     rad_op op_absorb = 0, op_paged = 0, op_sel = 0, op_expand = 0;
     rad_op op_lat_copy = 0, op_kvb = 0, op_split = 0, op_qn_copy = 0, op_qr_copy = 0, op_dense = 0, op_rebase = 0;
     rad_op op_gate = 0, op_post_norm = 0, op_ar = 0;
@@ -183,6 +195,15 @@ struct Attn {
                         RAD_STR("kv_dtype", "bf16") },
                       {}, { w.row }, {});
         HY4_NEED(op_store, "kv_store");
+        /* The streamed store: kv_store's operands plus the residency map and the layer's mirror
+         * row, added at issue. Declared only when the architecture can stream and --kv-resident
+         * asks for a ring (rad_op_declared); the sliding window never streams. */
+        if (!sliding && rad_op_declared(b, "kv_store_streamed"))
+            op_store_stream = mk(b, "kv_store_streamed",
+                                 { RAD_RANGE("M", 1, T), RAD_INT("head_dim", (L + R) / 2),
+                                   RAD_INT("n_head_kv", 1), RAD_INT("block_size", bs),
+                                   RAD_STR("kv_dtype", "bf16") },
+                                 {}, { w.row }, {});
         if (first_of_group && rad_kv_block_size(b, kv) != bs) {
             fprintf(stderr, "radiance: hyv4flash: layer %d's latent cache took a block of %lld "
                             "tokens; its ops are declared at %lld\n",
@@ -227,7 +248,8 @@ struct Attn {
 
     /* The attention proper and the output, declared after the sparse layer's indexer: `sel` and
      * `len` are its table (0 on a sliding layer). Declaration order is liveness. */
-    int declare_core(RadBuilder* b, Names& nm, const char* ap, rad_buf sel, rad_buf len) {
+    int declare_core(RadBuilder* b, Names& nm, const char* ap, rad_buf sel, rad_buf len,
+                     rad_buf nsel) {
         const int64_t T = g.max_tok, H = a.heads, L = s.kv_lora, R = a.qk_rope, N = a.qk_nope;
         const double scale = 1.0 / std::sqrt((double)a.qk());
         const int l = layer;
@@ -262,6 +284,9 @@ struct Attn {
                           RAD_STR("dtype", "bf16") },
                         { sinks }, { w.q_lat, w.q_rope, sel, len }, { w.lat });
             HY4_NEED(op_sel, "mla_attn_sel_sink");
+            /* Issued after the layer's selection and before mla_attn_sel_sink reads `sel`;
+             * `nsel` is qsa_select's entry count, the table's pitch the attention's `blocks`. */
+            op_resolve = kv_resolve_declare(b, g, kv, sel, nsel, s.ix_group_topk);
         }
 
         /* The non-absorbed prefill. */
@@ -338,8 +363,28 @@ struct Attn {
         RAD_ISSUE_N(c, op_q_rope, T, brows(w.q_rope, T), pos);
         RAD_ISSUE_N(c, op_k_rope, T, bcol(w.row, L, R, T), pos);
         const int64_t half = (L + R) / 2;
-        RAD_ISSUE_N(c, op_store, T, bcol(w.row, 0, half, T), bcol(w.row, half, half, T),
-                    praw(kb->slot_mapping, RAD_I32, T), kv_cache(kv, layer));
+        if (!kb->stream) {
+            RAD_ISSUE_N(c, op_store, T, bcol(w.row, 0, half, T), bcol(w.row, half, half, T),
+                        praw(kb->slot_mapping, RAD_I32, T), kv_cache(kv, layer));
+        } else {
+            /* The mirror always, the ring slot where the block is resident; the stage wait goes
+             * right before the store (core/kvstream/stage.h), and a staged pass also stores at
+             * block-id identity, which is how the stage is read. */
+            const bool staged = kv_stage_wait(c, kv, kb, layer);
+            const KVStreamLayer S = kv_stream_layer(c, kv, layer, kb);
+            if (!op_store_stream || !S.host || S.blocks <= 0) {
+                rad_step_fail(c, "hyv4flash: the sparse latent cache streams but the build has no "
+                                 "kv_store_streamed row to write its host mirror with");
+                return false;
+            }
+            RAD_ISSUE_N(c, op_store_stream, T, bcol(w.row, 0, half, T),
+                        bcol(w.row, half, half, T), praw(kb->slot_mapping, RAD_I32, T),
+                        kv_cache(kv, layer), praw(S.res, RAD_I32, S.blocks),
+                        praw2(S.host, RAD_U8, S.blocks, S.bbytes));
+            if (staged)
+                RAD_ISSUE_N(c, op_store, T, bcol(w.row, 0, half, T), bcol(w.row, half, half, T),
+                            praw(kb->slot_mapping, RAD_I32, T), kv_cache(kv, layer));
+        }
         gate.step(c, act(xa), w.gate, T);
         t_gate.step(c, brows(w.gate, T), T);
         return true;
@@ -381,10 +426,24 @@ struct Attn {
                     brow_slice(w.ao, DT, M, a.v_width()));
     }
 
+    /* Whether this layer's pass addresses a streamed group's ring: a ring smaller than the id
+     * space, and the pass not on the stage. Such a pass must select (the file's head comment).
+     * Called after front(), whose store already staged the layer if the pass stages. */
+    bool ring_bound(RadCtx* c, const RadBatch* batch) const {
+        if (sliding) return false;
+        const auto* kb = kv_batch(batch, kv);
+        const RadKVStream* st = kb ? kb->stream : nullptr;
+        if (!st || st->block_bytes <= 0 || st->slots <= 0) return false;
+        const int64_t blocks = st->host_layer_stride / st->block_bytes;
+        return st->slots < blocks && !kv_stage_layer(c, kv, kb, layer);
+    }
+
     /* The attention proper and everything after it. `sel`/`len`: the indexer's table, issued
-     * already (sparse layers on a selecting step). */
-    void core(RadCtx* c, const RadBatch* batch, const StepPlan& p, rad_buf sel, rad_buf len) const {
+     * already (sparse layers on a selecting step); `nsel` its entry count. */
+    void core(RadCtx* c, const RadBatch* batch, const StepPlan& p, rad_buf sel, rad_buf len,
+              rad_buf nsel) const {
         const int64_t T = p.T;
+        const auto* kb = kv_batch(batch, kv);
         auto act = [](rad_buf x) {
             ActFP8 v{};
             v.x = x;
@@ -396,6 +455,17 @@ struct Attn {
         if (abs_rows > 0) {
             RAD_ISSUE_N(c, op_absorb, abs_rows, brows(w.q_nope, abs_rows), RAD_W(kv_b),
                         brows(w.q_lat, abs_rows));
+            if (selecting && kb && kb->stream && !kv_stage_layer(c, kv, kb, layer)) {
+                /* After this layer's selection, before the attention reads `sel`. A pass on the
+                 * stage reads block ids and never resolves. */
+                const KVStreamLayer S = kv_stream_layer(c, kv, layer, kb);
+                if (!op_resolve || !nsel || !S.host || S.blocks <= 0 || S.slots <= 0) {
+                    rad_step_fail(c, "hyv4flash: the sparse latent cache streams but the build "
+                                     "has no kv_resolve for its selection");
+                    return;
+                }
+                kv_resolve_issue(c, op_resolve, S, brows(sel, T), brows(nsel, T), kv, layer, T);
+            }
             if (selecting)
                 RAD_ISSUE_N(c, op_sel, T, brows(w.q_lat, T), brows(w.q_rope, T),
                             kv_cache(kv, layer), brows(sel, T), brows(len, T), RAD_W(sinks),
@@ -412,6 +482,8 @@ struct Attn {
         t_o_proj.step(c, brows(w.o, T), T);
         RAD_ISSUE_N(c, op_post_norm, T, brows(w.o, T), RAD_W(post_gain), brows(ya, T));
         t_out.step(c, brows(ya, T), T);
+        /* After every attention launch of this layer (core/kvstream/stage.h). */
+        if (kb && kb->stream) kv_stage_next(c, kv, layer);
     }
 };
 

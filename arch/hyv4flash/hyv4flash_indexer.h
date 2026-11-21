@@ -13,7 +13,15 @@
  * group_topk - 1, signed, own 1: the query's own group is never a candidate and always appended).
  * The table and lengths it writes are what mla_attn_sel_sink reads: the latent group's pages are
  * the indexer's groups (both groups of block 4). At or below the limit HF attends densely, which is
- * what the selection would give (kernels/indexer.md §1), so nothing of the query side runs. */
+ * what the selection would give (kernels/indexer.md §1), so nothing of the query side runs.
+ *
+ * RADIANCE_HY4_INDEXER=fp8 (Shape::ix_fp8) swaps the key cache and the score for vLLM's IndexPool
+ * numerics on GLM's forms: idx_pool_gated_fp8 keeps the pooled, normed, rotated key in f32 and
+ * writes its Hadamard-rotated E4M3 codes and power-of-two scale into dsa_pool's packed page (u8,
+ * 136 bytes a group); the rotated query goes through dsa_query (the same Hadamard and quantiser,
+ * per head) and dsa_score (16 heads, the head weights as f32 gates). The selection is
+ * qsa_select's either way. The exact path stays the default: HF is the parity reference, and FP8
+ * moves near-ties (the Jaccard of the recalled sets is the measure, notes/wp14.md). */
 #ifndef HYV4FLASH_INDEXER_H
 #define HYV4FLASH_INDEXER_H
 
@@ -36,6 +44,11 @@ struct IndexWire {
     rad_buf sel = 0;      /* [T, group_topk] i32 page table a row */
     rad_buf nsel = 0;     /* [T] i32 */
     rad_buf len = 0;      /* [T] i32 */
+    /* RADIANCE_HY4_INDEXER=fp8 only */
+    rad_buf iqf = 0;      /* [T * Hi, D] the rotated query, a row a head (dsa_query's form) */
+    rad_buf qcodes = 0;   /* [T * Hi, D] E4M3 */
+    rad_buf qscale = 0;   /* [T * Hi, 1] f32 */
+    rad_buf iwf = 0;      /* [T, Hi] f32 head weights (dsa_score's gates) */
     /* taps only */
     rad_buf zero_pos = 0; /* [work] i32 zeros: the pooled key before its rotation */
     rad_buf ident = 0;    /* [seqs, blocks] i32 the identity table: selections as group indices */
@@ -62,6 +75,13 @@ struct IndexWire {
         if (!tk || !stage || !page || !bpos || !nc || !iqn || !iqr || !iq || !iw || !score ||
             !sel || !nsel || !len)
             return RAD_E_INVAL;
+        if (s.ix_fp8) {
+            iqf = decl_b(b, nm.f("ix.query_rows"), RAD_BF16, { T * Hi, D });
+            qcodes = decl_b(b, nm.f("ix.query_codes"), RAD_F8E4M3, { T * Hi, D });
+            qscale = decl_b(b, nm.f("ix.query_scales"), RAD_F32, { T * Hi, 1 });
+            iwf = decl_b(b, nm.f("ix.head_gates"), RAD_F32, { T, Hi });
+            if (!iqf || !qcodes || !qscale || !iwf) return RAD_E_INVAL;
+        }
         if (taps_on()) {
             /* PERSIST: a tap's scratch is not in the declared op order's liveness. */
             zero_pos = decl_b(b, nm.f("ix.zero_pos"), RAD_I32, { work }, RAD_BUF_PERSIST);
@@ -85,6 +105,7 @@ struct Indexer {
     rad_weight key_gain = 0, wv = 0, wg = 0, ape = 0, pool_gain = 0;
     rad_op op_key_norm = 0, op_work = 0, op_pool = 0, op_tail = 0;
     rad_op op_q_rope = 0, op_qn_copy = 0, op_qr_copy = 0, op_score = 0, op_select = 0;
+    rad_op op_q_rows = 0, op_q_quant = 0, op_gate_f32 = 0;   /* RADIANCE_HY4_INDEXER=fp8 */
     rad_op op_tap_zero = 0, op_tap_pool = 0, op_tap_ident = 0, op_tap_select = 0, op_tap_nsel0 = 0;
     Tap t_token_keys{}, t_group_keys{}, t_sel{}, t_nsel{}, t_score{};
 
@@ -137,13 +158,14 @@ struct Indexer {
                        RAD_STR("dtype", "bf16") },
                      {}, { w.tk }, { w.stage, w.page, w.bpos, w.nc });
         HY4_NEED(op_work, "qsa_work");
-        op_pool = mk(b, "idx_pool_gated",
+        op_pool = mk(b, s.ix_fp8 ? "idx_pool_gated_fp8" : "idx_pool_gated",
                      { RAD_RANGE("M", 1, w.work), RAD_INT("n", D), RAD_INT("ratio", r),
                        RAD_INT("rotary_dim", R), RAD_F64("eps", s.eps),
                        RAD_F64("theta", s.theta_sparse), RAD_STR("mode", "gptj"),
                        RAD_INT("block_size", r), RAD_STR("dtype", "bf16") },
                      { wv, wg, ape, pool_gain }, { w.stage, w.bpos, w.page }, {});
-        HY4_NEED(op_pool, "idx_pool_gated");
+        HY4_NEED(op_pool, s.ix_fp8 ? "idx_pool_gated_fp8 (RADIANCE_HY4_INDEXER=fp8)"
+                                   : "idx_pool_gated");
         if (first_of_group && rad_kv_block_size(b, index) != r) {
             fprintf(stderr, "radiance: hyv4flash: the indexer cache took a block of %lld tokens; "
                             "a page is one group of %lld\n",
@@ -189,12 +211,36 @@ struct Indexer {
                                   RAD_SHARD_NONE, grp,
                                   { nm.ckpt("%s.head_weight_projection.weight", ip) }, act(xa),
                                   w.iw));
-        op_score = mk(b, "idx_score",
-                      { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("heads", Hi),
-                        RAD_INT("blocks", w.blocks), RAD_INT("seqs", g.max_seqs),
-                        RAD_STR("dtype", "bf16") },
-                      {}, { w.iq, w.iw, w.nc }, { w.score });
-        HY4_NEED(op_score, "idx_score");
+        if (s.ix_fp8) {
+            /* The rotated query a row a head, its E4M3 codes and scales, the head weights as
+             * f32 gates; dsa_score's (heads n)^-0.5 is HF's head weight scale. */
+            op_q_rows = mk(b, "cast",
+                           { RAD_RANGE("M", 1, T * Hi), RAD_INT("n", D), RAD_STR("from", "bf16"),
+                             RAD_STR("to", "bf16") },
+                           {}, { w.iq }, { w.iqf });
+            op_q_quant = mk(b, "dsa_query",
+                            { RAD_RANGE("M", 1, T * Hi), RAD_INT("n", D), RAD_STR("dtype", "bf16") },
+                            {}, { w.iqf }, { w.qcodes, w.qscale });
+            op_gate_f32 = mk(b, "cast",
+                             { RAD_RANGE("M", 1, T), RAD_INT("n", Hi), RAD_STR("from", "bf16"),
+                               RAD_STR("to", "f32") },
+                             {}, { w.iw }, { w.iwf });
+            op_score = mk(b, "dsa_score",
+                          { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("heads", Hi),
+                            RAD_INT("blocks", w.blocks), RAD_INT("seqs", g.max_seqs),
+                            RAD_STR("dtype", "fp8_e4m3") },
+                          {}, { w.qcodes, w.qscale, w.iwf, w.nc }, { w.score });
+            HY4_NEED(op_q_rows && op_gate_f32, "cast");
+            HY4_NEED(op_q_quant, "dsa_query (RADIANCE_HY4_INDEXER=fp8)");
+            HY4_NEED(op_score, "dsa_score at 16 heads (RADIANCE_HY4_INDEXER=fp8)");
+        } else {
+            op_score = mk(b, "idx_score",
+                          { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("heads", Hi),
+                            RAD_INT("blocks", w.blocks), RAD_INT("seqs", g.max_seqs),
+                            RAD_STR("dtype", "bf16") },
+                          {}, { w.iq, w.iw, w.nc }, { w.score });
+            HY4_NEED(op_score, "idx_score");
+        }
         op_select = mk(b, "qsa_select",
                        { RAD_RANGE("M", 1, T), RAD_INT("blocks", w.blocks),
                          RAD_INT("topk", s.ix_group_topk - 1), RAD_INT("ratio", r),
@@ -276,9 +322,14 @@ struct Indexer {
                     praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), RAD_NONE,
                     brows(w.stage, work * s.ix_pool), brows(w.page, work), brows(w.bpos, work),
                     brows(w.nc, S));
-        RAD_ISSUE_N(c, op_pool, work, brows(w.stage, work * s.ix_pool), RAD_W(wv), RAD_W(wg),
-                    RAD_W(ape), RAD_W(pool_gain), brows(w.bpos, work), brows(w.page, work),
-                    kv_cache(index, layer), RAD_NONE);
+        if (s.ix_fp8)
+            RAD_ISSUE_N(c, op_pool, work, brows(w.stage, work * s.ix_pool), RAD_W(wv), RAD_W(wg),
+                        RAD_W(ape), RAD_W(pool_gain), brows(w.bpos, work), brows(w.page, work),
+                        kv_cache(index, layer), RAD_NONE, RAD_NONE);
+        else
+            RAD_ISSUE_N(c, op_pool, work, brows(w.stage, work * s.ix_pool), RAD_W(wv), RAD_W(wg),
+                        RAD_W(ape), RAD_W(pool_gain), brows(w.bpos, work), brows(w.page, work),
+                        kv_cache(index, layer), RAD_NONE);
         if (op_tap_pool) {
             RAD_ISSUE_N(c, op_tap_zero, work, brows(w.zero_pos, work));
             RAD_ISSUE_N(c, op_tap_pool, work, brows(w.stage, work * s.ix_pool), RAD_W(wv),
@@ -303,9 +354,22 @@ struct Indexer {
         RAD_ISSUE_N(c, op_qr_copy, T, brows(w.iqr, T), qr);
         head.step(c, act(xa), w.iw, T);
         const RadOperand score = bcol_at(w.score, 0, w.blocks, 0, p.live, T);
-        RAD_ISSUE_N(c, op_score, T, brows(w.iq, T), brows(w.iw, T), kv_cache(index, layer),
-                    praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), cu, brows(w.nc, S),
-                    score);
+        if (s.ix_fp8) {
+            const int64_t Hi = s.ix_heads;
+            RAD_ISSUE_N(c, op_q_rows, T * Hi, brows(w.iq, T), brows(w.iqf, T * Hi));
+            RAD_ISSUE_N(c, op_q_quant, T * Hi, brows(w.iqf, T * Hi), brows(w.qcodes, T * Hi),
+                        brows(w.qscale, T * Hi));
+            RAD_ISSUE_N(c, op_gate_f32, T, brows(w.iw, T), brows(w.iwf, T));
+            /* The packed cache in place of `k` and its scales (dsa_score's packed form). */
+            RAD_ISSUE_N(c, op_score, T, brows(w.qcodes, T * Hi), brows(w.qscale, T * Hi),
+                        brows(w.iwf, T), kv_cache(index, layer), RAD_NONE,
+                        praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), cu,
+                        brows(w.nc, S), score, RAD_NONE);
+        } else {
+            RAD_ISSUE_N(c, op_score, T, brows(w.iq, T), brows(w.iw, T), kv_cache(index, layer),
+                        praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), cu,
+                        brows(w.nc, S), score);
+        }
         RAD_ISSUE_N(c, op_select, T, score,
                     praw2(ab->block_table, RAD_I32, S, ab->block_table_pitch), brows(w.nc, S), pos,
                     cu, brows(w.sel, T), brows(w.nsel, T), brows(w.len, T));

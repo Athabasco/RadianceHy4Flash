@@ -621,6 +621,12 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
             d.dtype = RAD_BF16;
             d.n_head_kv = 1;
             d.head_dim = s.ix_dim / 8;
+            if (s.ix_fp8) {
+                /* dsa_pool's packed page: 128 E4M3 codes and the f32 scale, four rows of 34
+                 * bytes (GLM's kv_dsa_index). */
+                d.dtype = RAD_U8;
+                d.head_dim = 17;
+            }
             m.kv_index = rad_decl_kv_group(b, nm.f("kv_index_keys"), &d);
             if (!m.kv_index) return RAD_E_INVAL;
             /* The scorer reads every group of the history every step: resident. */
@@ -630,7 +636,7 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
                                     m.kv_tail, kv, ap, first_ix));
     }
     RAD_ARCH_TRY(lay.attn.declare_core(b, nm, ap, lay.sliding ? 0 : m.iw.sel,
-                                       lay.sliding ? 0 : m.iw.len));
+                                       lay.sliding ? 0 : m.iw.len, lay.sliding ? 0 : m.iw.nsel));
     RAD_ARCH_TRY(lay.hc_attn.declare_post(b, s, T, m.tr.h, m.tr.post, m.tr.y));
     RAD_ARCH_TRY(lay.t_mid.declare(b, nm, T, "resid_mid", l, RAD_BF16, s.hc * E, m.tr.h));
 
@@ -725,6 +731,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     {
         const char* e = std::getenv("RADIANCE_HY4_PREFILL");
         m.force_absorbed = e && !std::strcmp(e, "absorbed");
+        /* The indexer's numerics: HF's (the default) or vLLM's FWHT + FP8 (hyv4flash_indexer.h). */
+        const char* ix = std::getenv("RADIANCE_HY4_INDEXER");
+        if (ix && *ix && std::strcmp(ix, "exact") && std::strcmp(ix, "fp8"))
+            return refuse("RADIANCE_HY4_INDEXER is 'exact' (the default) or 'fp8'");
+        s.ix_fp8 = ix && !std::strcmp(ix, "fp8");
+        if (s.ix_fp8 && s.ix_dim != 128)
+            return refuse("RADIANCE_HY4_INDEXER=fp8 needs an indexer head of 128 (dsa_pool's page)");
     }
 
     /* The token embedding and the head. The release ships its own lm_head (`tie_word_embeddings`
@@ -928,8 +941,12 @@ static void step(RadCtx* c, const RadBatch* batch) {
         RAD_ISSUE_N(c, l.op_attn_norm, T, brows(m.tr.x, T), RAD_W(l.attn_gain), brows(m.tr.xn, T));
         if (!l.attn.front(c, batch)) return;
         m.calib.after_front(c, (int)i, l.attn, T);
-        if (!l.sliding && !l.ix.step(c, batch, p)) return;
-        l.attn.core(c, batch, p, m.iw.sel, m.iw.len);
+        /* A pass on a streamed group's ring attends through the selection at every context
+         * (hyv4flash_attn.h); every sparse layer of a pass agrees, the view being the pass's. */
+        StepPlan lp = p;
+        if (!l.sliding && !lp.select && l.attn.ring_bound(c, batch)) lp.select = true;
+        if (!l.sliding && !l.ix.step(c, batch, lp)) return;
+        l.attn.core(c, batch, lp, m.iw.sel, m.iw.len, m.iw.nsel);
         m.calib.after_attn(c, (int)i, T);
         l.hc_attn.post_add(c, m.tr.y, m.tr.post, m.tr.h, T);
         l.t_mid.step(c, brows(m.tr.h, T), T);
@@ -960,10 +977,13 @@ static void step(RadCtx* c, const RadBatch* batch) {
 
 /* Chained launches, with a drafter and without: the decode step is launch-bound and the rows that
  * have a chained form (GEMM, norm, rope, kv_store, add, silu_mul, MoE, gather) chain; the others
- * keep their barrier. Bit-identical: the same kernels launched with the barrier bit (WP16.1a). */
+ * keep their barrier. Bit-identical: the same kernels launched with the barrier bit (WP16.1a).
+ * The sparse latent group can stream (--kv-resident): the attention declares the streamed store
+ * and the resolve (hyv4flash_attn.h). */
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
     out->chain_pays = RAD_CHAIN_ALWAYS;
+    out->kv_stream_ok = 1;
     return RAD_OK;
 }
 } // namespace hyv4flash

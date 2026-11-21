@@ -3417,6 +3417,27 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   a page is an indexer group and `qsa_select`'s table is the attention's; the indexer's pooled keys
   in a full group of block 4 (one key a page); its raw-key tail a linear state of `4 + n_spec` rows;
   each Engram layer's token history a CONV state of two ids.
+- **Streamed sparse KV** (`--kv-resident N`, [KV-STREAMING.md](KV-STREAMING.md)). The plugin's
+  probe says it can stream (`kv_stream_ok`), and the sparse latent group streams as GLM-5.3's MLA
+  does: `kv_store_streamed` writes the host mirror always and the ring slot where the block is
+  resident, and a pass on the ring (decode, verify) resolves the selection between `qsa_select`
+  and `mla_attn_sel_sink` (`kv_resolve`, with `qsa_select`'s entry count; `sel` rewritten to ring
+  slots). Such a pass attends through the selection at every context, also at or below the dense
+  limit, where the selection is every closed group and so the dense result
+  (`mla_attn_paged_sink` at window 0 and `mla_attn_sel_sink` over a full table give the same
+  bytes); the dense kernel would read block ids as ring slots. Prefill and mixed steps take the
+  stage (block-id addressing, no resolve), as on the resident path. The sliding group is a window
+  and never streams; the indexer's key cache is read whole every step and stays resident
+  (`rad_kv_group_dense_read`). Like every streamed model, a context under the ring's floor of
+  32 768 tokens does not stream.
+- **The FP8 indexer** (`RADIANCE_HY4_INDEXER=fp8`; `exact`, the default, is HF's numerics). The
+  key cache and the score take vLLM's IndexPool numerics on GLM's forms: `idx_pool_gated_fp8`
+  keeps the pooled, normed, rotated group key in f32 and writes its 128-wide Hadamard into E4M3
+  codes at a power-of-two scale in `dsa_pool`'s packed page (136 bytes a group instead of 256),
+  the rotated query goes through `dsa_query` a head at a time, and `dsa_score` (16 heads, the
+  head weights cast to f32 as its gates) scores the pages; `qsa_select` is unchanged. Selection is
+  discrete, so FP8 moves near-ties: measured on `gpu-mini` below. The HF parity harness compares
+  the exact path; the FP8 path is compared with it.
 - **The Engram norms' eps** is `finfo(dtype).eps` in the reference (DECISIONS U1):
   `RADIANCE_HY4_ENGRAM_EPS=bf16` (0.0078125, the default), `f32` (1.19e-7, the harness's parity
   mode) or a number.

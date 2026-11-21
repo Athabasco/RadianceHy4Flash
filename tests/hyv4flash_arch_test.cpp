@@ -348,6 +348,144 @@ TEST(the_debug_taps_are_persistent_buffers_and_lint_clean) {
     }
 }
 
+/* Streamed KV (docs/KV-STREAMING.md, WP14): the sparse latent group streams like GLM's MLA. A pass
+ * on the ring stores through kv_store_streamed (mirror and ring), selects even at or below the dense
+ * limit, and resolves between qsa_select and mla_attn_sel_sink with qsa_select's entry count; a
+ * staged pass stores twice (mirror, then the stage at identity) and never resolves; the sliding
+ * window and the indexer's caches never stream. */
+TEST(a_streamed_sparse_group_stores_to_its_mirror_and_resolves_between_select_and_attention) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    RadBuilder& b = d.b;
+    const auto& m = *hyv4flash::models[0];
+    CHECK_EQ(count_op(b, "kv_store_streamed"), 2);   /* the sparse layers only */
+    CHECK_EQ(count_op(b, "kv_resolve"), 2);
+    const RecOp* rs = find_op(b, "kv_resolve");
+    REQUIRE(rs != nullptr);
+    CHECK_EQ(pint(rs, "sel_pitch"), 4);              /* the selection row, group_topk */
+    CHECK_EQ(pint(rs, "block_bytes"), 320);          /* (32 + 8) bf16 a slot, 4 slots */
+    /* The probe states the capability. */
+    RadArchProbe pr{};
+    REQUIRE_EQ(hyv4flash::probe(d.mk.meta(), &pr), RAD_OK);
+    CHECK_EQ(pr.kv_stream_ok, 1);
+
+    const int64_t blocks = 64, slots = 16, bbytes = 320;
+    std::vector<uint8_t> host((size_t)(blocks * bbytes * 3));
+    std::vector<int32_t> res((size_t)(blocks * 3)), slot_block((size_t)(slots * 3)),
+        slot_state((size_t)(slots * 6)), ctl(16);
+    RadKVStream st{};
+    st.host = host.data();
+    st.res = res.data();
+    st.slot_block = slot_block.data();
+    st.slot_state = slot_state.data();
+    st.ctl = ctl.data();
+    st.block_bytes = bbytes;
+    st.host_layer_stride = bbytes * blocks;
+    st.slots = slots;
+    st.host_bytes = (int64_t)host.size();
+    auto find_issue = [&](const RadCtx& c, rad_op op, size_t from = 0) -> size_t {
+        for (size_t i = from; i < c.issues.size(); ++i)
+            if (c.issues[i].op == op) return i;
+        return SIZE_MAX;
+    };
+    for (int staged = 0; staged < 2; ++staged) {
+        /* Two decode rows at contexts 6 and 9: below the dense limit of 16. */
+        auto k = kit(b, { 1, 1 }, {}, 0);
+        k->pos[0] = 5; k->pos[1] = 8;     /* in place: the batch points into these */
+        k->used[0] = 6; k->used[1] = 9;
+        k->ctxl[0] = 5; k->ctxl[1] = 8;
+        k->b.positions_h = k->pos.data();
+        k->b.max_ctx_len = 9;
+        k->kv[(size_t)m.kv_sparse - 1].stream = &st;
+        RadCtx c{ .b = &b, .batch = &k->b };
+        c.stage_on = staged != 0;
+        hyv4flash::step(&c, &k->b);
+        CHECK_LINT(b, &c);
+        if (!c.step_fail.empty()) fprintf(stderr, "%s\n", c.step_fail.c_str());
+        CHECK(c.step_fail.empty());
+        for (const auto& l : m.layers) {
+            if (l.sliding) {
+                CHECK(find_issue(c, l.attn.op_store) != SIZE_MAX);
+                continue;
+            }
+            const size_t store = find_issue(c, l.attn.op_store_stream);
+            const size_t ident = find_issue(c, l.attn.op_store);
+            const size_t sel = find_issue(c, l.ix.op_select, store == SIZE_MAX ? 0 : store);
+            const size_t res_i = find_issue(c, l.attn.op_resolve);
+            const size_t attn = find_issue(c, l.attn.op_sel, store == SIZE_MAX ? 0 : store);
+            REQUIRE(store != SIZE_MAX);
+            if (staged) {
+                /* The stage reads block ids: the identity store follows the mirror's, nothing
+                 * resolves, and below the limit the pass attends densely as unstreamed. */
+                CHECK(ident != SIZE_MAX && store < ident);
+                CHECK_EQ(res_i, SIZE_MAX);
+                CHECK_EQ(attn, SIZE_MAX);
+                continue;
+            }
+            CHECK_EQ(ident, SIZE_MAX);
+            REQUIRE(sel != SIZE_MAX);
+            REQUIRE(res_i != SIZE_MAX);
+            REQUIRE(attn != SIZE_MAX);
+            CHECK(store < sel);
+            CHECK(sel < res_i);
+            CHECK(res_i < attn);
+            CHECK_EQ(c.issues[res_i].opd[0].handle, m.iw.sel);
+            CHECK_EQ(c.issues[res_i].opd[1].handle, m.iw.nsel);   /* the entry count */
+            CHECK_EQ(c.issues[res_i].n, (int64_t)2);
+        }
+    }
+}
+
+/* RADIANCE_HY4_INDEXER=fp8: the key cache becomes dsa_pool's packed page and the score dsa_score
+ * over dsa_query's codes; anything but exact/fp8, and an indexer head other than 128, is refused. */
+TEST(the_fp8_indexer_swaps_the_key_cache_and_the_score_for_the_dsa_forms) {
+    auto wide_ix = [](MetaKV& k) { k.set("index_head_dim", "128"); };
+    setenv("RADIANCE_HY4_INDEXER", "fp8", 1);
+    Declared small;
+    CHECK_EQ(small.rc, RAD_E_UNSUPPORTED);              /* mini's indexer head is 16 */
+    unsetenv("RADIANCE_HY4_INDEXER");
+    for (int fp8 = 0; fp8 < 2; ++fp8) {
+        if (fp8) setenv("RADIANCE_HY4_INDEXER", "fp8", 1);
+        MetaKV mk = mini_meta();
+        wide_ix(mk);
+        RadBuilder b;
+        bf16_encs(&b);
+        RadBuildCtx ctx = build_ctx();
+        int rc = 0;
+        const std::string err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
+        unsetenv("RADIANCE_HY4_INDEXER");
+        if (rc != RAD_OK) fputs(err.c_str(), stderr);
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK_EQ(count_op(b, "idx_pool_gated_fp8"), fp8 ? 2 : 0);
+        CHECK_EQ(count_op(b, "idx_pool_gated"), fp8 ? 0 : 2);
+        CHECK_EQ(count_op(b, "dsa_query"), fp8 ? 2 : 0);
+        CHECK_EQ(count_op(b, "dsa_score"), fp8 ? 2 : 0);
+        CHECK_EQ(count_op(b, "idx_score"), fp8 ? 0 : 2);
+        const RecKV* ixk = kv_named(b, "kv_index_keys");
+        REQUIRE(ixk != nullptr);
+        CHECK_EQ(ixk->d.dtype, fp8 ? RAD_U8 : RAD_BF16);
+        CHECK_EQ(ixk->d.head_dim, fp8 ? 17 : 16);
+        CHECK_EQ(block_of(b, "kv_index_keys"), 4);
+        if (fp8) {
+            const RecOp* sc = find_op(b, "dsa_score");
+            CHECK_EQ(pint(sc, "heads"), 2);
+            CHECK_EQ(pint(sc, "n"), 128);
+        }
+        auto k = kit(b, { 1, 1 }, {}, 0);
+        k->b.positions_h = k->pos.data();
+        RadCtx c{ .b = &b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK_LINT(b, &c);
+        CHECK(c.step_fail.empty());
+        CHECK_EQ(count_issued(b, c, fp8 ? "dsa_score" : "idx_score"), 2);
+        CHECK_EQ(count_issued(b, c, "mla_attn_sel_sink"), 2);
+    }
+    setenv("RADIANCE_HY4_INDEXER", "bf16", 1);
+    Declared bad;
+    unsetenv("RADIANCE_HY4_INDEXER");
+    CHECK_EQ(bad.rc, RAD_E_UNSUPPORTED);
+}
+
 /* What this build does not serve is refused by name at declare: a quantised kv_b (DECISIONS U2),
  * a recipe over a parameter the model applies in f32, a quantised token embedding, and a trunk
  * linear in a form that reads E4M3 codes no producer of this graph writes (MXFP4). */
