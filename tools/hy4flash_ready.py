@@ -160,7 +160,8 @@ def a1(c):
 
 def run_rad(c, preset, tp, scenario, kernels="libref", extra=()):
     # the harness needs a chunk of at least 16 (blocks of 4 and 16): as work/wp4/matrix.sh runs it
-    extra = list(extra) + {"oneshot": ["--chunk", "64"], "empty": ["--chunk", "16"]}.get(scenario, [])
+    # (gpu-mini's one-shot is the whole prompt in one step: its window and dense limit are 512 / 2048)
+    extra = list(extra) + ({} if preset == "gpu-mini" else {"oneshot": ["--chunk", "64"], "empty": ["--chunk", "16"]}).get(scenario, [])
     py = os.path.join(c.ref, "venv/bin/python")
     cmd = [py, os.path.join(c.refx, "run_rad.py"), "--preset", preset, "--tp", tp, "--scenario", scenario, "--build", c.build,
            "--src", SRC, "--kernels", kernels, "--json", f"{c.work}/rad-{preset}-{kernels}-tp{tp}-{scenario}.json", *extra]
@@ -220,16 +221,29 @@ def a5(c):
         say("A5", "PASS" if rc == 0 and m and m[1] == 0 else "FAIL", f"gpu-mini TP{tp} on the cards: rc {rc} {m}; {log}")
     kb = os.path.join(SRC, "data/kernels_hy4.rkb")
     if os.path.exists(kb):
-        rc, out = run(["flock", GPU_LOCK, f"{c.build}/bin/rad-kbench", "--kernels", "libr4d,libref", kb], f"{c.work}/a5-kbench.log",
+        rc, out = run(["flock", GPU_LOCK, f"{c.build}/bin/rad-kbench", "--kernels", "libr4d:libref", "--fixture", kb],
+                      f"{c.work}/a5-kbench.log", {"RADIANCE_HOME": c.home}, 3600)
+        m = re.search(r"(\d+) checked, (\d+) passed, (\d+) failed.*worst rel_l2 = (\S+)", out)
+        wrote = re.search(r"(\d+) wrote outside one", out)
+        ok = rc == 0 and m and int(m.group(3)) == 0 and wrote and int(wrote.group(1)) == 0
+        say("A5", "PASS" if ok else "FAIL", f"rad-kbench --kernels libr4d:libref over data/kernels_hy4.rkb: rc {rc}, "
+                                            f"{m.group(0) if m else 'no summary'}; {c.work}/a5-kbench.log")
+        rc, out = run(["flock", GPU_LOCK, f"{c.build}/bin/r4d_selftest", f"{c.home}/kernels/libr4d.so"], f"{c.work}/a5-selftest.log",
                       {"RADIANCE_HOME": c.home}, 3600)
-        say("A5", "PASS" if rc == 0 else "FAIL", f"rad-kbench over data/kernels_hy4.rkb: rc {rc}")
+        hy4 = ("ihc_", "gate_mul", "mla_", "attn_kv_sink", "idx_", "engram_", "embed_lookup_q", "qsa_", "cast_i32", "fill_i32",
+               "quant_act_fp8_grp", "dequant_fp8")
+        nosmoke = [l for l in out.splitlines() if "no smoke case" in l and any(h in l for h in hy4)]
+        fails = [l for l in out.splitlines() if l.startswith("  FAIL") and any(h in l for h in hy4)]
+        say("A5", "PASS" if not nosmoke and not fails else "FAIL",
+            f"r4d_selftest, Hy4 rows: {len(fails)} FAIL, {len(nosmoke)} without a smoke case (whole run rc {rc}); {c.work}/a5-selftest.log")
     else:
         say("A5", "OPEN", "data/kernels_hy4.rkb not in this tree (WP8)")
 
 
 def a6(c):
-    say("A6", "OPEN", "needs the cards and WP8: `debug-selection` on a real-geometry declare at TP1/2/4 (no reference kernel in the "
-                      "table); not decidable on the host")
+    say("A6", "OPEN", "gpu-mini (the real per-head geometry at n 512) starts on the cards at TP1 and TP2 without "
+                      "--debug-accept-reference-kernels (A5), and rad-kbench covers the Hy4 ops at 16/8 heads and n 3072 on libr4d; "
+                      "a real-geometry declare at TP1/2/4 (`--debug-selection`) needs a real-size container (not on this machine)")
 
 
 def a7(c):
