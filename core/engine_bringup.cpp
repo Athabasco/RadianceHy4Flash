@@ -973,6 +973,7 @@ int Engine::load_plugins() {
         RAD_TRY(rad_engine_claim(plugins_.arch_plugin, cfg_.tp, &base));
         slot_base_ = base;
         reg_->set_tp_group(base);
+        reg_->set_declare_only(cfg_.debug_graph && device_is_host());
     }
     const Plugin* ap = reg_->plugin(plugins_.arch_plugin);
     arch_step_ = ap ? ap->arch_step : nullptr;
@@ -4867,7 +4868,10 @@ int Engine::start() {
      * the same architecture (usable_devices), so the first engine's check holds for it. */
     if (rad_tools_registry().plugins().empty()) {
         rad_tools_registry().set_code_device(devs[0]);
-        rad_tools_registry().set_no_device_code(device_is_host());
+        /* --debug-graph only declares and prints: no kernel launches, so on the host backend (fake ranks,
+         * RADIANCE_HOST_DEVICES) the device rows stay in selection and the table shows what a card would
+         * resolve to (a real-geometry declare checked without the cards: tools/hy4flash_ready.py A6). */
+        rad_tools_registry().set_no_device_code(device_is_host() && !cfg_.debug_graph);
     }
     int plugins_st = RAD_OK;
     try {
@@ -5443,7 +5447,7 @@ int Engine::dump() {
     if (cfg_.debug_selection) fputs(reg_->selection_table().c_str(), stdout);
     /* The exit code reports device holes by declare()'s rule (Program::device_holes). */
     for (auto& r : ranks_)
-        if (!r->program.device_holes(device_is_host()).empty()) return RAD_E_NOKERNEL;
+        if (!r->program.device_holes(device_is_host() && !cfg_.debug_graph).empty()) return RAD_E_NOKERNEL;
     return RAD_OK;
 }
 
