@@ -406,7 +406,8 @@ def a7(c):
 #   (a) equal X^T X of radiance's own tapped activations to 1e-6 relative (Frobenius), and
 #   (b) sit within the bf16 noise band of X^T X of the HF f32 activations: <= 2 % relative (WP4's floor logic).
 A7_OWN_TOL = 1e-6
-A7_HF_TOL = 2e-2
+A7_HF_ABS = 1e-3       # the band is max(this, A7_HF_FLOORS x the floor); the floor is HF's own bf16 Gram vs its f32 Gram at the site (coordinator)
+A7_HF_FLOORS = 2.0
 A7_PROMPTS = ("short", "window")    # prompts the plugin and HF route identically (long and the indexer prompts hit near-tied sparse selections on random weights: WP3, WP9)
 A7_SITES = {"attn_q_a": "attn_in_norm", "attn_q_b": "attn_q_resid", "attn_kv_b": "attn_kv_latent", "ffn_gate_up": "ffn_in_norm",
             "ffn_latent_in": "ffn_in_norm", "ffn_latent_out": "moe_experts_out"}
@@ -423,6 +424,7 @@ def a7_gate(c, w, rad, cfg, ids):
         for pn in A7_PROMPTS:
             T = len(ids[pn])
             hf = np.load(os.path.join(c.ref, f"dumps/mini4/f32/{pn}.npz"))
+            hb = np.load(os.path.join(c.ref, f"dumps/mini4/bf16-patched/{pn}.npz"))     # the floor: HF's own bf16 run of the same prompt
             g = f"{w}/gate-tp{tp}-{pn}"
             shutil.rmtree(g, ignore_errors=True)
             os.makedirs(f"{g}/grams")
@@ -452,10 +454,14 @@ def a7_gate(c, w, rad, cfg, ids):
                     kk, rows, dom, lin, tri = cs.read_site(f)
                     H = cs.full_matrix(tri, kk).astype(np.float64)
                     Xh = hf[f"L{l:02d}.{key}"].astype(np.float64)
-                    e = np.linalg.norm(H - Xh.T @ Xh) / np.linalg.norm(Xh.T @ Xh)
-                    if not vhf or e > max(vhf):
-                        worst_site = f"{pn} blk.{l}.{site}"
-                    vhf.append(e)
+                    Gh = Xh.T @ Xh
+                    Xb = hb[f"L{l:02d}.{key}"].astype(np.float64)
+                    floor = np.linalg.norm(Xb.T @ Xb - Gh) / np.linalg.norm(Gh)
+                    e = np.linalg.norm(H - Gh) / np.linalg.norm(Gh)
+                    ratio = e / max(A7_HF_ABS, A7_HF_FLOORS * floor)          # <= 1: inside the band at this site
+                    if not vhf or ratio > max(vhf):
+                        worst_site = f"{pn} blk.{l}.{site}: {e:.2e} vs floor {floor:.2e}"
+                    vhf.append(ratio)
                     tap = glob.glob(f"{g}/dd/0--dbg.{key}.{l}.bin") or sorted(glob.glob(f"{g}/dd/*-dbg.{key}.{l}.bin"))
                     if tap:
                         u = np.fromfile(tap[0], dtype="<u2").astype(np.uint32) << 16
@@ -464,11 +470,11 @@ def a7_gate(c, w, rad, cfg, ids):
                     n += 1
         if failed:
             continue
-        ok = n >= 12 and own and max(own) <= A7_OWN_TOL and vhf and max(vhf) <= c.a7_hf_tol
+        ok = n >= 12 and own and max(own) <= A7_OWN_TOL and vhf and max(vhf) <= 1.0
         say("A7", "PASS" if ok else "FAIL",
             f"mini4 TP{tp} (fake ranks), {len(A7_PROMPTS)} prompts: {n} trunk site Grams; vs X^T X of radiance's own taps ({len(own)} sites) worst "
-            f"{max(own) if own else float('nan'):.1e} (gate {A7_OWN_TOL:g}); vs X^T X of the HF f32 activations worst "
-            f"{max(vhf) if vhf else float('nan'):.1e} at {worst_site} (gate {c.a7_hf_tol:g}, bf16 noise band)")
+            f"{max(own) if own else float('nan'):.1e} (gate {A7_OWN_TOL:g}); vs X^T X of the HF f32 activations, worst error / band "
+            f"{max(vhf) if vhf else float('nan'):.2f} of the band (tightest site: {worst_site}; band = max({A7_HF_ABS:g}, {A7_HF_FLOORS:g} x floor), HF bf16-patched Gram vs HF f32 Gram)")
 
 
 def kl_run(c, rad, refdir, out, tp=1):
@@ -699,7 +705,7 @@ def a8_preset_runs(c, preset, gpu, tps, label):
             rad = c.iqr_rad
             if not rad or not os.path.exists(rad):
                 say("A8", "OPEN", f"{label} iqr-gptq: its container takes ~95 min of GPTQ on the host (WP8); none given (--iqr-container, default "
-                                  f"work/wp8/q/gpu-mini/hy4-flash-iqr-gptq.rad)")
+                                  f"work/iqrtp/iqr128.rad)")
                 continue
         else:
             rad = a8_convert(c, P, name, os.path.join(SRC, f"data/recipes/hy4-flash-{name}.recipe"))
@@ -839,7 +845,9 @@ def baseline_failures():
     for d in (os.path.join(SRC, "..", ".."), os.path.join(SRC, "..")):
         f = os.path.join(d, "BASELINE_TESTS.md")
         if os.path.exists(f):
-            return set(re.findall(r"^\| (\w+) \|", open(f).read(), re.M)) - {"Test"}
+            # quant_test / recipe_test: fail under ctest only (ninja's relative __FILE__ in their path checks), pass run from build/
+            # (coordinator, after BASELINE_TESTS.md was written)
+            return (set(re.findall(r"^\| (\w+) \|", open(f).read(), re.M)) - {"Test"}) | {"quant_test", "recipe_test"}
     return set()
 
 
@@ -856,9 +864,8 @@ def main():
     ap.add_argument("--only", help="comma list, e.g. A1,A9")
     ap.add_argument("--gpu", action="store_true", help="also run the card items (A5), under flock gpu.lock")
     ap.add_argument("--full-suite", nargs="*", metavar="BUILD", help="run the whole ctest of these build directories (A11)")
-    ap.add_argument("--iqr-container", default=os.path.join(SRC, "..", "..", "work/wp8/q/gpu-mini/hy4-flash-iqr-gptq.rad"),
+    ap.add_argument("--iqr-container", default=os.path.join(SRC, "..", "..", "work/iqrtp/iqr128.rad"),
                     help="a gpu-mini container converted with hy4-flash-iqr-gptq.recipe (its GPTQ takes ~95 min on the host), for A8 on the cards")
-    ap.add_argument("--a7-hf-tol", type=float, default=2e-2, help="A7: the relative bf16 noise band of the Grams against X^T X of the HF activations")
     ap.add_argument("--offline", action="store_true", help="do not fetch the release structure")
     a = ap.parse_args()
     c = Ctx()
@@ -896,7 +903,6 @@ def main():
     c.gpu = a.gpu
     c.iqr_rad = a.iqr_container
     c.decl = {}
-    c.a7_hf_tol = a.a7_hf_tol
     c.decl_lock = threading.Lock()
     c.sk_locks = {}
     c.full_suite = [os.path.abspath(b) for b in (a.full_suite or [])]
