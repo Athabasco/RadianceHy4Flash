@@ -42,9 +42,25 @@ CALIB=$PWD/grams rad-convert <ckpt> --add engram-tables.safetensors \
     --recipe data/recipes/hy4-flash-w4nl64-gptq.recipe -o hy4-q.rad
 ```
 
-Recipes in `data/recipes/`: `hy4-flash-bf16.recipe` (Engram E4M3 only), `hy4-flash-w4nl64-rtn.recipe`
-(uncalibrated size/plumbing baseline), `hy4-flash-w4nl64-gptq.recipe`. Write your own from them; the
-forms the serving blocks read are listed in ARCHITECTURES.md (bounded by what the tree can serve).
+Recipes in `data/recipes/`: `hy4-flash-bf16.recipe` (Engram E4M3 only), `hy4-flash-bf16-f32.recipe`
+(the same at an f32 scale a row, code for code the port's f32 round trip), `hy4-flash-w4nl64-rtn.recipe`
+(uncalibrated baseline, also the boot container a calibration can run from), `hy4-flash-w4nl64-gptq.recipe`,
+`hy4-flash-w5nl64-rtn.recipe`, `hy4-flash-w6nl64-rtn.recipe`, `hy4-flash-i8.recipe` (trunk, experts and
+head int8), `hy4-flash-iqr-gptq.recipe` (u4 trellis gate_up, w6nl64 down, u5 trellis trunk, int8 rest).
+Write your own from them; ARCHITECTURES.md "Quantised Hy4-flash" lists every form the graph reads, per weight.
+
+What is served (all of it measured only on random-weight dummies):
+
+| weights | forms | note |
+|---|---|---|
+| routed experts | w4nl64, w5nl64, w6nl64 (rotated E4M3 activations); rotated int8, the IQR trellis, w4nl64 (rotated int8 activations); a w5nl64 / w6nl64 down behind a trellis gate_up; bf16 | SwiGLU clamp (gate <= 10, \|up\| <= 10) in every layer, every form: clamp in bf16, then quantise. TP2 / TP4: a slice of every expert (768 / 384 columns) |
+| trunk linears | bf16; int8 rotated (`/fwht128`) or not; IQ8R; the i8a8h trellis (u5 ...); rotated u4/u5 with a zero point | each int8 linear quantises its own input; kv_a not as a trellis on the cards (576 rows) |
+| lm_head | bf16, int8 | |
+| Engram table | bf16, E4M3 rows at a bf16 or f32 scale | |
+| kv_b, router, iHC, sinks, norms, indexer pooling, Engram projections, token embedding | as shipped | refused by name when a recipe touches them |
+
+The IQR trellis (experts or trunk) is decoded by libr4d only: such a container serves on the cards, not
+on the host. libavx has no w6nl64 kernel; on the host a w6nl64 container runs on libref.
 
 ## KL against your HF reference
 
@@ -80,10 +96,10 @@ listed as OPEN with the command that decides them.
 
 ## Known limits
 
-- Quantised routed experts and quantised trunk linears are declared (so `rad-convert` writes them) but the
-  plugin refuses to serve them until the formats work lands (WP10); today the KL step can score only
-  bf16 and the Engram E4M3 container. Calibrate from the bf16 container. Check ARCHITECTURES.md for the
-  state on your checkout.
+- The quantised forms above serve on the host (libref, libavx) at one, two and four (fake) ranks; on the
+  cards only kernel by kernel so far (`r4d_selftest`): `gpu-mini` does not run end to end on a card yet.
+  Calibrate from the bf16 container (the boot container with w4nl64 experts works too; its expert Grams
+  are then in the rotated domain the GEMMs read).
 - The Grams match `X^T X` of the plugin's own taps to 1e-7, of HF activations to 0.3 % to 1.6 % relative
   (bf16 activation rounding), TP4 against TP1 to 2 %.
 - The indexer's selection ties (relu scores of 0) and the router's near-ties break differently from HF's `topk`;
@@ -93,4 +109,4 @@ listed as OPEN with the command that decides them.
 - `gpu-mini` does not start on a card in some builds (Engram round trip kernels); the real-geometry card
   numbers are not measured.
 - Engram E4M3 rows are not exact against the port in bf16 (2.9 % of codes differ by one step: the port divides in
-  bf16 before the cast).
+  bf16 before the cast). `hy4-flash-bf16-f32.recipe` is exact against the port in f32.
