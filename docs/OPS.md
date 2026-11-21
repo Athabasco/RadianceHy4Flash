@@ -3755,8 +3755,8 @@ refuses the graph rather than resolving a similar op.
 | `rmsnorm_ihc_junction` | `M`(range) `n` `hc` `rows` `eps`:f64 `ihc_eps`:f64/opt `hc_eps`:f64/opt `post_mag`:f64/opt `tail`/opt `dtype` | `a`:inout, `b`?, `w_post`w, `post`:inout, `h`:inout, `fn`w?, `scale`w?, `base`w?, `w_next`w?, `xn`?, `y`?, `x`? |
 | `mla_project_kv` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `mode` `dtype` | `a`, `b`w → `y` |
 | `mla_expand_gate` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `dtype` | `x`, `w`w, `g` → `y` |
-| `mla_attn_paged_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `block_size` `window` `scale`:f64 `dtype` | `q`, `q_rope`, `kv`, `block_table`, `seqused`, `cu_seqlens`, `sinks`w → `out` |
-| `mla_attn_sel_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `blocks` `block_size` `scale`:f64 `dtype` | `q`, `q_rope`, `kv`, `bt`, `length`, `sinks`w → `out` |
+| `mla_attn_paged_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `block_size` `window` `scale`:f64 `dtype` `stable`/opt | `q`, `q_rope`, `kv`, `block_table`, `seqused`, `cu_seqlens`, `sinks`w → `out` |
+| `mla_attn_sel_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `blocks` `block_size` `scale`:f64 `dtype` `stable`/opt | `q`, `q_rope`, `kv`, `bt`, `length`, `sinks`w → `out` |
 | `mla_kv_split` | `M`(range) `heads` `k_dim` `v_dim` `rope_dim` `dtype` | `kvb`, `k_rope` → `k`, `v` |
 | `attn_kv_sink` | `M`(range) `N` `heads` `head_dim` `window` `scale`:f64 `dtype` | `q`, `k`, `v`, `cu_q`, `cu_k`, `sinks`w → `out` |
 | `gate_mul` | `M`(range) `n` `dtype` | `a`, `g` → `y` |
@@ -3872,6 +3872,18 @@ maximum is taken (libref shifts by the maximum of the scores and the sink).
   `blocks * block_size`. With a table that lists a sequence's pages in order it equals
   `mla_attn_paged_sink` at `window 0` (a test pins it), so a sequence crossing the dense limit has
   no seam.
+- **`stable`** (both ops, optional, 0 or 1, default 0) is a promise about bytes, not about the
+  value: with `stable 1` a row's output bytes are a function of its own operands, the cache it
+  sees and the op's parameters, not of `M`, the launch's other rows or the number of sequences, so
+  a verify row equals the single-row decode at its position at any stream count. libref and
+  libavx compute every row on its own already and ignore it; the value both forms approximate is
+  libref's. libr4d sums an absolute grid (16-token chunks, splits at absolute 64-token super-chunks
+  with a window and 128-token ones at window 0 and in the selection form, merged in ascending
+  order with the sink once), at every `M` under `stable 1`, sizing its scratch for every row of
+  the declared `M` and refusing a launch whose scratch is short (`RAD_E_SCRATCH`); under `stable
+  0` it runs that law up to 16 rows (window) / 32 rows (window 0, selection) and one unsplit pass
+  past them, which may differ in the last place. Hy4-flash declares its decode-class rows with
+  `stable 1` and its prefill rows with `stable 0`.
 - **`attn_kv_sink`** is dense attention over separate keys and values (the non-absorbed prefill).
   `cu_q`, `cu_k` hold absolute offsets into `q` and into `k` / `v`; sequence `s` has `m_s` query
   rows and `n_s >= m_s` key rows (otherwise `RAD_E_SHAPE`), query `i` sits at key index

@@ -231,11 +231,13 @@ static const RadOperandSpec oIhcJunction[] = { INOUT("a"), OPD_O("b"), WGT("w_po
 static const RadParamSpec pMlaProjectKv[] = { P_INT("M"), P_INT("heads"), P_INT("k_dim"),
     P_INT("v_dim"), P_INT("latent_dim"), P_STR("mode"), P_STR("dtype") };
 static const RadParamSpec pMlaAttnPagedSink[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
-    P_INT("rope_dim"), P_INT("block_size"), P_INT("window"), P_F64("scale"), P_STR("dtype") };
+    P_INT("rope_dim"), P_INT("block_size"), P_INT("window"), P_F64("scale"), P_STR("dtype"),
+    P_INTO("stable") };
 static const RadOperandSpec oMlaAttnPagedSink[] = { OPD("q"), OPD("q_rope"), OPD("kv"),
     OPD("block_table"), OPD("seqused"), OPD("cu_seqlens"), WGT("sinks"), OUT("out") };
 static const RadParamSpec pMlaAttnSelSink[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
-    P_INT("rope_dim"), P_INT("blocks"), P_INT("block_size"), P_F64("scale"), P_STR("dtype") };
+    P_INT("rope_dim"), P_INT("blocks"), P_INT("block_size"), P_F64("scale"), P_STR("dtype"),
+    P_INTO("stable") };
 static const RadOperandSpec oMlaAttnSelSink[] = { OPD("q"), OPD("q_rope"), OPD("kv"), OPD("bt"),
     OPD("length"), WGT("sinks"), OUT("out") };
 static const RadParamSpec pMlaKvSplit[] = { P_INT("M"), P_INT("heads"), P_INT("k_dim"),
@@ -1461,10 +1463,13 @@ static const RadOpSchema kSchemas[] = {
   "mla_attn_paged with a window and a sink. A row at position p sees keys [max(0, p-window+1), p] "
   "(window 0: all), the window counting the row's own token. s_j = scale*(q.latent_j + "
   "q_rope.rope_j); out = sum exp(s_j) latent_j / (sum exp(s_j) + exp(sink[h])): the sink joins the "
-  "softmax once and carries no value. No visible key gives zero." },
+  "softmax once and carries no value. No visible key gives zero. `stable` 1 (optional, default 0) "
+  "asks that a row's bytes not depend on the launch (M, its other rows); a row-independent "
+  "kernel ignores it." },
 { "mla_attn_sel_sink", ARR(pMlaAttnSelSink), ARR(oMlaAttnSelSink),
   "mla_attn's per-query page table and visible length with a rotary part and a sink: tokens "
-  "[0, length[r]) of table row bt[r]. The score and the sink are mla_attn_paged_sink's." },
+  "[0, length[r]) of table row bt[r]. The score, the sink and `stable` are "
+  "mla_attn_paged_sink's." },
 { "mla_kv_split", ARR(pMlaKvSplit), ARR(oMlaKvSplit),
   "kvb [N, heads*(k_dim+v_dim)] and k_rope [N, rope_dim] -> k [N, heads, k_dim+rope_dim] (the rope "
   "part shared by every head) and v [N, heads, v_dim]. A copy." },

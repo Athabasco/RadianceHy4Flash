@@ -2102,7 +2102,8 @@ static const RadOperandSpec oMlaAttnPaged[] = { { "q", RAD_OPD_IN, 0 },
 static const RadParamSpec pMlaAttnPagedSink[] = { P_INT("M"),          P_INT("heads"),
                                                   P_INT("latent_dim"), P_INT("rope_dim"),
                                                   P_INT("block_size"), P_INT("window"),
-                                                  P_F64("scale"),      P_STR("dtype") };
+                                                  P_F64("scale"),      P_STR("dtype"),
+                                                  P_INTO("stable") };
 static const RadOperandSpec oMlaAttnPagedSink[] = { { "q", RAD_OPD_IN, 0 },
                                                     { "q_rope", RAD_OPD_IN, 0 },
                                                     { "kv", RAD_OPD_IN, 0 },
@@ -2114,7 +2115,8 @@ static const RadOperandSpec oMlaAttnPagedSink[] = { { "q", RAD_OPD_IN, 0 },
 static const RadParamSpec pMlaAttnSelSink[] = { P_INT("M"),          P_INT("heads"),
                                                 P_INT("latent_dim"), P_INT("rope_dim"),
                                                 P_INT("blocks"),     P_INT("block_size"),
-                                                P_F64("scale"),      P_STR("dtype") };
+                                                P_F64("scale"),      P_STR("dtype"),
+                                                P_INTO("stable") };
 static const RadOperandSpec oMlaAttnSelSink[] = { { "q", RAD_OPD_IN, 0 },
                                                   { "q_rope", RAD_OPD_IN, 0 },
                                                   { "kv", RAD_OPD_IN, 0 },
@@ -3393,10 +3395,13 @@ static const RadOpSchema kSchemas[] = {
            "mla_attn_paged with a window and a sink. A row at position p sees keys [max(0, p-window+1), p] "
            "(window 0: all), the window counting the row's own token. s_j = scale*(q.latent_j + "
            "q_rope.rope_j); out = sum exp(s_j) latent_j / (sum exp(s_j) + exp(sink[h])): the sink joins the "
-           "softmax once and carries no value. No visible key gives zero."),
+           "softmax once and carries no value. No visible key gives zero. `stable` 1 (optional, default 0) "
+           "asks that a row's bytes not depend on the launch (M, its other rows); a row-independent "
+           "kernel ignores it."),
     SCHEMA("mla_attn_sel_sink", pMlaAttnSelSink, oMlaAttnSelSink,
            "mla_attn's per-query page table and visible length with a rotary part and a sink: tokens "
-           "[0, length[r]) of table row bt[r]. The score and the sink are mla_attn_paged_sink's."),
+           "[0, length[r]) of table row bt[r]. The score, the sink and `stable` are "
+           "mla_attn_paged_sink's."),
     SCHEMA("mla_project", pMlaProject, oGemmNt,
            "Per-head query absorption or value expansion through the shared [head,(K|V),latent] BF16 matrix."),
     SCHEMA("dsa_score", pDsaScore, oDsaScore,
@@ -7175,20 +7180,20 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_mla_attn_paged, r4d_rad_mla_attn_paged_scratch, nullptr, nullptr,
   r4d_shape_mla_attn_paged },
 { "mla_attn_paged_sink_bf16", "mla_attn_paged_sink", "attn",
-  "absorbed latent attention with a window and a sink: a workgroup a row and 16 or 32 heads, WMMA "
-  "scores over latent and rotary columns, split history (2 splits with a window, 8 without) and a "
-  "merge that applies the sink once",
+  "absorbed latent attention with a window and a sink: a workgroup a row and 16, 32 or 64 heads, "
+  "WMMA scores over latent and rotary columns, the stable law (absolute 16-token chunks, splits at "
+  "absolute 64-token super-chunks with a window, 128 without) and a merge that applies the sink once",
   "latent_dim=512, rope_dim=64, heads 8..64 a multiple of 8, block_size a power of two <=256; one page table a "
-  "sequence; split at M<=64",
+  "sequence; stable 1 splits at every M (scratch for every row), stable 0 at M<=16 (window) / 32",
   "bf16 Q/rotary/cache/output, f32 sinks, softmax and partials; P as bf16 high plus low part",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaAttnPagedSink), NOTUNE,
   nullptr, nullptr, r4d_rad_mla_attn_paged_sink, r4d_rad_mla_attn_paged_sink_scratch, nullptr,
   nullptr, r4d_shape_mla_attn_paged_sink },
 { "mla_attn_sel_sink_bf16", "mla_attn_sel_sink", "attn",
   "mla_attn_paged_sink_bf16's kernel over a per-row table and length (the indexer's selection), "
-  "8 splits",
-  "latent_dim=512, rope_dim=64, heads 8..64 a multiple of 8, block_size a power of two <=256; split at "
-  "M<=64",
+  "128-token super-chunks of the table order",
+  "latent_dim=512, rope_dim=64, heads 8..64 a multiple of 8, block_size a power of two <=256; stable 1 "
+  "splits at every M, stable 0 at M<=32",
   "bf16 Q/rotary/cache/output, f32 sinks, softmax and partials; P as bf16 high plus low part",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaAttnSelSink), NOTUNE,
   nullptr, nullptr, r4d_rad_mla_attn_sel_sink, r4d_rad_mla_attn_sel_sink_scratch, nullptr,

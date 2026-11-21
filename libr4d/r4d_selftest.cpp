@@ -20028,7 +20028,7 @@ struct SinkOps {
  * last). */
 static SinkOps sink_ops(bool sel, int64_t heads, const std::vector<int64_t>& qlen,
                         const std::vector<int64_t>& ctx, int64_t window, int64_t bs,
-                        int64_t sel_keep = 0, uint32_t seed = 1) {
+                        int64_t sel_keep = 0, uint32_t seed = 1, int stable = -1) {
     SinkOps o;
     const int64_t L = 512, R = 64, S = (int64_t)qlen.size();
     int64_t M = 0, bmax = 1, pages = 0;
@@ -20056,6 +20056,7 @@ static SinkOps sink_ops(bool sel, int64_t heads, const std::vector<int64_t>& qle
     o.ps.push_back(PI("block_size", bs));
     o.ps.push_back(PF("scale", 1 / 16.0));
     o.ps.push_back(PS("dtype", "bf16"));
+    if (stable >= 0) o.ps.push_back(PI("stable", stable));
     const int n = sel ? 7 : 8;
     o.out = n - 1;
     o.host.assign((size_t)n, RadTensor{});
@@ -20188,7 +20189,7 @@ static const RadKernelInfo* sink_oracle(void*& ref, const char* op) {
 /* One case against libref: every element within 0.002 + 0.008 |want|, margins untouched. */
 static void mla_sink_check(const Plugin& pl, bool sel, int64_t heads, std::vector<int64_t> qlen,
                            std::vector<int64_t> ctx, int64_t window, int64_t bs,
-                           int64_t sel_keep = 0) {
+                           int64_t sel_keep = 0, int stable = -1) {
     const char* what = sel ? "mla_attn_sel_sink_bf16" : "mla_attn_paged_sink_bf16";
     const auto* row = find(pl, what);
     if (!row || !g_plugin) {
@@ -20202,11 +20203,12 @@ static void mla_sink_check(const Plugin& pl, bool sel, int64_t heads, std::vecto
         if (ref) dlclose(ref);
         return;
     }
-    SinkOps o = sink_ops(sel, heads, qlen, ctx, window, bs, sel_keep);
-    std::string label = fmt("%s H=%lld bs=%lld%s%s ctx", sel ? "sel_sink" : "paged_sink",
+    SinkOps o = sink_ops(sel, heads, qlen, ctx, window, bs, sel_keep, 1, stable);
+    std::string label = fmt("%s H=%lld bs=%lld%s%s%s ctx", sel ? "sel_sink" : "paged_sink",
                             (long long)heads, (long long)bs,
                             sel ? "" : fmt(" w=%lld", (long long)window).c_str(),
-                            sel_keep ? fmt(" keep=%lld", (long long)sel_keep).c_str() : "");
+                            sel_keep ? fmt(" keep=%lld", (long long)sel_keep).c_str() : "",
+                            stable >= 0 ? fmt(" stable=%d", stable).c_str() : "");
     for (size_t s = 0; s < ctx.size(); ++s)
         label += fmt(" %lld/%lld", (long long)qlen[s], (long long)ctx[s]);
     std::vector<uint8_t> got;
@@ -20249,20 +20251,22 @@ static void mla_sink_check(const Plugin& pl, bool sel, int64_t heads, std::vecto
 }
 /* The byte promises on the card. The rows of each sequence against one-row launches at their
  * positions; at window 0 the paged form against the selection form over the same pages; forms
- * 1..3 against the rule (form 0). */
+ * 1..3 (5: 64 heads a workgroup; 6: the fused form) against the rule (form 0). With `stable 1`
+ * at any row count and number of sequences (WP16 3.4.1: verify == decode at any stream count). */
 static void mla_sink_bytes(const Plugin& pl, int64_t heads, std::vector<int64_t> qlen,
-                           std::vector<int64_t> ctx, int64_t window, int64_t bs) {
+                           std::vector<int64_t> ctx, int64_t window, int64_t bs, int stable = -1) {
     const auto* paged = find(pl, "mla_attn_paged_sink_bf16");
     const auto* selr = find(pl, "mla_attn_sel_sink_bf16");
     if (!paged || !selr) {
         ok("mla_sink bytes", false, "kernel missing");
         return;
     }
-    std::string label = fmt("sink bytes H=%lld w=%lld bs=%lld ctx", (long long)heads,
-                            (long long)window, (long long)bs);
+    std::string label = fmt("sink bytes H=%lld w=%lld bs=%lld%s ctx", (long long)heads,
+                            (long long)window, (long long)bs,
+                            stable >= 0 ? fmt(" stable=%d", stable).c_str() : "");
     for (size_t s = 0; s < ctx.size(); ++s)
         label += fmt(" %lld/%lld", (long long)qlen[s], (long long)ctx[s]);
-    SinkOps all = sink_ops(false, heads, qlen, ctx, window, bs);
+    SinkOps all = sink_ops(false, heads, qlen, ctx, window, bs, 0, 1, stable);
     std::vector<uint8_t> base;
     if (!sink_device(pl, paged, all, 0, base)) {
         ok(label.c_str(), false, "device launch failed");
@@ -20281,7 +20285,7 @@ static void mla_sink_bytes(const Plugin& pl, int64_t heads, std::vector<int64_t>
     int64_t r = 0;
     for (size_t s = 0; s < qlen.size(); ++s)
         for (int64_t i = 0; i < qlen[s]; ++i, ++r) {
-            SinkOps one = sink_ops(false, heads, { 1 }, { ctx[s] }, window, bs);
+            SinkOps one = sink_ops(false, heads, { 1 }, { ctx[s] }, window, bs, 0, 1, stable);
             /* the whole launch's cache */
             one.bytes[2] = all.bytes[2];
             one.host[2] = all.host[2];
@@ -20304,13 +20308,14 @@ static void mla_sink_bytes(const Plugin& pl, int64_t heads, std::vector<int64_t>
                 same = false;
         }
     ok(fmt("%s verify rows == decode rows", label.c_str()).c_str(), same);
-    for (int form : { 1, 2, 3 }) {
+    for (int form : { 1, 2, 3, 5, 6 }) {
+        if ((form == 5 && heads <= 32) || (form == 6 && stable != 1)) continue;
         std::vector<uint8_t> g;
         const bool ran = sink_device(pl, paged, all, form, g);
         ok(fmt("%s form %d == rule", label.c_str(), form).c_str(), ran && g == base);
     }
     if (!window) {
-        SinkOps s = sink_ops(true, heads, qlen, ctx, 0, bs);
+        SinkOps s = sink_ops(true, heads, qlen, ctx, 0, bs, 0, 1, stable);
         std::vector<uint8_t> g;
         bool eq = sink_device(pl, selr, s, 0, g);
         for (int64_t rr = 0; eq && rr < ot.shape[0]; ++rr)
@@ -37434,6 +37439,17 @@ static void device_phase(const Plugin& pl) {
         mla_sink_bytes(pl, 32, { 1, 1, 1 }, { 511, 512, 513 }, 512, 16);
         mla_sink_bytes(pl, 32, { 5, 1 }, { 2049, 600 }, 0, 4);
         mla_sink_bytes(pl, 16, { 3 }, { 513 }, 0, 4);
+        /* WP16 3.4.1, the stable law past the old split caps (16 rows with a window, 32 at
+         * window 0): several streams' verify rows equal their single-row decode; against libref. */
+        mla_sink_check(pl, false, 64, { 20 }, { 600 }, 512, 4, 0, 1);
+        mla_sink_check(pl, false, 32, { 100 }, { 300 }, 0, 4, 0, 1);
+        mla_sink_check(pl, false, 16, { 6, 6, 6, 6 }, { 530, 2100, 700, 4097 }, 512, 16, 0, 1);
+        mla_sink_bytes(pl, 64, { 6, 6, 6, 6 }, { 530, 2100, 700, 1200 }, 512, 4, 1);
+        mla_sink_bytes(pl, 16, { 6, 6, 6, 6, 6, 6, 6, 6 }, { 600, 520, 900, 3000, 512, 513, 17, 2049 },
+                       512, 16, 1);
+        mla_sink_bytes(pl, 32, { 6, 6, 6, 6 }, { 2049, 600, 1500, 2100 }, 0, 4, 1);
+        mla_sink_bytes(pl, 32, { 16, 16, 8, 1, 1, 1, 1 }, { 2100, 600, 1500, 1, 15, 16, 17 }, 0, 4, 1);
+        mla_sink_bytes(pl, 8, { 33, 31 }, { 700, 2000 }, 0, 4, 1);
     }
     if (sel("mla_attn_sel_sink_bf16")) {
         /* The indexer's selection: full selections below 2048 keys, a 2048-key subset (512 blocks
@@ -37444,6 +37460,8 @@ static void device_phase(const Plugin& pl) {
         }
         mla_sink_check(pl, true, 64, { 8 }, { 2500 }, 0, 4, 512);
         mla_sink_check(pl, true, 32, { 80 }, { 2200 }, 0, 4, 512); /* unsplit */
+        mla_sink_check(pl, true, 32, { 80 }, { 2200 }, 0, 4, 512, 1); /* the stable law */
+        mla_sink_check(pl, true, 8, { 24, 24 }, { 3000, 2600 }, 0, 4, 512, 1);
     }
     if (sel("mla_attn_rows_bf16")) {
         /* A rank's run of rows with all 64 heads (GLM's prefill split by rows), against the matrix

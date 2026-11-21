@@ -18,13 +18,33 @@
  * same scores. P goes to the value product as bf16 high part plus bf16 remainder. The next chunk's
  * keys are fetched into registers while the current one is multiplied; two barriers a chunk.
  *
- * A row's bytes do not depend on the launch: the split count is a function of the op and the
- * window alone (kSplitsWindow, kSplitsFull) and HG changes only which heads share a workgroup. So
- * a verify of k + 1 rows gives the single-row decode at each position bit for bit, and with the
- * same split count the paged form at window 0 and the selection form over a table listing the
- * same pages in order give the same bytes. Launches of more rows than kRowsWindow / kRowsFull
- * (several streams' verify, prefill through the absorbed path) and launches whose scratch is short
- * run unsplit, so their rows' bytes differ from a split launch's in the last place. */
+ * The stable law (WP16 perf.md 3.4.1): chunks are the absolute 16-token groups [16c, 16c + 16) of
+ * the sequence (paged) or of the row's table order (selection), masked at both ends of the visible
+ * range, and a split is an absolute super-chunk of 64 tokens with a window and of 128 at window 0
+ * and in the selection form. Slot j of a row is super-chunk floor(lo / SC) + j; the law has
+ * sink_law() slots (9 at a window of 512, kMaxSplits at window 0 and in the selection form), the
+ * last one taking whatever lies past it. The slots holding a visible key fold in ascending order
+ * (the first copied, each later one acc * exp(acc_m - m') + part * exp(part_m - m')), then the sink
+ * joins once. So a row's bytes are a function of its own operands, the cache it sees and the op's
+ * parameters: not of M, the launch's other rows, HG, the form, the slots a launch needs (the
+ * table's width bounds them) or the number of streams. A verify of k + 1 rows of any number of
+ * streams gives the single-row decode at each position bit for bit, and the paged form at window 0
+ * equals the selection form over a table listing the same pages in order (both anchor at 0).
+ *
+ * Two forms run the law. The split form (up to kRowsWindow / kRowsFull rows): a workgroup a slot,
+ * the partial (relative to its own maximum) to the scratch, merge_sink folds them. The fused form
+ * (more rows, `stable 1`): one workgroup walks the row's chunks as the unsplit pass does and at
+ * each super-chunk boundary folds the slot's state into an accumulator a row in the scratch with
+ * the merge's arithmetic (sink_fold, explicit fmaf), so the bytes are the split form's without its
+ * partials' traffic (9 or 20 of them a row and head). The order of the vLLM-style merge (every
+ * maximum first) is not used: it cannot be computed in one pass.
+ *
+ * `stable 1` (the plugin's decode-class instance) always runs the law and refuses a launch whose
+ * scratch does not hold the fused form's accumulator (RAD_E_SCRATCH); the scratch hook sizes the
+ * split form's partials up to the cap and the accumulator for every row of the declared M.
+ * `stable 0` (default; prefill rows) runs the split form up to the cap when the scratch holds it,
+ * and unsplit (one pass over the absolute chunks, one running maximum) past that, which differs
+ * from the law in the last place. */
 #include <hip/hip_runtime.h>
 #include "r4d_args.h"
 #include "r4d_common.h"
@@ -41,26 +61,30 @@ constexpr int D = 512, RD = 64, W = D + RD, PART = D + 4;
 /* Row pitch of a staged token in LDS: 576 + 8, so consecutive rows do not share a bank pattern. */
 constexpr int kPitch = W + 8;
 constexpr int kPieces = 16 * W / 8; /* 16-byte pieces of a 16-token chunk */
-/* Splits: a window's 512 keys in 64-token pieces, a selection's 2048 in 128-token ones. A lone
+/* Super-chunks: 64 tokens with a window, 128 at window 0 and in the selection form. A lone
  * workgroup takes about 1.8 us a 16-token chunk (gfx1201), so a decode row's time is the chunks of
- * one split; more splits cost the partials' write and merge. */
-constexpr int kSplitsWindow = 8, kSplitsFull = 16;
-static_assert(kSplitsWindow <= 16 && kSplitsFull <= 16, "merge_sink holds 16 partials");
-/* The most rows a launch splits (a verify at depth 15 or 31, or that many decode rows); past them
- * the workgroups fill the card unsplit, which is then also faster (measured: the window at 16 rows
- * 79 us split against 68 unsplit, the selection at 64 rows 362 against 269). */
+ * one super-chunk; more of them cost the partials' write and merge. The merge holds kMaxSplits. */
+constexpr int kShiftWindow = 6, kShiftFull = 7, kMaxSplits = 20;
+/* The most rows a `stable 0` launch splits; past them the workgroups fill the card unsplit, which
+ * is then also faster (measured: the window at 16 rows 79 us split against 68 unsplit, the
+ * selection at 64 rows 362 against 269). `stable 1` splits at every M. */
 constexpr long kRowsWindow = 16, kRowsFull = 32;
 /* Table entries a split reads through LDS: a selection split of 128 tokens at block size 1. */
 constexpr int kSpanPages = 160;
 
 struct SinkMeta {
     long qr, qh, rr, rh, kp, kt, bp, bc, lp, orr, oh, ss;
-    int rows, heads, seqs, blocks, bs, bs_shift, pages, splits, window;
+    /* splits: the launch's slots (grid z, the partial pitch; 1 = unsplit), law: the law's slot
+     * count, sc_shift: log2 of the super-chunk, fused: an unsplit launch that still runs the law
+     * (one workgroup walks the row's slots in order and folds each into an accumulator in the
+     * scratch as merge_sink folds the partials). */
+    int rows, heads, seqs, blocks, bs, bs_shift, pages, splits, law, sc_shift, fused, window;
     float scale;
 };
 
 /* r4d_mla_sink_pin_form: 0 the launcher's rule, 1 sixteen heads a workgroup, 2 thirty-two, 3 the
- * element-wise key load, 4 unsplit, 5 sixty-four heads a workgroup. A test hook (r4d_selftest, r4d_emu); nothing else sets it. */
+ * element-wise key load, 4 unsplit (not the law), 5 sixty-four heads a workgroup, 6 the fused
+ * form (the law in one workgroup a row). A test hook (r4d_selftest, r4d_emu); nothing else sets it. */
 int g_sink_form = 0;
 
 __device__ __forceinline__ int sink_seq(const int* cu, int seqs, int r) {
@@ -90,7 +114,28 @@ __device__ __forceinline__ void sink_range(const int* used, const int* cu, const
     }
 }
 
-template <int HG, bool WIDE, bool SEL>
+/* The law's merge, shared by merge_sink and the fused form so both give the same bytes: slots with
+ * a visible key folded in ascending order into (acc_m, acc_d, acc), the first one copied, each later
+ * one by acc = acc * exp(acc_m - m') + part * exp(part_m - m'), m' = max(acc_m, part_m); explicit
+ * fmaf so no contraction choice of the compiler differs between the two kernels. */
+struct SinkFold {
+    float a, b, m;
+};
+__device__ __forceinline__ SinkFold sink_fold(float acc_m, float part_m) {
+    const float mn = fmaxf(acc_m, part_m);
+    return { expf(acc_m - mn), expf(part_m - mn), mn };
+}
+/* The sink once at the end: shift to max(m, sink) as libref does, so a sink far above every score
+ * cannot overflow. No visible key gives zero, sink or not. */
+__device__ __forceinline__ float sink_inv(float m, float d, float sink) {
+    if (!(d > 0)) return 0;
+    const float top = fmaxf(m, sink), c = expf(m - top);
+    return c / fmaf(d, c, expf(sink - top));
+}
+
+/* FUSED: the fused form (m.fused), its own instance so its accumulator's registers do not touch
+ * the other forms' schedule. */
+template <int HG, bool WIDE, bool SEL, bool FUSED>
 __global__ __launch_bounds__(HG * 128) void mla_sink_rows(
     const uint16_t* q, const uint16_t* qrot, const uint16_t* kv, const int* bt, const int* used,
     const int* cu, const int* len, const float* sinks, uint16_t* out, float* scratch, SinkMeta m) {
@@ -107,8 +152,27 @@ __global__ __launch_bounds__(HG * 128) void mla_sink_rows(
     const bool mine = head < m.heads;
     int lo, hi, trow;
     sink_range<SEL>(used, cu, len, m, r, lo, hi, trow);
-    const long n = hi - lo;
-    const int begin = lo + (int)(n * split / m.splits), end = lo + (int)(n * (split + 1) / m.splits);
+    int begin = lo, end = hi;
+    if (m.splits > 1) {
+        /* Slot `split` is the absolute super-chunk floor(lo / SC) + split; the law's last slot
+         * takes the rest of the range. */
+        const long sc = ((long)(lo >> m.sc_shift) + split) << m.sc_shift,
+                   sc_end = sc + (1L << m.sc_shift);
+        begin = sc < lo ? lo : sc < hi ? (int)sc : hi;
+        if (split + 1 < m.law) end = sc_end < begin ? begin : sc_end < hi ? (int)sc_end : hi;
+    }
+    if (m.splits > 1 && begin >= end) {
+        /* An empty slot: the merge skips it by its denominator and reads nothing else. */
+        if (mine && !quarter && lane < 16) {
+            float* dst = scratch + (((long)r * m.heads + head) * m.splits + split) * PART;
+            dst[D] = -INFINITY;
+            dst[D + 1] = 0;
+        }
+        return;
+    }
+    /* The absolute 16-token chunks covering [begin, end); tokens outside it are masked. */
+    const int first = begin & ~15, c0 = lo >> m.sc_shift;
+    auto slot_of = [&](int token) { return min((token >> m.sc_shift) - c0, m.law - 1); };
     /* Query fragments: eight latent k-steps of the wave's quarter, one rotary. */
     v8bf query[9];
     {
@@ -142,7 +206,7 @@ __global__ __launch_bounds__(HG * 128) void mla_sink_rows(
               span = begin < end ? ((end - 1) >> m.bs_shift) - first_block + 1 : 0;
     const bool spanned = span <= kSpanPages;
     auto token_at = [&](int token) -> long {
-        if (token >= end) return -1;
+        if (token < begin || token >= end) return -1;
         const int block = token >> m.bs_shift;
         const int page = spanned ? span_pages[block - first_block] : table[(long)block * m.bc];
         return page >= 0 && page < m.pages
@@ -187,18 +251,72 @@ __global__ __launch_bounds__(HG * 128) void mla_sink_rows(
 #pragma unroll
     for (int mt = 0; mt < 8; ++mt) value[mt] = (v8f){ 0 };
     float run_max = -INFINITY, run_den = 0;
+    /* The fused form's accumulator: the row's (head's) maximum and denominator in registers, its
+     * 512 values in the scratch, each lane reading back only what it wrote. */
+    float acc_m = -INFINITY, acc_d = 0;
+    float* const acc = scratch + ((long)r * m.heads + (mine ? head : 0)) * PART;
+    auto fold = [&]() {
+        if (run_den > 0 && mine) {
+            if (!(acc_d > 0)) {
+                acc_m = run_max;
+                acc_d = run_den;
+#pragma unroll
+                for (int mt = 0; mt < 8; ++mt) {
+                    float* const to = acc + quarter * 128 + 8 * (lane >> 4) + mt * 16;
+                    *(float4*)to = make_float4(value[mt][0], value[mt][1], value[mt][2], value[mt][3]);
+                    *(float4*)(to + 4) =
+                        make_float4(value[mt][4], value[mt][5], value[mt][6], value[mt][7]);
+                }
+            } else {
+                /* Every load first (the chunk's staged registers are dead here), then the folds. */
+                float4 old[16];
+                const float* const at = acc + quarter * 128 + 8 * (lane >> 4);
+#pragma unroll
+                for (int mt = 0; mt < 8; ++mt) {
+                    old[2 * mt] = *(const float4*)(at + mt * 16);
+                    old[2 * mt + 1] = *(const float4*)(at + mt * 16 + 4);
+                }
+                const SinkFold f = sink_fold(acc_m, run_max);
+                acc_d = fmaf(run_den, f.b, acc_d * f.a);
+                acc_m = f.m;
+#pragma unroll
+                for (int mt = 0; mt < 8; ++mt) {
+                    float4 lo4 = old[2 * mt], hi4 = old[2 * mt + 1];
+                    lo4.x = fmaf(value[mt][0], f.b, lo4.x * f.a);
+                    lo4.y = fmaf(value[mt][1], f.b, lo4.y * f.a);
+                    lo4.z = fmaf(value[mt][2], f.b, lo4.z * f.a);
+                    lo4.w = fmaf(value[mt][3], f.b, lo4.w * f.a);
+                    hi4.x = fmaf(value[mt][4], f.b, hi4.x * f.a);
+                    hi4.y = fmaf(value[mt][5], f.b, hi4.y * f.a);
+                    hi4.z = fmaf(value[mt][6], f.b, hi4.z * f.a);
+                    hi4.w = fmaf(value[mt][7], f.b, hi4.w * f.a);
+                    *(float4*)(acc + quarter * 128 + 8 * (lane >> 4) + mt * 16) = lo4;
+                    *(float4*)(acc + quarter * 128 + 8 * (lane >> 4) + mt * 16 + 4) = hi4;
+                }
+            }
+        }
+        run_max = -INFINITY;
+        run_den = 0;
+#pragma unroll
+        for (int mt = 0; mt < 8; ++mt) value[mt] = (v8f){ 0 };
+    };
+    int slot = slot_of(first);
     if (begin < end) {
         if (spanned)
             for (int i = tid; i < span; i += NT) span_pages[i] = table[(long)(first_block + i) * m.bc];
         __syncthreads();
-        if (tid < 32) rows_at[tid >> 4][tid & 15] = token_at(begin + tid);
+        if (tid < 32) rows_at[tid >> 4][tid & 15] = token_at(first + tid);
         __syncthreads();
         fetch(0);
         stash(0);
     }
     __syncthreads();
     int buf = 0;
-    for (int start = begin; start < end; start += 16) {
+    for (int start = first; start < end; start += 16) {
+        if (FUSED && slot_of(start) != slot) {
+            fold();
+            slot = slot_of(start);
+        }
         const bool more = start + 16 < end;
         if (more) fetch(buf ^ 1);
         long ahead = -1;
@@ -273,15 +391,22 @@ __global__ __launch_bounds__(HG * 128) void mla_sink_rows(
         buf ^= 1;
     }
     if (!mine) return;
+    if (FUSED) {
+        fold();
+        const float inv = sink_inv(acc_m, acc_d, sinks[(long)head * m.ss]);
+#pragma unroll
+        for (int mt = 0; mt < 8; ++mt)
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int col = quarter * 128 + mt * 16 + 8 * (lane >> 4) + e;
+                out[(long)r * m.orr + (long)head * m.oh + col] =
+                    f32_to_bf16(acc_d > 0 ? acc[col] * inv : 0.f);
+            }
+        return;
+    }
     if (m.splits == 1) {
-        /* The sink joins the softmax once: shift to max(run_max, sink) as libref does, so a sink far
-         * above every score cannot overflow. No visible key gives zero, sink or not. */
-        float inv = 0;
-        if (run_den > 0) {
-            const float sink = sinks[(long)head * m.ss], top = fmaxf(run_max, sink),
-                        c = expf(run_max - top);
-            inv = c / (run_den * c + expf(sink - top));
-        }
+        /* The sink joins the softmax once (sink_inv). One slot: the law's bytes as well. */
+        const float inv = sink_inv(run_max, run_den, sinks[(long)head * m.ss]);
 #pragma unroll
         for (int mt = 0; mt < 8; ++mt)
 #pragma unroll
@@ -302,10 +427,10 @@ __global__ __launch_bounds__(HG * 128) void mla_sink_rows(
     }
 }
 
-/* A workgroup a (row, head), thread t holding columns 4t..4t+3: every split's maximum and partial
- * loaded at once (no serial dependency between splits), the partials rescaled to the global
- * maximum and added in split order, then the sink once. */
-constexpr int kMaxSplits = 16;
+/* A workgroup a (row, head), thread t holding columns 4t..4t+3: every slot's maximum and partial
+ * loaded at once (no serial dependency between the loads), then the slots with a visible key folded
+ * in ascending order (sink_fold, the fused form's rule) and the sink once. An empty slot (den 0)
+ * wrote only its maximum and denominator; its values are not read. */
 __global__ __launch_bounds__(128) void merge_sink(const float* scratch, const float* sinks,
                                                   uint16_t* out, SinkMeta m) {
     const int t = threadIdx.x, head = blockIdx.y, r = blockIdx.x;
@@ -317,30 +442,29 @@ __global__ __launch_bounds__(128) void merge_sink(const float* scratch, const fl
         if (s < m.splits) {
             part_max[s] = src[s * PART + D];
             part_den[s] = src[s * PART + D + 1];
-            part[s] = *(const float4*)(src + s * PART + 4 * t);
+            part[s] = part_den[s] > 0 ? *(const float4*)(src + s * PART + 4 * t)
+                                      : make_float4(0, 0, 0, 0);
         }
-    float top = -INFINITY;
-#pragma unroll
-    for (int s = 0; s < kMaxSplits; ++s)
-        if (s < m.splits && part_den[s] > 0) top = fmaxf(top, part_max[s]);
     float4 value = make_float4(0, 0, 0, 0);
-    float den = 0;
+    float acc_m = -INFINITY, den = 0;
 #pragma unroll
     for (int s = 0; s < kMaxSplits; ++s) {
         if (!(s < m.splits && part_den[s] > 0)) continue;
-        const float w = expf(part_max[s] - top);
-        den += part_den[s] * w;
-        value.x += part[s].x * w;
-        value.y += part[s].y * w;
-        value.z += part[s].z * w;
-        value.w += part[s].w * w;
+        if (!(den > 0)) {
+            acc_m = part_max[s];
+            den = part_den[s];
+            value = part[s];
+            continue;
+        }
+        const SinkFold f = sink_fold(acc_m, part_max[s]);
+        den = fmaf(part_den[s], f.b, den * f.a);
+        acc_m = f.m;
+        value.x = fmaf(part[s].x, f.b, value.x * f.a);
+        value.y = fmaf(part[s].y, f.b, value.y * f.a);
+        value.z = fmaf(part[s].z, f.b, value.z * f.a);
+        value.w = fmaf(part[s].w, f.b, value.w * f.a);
     }
-    float inv = 0;
-    if (den > 0) {
-        const float sink = sinks[(long)head * m.ss], shifted = fmaxf(top, sink),
-                    c = expf(top - shifted);
-        inv = c / (den * c + expf(sink - shifted));
-    }
+    const float inv = sink_inv(acc_m, den, sinks[(long)head * m.ss]);
     uint16_t* const o = out + (long)r * m.orr + (long)head * m.oh + 4 * t;
     o[0] = f32_to_bf16(value.x * inv);
     o[1] = f32_to_bf16(value.y * inv);
@@ -348,7 +472,21 @@ __global__ __launch_bounds__(128) void merge_sink(const float* scratch, const fl
     o[3] = f32_to_bf16(value.w * inv);
 }
 
-int sink_splits(bool sel, long window) { return !sel && window > 0 ? kSplitsWindow : kSplitsFull; }
+int sink_shift(bool sel, long window) { return !sel && window > 0 ? kShiftWindow : kShiftFull; }
+/* The law's slots: the super-chunks a window's range can touch, (window - 1) / SC rounded up plus
+ * one (9 at 512), at most kMaxSplits; kMaxSplits at window 0 and in the selection form. A function
+ * of the op and the window alone. */
+int sink_law(bool sel, long window) {
+    if (sel || window <= 0) return kMaxSplits;
+    const long sc = 1L << kShiftWindow;
+    return (int)std::min<long>(kMaxSplits, (window - 1 + sc - 1) / sc + 1);
+}
+/* The slots a launch needs: no visible token lies at or past the table's capacity, so a slot past
+ * it is empty in every row. Moves no bits (empty slots are skipped). */
+int sink_slots(bool sel, long window, long cap) {
+    const long need = cap < 1 ? 1 : ((cap - 1) >> sink_shift(sel, window)) + 1;
+    return (int)std::min<long>(sink_law(sel, window), need);
+}
 long sink_rows_cap(bool sel, long window) { return !sel && window > 0 ? kRowsWindow : kRowsFull; }
 
 void heads_view(RadTensor& t, long heads, long width) {
@@ -383,6 +521,7 @@ int sink_body(const RadArgs* a, RadStream stream) {
     const long heads = r4d_geti_or(a, "heads", 0), bs = r4d_geti_or(a, "block_size", 0),
                window = SEL ? 0 : r4d_geti_or(a, "window", 0);
     const float scale = (float)r4d_getf(a, "scale", 0);
+    const long stable = r4d_geti_or(a, "stable", 0);
     heads_view(q, heads, D);
     heads_view(qr, heads, RD);
     heads_view(o, heads, D);
@@ -393,7 +532,7 @@ int sink_body(const RadArgs* a, RadStream stream) {
         return RAD_E_DTYPE;
     const long rows = q.shape[0];
     if (r4d_geti_or(a, "latent_dim", 0) != D || r4d_geti_or(a, "rope_dim", 0) != RD ||
-        heads < 8 || heads > 64 || heads % 8 || bs < 1 || bs > 256 || (bs & (bs - 1)) || window < 0 ||
+        stable < 0 || stable > 1 || heads < 8 || heads > 64 || heads % 8 || bs < 1 || bs > 256 || (bs & (bs - 1)) || window < 0 ||
         window > INT_MAX || !std::isfinite(scale) || scale <= 0 || q.rank != 3 || rows < 1 ||
         rows > 65535 || !row_tensor_ok(q, rows, heads, D) || !row_tensor_ok(qr, rows, heads, RD) ||
         !row_tensor_ok(o, rows, heads, D) || kv.rank != 4 || kv.shape[0] < 1 ||
@@ -410,10 +549,27 @@ int sink_body(const RadArgs* a, RadStream stream) {
                  !r4d_contig(su) || !r4d_contig(cu) || r4d_numel(cu) != su->shape[0] + 1))
         return RAD_E_SHAPE;
     const int form = g_sink_form;
-    int splits = sink_splits(SEL, window);
-    if (form == 4 || rows > sink_rows_cap(SEL, window) || !a->scratch ||
-        a->scratch_bytes < rows * heads * splits * PART * 4)
-        splits = 1;
+    const int law = sink_law(SEL, window);
+    /* The split form up to the row cap (a workgroup a slot, merge_sink); past it, or where the
+     * scratch holds no partials, `stable 1` runs the fused form (the same bytes: a workgroup walks
+     * the row's slots and folds them as the merge does, an accumulator a row in the scratch) and
+     * refuses a launch without even that scratch rather than change a bit; `stable 0` runs
+     * unsplit. */
+    int splits = sink_slots(SEL, window, bt.shape[1] * bs), fused = 0;
+    if (splits > 1) {
+        const int64_t have = a->scratch ? a->scratch_bytes : 0;
+        const bool split_fits = have >= rows * heads * splits * PART * 4,
+                   fused_fits = have >= rows * heads * PART * 4;
+        if (form == 4) {
+            splits = 1;
+        } else if (form == 6 || (stable && (rows > sink_rows_cap(SEL, window) || !split_fits))) {
+            if (!fused_fits) return RAD_E_SCRATCH; /* never silently unsplit */
+            splits = 1;
+            fused = 1;
+        } else if (rows > sink_rows_cap(SEL, window) || !split_fits) {
+            splits = 1;
+        }
+    }
     const bool wide = form != 3 && !((uintptr_t)kv.data & 15) && !(kv.stride[0] % 8) &&
                       !(kv.stride[2] % 8);
     /* More heads a workgroup load each key chunk once for more of them: the widest group (64,
@@ -425,6 +581,9 @@ int sink_body(const RadArgs* a, RadStream stream) {
             hg = g;
             break;
         }
+    /* Thirty-two heads a workgroup just past one round of 64 (four rows of a window's 9 slots at
+     * 64 heads: 72) take two rounds; sixty-four heads take one (measured: 25.6 against 22.5 us). */
+    if (hg == 2 && heads > 32 && rows * splits * ((heads + 31) / 32) <= 80) hg = 4;
     if (form == 1) hg = 1;
     if (form == 2 && heads > 16) hg = 2;
     if (form == 5 && heads > 32) hg = 4;
@@ -448,6 +607,9 @@ int sink_body(const RadArgs* a, RadStream stream) {
                       __builtin_ctzl((unsigned long)bs),
                       (int)kv.shape[0],
                       splits,
+                      law,
+                      sink_shift(SEL, window),
+                      fused,
                       (int)window,
                       scale };
     const auto* qp = (const uint16_t*)q.data;
@@ -460,10 +622,11 @@ int sink_body(const RadArgs* a, RadStream stream) {
     const auto* sp = (const float*)sk.data;
     auto* op = (uint16_t*)o.data;
     auto* scr = (float*)a->scratch;
-#define SINK_EMIT(HG, WD)                                                                          \
-    R4D_EMIT(stream, (mla_sink_rows<HG, WD, SEL>),                                                 \
+#define SINK_EMIT2(HG, WD, FU)                                                                     \
+    R4D_EMIT(stream, (mla_sink_rows<HG, WD, SEL, FU>),                                             \
              dim3((unsigned)rows, (unsigned)((heads + 16 * HG - 1) / (16 * HG)), (unsigned)splits), \
              dim3(HG * 128), 0, qp, rp, kp, bp, up, cp, lp, sp, op, scr, m)
+#define SINK_EMIT(HG, WD) (fused ? SINK_EMIT2(HG, WD, true) : SINK_EMIT2(HG, WD, false))
     int rc;
     if (hg == 4)
         rc = wide ? SINK_EMIT(4, true) : SINK_EMIT(4, false);
@@ -472,17 +635,28 @@ int sink_body(const RadArgs* a, RadStream stream) {
     else
         rc = wide ? SINK_EMIT(1, true) : SINK_EMIT(1, false);
 #undef SINK_EMIT
+#undef SINK_EMIT2
     if (rc == RAD_OK && splits > 1)
         rc = R4D_EMIT(stream, merge_sink, dim3((unsigned)rows, (unsigned)heads), dim3(128), 0,
                       (const float*)scr, sp, op, m);
     return rc;
 }
 
+/* `stable 1`: every row of the declared M; `stable 0`: up to the split row cap. The selection's
+ * `blocks` bounds its slots; a paged table's width is not known here, so the law's count. */
 int64_t sink_scratch(const RadArgs* a, bool sel) {
     const long heads = r4d_geti_or(a, "heads", 0), rows = r4d_geti_or(a, "M", kRowsFull),
-               window = sel ? 0 : r4d_geti_or(a, "window", 0);
-    if (heads < 1 || heads > 64 || rows < 1 || window < 0) return RAD_E_SHAPE;
-    return std::min(rows, sink_rows_cap(sel, window)) * heads * sink_splits(sel, window) * PART * 4;
+               window = sel ? 0 : r4d_geti_or(a, "window", 0), stable = r4d_geti_or(a, "stable", 0),
+               blocks = sel ? r4d_geti_or(a, "blocks", 0) : 0, bs = r4d_geti_or(a, "block_size", 0);
+    if (heads < 1 || heads > 64 || rows < 1 || rows > 65535 || window < 0 || stable < 0 ||
+        stable > 1)
+        return RAD_E_SHAPE;
+    const int slots = sel && blocks > 0 && bs > 0 ? sink_slots(true, 0, blocks * bs)
+                                                  : sink_law(sel, window);
+    if (slots <= 1) return 0;
+    const long cap = std::min(rows, sink_rows_cap(sel, window));
+    /* stable 1: the split form's partials up to the cap, the fused form's accumulator past it */
+    return (stable ? std::max(cap * slots, rows) : cap * slots) * heads * PART * 4;
 }
 }  // namespace
 
@@ -492,9 +666,9 @@ extern "C" int r4d_rad_mla_attn_paged_sink(const RadArgs* a, RadStream stream) {
 extern "C" int r4d_rad_mla_attn_sel_sink(const RadArgs* a, RadStream stream) {
     return sink_body<true>(a, stream);
 }
-/* Sized for min(M, the split row cap) rows at the op's split count: with a window (16 rows, 8
- * splits) 16.1 MiB at 64 heads; at window 0 or a selection (32 rows, 16 splits) 32.3 MiB at 32
- * heads, 64.5 MiB at 64. */
+/* Per row: 9 slots at a window of 512 and 64 heads 1.19 MiB (stable 0: 16 rows, 19.0 MiB); 20
+ * slots at window 0 and 32 heads 1.32 MiB (stable 0: 32 rows, 42.3 MiB); the selection at blocks
+ * x block_size 2048 has 16 slots (1.06 MiB a row at 32 heads). */
 extern "C" int64_t r4d_rad_mla_attn_paged_sink_scratch(const RadArgs* a) {
     return sink_scratch(a, false);
 }

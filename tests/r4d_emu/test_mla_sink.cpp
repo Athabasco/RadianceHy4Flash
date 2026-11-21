@@ -4,7 +4,13 @@
  * against each other bit for bit; the unsplit form within the bound; verify rows against the
  * single-row decode at each position, bit for bit; the paged form at window 0 against the
  * selection form over the same pages, bit for bit; the window edge with boosted keys on both sides
- * of it; sinks far above and below the scores; unmapped and out-of-range pages; heads 8 to 64. */
+ * of it; sinks far above and below the scores; unmapped and out-of-range pages; heads 8 to 64.
+ * The stable law (`stable 1`, WP16 perf.md 3.4.1): a row's bytes in launches of 2 to 64 rows of 1,
+ * 3 and 8 sequences equal its one-row launch; paged window 0 == sel past the old split cap; the
+ * lengths 0..2049 (and past the law's last slot) at both windows; HG 1 / 2 / 4 equal; the table's
+ * width moves no bit; the fused form (one workgroup a row folding the slots) equals the split form;
+ * no room for the partials runs the fused form, no room for its accumulator is refused, never
+ * unsplit. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
@@ -194,7 +200,9 @@ struct Params {
     }
 };
 
-int launch(const Problem& p, bool sel, int form, std::vector<uint16_t>& out) {
+/* `stable` -1 leaves the parameter out (its default, 0). `scratch_cut` shortens the scratch. */
+int launch(const Problem& p, bool sel, int form, std::vector<uint16_t>& out, int stable = -1,
+           int64_t scratch_cut = 0) {
     const int M = p.rows();
     out.assign((size_t)M * p.heads * L, 0xffff);
     auto& P = const_cast<Problem&>(p);
@@ -219,6 +227,7 @@ int launch(const Problem& p, bool sel, int form, std::vector<uint16_t>& out) {
     }
     ps.i("block_size", p.bs);
     ps.f("scale", kScale);
+    if (stable >= 0) ps.i("stable", stable);
     t.push_back(tens(P.sinks.data(), RAD_F32, { p.heads }));
     t.push_back(tens(out.data(), RAD_BF16, { M, p.heads, L }));
     RadArgs a{};
@@ -230,7 +239,7 @@ int launch(const Problem& p, bool sel, int form, std::vector<uint16_t>& out) {
         sel ? r4d_rad_mla_attn_sel_sink_scratch(&a) : r4d_rad_mla_attn_paged_sink_scratch(&a);
     std::vector<char> scratch((size_t)need + 16);
     a.scratch = scratch.data() + ((16 - ((uintptr_t)scratch.data() & 15)) & 15);
-    a.scratch_bytes = need;
+    a.scratch_bytes = need > scratch_cut ? need - scratch_cut : 0;
     r4d_mla_sink_pin_form(form);
     const int rc = sel ? r4d_rad_mla_attn_sel_sink(&a, nullptr)
                        : r4d_rad_mla_attn_paged_sink(&a, nullptr);
@@ -348,6 +357,155 @@ void check_edge(int heads, int window, int ctx, std::mt19937& rng) {
     report("window edge H" + std::to_string(heads) + " ctx " + std::to_string(ctx), ok, buf);
 }
 
+/* One row r of a paged problem as its own one-row launch at its position over the same table. */
+Problem one_row(const Problem& p, int s, int i) {
+    Problem one = p;
+    one.qlen = { 1 };
+    one.ctx = { p.used[s] - p.qlen[s] + i + 1 };
+    one.used = one.ctx;
+    one.cu = { 0, 1 };
+    one.bt.assign(p.bt.begin() + (size_t)s * p.blocks, p.bt.begin() + (size_t)(s + 1) * p.blocks);
+    const int r = p.cu[s] + i;
+    one.q.assign(p.q.begin() + (size_t)r * p.heads * L, p.q.begin() + (size_t)(r + 1) * p.heads * L);
+    one.qr.assign(p.qr.begin() + (size_t)r * p.heads * R,
+                  p.qr.begin() + (size_t)(r + 1) * p.heads * R);
+    return one;
+}
+
+/* stable 1: every row of a launch against its one-row launch (paged and, at window 0, the
+ * selection form over the same pages), the launch against the f64 reference, and the HG forms. */
+void check_stable(const std::string& name, const Problem& p) {
+    const std::vector<double> want = ref_paged(p);
+    std::vector<uint16_t> all;
+    int rc = launch(p, false, 0, all, 1);
+    double err = 0;
+    const bool ok = rc == RAD_OK && close_to(all, want, err);
+    char buf[96];
+    std::snprintf(buf, sizeof buf, "max_abs %.2e", err);
+    report(name + " stable 1 vs f64", ok, buf);
+    bool same = rc == RAD_OK;
+    const int S = (int)p.qlen.size();
+    for (int s = 0; same && s < S; ++s)
+        for (int i = 0; same && i < p.qlen[s]; ++i) {
+            std::vector<uint16_t> o;
+            const int r = p.cu[s] + i;
+            same = launch(one_row(p, s, i), false, 0, o, 1) == RAD_OK &&
+                   std::equal(o.begin(), o.end(), all.begin() + (size_t)r * p.heads * L);
+        }
+    report(name + " stable 1: every row == its one-row launch (bytes)", same);
+    bool forms = true;
+    for (int form : { 1, 2, 3, 5, 6 }) {
+        if ((form == 2 && p.heads <= 16) || (form == 5 && p.heads <= 32)) continue;
+        std::vector<uint16_t> o;
+        forms = forms && launch(p, false, form, o, 1) == RAD_OK && o == all;
+    }
+    report(name + " stable 1: HG 1 / 2 / 4, the element load and the fused form equal (bytes)",
+           forms);
+    if (p.window == 0) {
+        Problem q = p;
+        make_sel_from_paged(q);
+        std::vector<uint16_t> b;
+        report(name + " stable 1: paged(window 0) == sel (bytes)",
+               launch(q, true, 0, b, 1) == RAD_OK && b == all);
+    }
+}
+
+void stable_suite(std::mt19937& rng, bool quick) {
+    /* (a) launches of 2..64 rows of 1, 3 and 8 sequences: the row's bytes equal its M = 1 launch,
+     * whatever M, the number of streams or the other rows. */
+    for (int window : { 512, 0 })
+        for (int M : { 2, 6, 16, 17, 33, 64 })
+            for (int seqs : { 1, 3, 8 }) {
+                if (seqs > M || (quick && M > 17)) continue;
+                std::vector<int> qlen(seqs, M / seqs), ctx(seqs);
+                for (int s = 0; s < M % seqs; ++s) ++qlen[s];
+                for (int s = 0; s < seqs; ++s) ctx[s] = 520 + 37 * s + qlen[s];
+                Problem p;
+                make_paged(p, qlen, ctx, 8, 4, window, true, rng);
+                check_stable("stable H8 w" + std::to_string(window) + " M " + std::to_string(M) +
+                                 " seqs " + std::to_string(seqs),
+                             p);
+            }
+    /* (c) lengths at the edges of chunks, super-chunks, the window and the law's last slot (20 x
+     * 128 = 2560 at window 0), each a sequence of one row in one launch. */
+    for (int window : { 512, 0 }) {
+        std::vector<int> lens = { 0, 1, 15, 16, 17, 511, 512, 513, 2048, 2049 };
+        if (window == 0) lens.push_back(2700);
+        Problem p;
+        make_paged(p, std::vector<int>(lens.size(), 1), lens, 8, 16, window, false, rng);
+        check_stable("stable H8 w" + std::to_string(window) + " lengths 0..2049", p);
+    }
+    /* heads 16 / 32 / 64 (HG 1, 2, 4 by the rule and pinned) at a verify-sized launch */
+    for (int heads : { 16, 32, 64 }) {
+        if (quick && heads > 16) continue;
+        Problem p;
+        make_paged(p, { 6, 6, 6 }, { 600, 530, 1100 }, heads, 4, heads == 32 ? 0 : 512, true, rng);
+        check_stable("stable H" + std::to_string(heads) + " 3 streams x 6", p);
+    }
+    /* stable 0 equals stable 1 below its row cap; the table's width (the slots a launch needs)
+     * moves no bit; a short scratch is refused at stable 1 and unsplit at stable 0. */
+    {
+        Problem p;
+        make_paged(p, { 3, 2 }, { 700, 90 }, 16, 4, 512, true, rng);
+        std::vector<uint16_t> a, b, c;
+        launch(p, false, 0, a, 1);
+        report("stable 0 == stable 1 below the row cap (bytes)",
+               launch(p, false, 0, b, 0) == RAD_OK && launch(p, false, 0, c, -1) == RAD_OK &&
+                   a == b && a == c);
+        for (int window : { 512, 0 }) {
+            p.window = window;
+            launch(p, false, 0, a, 1);
+            Problem wide = p;
+            const int extra = 700;
+            wide.bt.assign((size_t)2 * (p.blocks + extra), -1);
+            for (int s = 0; s < 2; ++s)
+                std::copy(p.bt.begin() + (size_t)s * p.blocks, p.bt.begin() + (size_t)(s + 1) * p.blocks,
+                          wide.bt.begin() + (size_t)s * (p.blocks + extra));
+            wide.blocks = p.blocks + extra;
+            report("stable 1 w" + std::to_string(window) + ": table width moves no bit",
+                   launch(wide, false, 0, b, 1) == RAD_OK && a == b);
+        }
+        p.window = 512; /* the hook's count is the launch's: a paged window 0 sizes for 20 slots */
+        /* the split form's partials do not fit: the fused form, the same bytes */
+        std::vector<uint16_t> want;
+        launch(p, false, 0, want, 1);
+        report("stable 1: no room for the partials runs the fused form (bytes)",
+               launch(p, false, 0, a, 1, 16) == RAD_OK && a == want);
+        /* no room for the accumulator either (5 rows x 16 heads x 516 floats): refused */
+        const int64_t keep = (int64_t)5 * 16 * 516 * 4 - 16;
+        std::vector<uint16_t> tmp;
+        {
+            /* the hook's size minus everything but `keep` bytes */
+            Problem q = p;
+            int64_t need = 0;
+            {
+                RadArgs args{};
+                std::vector<RadParam> ps(4);
+                ps[0].key = "M"; ps[0].kind = RAD_P_INT; ps[0].ival = q.rows();
+                ps[1].key = "heads"; ps[1].kind = RAD_P_INT; ps[1].ival = q.heads;
+                ps[2].key = "window"; ps[2].kind = RAD_P_INT; ps[2].ival = q.window;
+                ps[3].key = "stable"; ps[3].kind = RAD_P_INT; ps[3].ival = 1;
+                args.p = ps.data();
+                args.n_p = 4;
+                need = r4d_rad_mla_attn_paged_sink_scratch(&args);
+            }
+            report("stable 1: no room for the accumulator refused (RAD_E_SCRATCH)",
+                   launch(q, false, 0, tmp, 1, need - keep) == RAD_E_SCRATCH);
+        }
+        report("stable 0: short scratch runs unsplit", launch(p, false, 0, a, 0, 16) == RAD_OK);
+        report("stable 2 refused", launch(p, false, 0, a, 2) == RAD_E_SHAPE);
+    }
+    /* stable 0 past the row cap runs unsplit: within the bound, and still the reference */
+    {
+        Problem p;
+        make_paged(p, { 20 }, { 600 }, 8, 4, 512, true, rng);
+        std::vector<uint16_t> o;
+        double err;
+        const bool ok = launch(p, false, 0, o, 0) == RAD_OK && close_to(o, ref_paged(p), err);
+        report("stable 0 past 16 rows (unsplit) vs f64", ok);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -389,6 +547,7 @@ int main(int argc, char** argv) {
         check_verify("H16 w0 verify 8 at 530", p);
         check_paged_vs_sel("H16 w0 verify 8 at 530", p);
     }
+    stable_suite(rng, quick);
     check_edge(16, 512, 600, rng);
     if (!quick) check_edge(64, 512, 530, rng);
     /* The selection form on its own tables: scattered pages, holes, a zero length. */
