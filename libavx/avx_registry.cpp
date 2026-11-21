@@ -1236,6 +1236,9 @@ static const RadOpSchema kSchemas[] = {
   "symmetric int8, one f32 scale per `group` contiguous elements, row-major." },
 { "quant_act_fp8", ARR(pQuant), ARR(oQuantFp8), "symmetric block-scaled E4M3 quantiser." },
 { "quant_cols_fp8", ARR(pQuantCols), ARR(oQuantCols), "E4M3 with one scale per column." },
+{ "had_quant_act_fp8", ARR(pQuant), ARR(oQuantFp8),
+  "width-128 Hadamard, then quant_act_fp8's symmetric E4M3 per group. No normalisation: the "
+  "1/128 is the rotated expert weight's stored scale (docs/OPS.md)." },
 { "had_quant_act_i8g", ARR(pQuant), ARR(oQuantFp8),
   "width-`group` Hadamard, then quant_act_i8g's symmetric int8 per group. No normalisation: the "
   "1/group is the i8a8h weight's stored scale (docs/OPS.md)." },
@@ -1940,6 +1943,10 @@ SIMPLE("avx_quant_act_fp8", "quant_act_fp8", "quant", "symmetric block-scaled E4
        "float in, fp8_e4m3 out, f32 scale", L(quant_act_fp8)),
 SIMPLE("avx_quant_cols_fp8", "quant_cols_fp8", "quant", "E4M3 with one scale per column",
        "float in, fp8_e4m3 out, f32 scale", L(quant_cols_fp8)),
+SIMPLE("avx_had_quant_act_fp8", "had_quant_act_fp8", "quant",
+       "128-wide Hadamard, then the symmetric E4M3 quantiser, one scale per 128",
+       "float in, fp8_e4m3 out, f32 scale per group; n a multiple of 128",
+       L(had_quant_act_fp8)),
 SIMPLE("avx_had_quant_act_i8g", "had_quant_act_i8g", "quant",
        "width-`group` Hadamard, then the symmetric int8 quantiser, one scale per group",
        "float in, i8 out, f32 scale per group; n a multiple of group",

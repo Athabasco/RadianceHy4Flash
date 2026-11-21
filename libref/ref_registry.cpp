@@ -1608,6 +1608,11 @@ static const RadOpSchema kSchemas[] = {
 /* The rotated fp8 twin. Unlike had_quant_act_i8, the group is both rotation width and scale
  * granularity, and the factor of `group` is left entirely to the paired w4a8h weight plane, where
  * the division is an exact exponent shift on a bf16 (libref/ref_quant.cpp). */
+{ "had_quant_act_fp8", ARR(pQuant), ARR(oQuantFp8),
+  "quant_act_fp8 with a Walsh-Hadamard rotation of width `group` (128) along n first: scale = "
+  "amax(rotated) / 448 per group, [M, n/group] in f32, n a multiple of `group`. Pairs with a "
+  "four-, five- or six-bit expert weight rotated the same way, its scale carrying the factor of "
+  "`group` (dtypes w4a8h, w4nla8h, w4nl64a8h, w5nl64a8h, w6nl64a8h)." },
 /* Its int8 twin, the activation of the i8a8h GEMMs; the factor of `group` is the weight's here
  * too. */
 { "had_quant_act_i8g", ARR(pQuant), ARR(oQuantFp8),
@@ -2653,6 +2658,10 @@ SIMPLE("ref_dflash_markov_greedy_f32", "dflash_markov_greedy_f32", "draft",
 SIMPLE("ref_dflash_tree", "dflash_tree", "draft",
        "DFlash2's candidate lattice grown best-first into a tree",
        "i32 candidates, bf16 codebooks, i32 tokens and parents out", ref_dflash_tree),
+SIMPLE("ref_had_quant_act_fp8", "had_quant_act_fp8", "quant",
+       "128-wide Hadamard, then the symmetric E4M3 quantiser, one scale per 128",
+       "float in, fp8_e4m3 out, f32 scale per group; n a multiple of 128",
+       ref_had_quant_act_fp8),
 SIMPLE("ref_had_quant_act_i8g", "had_quant_act_i8g", "quant",
        "width-`group` Hadamard (128-wide rotations where `group` is wider), then the symmetric "
        "int8 quantiser, one scale per group",

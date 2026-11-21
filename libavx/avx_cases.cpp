@@ -277,6 +277,7 @@ std::vector<Case> build_cases() {
 
     /* IQ8R's activation: one scale per 256 columns, each 128-wide half rotated on its own. */
     add("had_quant_act_i8g", { HI("M", 5), HI("n", 512), HI("group", 256), HS("dtype", "bf16") });
+    add("had_quant_act_fp8", { HI("M", 5), HI("n", 384), HI("group", 128), HS("dtype", "bf16") });
 
     /* The packed four-bit weight read back: two's complement at a group of 64, a zero point at
      * 128, one fragment tile of rows each. */

@@ -444,6 +444,12 @@ int ref_had_quant_act_i8g(const RadArgs* a, RadStream) {
     return had_quant_act_q8(a, 127.0f, 128);
 }
 
+/* The E4M3 form (`top` 448), for a rotated codebook expert (w4nl64a8h and its kin). */
+int ref_had_quant_act_fp8(const RadArgs* a, RadStream) {
+    if (p_int(a, "group", 0) != 128) return RAD_E_SHAPE;
+    return had_quant_act_q8(a, 448.0f);
+}
+
 
 /* ---------------------------------------------------------------- the Gram accumulator
  *

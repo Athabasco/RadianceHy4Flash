@@ -1279,7 +1279,7 @@ TEST(op_vocabulary) {
         "scale_rows",
         "softmax",
         "quant_act_i8", "quant_act_i8g", "quant_act_fp8", "quant_cols_fp8", "had_quant_act_i8",
-        "had_quant_act_i8g",
+        "had_quant_act_i8g", "had_quant_act_fp8",
         "gram_accum",
         /* The fused fp8 forms. A host run needs every op covered, so these keep a host-backend run
          * from failing with "site 'host' is unavailable for this band". */
@@ -9820,6 +9820,23 @@ TEST(had_quant_act_i8g_rotates_before_the_absmax) {
     CHECK_EQ(q.at(2), 0.0f); CHECK_EQ(q.at(3), 127.0f);
 }
 
+/* had_quant_act_fp8 is the same at E4M3 codes: the 128-wide rotation, then amax / 448 a group, the
+ * factor of 128 left to the weight. A group other than 128 (the rotated experts' scale grid) is
+ * refused. */
+TEST(had_quant_act_fp8_rotates_before_the_absmax) {
+    T x(RAD_F32, {1, 128}), q(RAD_F8E4M3, {1, 128}), s(RAD_F32, {1, 1});
+    std::vector<float> v(128, 0.0f);
+    v[0] = 1.0f;   /* H e0 is all ones: amax 1, every code 448 */
+    x.f(v);
+    A a; a.t(x).t(q).t(s).i("M", 1).i("n", 128).i("group", 128).s("dtype", "f32");
+    CHECK_OK(run("had_quant_act_fp8", a));
+    CHECK_EQ(s.at(0), 1.0f / 448.0f);
+    for (int i = 0; i < 128; ++i) CHECK_EQ(q.at(i), 448.0f);
+    T s2(RAD_F32, {1, 2});
+    A b; b.t(x).t(q).t(s2).i("M", 1).i("n", 128).i("group", 64).s("dtype", "f32");
+    CHECK(run("had_quant_act_fp8", b) < 0);
+}
+
 namespace {
 void put_pair(T& t, int64_t i, int32_t id, float v) {
     std::memcpy((float*)t.t.data + 2 * i, &id, 4);
@@ -10506,6 +10523,7 @@ std::vector<Geo> geometries() {
         G("quant_act_fp8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("quant_cols_fp8", "M", 3, a.i("M", R).i("n", 32).s("dtype", "f32")),
         G("had_quant_act_i8g", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
+        G("had_quant_act_fp8", "M", 3, a.i("M", R).i("n", 256).i("group", 128).s("dtype", "f32")),
         G("had_quant_act_i8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("rmsnorm_had_quant_i8", "M", 3, a.i("M", R).i("n", 32).d("eps", 1e-6).i("group", 16)
                                           .s("dtype", "f32")),

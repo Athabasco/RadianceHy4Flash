@@ -673,6 +673,7 @@ int r4d_rad_moe_gemm_iqr_mod4(const RadArgs*, RadStream);
 int64_t r4d_rad_moe_gemm_iqr_scratch(const RadArgs*);
 int r4d_rad_quant_act_i8g(const RadArgs*, RadStream);
 int r4d_rad_had_quant_act_i8g(const RadArgs*, RadStream);
+int r4d_rad_had_quant_act_fp8(const RadArgs*, RadStream);
 int r4d_rad_quant_act_fp8   (const RadArgs*, RadStream);
 int r4d_rad_had_quant_act_fp8 (const RadArgs*, RadStream);
 int r4d_rad_givens_rotate (const RadArgs*, RadStream);

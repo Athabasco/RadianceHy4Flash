@@ -614,6 +614,12 @@ AVX_KERNEL(had_quant_act_i8g) {
     return had_quant_q8(a, 127.0f, 128);
 }
 
+/* The E4M3 form, for a rotated codebook expert (w4nl64a8h and its kin): libref's arithmetic. */
+AVX_KERNEL(had_quant_act_fp8) {
+    if (p_int(a, "group", 0) != 128) return RAD_E_SHAPE;
+    return had_quant_q8(a, 448.0f);
+}
+
 /* ------------------------------------------------------------- givens_rotate */
 /* ParoQuant's activation side for a 16-bit GEMM: each row is divided by its channel scales and
  * rotated by `stages` rounds of disjoint Givens pairs, once per part, parts side by side in y.

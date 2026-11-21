@@ -661,7 +661,7 @@ not slow. `libref/ref_quant.cpp` is the definition.
 - **The `had_*` int8 forms**: `group` is the Walsh–Hadamard rotation width (libr4d's `had`), and
   the int8 scale is per row, carrying the `1/sqrt(group)` normalisation. The rotation is what makes
   one scale per row viable, so its width and the scale granularity cannot be the same number.
-- **The rotated E4M3 form** (`hc_read`'s `rq`, `rscale`): `group` is both. It
+- **The rotated E4M3 form** (`had_quant_act_fp8`, and `hc_read`'s `rq`, `rscale`): `group` is both. It
   serves a four-bit MoE expert whose scale grid is already one bf16 per (row, 128 of K); a rotation
   of the same 128 lines the two up, so the scale is per group, `[M, n/group]` as for
   `quant_act_fp8`. It applies no normalisation: `<Hw, Ha> = group * <w, a>`, and the whole factor is
@@ -694,6 +694,7 @@ and is optional.
 | op | params | operands |
 |---|---|---|
 | `quant_act_fp8` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
+| `had_quant_act_fp8` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
 | `quant_cols_fp8` | `M` `n` `dtype` | `x` → `y`, `scale` |
 | `rmsnorm_quant_fp8` | `M` `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gated_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |

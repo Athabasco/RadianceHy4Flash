@@ -3991,6 +3991,9 @@ static const RadOpSchema kSchemas[] = {
            "quant_act_fp8 at INT8 codes: per-(row, `group`-column) symmetric int8, PLAIN ROW-MAJOR, "
            "the scale amax/127 and a code the value over it rounded to nearest-even. What the int8 "
            "trunk GEMMs (dtype i8a8) read."),
+    SCHEMA("had_quant_act_fp8", pQuantActFp8, oQuantActFp8,
+           "quant_act_fp8 with a `group`-wide Hadamard along K first; pairs with a four-, five- "
+           "or six-bit expert weight stored rotated, its scale carrying the factor of `group`."),
     SCHEMA("had_quant_act_i8g", pQuantActFp8, oQuantActFp8,
            "quant_act_i8g with a `group`-wide Hadamard along K first; pairs with an i8 weight stored "
            "rotated, its scale carrying the residual factor of `group`."),
@@ -9475,7 +9478,18 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 /* The rotated twin, for the four-bit expert weight only. At E4M3 a rotation is slightly worse
  * (four exponent bits already carry the outliers it removes); at four bits, sixteen levels spent
  * covering one outlier channel is the whole error. The trade pays off only with GPTQ: rotation
- * alone makes round-to-nearest int4 substantially worse. */
+ * alone makes round-to-nearest int4 substantially worse. The rotated codebook experts read it
+ * where no fused producer writes their input (a latent projection's output, a clamped SwiGLU's
+ * product: GateQuantFP8's clamp then quantise). */
+{ "had_quant_act_fp8", "had_quant_act_fp8", "quant",
+  "a 128-wide Hadamard along K, then per-(row, 128-column) symmetric E4M3 quantisation",
+  "n a multiple of 128 and group 128",
+  "bf16 in, E4M3 out in PLAIN ROW-MAJOR order with an f32 scale of amax/448 per (row, 128 "
+  "columns); the factor of 128 of the unnormalised transform is left to the weight's stored "
+  "scale (dtypes w4a8h, w4nla8h, w4nl64a8h, w5nl64a8h, w6nl64a8h)",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cHadQuantActFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_had_quant_act_fp8 },
 
 { "quant_act_i8g", "quant_act_i8g", "quant",
   "per-(row, 128-column) symmetric int8 quantisation of a bf16 activation",

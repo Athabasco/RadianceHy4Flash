@@ -218,6 +218,13 @@ extern "C" int r4d_rad_had_quant_act_i8g(const RadArgs* a, RadStream stream) {
     return rad_quant_act_fp8(a, stream, true, true);
 }
 
+/* The rotated E4M3 pair: the activation of the rotated codebook experts (w4nl64a8h, w5nl64a8h,
+ * w6nl64a8h, ...) where no fused producer writes it, e.g. behind a clamped SwiGLU or a latent
+ * projection. */
+extern "C" int r4d_rad_had_quant_act_fp8(const RadArgs* a, RadStream stream) {
+    return rad_quant_act_fp8(a, stream, true);
+}
+
 // ============================================================== quant_cols_fp8
 // E4M3 codes with one scale per column over every row: an attention's V for its fp8 P.V. The
 // formula is quant_act_fp8's (scale amax / 448, 1 for an all-zero column, codes of x / scale

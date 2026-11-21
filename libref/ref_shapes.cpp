@@ -1497,6 +1497,18 @@ int ref_had_quant_act_i8g_shape(const RadParam* p, int n_p, int operand, RadOpdD
     return o.finish("had_quant_act_i8g", operand, out);
 }
 
+/* quant_act_fp8's extents, the same for its rotated twin. */
+int ref_had_quant_act_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t ng = scale_groups(n, gi(p, n_p, "group", 0));
+    Opd o;
+    o.t(D, { M, n });                       /* x */
+    o.t((uint32_t)RAD_F8E4M3, { M, n });    /* q */
+    o.t((uint32_t)RAD_F32, { M, ng });      /* scale (amax / 448) */
+    return o.finish("had_quant_act_fp8", operand, out);
+}
+
 /* The int8 rotated forms: `group` is the Walsh-Hadamard rotation width (libr4d's `had`) and the
  * scale is one per row, carrying the 1/sqrt(group) normalisation (ref_quant.cpp). Describing it as
  * [M, n/group] would leave the tail of every scale buffer unwritten by both sides, comparing two
