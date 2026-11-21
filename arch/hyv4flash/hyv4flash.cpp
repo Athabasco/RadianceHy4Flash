@@ -14,7 +14,8 @@
  *   Engram: before layers 1, 11, 21 and 31 a hashed bigram/trigram lookup (16 heads of 96 over a
  *     165M-row table a layer, 63.4B parameters in all) gated per stream
  *   DFly2: a 5-layer drafter over the sparse layers' cache and selection
- *   vision: a 27-layer ViT (1152 wide, patch 16) and a two-convolution projector
+ *   vision: a 27-layer ViT (1152 wide, patch 16) and a two-convolution projector with a newline
+ *     row closing each merged row (hyv4flash_vision.h); the trunk then rotates at M-RoPE positions
  *
  * ============================== THE GRAPH (PLAN §1.2) ==============================
  *
@@ -32,8 +33,9 @@
  * expert a rank at two and four ranks), the trunk linears bf16 or int8 (Lin: rotated or not, IQ8R,
  * the IQR trellis such as u5), the lm_head bf16 or int8, the Engram table bf16 or E4M3 rows. Refused
  * by name: other worlds, a trunk linear in another form, a quantised embedding, kv_b (DECISIONS U2),
- * Engram projection or f32 parameter, pictures (WP15). DFly2 and the tower are declared
- * as the checkpoint holds them and not served (WP13, WP15).
+ * Engram projection or f32 parameter. Pictures and video through the tower
+ * (hyv4flash_vision.h; the trunk then rotates at M-RoPE positions, `imrope_gptj`). DFly2 is
+ * declared as the checkpoint holds it and not served (WP13).
  *
  * The caches (PLAN §1.3): the sliding layers' latent rows in a window group (block 16), the sparse
  * layers' in a full group of block 4 (a page is one indexer group, so the indexer's table is the
@@ -49,6 +51,7 @@
 #include "hyv4flash_moe.h"
 #include "hyv4flash_engram.h"
 #include "hyv4flash_calib.h"
+#include "hyv4flash_vision.h"
 
 #include "chat.h"
 
@@ -93,6 +96,12 @@ struct Model {
     bool force_absorbed = false;
     Calib calib{};   /* --calib-dir: the trunk's Hessians (hyv4flash_calib.h) */
     Codes codes{};   /* the int8 trunk linears' code pair (hyv4flash_common.h, Lin) */
+    Vision vision{}; /* the tower, served on encoder passes (hyv4flash_vision.h) */
+    /* A media step's encoder rows, every rank's: the core hands rank 0 the rows and the others
+     * zeros (RadBatch::mm_rows), and the embedding here is replicated, so the rows are summed
+     * over the ranks (exactly: one non-zero term) before they replace the lookup's. */
+    rad_buf mm_rows = 0;
+    rad_op op_mm_scatter = 0, op_mm_copy = 0, op_mm_reduce = 0;
     int arm = kArmBf16;   /* the routed arms' activation codes (Ffn::arm) */
 };
 static std::unique_ptr<Model> models[MAX_SLOTS];
@@ -246,6 +255,22 @@ static int read_shape(Shape& s, const RadModelMeta* m) {
     s.v_chan = top(m, "vision_config.num_channels", 3);
     s.v_merge = top(m, "vision_config.spatial_merge_size", 0);
     s.v_pos = top(m, "vision_config.max_vit_seq_len", 0) + 1;
+    s.v_heads = top(m, "vision_config.num_attention_heads", 0);
+    /* HF reads `layer_norm_eps` through attribute_map as `rms_norm_eps`: one eps for the blocks'
+     * LayerNorms and the merger's RMSNorm. */
+    s.v_eps = rad_meta_getf(m, "vision_config.rms_norm_eps",
+                            rad_meta_getf(m, "vision_config.layer_norm_eps", 1e-5));
+    /* The position grid's side: max_image_size / patch (HF's position_edge), else the table's own
+     * (max_vit_seq_len = side^2, a class row on top). */
+    s.v_side = s.v_patch > 0 ? top(m, "vision_config.max_image_size", 0) / s.v_patch : 0;
+    if (s.v_side <= 0 && s.v_pos > 1) {
+        const int64_t r = (int64_t)std::llround(std::sqrt((double)(s.v_pos - 1)));
+        if (r * r == s.v_pos - 1) s.v_side = r;
+    }
+    s.mrope_sliding = meta_text_gets(m, "rope_parameters.sliding_attention.mrope_section", "");
+    s.mrope_sparse = meta_text_gets(
+        m, "rope_parameters.deepseek_sparse_attention.mrope_section",
+        meta_text_gets(m, "rope_parameters.indexed_attention.mrope_section", ""));
     return RAD_OK;
 }
 
@@ -434,71 +459,6 @@ static int drafter(RadBuilder* b, Model& m) {
         if (w.gain) RAD_ARCH_TRY(d.f32(name, { w.rows }));
         else RAD_ARCH_TRY(d.mat(name, { w.rows, w.cols }));
     }
-    return RAD_OK;
-}
-
-/* The tower (`vit.*`): a patch convolution and learned positions, pre-norm blocks of separate
- * biased q, k, v and o with a GELU MLP, and the projector `perceive` (a norm, a merging
- * convolution, a 1x1 convolution to the hidden size, and the row-end newline embedding). Kept as
- * the checkpoint holds it: this tree's towers each fuse differently, and the fusion belongs to
- * the block that will read it. Its groups follow the drafter's. */
-static int tower(RadBuilder* b, Model& m) {
-    Names& nm = m.nm;
-    const Shape& s = m.s;
-    const int g0 = (int)(s.n_layer + s.dfly_layers + 1);
-    const int64_t V = s.v_embd, F = s.v_ff, P = s.v_patch, M = s.v_merge, E = s.n_embd;
-    Decl d{ b, m, g0, RAD_ACCESS_PER_REQUEST };
-    auto take = [&](const char* name, const char* src, bool flt,
-                    std::initializer_list<int64_t> shape) {
-        const char* n = nm.f("%s", name);
-        RAD_ARCH_TRY(map_copy(b, n, nm.ckpt("%s", src)));
-        return flt ? d.f32(n, shape) : d.mat(n, shape);
-    };
-    RAD_ARCH_TRY(take("v.patch.weight", "vit.embeddings.patch_embedding.weight", false,
-                      { V, s.v_chan, P, P }));
-    RAD_ARCH_TRY(take("v.patch.bias", "vit.embeddings.patch_embedding.bias", true, { V }));
-    const char* pos = nm.f("v.position.weight");
-    RAD_ARCH_TRY(map_copy(b, pos, "vit.embeddings.position_embedding.weight"));
-    RAD_ARCH_TRY(d.mat(pos, { d.extent(pos, 0, s.v_pos), V }));
-    for (int64_t l = 0; l < s.v_layers; ++l) {
-        d.layer = g0 + 1 + (int)l;
-        const std::string vp = "vit.layers." + std::to_string(l);
-        const std::string vn = "v.blk." + std::to_string(l);
-        struct { const char* name; const char* src; bool flt; int64_t rows, cols; } w[] = {
-            { "attn_norm.weight", "input_layernorm.weight", true, V, 0 },
-            { "attn_norm.bias", "input_layernorm.bias", true, V, 0 },
-            { "attn_q.weight", "self_attn.q_proj.weight", false, V, V },
-            { "attn_q.bias", "self_attn.q_proj.bias", true, V, 0 },
-            { "attn_k.weight", "self_attn.k_proj.weight", false, V, V },
-            { "attn_k.bias", "self_attn.k_proj.bias", true, V, 0 },
-            { "attn_v.weight", "self_attn.v_proj.weight", false, V, V },
-            { "attn_v.bias", "self_attn.v_proj.bias", true, V, 0 },
-            { "attn_output.weight", "self_attn.o_proj.weight", false, V, V },
-            { "attn_output.bias", "self_attn.o_proj.bias", true, V, 0 },
-            { "ffn_norm.weight", "post_attention_layernorm.weight", true, V, 0 },
-            { "ffn_norm.bias", "post_attention_layernorm.bias", true, V, 0 },
-            { "ffn_up.weight", "mlp.dense_h_to_4h.weight", false, F, V },
-            { "ffn_up.bias", "mlp.dense_h_to_4h.bias", true, F, 0 },
-            { "ffn_down.weight", "mlp.dense_4h_to_h.weight", false, V, F },
-            { "ffn_down.bias", "mlp.dense_4h_to_h.bias", true, V, 0 },
-        };
-        for (const auto& t : w) {
-            const char* n = nm.f("%s.%s", vn.c_str(), t.name);
-            RAD_ARCH_TRY(map_copy(b, n, nm.ckpt("%s.%s", vp.c_str(), t.src)));
-            if (t.flt) RAD_ARCH_TRY(d.f32(n, { t.rows }));
-            else RAD_ARCH_TRY(d.mat(n, { t.rows, t.cols }));
-        }
-    }
-    d.layer = g0 + 1 + (int)s.v_layers;
-    const int64_t C = V * M * M;
-    RAD_ARCH_TRY(take("v.merger.norm.weight", "vit.perceive.norm.weight", true, { V }));
-    RAD_ARCH_TRY(take("v.merger.merge.weight", "vit.perceive.proj.0.weight", false,
-                      { C, V, M, M }));
-    RAD_ARCH_TRY(take("v.merger.merge.bias", "vit.perceive.proj.0.bias", true, { C }));
-    RAD_ARCH_TRY(take("v.merger.proj.weight", "vit.perceive.proj.2.weight", false,
-                      { E, C, 1, 1 }));
-    RAD_ARCH_TRY(take("v.merger.proj.bias", "vit.perceive.proj.2.bias", true, { E }));
-    RAD_ARCH_TRY(take("v.merger.newline", "vit.perceive.image_newline", false, { E }));
     return RAD_OK;
 }
 
@@ -791,12 +751,44 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     for (int l = 0; l < (int)s.n_layer; ++l)
         if (s.is_moe[(size_t)l]) Ffn::apply(s, msrc[(size_t)l].cfg);
 
+    /* Pictures: the tower is served wherever the checkpoint has one and the caller left room for
+     * a pass (--mm-max-patches; rad-convert declares it too, so the container carries it). The
+     * trunk then rotates at the step's three-component positions (PLAN D6), which only a program
+     * declaring an encoder is handed. */
+    const bool vit_weights = s.v_layers > 0 && s.v_embd > 0 && s.v_patch > 0 &&
+                             s.v_merge > 0 && ctx->max_enc_patches > 0;
+    /* Served when the config states what the tower and the 3-D positions need; otherwise the
+     * weights alone are declared (a converted container still carries them), and why is noted. */
+    const char* why_not = !vit_weights ? nullptr
+        : (s.mrope_sliding.empty() || s.mrope_sparse.empty()) ? "no mrope_section for both layer kinds"
+        : s.v_heads <= 0 ? "no vision_config.num_attention_heads"
+        : (s.image_token < 0 || s.video_token < 0) ? "no image_token_id / video_token_id"
+        : nullptr;
+    const bool vit = vit_weights && !why_not;
+    s.mrope = vit;
     RAD_ARCH_TRY(buffers(b, m));
     const int64_t T = g.max_tok, E = s.n_embd;
     m.embed = mk(b, "embed_lookup",
                  { RAD_RANGE("M", 1, T), RAD_INT("n_embd", E), RAD_INT("n_vocab", s.n_vocab),
                    RAD_STR("dtype", "bf16") },
                  { m.token }, {}, { m.x0 });
+    if (vit) {
+        /* The encoder's rows replace their placeholders' lookups (spec §11). */
+        m.mm_rows = decl_b(b, nm.f("mm_rows"), RAD_BF16, { T, E });
+        if (!m.mm_rows) return RAD_E_INVAL;
+        /* The core's rows (a raw operand) into a buffer the reduction may write. */
+        m.op_mm_copy = mk(b, "cast",
+                          { RAD_RANGE("M", 1, T), RAD_INT("n", E), RAD_STR("from", "bf16"),
+                            RAD_STR("to", "bf16") },
+                          {}, {}, { m.mm_rows });
+        int arc = RAD_OK;
+        m.op_mm_reduce = decl_all_reduce(b, g, E, m.mm_rows, &arc);
+        RAD_ARCH_TRY(arc);
+        m.op_mm_scatter = mk(b, "scatter_rows",
+                             { RAD_RANGE("M", 1, T), RAD_INT("n", E), RAD_STR("dtype", "bf16") },
+                             {}, { m.mm_rows, m.x0 }, { m.x0 });
+        HY4_NEED(m.op_mm_copy && m.op_mm_scatter, "the media rows' cast and scatter_rows");
+    }
     m.op_stream = decl_copy(b, T, E, RAD_BF16, m.x0, m.tr.h);
     HY4_NEED(m.embed, "embed_lookup");
     HY4_NEED(m.op_stream, "cast");
@@ -850,10 +842,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * wherever the checkpoint has them and the caller left room (rad-convert's --max-spec 0
      * leaves the drafter out). Neither is served by this build. */
     const bool dfly = s.dfly_layers > 0 && ctx->max_spec > 0;
-    const bool vit = s.v_layers > 0 && s.v_embd > 0 && s.v_patch > 0 && s.v_merge > 0 &&
-                     ctx->max_enc_patches > 0;
     if (dfly) RAD_ARCH_TRY(drafter(b, m));
-    if (vit) RAD_ARCH_TRY(tower(b, m));
+    if (vit_weights) {
+        RAD_ARCH_TRY(m.vision.declare(b, nm, s, ctx, (int)(s.n_layer + s.dfly_layers + 1), vit));
+        if (why_not) rad_note(b, "the vision tower is declared and not served: %s", why_not);
+    }
 
     int64_t n_sparse = 0, n_moe = 0;
     for (int64_t l = 0; l < s.n_layer; ++l) {
@@ -869,7 +862,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              (long long)(s.n_layer - n_sparse), (long long)s.window, (long long)s.dense_limit,
              (long long)n_moe, (long long)s.n_expert, (long long)s.top_k, s.engram_layers.size(),
              s.engram_layers.empty() ? 0.0 : engram_eps(),
-             dfly ? "declared (not served)" : "left out", vit ? "declared (not served)" : "left out",
+             dfly ? "declared (not served)" : "left out",
+             vit ? "served" : vit_weights ? "declared (not served)" : "left out",
              s.world, s.rank, (long long)s.sparse_r.heads, (long long)s.sparse.heads,
              (long long)s.sliding_r.heads, (long long)s.sliding.heads,
              s.world == 1 ? "all" : s.experts_whole ? "whole per rank" : "sliced per rank",
@@ -913,17 +907,31 @@ static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = *models[rad_slot(c)];
     const auto& s = m.s;
     const int64_t T = batch->n_tok, E = s.n_embd;
-    if (batch->enc || batch->draft_pass || batch->gen) {
-        rad_step_fail(c, "hyv4flash serves the text trunk; pictures, the DFly2 drafter and "
-                         "generator passes are not built (WP13, WP15)");
+    if (batch->enc) {
+        m.vision.step(c, batch);
         return;
     }
-    if (batch->n_mm_rows > 0) {
-        rad_step_fail(c, "hyv4flash serves text; this step carries media rows (WP15)");
+    if (batch->draft_pass || batch->gen) {
+        rad_step_fail(c, "hyv4flash serves the text trunk and its tower; the DFly2 drafter and "
+                         "generator passes are not built (WP13)");
+        return;
+    }
+    const int64_t nmm = batch->n_mm_rows;
+    if (nmm > 0 && (!m.op_mm_scatter || nmm > T)) {
+        rad_step_fail(c, "hyv4flash: this step carries media rows and the program declares no "
+                         "tower to take them");
         return;
     }
     const StepPlan p = plan(m, batch);
     RAD_ISSUE_N(c, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.x0, T));
+    if (nmm > 0) {
+        /* Rank 0 holds the rows, the others zeros: the exact sum gives every rank the rows. */
+        RAD_ISSUE_N(c, m.op_mm_copy, nmm, praw2(batch->mm_embd, RAD_BF16, nmm, E),
+                    brows(m.mm_rows, nmm));
+        issue_all_reduce(c, m.op_mm_reduce, m.mm_rows, nmm, E);
+        RAD_ISSUE_N(c, m.op_mm_scatter, nmm, brows(m.mm_rows, nmm),
+                    praw(batch->mm_rows, RAD_I32, nmm), brows(m.x0, T));
+    }
     m.t_embed.step(c, brows(m.x0, T), T);
     for (int64_t j = 0; j < s.hc; ++j)
         RAD_ISSUE_N(c, m.op_stream, T, brows(m.x0, T), bcol(m.tr.h, j * E, E, T));
@@ -1008,8 +1016,8 @@ static uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t*) {
 RAD_ARCH_PROBE(hyv4flash)
 RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(hyv4flash, "hyv4flash", "", "0.2.0",
-                "Tencent Hy4-flash: the text trunk at 1, 2 or 4 ranks (bf16), the weight manifest and "
-                "checkpoint name map")
+                "Tencent Hy4-flash: the text trunk at 1, 2 or 4 ranks, pictures and video through its "
+                "tower, the weight manifest and checkpoint name map")
 RAD_ARCH_CHAT_FORMAT(hyv4flash)
 extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
     return hyv4flash::pass_key(c, batch, used_max_h);

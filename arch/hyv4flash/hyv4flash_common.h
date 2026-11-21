@@ -59,6 +59,14 @@ struct Shape {
     /* DFly2 and the tower */
     int64_t dfly_layers = 0;
     int64_t v_layers = 0, v_embd = 0, v_ff = 0, v_patch = 0, v_chan = 0, v_merge = 0, v_pos = 0;
+    int64_t v_heads = 0, v_side = 0;   /* v_side: the position grid's side, max_image_size / patch */
+    double v_eps = 1e-5;
+    /* M-RoPE (PLAN D6): the layer kinds' `mrope_section` ("12 10 10"), and whether this program
+     * rotates at the three-component positions (`mrope`: set when the tower is served, so every
+     * rope reads RadBatch::rope_pos; a text-only program keeps gptj, the same rotation at equal
+     * components). */
+    std::string mrope_sparse, mrope_sliding;
+    bool mrope = false;
 
     /* This rank's share (PLAN §1.5, set by split_ranks; at one rank the whole). The attention's
      * heads are whole and contiguous a rank (q_nope, q_rope, kv_b, attn_gate and the sinks by
@@ -170,14 +178,29 @@ inline rad_op decl_copy(RadBuilder* b, int64_t rows, int64_t n, uint32_t dt, rad
 }
 
 /* rope (interleaved pairs, `gptj`) over `heads` heads of `dim`, all of them rotated, in place.
- * The text trunk's M-RoPE with equal components is this rotation (plan D6). */
+ * The text trunk's M-RoPE with equal components is this rotation (plan D6). With `sections`
+ * (a program that serves pictures, Shape::mrope) it is `imrope_gptj`, the reference's interleaved
+ * M-RoPE over the same pairs, issued with the step's [3, T] rotary positions (rope_pos_of). */
 inline rad_op decl_rope_gptj(RadBuilder* b, int64_t rows, int64_t heads, int64_t dim,
-                             double theta, rad_buf x) {
+                             double theta, rad_buf x, const char* sections = nullptr) {
+    if (sections && *sections)
+        return mk(b, "rope",
+                  { RAD_RANGE("M", 1, rows), RAD_INT("head_dim", dim), RAD_INT("n_head", heads),
+                    RAD_INT("n_head_kv", 0), RAD_F64("theta", theta), RAD_F64("scale", 1.0),
+                    RAD_STR("mode", "imrope_gptj"), RAD_INT("rotary_dim", dim),
+                    RAD_STR("sections", sections) },
+                  {}, { x }, { x });
     return mk(b, "rope",
               { RAD_RANGE("M", 1, rows), RAD_INT("head_dim", dim), RAD_INT("n_head", heads),
                 RAD_INT("n_head_kv", 0), RAD_F64("theta", theta), RAD_F64("scale", 1.0),
                 RAD_STR("mode", "gptj"), RAD_INT("rotary_dim", dim) },
               {}, { x }, { x });
+}
+/* The positions a rope of this program reads: the step's [3, T] rotary planes under M-RoPE (the
+ * core carries them whenever the program declares an encoder), else the token positions. */
+inline RadOperand rope_pos_of(const Shape& s, const RadBatch* batch, int64_t T) {
+    if (s.mrope && batch->rope_pos) return praw2(batch->rope_pos, RAD_I32, 3, T);
+    return praw(batch->positions, RAD_I32, T);
 }
 
 /* ------------------------------------------------------------------ quantised trunk linears

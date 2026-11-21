@@ -14,7 +14,7 @@ plugin claims.
 | `arch/hyv3_bf16` | `hyv3` | *(empty)* | Tencent Hy-Memory-30B-A3B BF16 safetensors; BF16, W4 or W8A8 weights by recipe; TP1/2, BF16 KV |
 | `arch/hyv3_fp8` | `hyv3` | `fp8` | Tencent Hy-Memory-30B-A3B-FP8's descriptor: the same graph, one dense layer then sigmoid-routed MoE; its per-tensor E4M3 linears are a form this build does not serve; TP1/2, bf16 or int8 KV |
 | `arch/hyv3_gguf` | `hyv3` | `gguf_ftype_15` | llama.cpp Hy-Memory Q4_K_M GGUF, dequantized and recipe-converted to native Radiance weights; TP1/2 |
-| `arch/hyv4flash` | `hyv4flash` | *(empty)* | Tencent Hy4-flash from its bf16 checkpoint: the text trunk at one, two or four ranks (TP1/2/4, whole heads a rank, whole experts a rank) on bf16 weights (the Engram table also as the bf16 recipe's E4M3 rows), the weight manifest and the checkpoint name map, so `rad-convert` quantises the release by a recipe (`data/recipes/hy4-flash-bf16.recipe`, `hy4-flash-w4nl64-rtn.recipe`, `hy4-flash-w4nl64-gptq.recipe`); quantised experts and trunk linears, DFly2 and pictures are not served yet ([the graph](#hyv4flash-tencent-hy4-flash)) |
+| `arch/hyv4flash` | `hyv4flash` | *(empty)* | Tencent Hy4-flash from its bf16 checkpoint: the text trunk at one, two or four ranks (TP1/2/4, whole heads a rank, whole experts a rank) on bf16 weights (the Engram table also as the bf16 recipe's E4M3 rows), the weight manifest and the checkpoint name map, so `rad-convert` quantises the release by a recipe (`data/recipes/hy4-flash-bf16.recipe`, `hy4-flash-w4nl64-rtn.recipe`, `hy4-flash-w4nl64-gptq.recipe`); pictures and video through its tower (`arch/hyv4flash/hyv4flash_vision.h`, 3-D M-RoPE); quantised experts and trunk linears, DFly2 is not served yet ([the graph](#hyv4flash-tencent-hy4-flash)) |
 | `arch/flint` | `flint` | *(empty)* | Recursive Flint (39.8B-A2.5B): 2 dense layers then 47 sigmoid-routed MoE layers (256 experts top-6, ungated 1024-wide shared expert), GQA 32/4 at head_dim 128 with QK RMSNorm, a learned per-head sink on every layer, RoPE on the 35 sliding layers (window 513) and NoPE on the 14 full layers; two KV groups (full and window), TP1/2 (expert parallel); BF16 or int8 KV. Weights by recipe: an IQ8R trunk with rotated int8 experts (`data/recipes/flint-iq8r.recipe`), or u4 attention, int4 experts and plain int8 dense/shared/head (`data/recipes/flint-bf16-q4.recipe`); `docs/FLINT.md` |
 | `arch/qwen35_w8a8` | `qwen35` | `w8a8_fwht128` | `qwen35_fp8` with an int8 trunk: i8 weights with a bf16 scale per 128 of K, rotated by a 128-wide Hadamard, against int8 activations under the same rotation: IQ8R and IQR-V4 (`data/recipes/q38-27b-iq8r.recipe`, `q38-27b-iq4r-s-v4.recipe`) |
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
@@ -3485,7 +3485,7 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   embedding, Engram projection or f32 parameter, a trunk linear in a form that reads E4M3 codes
   (block fp8, MXFP4: no producer of this graph writes them), quantised experts whose width does not
   split into whole 128-column groups a rank; a library without an exact all-reduce at more ranks;
-  pictures and the drafter.
+  the drafter.
 
 ### Tensor parallelism
 
@@ -3512,6 +3512,42 @@ latent for all heads). Quantised experts are a slice of every expert's width (76
 serves a bf16 expert only whole. At more than one rank the taps of a rank's partial values
 (`attn_gate_logits`, `moe_experts_out`, `moe_routed_out`, `moe_shared_out`) are left out and
 `attn_o_proj` is tapped behind its reduction.
+
+### Pictures and video
+
+Served when the deployment leaves room for an encoder pass (`--mm-max-patches`) and the config
+states the tower, both layer kinds' `mrope_section` and the media ids; otherwise the tower's weights
+are declared alone (a container carries them) and a note says why. The reference is transformers
+c2ec8505's `HYV4FlashVisionTransformer` and `HYV4FlashModel`:
+
+```
+encoder pass (hyv4flash_vision.h), P patches in segments (a picture, a video frame)
+  gemm_nt_bias patch (the Conv2d over (channel, y, x)), grid_embed_sf (the 16385-row table without
+    its class row, bilinear at scale_factor (size + 0.1) / 128 an axis, torch's own arithmetic)
+  27 x: layernorm, gemm_nt_bias qkv (fused at convert), attn_dense within a segment, gemm_nt_bias o
+        + residual, layernorm, gemm_nt_bias fc1 (exact gelu), gemm_nt_bias fc2 + residual
+  rmsnorm (before_rms), conv2d_unfold 2x2, gemm_nt_bias 4608 (gelu), gemm_nt_bias 3072
+  the layout: each merged row of a segment, then the image_newline (embed_lookup of the one-row table)
+trunk step with media rows: embed_lookup, the encoder's rows over their placeholders (cast, an exact
+  all_reduce at more ranks since the core hands rank 0 the rows and the others zeros, scatter_rows),
+  then the trunk with every rope `imrope_gptj` (sections 12 10 10) at RadBatch::rope_pos, the
+  indexer's groups pooled at their first token's three components (qsa_work's bpos [work, 3])
+```
+
+- **The processor** is `core/mm`'s `HyV4Flash` family: a picture through QwenVL's smart_resize into
+  `[min_pixels, max_pixels]` (default 512^2 .. 2048^2) with PIL's bicubic, CLIP's mean and deviation;
+  a video frame to the largest whole merged grid that never upscales and keeps the clip within its
+  token budget (`hy_video_size`), 0.5 / 0.5; patches (channel, y, x), merge-block order.
+- **The newline rows.** Every merged row of a picture or frame ends in one more placeholder whose
+  embedding is the projector's `image_newline`; an item's rows are `rows_h x (grid_w / 2 + 1)` and
+  the rotary grid wraps at that width, which is the reference's `get_rope_index` exactly: a frame is
+  a block of `max(H, W + 1)` positions, the text after the media continues from its largest
+  component plus one. Every placeholder, newline ones included, is the pad id (120120 or 120124),
+  which the Engram hash reads and its mask excludes (`engram_ids`' `image` / `video`).
+- **Measured** against HF f32 (`ref/run_vis.py --preset mini-vis`: two pictures in one prompt, a
+  2-frame clip, the indexer selecting): the patches equal HF's own bf16, the tower's rows within
+  relL2 3e-3 .. 6e-3, every trunk tap within twice HF bf16's own distance under radiance's decisions,
+  on libref and libavx at TP1 and libref on two fake ranks; `--preset gpu-mini-vis --gpu` on cards.
 
 Tests: `hyv4flash_arch_test` (the declared graph of the `mini` geometry, each step kind lint clean,
 the taps, the refusals; at two and four ranks every weight covered exactly once, each rank's heads,

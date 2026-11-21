@@ -334,6 +334,17 @@ TEST(every_checkpoint_tensor_is_read_and_kept_as_the_release_holds_it) {
     CHECK(plain(f, "dfly.fusion.weight") == at("model.dfly_layers.mtp_fusion.eh_proj.weight"));
     CHECK(plain(f, "v.patch.weight") == at("vit.embeddings.patch_embedding.weight"));
     CHECK(plain(f, "v.merger.newline") == at("vit.perceive.image_newline"));
+    /* The tower in its served form (hyv4flash_vision.h): q, k and v fused with their biases, the
+     * position table without its class row, the merger's convolutions as stored. */
+    const std::string v0 = "vit.layers.0.self_attn.";
+    CHECK(plain(f, "v.blk.0.attn_qkv.weight") ==
+          at(v0 + "q_proj.weight") + at(v0 + "k_proj.weight") + at(v0 + "v_proj.weight"));
+    CHECK(plain(f, "v.blk.0.attn_qkv.bias") ==
+          at(v0 + "q_proj.bias") + at(v0 + "k_proj.bias") + at(v0 + "v_proj.bias"));
+    CHECK(plain(f, "v.position.weight") ==
+          at("vit.embeddings.position_embedding.weight").substr((size_t)VE * 2));
+    CHECK(plain(f, "v.merger.merge.weight") == at("vit.perceive.proj.0.weight"));
+    CHECK(plain(f, "v.blk.0.ffn_down.bias") == at("vit.layers.0.mlp.dense_4h_to_h.bias"));
 }
 
 TEST(max_spec_0_leaves_the_drafter_out) {

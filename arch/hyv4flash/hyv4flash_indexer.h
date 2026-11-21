@@ -34,7 +34,7 @@ struct IndexWire {
     rad_buf tk = 0;       /* [T, D] token keys */
     rad_buf stage = 0;    /* [work * ratio, D] the closing groups' raw keys */
     rad_buf page = 0;     /* [work] i32 */
-    rad_buf bpos = 0;     /* [work] i32 the groups' first positions */
+    rad_buf bpos = 0;     /* [work] i32 the groups' first positions; [work, 3] under M-RoPE */
     rad_buf nc = 0;       /* [seqs] i32 closed groups a sequence */
     rad_buf iqn = 0;      /* [T, Hi * (D - R)] */
     rad_buf iqr = 0;      /* [T, Hi * R] */
@@ -66,7 +66,10 @@ struct IndexWire {
         tk = decl_b(b, nm.f("ix.token_keys"), RAD_BF16, { T, D });
         stage = decl_b(b, nm.f("ix.stage"), RAD_BF16, { work * s.ix_pool, D });
         page = decl_b(b, nm.f("ix.page"), RAD_I32, { work });
-        bpos = decl_b(b, nm.f("ix.bpos"), RAD_I32, { work });
+        /* Under M-RoPE a group rotates at its first token's three components, side by side as
+         * qsa_work writes them from the step's rotary planes and idx_pool_gated reads them. */
+        bpos = s.mrope ? decl_b(b, nm.f("ix.bpos"), RAD_I32, { work, 3 })
+                       : decl_b(b, nm.f("ix.bpos"), RAD_I32, { work });
         nc = decl_b(b, nm.f("ix.nc"), RAD_I32, { g.max_seqs });
         iqn = decl_b(b, nm.f("ix.query_nope"), RAD_BF16, { T, Hi * (D - R) });
         iqr = decl_b(b, nm.f("ix.query_rope"), RAD_BF16, { T, Hi * R });
@@ -162,12 +165,25 @@ struct Indexer {
                        RAD_STR("dtype", "bf16") },
                      {}, { w.tk }, { w.stage, w.page, w.bpos, w.nc });
         HY4_NEED(op_work, "qsa_work");
-        op_pool = mk(b, s.ix_fp8 ? "idx_pool_gated_fp8" : "idx_pool_gated",
+        {
+            /* Under M-RoPE a group turns at its first token's three components (qsa_work's bpos
+             * [work, 3]); the FP8 form shares the pooling and its positions. */
+            const char* pool_op = s.ix_fp8 ? "idx_pool_gated_fp8" : "idx_pool_gated";
+            op_pool = s.mrope
+                ? mk(b, pool_op,
+                     { RAD_RANGE("M", 1, w.work), RAD_INT("n", D), RAD_INT("ratio", r),
+                       RAD_INT("rotary_dim", R), RAD_F64("eps", s.eps),
+                       RAD_F64("theta", s.theta_sparse), RAD_STR("mode", "imrope_gptj"),
+                       RAD_STR("sections", s.mrope_sparse.c_str()), RAD_INT("block_size", r),
+                       RAD_STR("dtype", "bf16") },
+                     { wv, wg, ape, pool_gain }, { w.stage, w.bpos, w.page }, {})
+                : mk(b, pool_op,
                      { RAD_RANGE("M", 1, w.work), RAD_INT("n", D), RAD_INT("ratio", r),
                        RAD_INT("rotary_dim", R), RAD_F64("eps", s.eps),
                        RAD_F64("theta", s.theta_sparse), RAD_STR("mode", "gptj"),
                        RAD_INT("block_size", r), RAD_STR("dtype", "bf16") },
                      { wv, wg, ape, pool_gain }, { w.stage, w.bpos, w.page }, {});
+        }
         HY4_NEED(op_pool, s.ix_fp8 ? "idx_pool_gated_fp8 (RADIANCE_HY4_INDEXER=fp8)"
                                    : "idx_pool_gated");
         if (first_of_group && rad_kv_block_size(b, index) != r) {
@@ -207,7 +223,8 @@ struct Indexer {
                                         s.q_lora, RAD_SHARD_NONE, grp, { qsrc }, act(qa), w.iqn));
         RAD_ARCH_TRY(query_rope.declare(b, nm, g, nm.f("blk.%d.index_query_rope", l), Hi * R,
                                         s.q_lora, RAD_SHARD_NONE, grp, { qsrc }, act(qa), w.iqr));
-        op_q_rope = decl_rope_gptj(b, T, Hi, R, s.theta_sparse, w.iqr);
+        op_q_rope = decl_rope_gptj(b, T, Hi, R, s.theta_sparse, w.iqr,
+                                   s.mrope ? s.mrope_sparse.c_str() : nullptr);
         op_qn_copy = decl_copy(b, T, Hi * (D - R), RAD_BF16, w.iqn, w.iq);
         op_qr_copy = decl_copy(b, T, Hi * R, RAD_BF16, w.iqr, w.iq);
         HY4_NEED(op_q_rope && op_qn_copy && op_qr_copy, "rope / cast");
@@ -318,12 +335,20 @@ struct Indexer {
         };
         const RadOperand pos = praw(batch->positions, RAD_I32, T);
         const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, S + 1);
+        /* M-RoPE: the step's rotary planes into qsa_work, which writes each group's three
+         * components; a step without them (no encoder declared) cannot occur under s.mrope. */
+        if (s.mrope && !batch->rope_pos) {
+            rad_step_fail(c, "hyv4flash: the program rotates at M-RoPE positions and the step "
+                             "carries no rope_pos");
+            return false;
+        }
+        const RadOperand rope = s.mrope ? praw2(batch->rope_pos, RAD_I32, 3, T) : RAD_NONE;
         key.step(c, act(xa), w.tk, T);
         RAD_ISSUE_N(c, op_key_norm, T, brows(w.tk, T), RAD_W(key_gain), brows(w.tk, T));
         t_token_keys.step(c, brows(w.tk, T), T);
         RAD_ISSUE_N(c, op_work, T, brows(w.tk, T), pos, cu, kv_cache(tail, layer),
                     praw2(tb->state_index, RAD_I32, S, pitch),
-                    praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), RAD_NONE,
+                    praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), rope,
                     brows(w.stage, work * s.ix_pool), brows(w.page, work), brows(w.bpos, work),
                     brows(w.nc, S));
         if (s.ix_fp8)
@@ -349,7 +374,7 @@ struct Indexer {
         }
         query_nope.step(c, act(qa), w.iqn, T);
         query_rope.step(c, act(qa), w.iqr, T);
-        RAD_ISSUE_N(c, op_q_rope, T, brows(w.iqr, T), pos);
+        RAD_ISSUE_N(c, op_q_rope, T, brows(w.iqr, T), rope_pos_of(s, batch, T));
         RadOperand qn = brows(w.iq, T), qr = qn;
         qn.cols = D - R;
         qr.offset = D - R;

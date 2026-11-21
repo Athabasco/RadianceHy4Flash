@@ -183,8 +183,10 @@ struct Attn {
                            nm.ckpt("%s.kv_a_layernorm.weight", ap), { L }, grp);
         if (!kv_gain) return RAD_E_INVAL;
         op_kv_norm = decl_rmsnorm(b, T, L, s.eps, kv_gain, w.row, w.row);
-        op_q_rope = decl_rope_gptj(b, T, H, R, theta, w.q_rope);
-        op_k_rope = decl_rope_gptj(b, T, 1, R, theta, w.row);
+        const char* sec = !s.mrope ? nullptr : sliding ? s.mrope_sliding.c_str()
+                                                         : s.mrope_sparse.c_str();
+        op_q_rope = decl_rope_gptj(b, T, H, R, theta, w.q_rope, sec);
+        op_k_rope = decl_rope_gptj(b, T, 1, R, theta, w.row, sec);
         HY4_NEED(op_kv_norm && op_q_rope && op_k_rope, "rmsnorm / rope (gptj)");
         /* The cache row as one KV head of (L + R) / 2, its first half in the K slot and the rest in
          * the V slot (bailing_hybrid's arrangement). The first op after the group to carry a
@@ -360,8 +362,9 @@ struct Attn {
         kv_a.step(c, act(xa), w.row, T);
         RAD_ISSUE_N(c, op_kv_norm, T, bcol(w.row, 0, L, T), RAD_W(kv_gain), bcol(w.row, 0, L, T));
         t_kv_latent.step(c, bcol(w.row, 0, L, T), T);
-        RAD_ISSUE_N(c, op_q_rope, T, brows(w.q_rope, T), pos);
-        RAD_ISSUE_N(c, op_k_rope, T, bcol(w.row, L, R, T), pos);
+        const RadOperand rpos = rope_pos_of(s, batch, T);
+        RAD_ISSUE_N(c, op_q_rope, T, brows(w.q_rope, T), rpos);
+        RAD_ISSUE_N(c, op_k_rope, T, bcol(w.row, L, R, T), rpos);
         const int64_t half = (L + R) / 2;
         if (!kb->stream) {
             RAD_ISSUE_N(c, op_store, T, bcol(w.row, 0, half, T), bcol(w.row, half, half, T),

@@ -520,6 +520,115 @@ TEST(the_fp8_indexer_swaps_the_key_cache_and_the_score_for_the_dsa_forms) {
     CHECK_EQ(bad.rc, RAD_E_UNSUPPORTED);
 }
 
+/* WP15: the tower and the 3-D positions. With room for an encoder pass (--mm-max-patches) and a
+ * config that states the tower, the M-RoPE sections and the media ids, the program declares the
+ * encoder (pictures and video, 4 patches a row, the mini tower's 4 x 4 position grid), every
+ * rotary of the trunk becomes imrope_gptj over the layer kind's sections, the indexer's groups
+ * rotate at three components ([work, 3], qsa_work's), and a media step scatters the encoder's rows
+ * over the lookups. An encoder pass of two segments (4 x 6 and 4 x 4 patches: 12 + 8 rows with
+ * their newlines) and the media prefill after it are lint clean. */
+TEST(the_tower_and_the_three_component_positions) {
+    struct Vis : Declared {
+        explicit Vis(bool sections) : Declared(bf16_encs) {
+            auto& k = mk;
+            k.set("vision_config.num_hidden_layers", "1").set("vision_config.hidden_size", "32")
+                .set("vision_config.intermediate_size", "64").set("vision_config.patch_size", "4")
+                .set("vision_config.num_channels", "3").set("vision_config.spatial_merge_size", "2")
+                .set("vision_config.num_attention_heads", "2")
+                .set("vision_config.max_image_size", "16")
+                .set("vision_config.max_vit_seq_len", "16")
+                .set("vision_config.rms_norm_eps", "1e-05");
+            if (sections)
+                k.set("rope_parameters.sliding_attention.mrope_section", "2 1 1")
+                    .set("rope_parameters.deepseek_sparse_attention.mrope_section", "2 1 1");
+            b = RadBuilder();
+            bf16_encs(&b);
+            ctx = build_ctx();
+            ctx.max_enc_patches = 64;
+            rc = hyv4flash::declare(&b, mk.meta(), &ctx);
+        }
+    };
+    Vis d(true);
+    REQUIRE_EQ(d.rc, RAD_OK);
+    RadBuilder& b = d.b;
+    REQUIRE(b.encoder.out != 0);
+    CHECK_EQ(b.encoder.modalities, (uint32_t)(RAD_MM_IMAGE | RAD_MM_VIDEO));
+    CHECK_EQ(b.encoder.patch_dim, 48);
+    CHECK_EQ(b.encoder.merge, 4);
+    CHECK_EQ(b.encoder.max_patches, 64);
+    CHECK_EQ(count_op(b, "grid_embed_sf"), 1);
+    CHECK_EQ(pint(find_op(b, "grid_embed_sf"), "side"), 4);
+    CHECK(std::fabs(pflt(find_op(b, "grid_embed_sf"), "offset") - 0.1) < 1e-12);
+    CHECK_EQ(count_op(b, "attn_dense"), 1);
+    CHECK_EQ(count_op(b, "conv2d_unfold"), 1);
+    CHECK_EQ(count_op(b, "scatter_rows"), 1);
+    for (const auto& o : b.ops)
+        if (o.op == "rope") {
+            CHECK_EQ(pstr(&o, "mode"), std::string("imrope_gptj"));
+            CHECK_EQ(pstr(&o, "sections"), std::string("2 1 1"));
+        }
+    CHECK_EQ(pstr(find_op(b, "idx_pool_gated"), "mode"), std::string("imrope_gptj"));
+    const RecBuf* bp = find_b(b, "ix.bpos");
+    REQUIRE(bp != nullptr);
+    CHECK_EQ(bp->d.rank, 2u);
+    CHECK_EQ(bp->d.shape[1], 3);
+    CHECK(find_w(b, "v.blk.0.attn_qkv.weight") != nullptr);
+    CHECK_EQ(find_w(b, "v.position.weight")->d.shape[0], 16);
+
+    /* The encoder pass. */
+    {
+        const int segs[2][2] = { { 4, 6 }, { 4, 4 } };
+        const int64_t n = 40;
+        std::vector<uint16_t> pix((size_t)(n * 48), 0);
+        std::vector<int32_t> coord((size_t)(4 * n), 0), cu = { 0, 24, 40 };
+        std::vector<int32_t> sh = { segs[0][0], segs[1][0] }, sw = { segs[0][1], segs[1][1] };
+        RadBatch e{};
+        e.enc = RAD_MM_IMAGE;
+        e.enc_n_patch = n;
+        e.enc_pixels = pix.data();
+        e.enc_coord = coord.data();
+        e.enc_n_seg = 2;
+        e.enc_cu = cu.data();
+        e.enc_max_seg = 24;
+        e.enc_seg_h = sh.data();
+        e.enc_seg_w = sw.data();
+        RadCtx c{ .b = &b, .batch = &e };
+        hyv4flash::step(&c, &e);
+        CHECK_LINT(b, &c);
+        if (!c.step_fail.empty()) fprintf(stderr, "encoder pass: %s\n", c.step_fail.c_str());
+        CHECK(c.step_fail.empty());
+        CHECK_EQ(count_issued(b, c, "gemm_nt_bias"), 7);   /* patch, 4 a block, 2 merger */
+    }
+    /* A prefill with media rows at three-component positions. */
+    {
+        auto k = kit(b, {}, { 12 }, 0);
+        k->b.positions_h = k->pos.data();
+        std::vector<int32_t> rp((size_t)(3 * 12));
+        for (int c = 0; c < 3; ++c)
+            for (int t = 0; t < 12; ++t) rp[(size_t)(c * 12 + t)] = t < 2 ? t : 2 + c;
+        std::vector<int32_t> rows = { 2, 3, 4, 5 };
+        std::vector<uint16_t> embd((size_t)(4 * 128), 0);
+        k->b.rope_pos = rp.data();
+        k->b.rope_mixed = 1;
+        k->b.n_mm_rows = 4;
+        k->b.mm_rows = rows.data();
+        k->b.mm_embd = embd.data();
+        RadCtx c{ .b = &b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK_LINT(b, &c);
+        if (!c.step_fail.empty()) fprintf(stderr, "media prefill: %s\n", c.step_fail.c_str());
+        CHECK(c.step_fail.empty());
+        CHECK_EQ(count_issued(b, c, "scatter_rows"), 1);
+    }
+    /* No sections: the tower's weights are declared (a container carries them), nothing served,
+     * and the trunk stays gptj. */
+    Vis n(false);
+    REQUIRE_EQ(n.rc, RAD_OK);
+    CHECK_EQ(n.b.encoder.out, (rad_buf)0);
+    CHECK(find_w(n.b, "v.blk.0.attn_qkv.weight") != nullptr);
+    CHECK_EQ(pstr(find_op(n.b, "rope"), "mode"), std::string("gptj"));
+}
+
 /* What this build does not serve is refused by name at declare: a quantised kv_b (DECISIONS U2),
  * a recipe over a parameter the model applies in f32, a quantised token embedding, and a trunk
  * linear in a form that reads E4M3 codes no producer of this graph writes (MXFP4). */
