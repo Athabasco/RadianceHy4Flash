@@ -14,7 +14,7 @@ plugin claims.
 | `arch/hyv3_bf16` | `hyv3` | *(empty)* | Tencent Hy-Memory-30B-A3B BF16 safetensors; BF16, W4 or W8A8 weights by recipe; TP1/2, BF16 KV |
 | `arch/hyv3_fp8` | `hyv3` | `fp8` | Tencent Hy-Memory-30B-A3B-FP8's descriptor: the same graph, one dense layer then sigmoid-routed MoE; its per-tensor E4M3 linears are a form this build does not serve; TP1/2, bf16 or int8 KV |
 | `arch/hyv3_gguf` | `hyv3` | `gguf_ftype_15` | llama.cpp Hy-Memory Q4_K_M GGUF, dequantized and recipe-converted to native Radiance weights; TP1/2 |
-| `arch/hyv4flash` | `hyv4flash` | *(empty)* | Tencent Hy4-flash from its bf16 checkpoint: the text trunk at one, two or four ranks (TP1/2/4, whole heads a rank, whole experts a rank) on bf16 weights (the Engram table also as the bf16 recipe's E4M3 rows), the weight manifest and the checkpoint name map, so `rad-convert` quantises the release by a recipe (`data/recipes/hy4-flash-bf16.recipe`, `hy4-flash-w4nl64-rtn.recipe`); quantised experts and trunk linears, DFly2 and pictures are not served yet ([the graph](#hyv4flash-tencent-hy4-flash)) |
+| `arch/hyv4flash` | `hyv4flash` | *(empty)* | Tencent Hy4-flash from its bf16 checkpoint: the text trunk at one, two or four ranks (TP1/2/4, whole heads a rank, whole experts a rank) on bf16 weights (the Engram table also as the bf16 recipe's E4M3 rows), the weight manifest and the checkpoint name map, so `rad-convert` quantises the release by a recipe (`data/recipes/hy4-flash-bf16.recipe`, `hy4-flash-w4nl64-rtn.recipe`, `hy4-flash-w4nl64-gptq.recipe`); quantised experts and trunk linears, DFly2 and pictures are not served yet ([the graph](#hyv4flash-tencent-hy4-flash)) |
 | `arch/flint` | `flint` | *(empty)* | Recursive Flint (39.8B-A2.5B): 2 dense layers then 47 sigmoid-routed MoE layers (256 experts top-6, ungated 1024-wide shared expert), GQA 32/4 at head_dim 128 with QK RMSNorm, a learned per-head sink on every layer, RoPE on the 35 sliding layers (window 513) and NoPE on the 14 full layers; two KV groups (full and window), TP1/2 (expert parallel); BF16 or int8 KV. Weights by recipe: an IQ8R trunk with rotated int8 experts (`data/recipes/flint-iq8r.recipe`), or u4 attention, int4 experts and plain int8 dense/shared/head (`data/recipes/flint-bf16-q4.recipe`); `docs/FLINT.md` |
 | `arch/qwen35_w8a8` | `qwen35` | `w8a8_fwht128` | `qwen35_fp8` with an int8 trunk: i8 weights with a bf16 scale per 128 of K, rotated by a 128-wide Hadamard, against int8 activations under the same rotation: IQ8R and IQR-V4 (`data/recipes/q38-27b-iq8r.recipe`, `q38-27b-iq4r-s-v4.recipe`) |
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
@@ -3475,6 +3475,7 @@ rad-info -v hy4-flash-w4nl64.rad
 | none | bf16, 277 GiB | bf16, 118 GiB | bf16 | 410.3 GiB |
 | `hy4-flash-bf16.recipe` | bf16 | E4M3 rows at a bf16 scale each, 60.2 GiB | bf16 | 352.5 GiB |
 | `hy4-flash-w4nl64-rtn.recipe` | the `w4nl` codebook at an E4M3 scale a 64 of K, rotated, round to nearest: 71.3 GiB | as above | bf16 | 147.1 GiB |
+| `hy4-flash-w4nl64-gptq.recipe` | the same form, GPTQ against `CALIB=<grams dir>` ([Calibrating](#calibrating-hy4-flash)) | as above | bf16 | 147.1 GiB |
 
 The sizes are `rad-convert --plan-only`'s over the release's 1964 tensors (43699 declared weights,
 41984 of them expert projections), which is how the name map was checked against the release: its
@@ -3504,8 +3505,109 @@ writes, and a container can hold a form nothing in this tree serves. The forms t
 read for the same roles are the safe choices: for routed experts the ones `MoeFP8` takes
 (`docs/MOE-W4.md`, `docs/IQR.md`; both K here are 1536, twelve whole 128 blocks), for the block
 linears rotated int8 (`i8*bf16[1x128]/fwht128`) or bf16. Calibrated quantisers (`gptq`, `awq`,
-`autoround` with `calib=`) need the Grams an engine run records, which needs the graph; until then
-a recipe is uncalibrated, or weighted by an `--imatrix`.
+`autoround` with `calib=`) read the Grams of a calibration run ([Calibrating](#calibrating-hy4-flash)
+below); a recipe without `calib=` is uncalibrated, or weighted by an `--imatrix`.
+
+## Calibrating Hy4-flash
+
+A calibration run serves nothing: `--calib-corpus` pushes a JSONL corpus (`{"prompt": ...}` a line,
+the KL mode's) through prefill once, every token counted once (prefix cache and speculation are off
+in this mode), and writes the Gram `H = sum x x^T` of every linear's input into `--calib-dir`. Two
+taps fill the directory in one run:
+
+| tap | records | files in DIR |
+|---|---|---|
+| `CalibFull` (`hyv4flash_calib.h`) | the trunk: one Gram a distinct input | `<site>.safetensors` (below), `hessian_upper` f32 |
+| `MoeFP8`'s own | the latent experts | `gram.r0.blk.L.ffn_gate_up_exps.bin` (pooled), `gram.r0.blk.L.ffn_down_exps.bin` (pooled) and `gram.r0.blk.L.ffn_down_exps.E.bin` (one a expert), RADGRAM2 |
+
+The trunk sites (layer `l`; K the input's width; `linears` the declared weight stems that read it,
+which is what the file's metadata lists):
+
+| site `blk.l.<s>.input` | K | the input | linears |
+|---|---|---|---|
+| `attn_q_a` | 3072 | the attention norm's output | `attn_q_a attn_kv_a attn_gate`, on the 12 sparse layers also `index_key index_head` |
+| `attn_q_b` | 1024 | the normed q_a | `attn_q_nope attn_q_rope`, sparse: also `index_query_nope index_query_rope` |
+| `attn_kv_b` | 512 | the normed latent | `attn_kv_b` (stays bf16; recorded all the same) |
+| `attn_output` | 8192 sparse, 16384 sliding | the gated attention output | `attn_output` |
+| `ffn_gate_up`, `ffn_down` (layer 0) | 3072, 13824 | the MLP's input, its activation | `ffn_gate_up`, `ffn_down` |
+| `ffn_latent_in` | 3072 | the feed-forward norm's output | `ffn_latent_in ffn_gate_up_shexp` |
+| `ffn_down_shexp` | 1536 | the shared expert's activation | `ffn_down_shexp` |
+| `ffn_latent_out` | 1536 | the routed sum in the latent | `ffn_latent_out` |
+| `engram_key` (layers 1, 11, 21, 31) | 1536 | the normed Engram rows | `engram_key engram_value` |
+| `output` (no `blk.l.`) | 3072 | the final norm's output | `output` |
+
+The router, the norms, the hyper-connection and indexer-pooling parameters and the sinks are not
+linears a recipe quantises and have no site.
+
+**How a recipe finds a Gram.** libquant reads `gram.r<rank>.<the weight's own stem>.bin` (RADGRAM2,
+`libquant/lq_hess.cpp`): `blk.7.attn_q_nope.weight` looks for `gram.r0.blk.7.attn_q_nope.bin`, a
+routed expert `blk.7.ffn_down_exps.123.weight` for `...ffn_down_exps.123.bin`, else the pooled
+`...ffn_down_exps.bin` (the expert's own is used from 4 x K rows of that expert). It never reads
+the `linears` list and never reads safetensors. The trunk's files are safetensors, so
+`tools/calib_st2gram.py` writes the RADGRAM2 file for every stem in each site's `linears` (one copy,
+hard-linked under the other names, domain 0: libquant rotates a Gram into the recipe's grid itself).
+The experts' files are already RADGRAM2 and are read as they are. A weight with no file is rounded
+to nearest and the converter says `no calibration for '<name>'`.
+
+### The run
+
+Flags are YAML keys (`radiance` reads only a YAML file, TOOLS.md "The calibration mode"); `rad-yaml`
+writes one from command-line flags. The commands below are the ones run on the `mini` checkpoint
+(host, one rank, `libref`); the paths are the friend's.
+
+```sh
+# 1. a bf16 container (tables for the Engram hash constants first). The experts stay bf16: the
+#    experts' tap runs on bf16 experts, and the Grams then belong to the checkpoint's own
+#    activations, which any recipe's grid is fitted against (docs/MOE-W4.md)
+python3 data/hy4flash_engram_tables.py <ckpt> engram-tables.safetensors
+rad-convert <ckpt> --add engram-tables.safetensors --recipe data/recipes/hy4-flash-bf16.recipe \
+    -o hy4-bf16.rad
+# 2. record. --calib-dir and --calib-layers reach the experts' tap by themselves (the plugin sets
+#    RADIANCE_CALIB_DIR / _TOKENS / _LAYERS from them; a RADIANCE_CALIB_DIR naming another
+#    directory is refused). The corpus's token count is read by the engine.
+mkdir grams
+rad-yaml --model hy4-bf16.rad --max-model-len 8192 --max-num-batched-tokens 8192 --max-num-seqs 4 \
+    --no-prefix-cache --calib-corpus corpus.jsonl --calib-dir grams [--calib-layers 0:14] > calib.yaml
+radiance --config calib.yaml
+#    ... radiance: calibration: rank 0 wrote N Hessian(s) of layers 0:42 after T rows to grams
+# 3. the trunk's safetensors to RADGRAM2 under every weight stem (the experts' files stay)
+python3 tools/calib_st2gram.py grams
+# 4. quantise against them
+CALIB=$PWD/grams rad-convert <ckpt> --add engram-tables.safetensors \
+    --recipe data/recipes/hy4-flash-w4nl64-gptq.recipe -o hy4-q.rad
+# 5. KL against the bf16 container (TOOLS.md "The KL mode"): record once, score each candidate
+rad-yaml --model hy4-bf16.rad ... --kld-record ref/ --kld-corpus heldout.jsonl > ref.yaml
+rad-yaml --model hy4-q.rad    ... --kld-ref ref/ --kld-out kl.json > cand.yaml
+```
+
+Notes that are not in the commands:
+
+- **Layer windows.** The host holds every recorded Gram until the corpus is through: about 0.2 GB a
+  sparse layer and 0.6 GB a sliding layer (the o_proj input is 16384 wide), plus 2.4 GB a MoE layer
+  for the 512 experts' down Grams. Run several times over the same corpus with `--calib-layers
+  0:14`, `14:28`, `28:42`; each writes only its layers' files into the same directory, and the run
+  ending at layer 42 also writes `output`. The device holds an f32 `kmax x kmax` scratch (1 GB) and
+  two pinned host squares of the same size.
+- **The corpus** has to look like the traffic the quantised model will serve (code-heavy prompts,
+  for this deployment), at least a million tokens for the trunk (MOE-W4.md); score on a different
+  slice. A document is a sequence: Engram history and positions restart at each.
+- **Ranks.** This build serves one rank (`--tp 1`). The recorder is rank-aware (a column-split input
+  is gathered to its whole width, one rank records each layer), and the experts' tap wants whole
+  experts per rank, so the multi-rank run is a WP7 question; until then a calibration of the real
+  checkpoint needs the weights on one rank (the disk tier, GUIDE.md section 4.3).
+- **Quantised experts are not served yet** (WP10): calibrate the bf16 container, not
+  `hy4-flash-w4nl64-rtn.recipe`'s, and the KL step 5 can only score a candidate this build serves
+  (bf16 today). Trunk `gptq` lines in a recipe are refused at declare for the same reason; the
+  Grams for them are already in `grams/` under the weight stems of the table above.
+- **Accuracy of the Grams.** On `mini`, the Grams equal `X^T X` of the plugin's own debug taps
+  (`RADIANCE_HY4_TAPS=1`, `RADIANCE_DUMP_BUF`) to 2e-8 (f32 accumulation), and `X^T X` of the
+  transformers f32 activations to 0.3% to 1.6% relative Frobenius (bf16 rounding of the activations
+  themselves; the layers' parity budget, PLAN 3.1).
+- **gpu-mini on a card** does not start yet: the Engram's E4M3 round trip has no device kernel
+  (`quant_act_fp8` at group 96, `dequant`), a WP5/WP6 matter.
+
+Tests: `hyv4flash_calib_test` (the site table against the declared weights, `--calib-layers`, the
+environment mapping, one Gram a site per step, `calib_st2gram.py`'s output).
 
 ## What serving needs
 
