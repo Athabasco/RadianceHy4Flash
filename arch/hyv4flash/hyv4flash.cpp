@@ -35,7 +35,10 @@
  * by name: other worlds, a trunk linear in another form, a quantised embedding, kv_b (DECISIONS U2),
  * Engram projection or f32 parameter. Pictures and video through the tower
  * (hyv4flash_vision.h; the trunk then rotates at M-RoPE positions, `imrope_gptj`). DFly2 is
- * declared as the checkpoint holds it and not served (WP13).
+ * served at one rank as a block drafter (hyv4flash_dfly.h) when the deployment speculates
+ * (--num-speculative-tokens 1..5; the probe states no depth, so speculation stays off unless
+ * asked for); elsewhere it is declared as the checkpoint holds it, and says why it is not
+ * served.
  *
  * The caches (PLAN §1.3): the sliding layers' latent rows in a window group (block 16), the sparse
  * layers' in a full group of block 4 (a page is one indexer group, so the indexer's table is the
@@ -52,6 +55,7 @@
 #include "hyv4flash_engram.h"
 #include "hyv4flash_calib.h"
 #include "hyv4flash_vision.h"
+#include "hyv4flash_dfly.h"
 
 #include "chat.h"
 
@@ -102,6 +106,7 @@ struct Model {
      * over the ranks (exactly: one non-zero term) before they replace the lookup's. */
     rad_buf mm_rows = 0;
     rad_op op_mm_scatter = 0, op_mm_copy = 0, op_mm_reduce = 0;
+    Dfly df{};       /* DFly2, the block drafter (hyv4flash_dfly.h) */
     int arm = kArmBf16;   /* the routed arms' activation codes (Ffn::arm) */
 };
 static std::unique_ptr<Model> models[MAX_SLOTS];
@@ -275,7 +280,8 @@ static int read_shape(Shape& s, const RadModelMeta* m) {
 }
 
 /* ------------------------------------------------------------------ declaring one weight */
-/* The manifest's declarations, for what this build declares and does not serve (DFly2, the tower):
+/* The manifest's declarations, for what this build declares as the checkpoint holds it (DFly2,
+ * whose ops then read these handles, and the tower):
  * every weight at the encoding it is stored in, so rad-convert writes the
  * whole release. The served graph's weights are declared by the blocks that read them. */
 struct Decl {
@@ -283,6 +289,9 @@ struct Decl {
     Model&      m;
     int         layer;   /* the movement group; -1 for a model-level weight */
     int         access;
+    /* Where a single-plane weight's handle is recorded, by declared name (the drafter's ops read
+     * them); null records nothing. */
+    std::map<std::string, rad_weight>* rec = nullptr;
 
     /* The checkpoint's extents of `name` where the model behind the builder has it, else the
      * config's (`dflt`): a builder with no model (a test's) answers nothing. */
@@ -325,8 +334,9 @@ struct Decl {
                 const bool widens = want == RAD_F32 && (have == RAD_BF16 || have == RAD_F16);
                 if (!widens) dt = have;
             }
-            return decl_w(b, name, dt, shape, access, RAD_SHARD_NONE, g, optional) ? RAD_OK
-                                                                                 : RAD_E_INVAL;
+            const rad_weight h = decl_w(b, name, dt, shape, access, RAD_SHARD_NONE, g, optional);
+            if (h && rec) (*rec)[name] = h;
+            return h ? RAD_OK : RAD_E_INVAL;
         }
         int64_t rows = 1, cols = 1;
         std::vector<int64_t> dims(shape);
@@ -351,10 +361,10 @@ struct Decl {
 };
 
 /* ------------------------------------------------------------------ the drafter's manifest */
-/* The drafter's gated MLA, declared as the checkpoint holds it (not served). `scope` is
+/* The drafter's gated MLA, declared as the checkpoint holds it. `scope` is
  * "dfly.blk.<l>", `ap` the checkpoint's `...self_attn`. */
 static int attention(Decl& d, Names& nm, const Shape& s, const AttnGeom& a, const char* scope,
-                     const char* ap) {
+                     const char* ap, int* has_post = nullptr) {
     RadBuilder* b = d.b;
     auto n = [&](const char* leaf) { return nm.f("%s.%s", scope, leaf); };
     const char* q_a = n("attn_q_a.weight");
@@ -388,7 +398,15 @@ static int attention(Decl& d, Names& nm, const Shape& s, const AttnGeom& a, cons
     RAD_ARCH_TRY(d.mat(kv_b, { a.kv_width(), s.kv_lora }));
     RAD_ARCH_TRY(d.mat(gate, { a.v_width(), s.n_embd }));
     RAD_ARCH_TRY(d.mat(out, { s.n_embd, a.v_width() }));
-    RAD_ARCH_TRY(d.f32(post, { s.n_embd }));
+    /* post_proj_norm is optional in vLLM's draft (present iff the checkpoint has it): a model
+     * that has q_a and lacks it is declared without; a builder with no model declares it. */
+    {
+        RadEncoding e{};
+        const bool model = weight_enc(b, q_a, &e);
+        const bool post_on = !model || weight_enc(b, post, &e);
+        if (has_post) *has_post = post_on;
+        if (post_on) RAD_ARCH_TRY(d.f32(post, { s.n_embd }));
+    }
     RAD_ARCH_TRY(d.f32(sinks, { a.heads }));
     return RAD_OK;
 }
@@ -421,9 +439,14 @@ static int drafter(RadBuilder* b, Model& m) {
     Names& nm = m.nm;
     const Shape& s = m.s;
     const char* dp = "model.dfly_layers";
+    /* Served, the drafter's weights are read every step; declared only, maybe never. The access
+     * class is a placement hint and not part of the container (hyv4flash_convert_test). */
+    const int access = m.df.served ? RAD_ACCESS_PER_TOKEN : RAD_ACCESS_RARE;
+    m.df.post.clear();
+    m.df.w.clear();
     for (int64_t i = 0; i < s.dfly_layers; ++i) {
         const int grp = (int)(s.n_layer + i);
-        Decl d{ b, m, grp, RAD_ACCESS_RARE };
+        Decl d{ b, m, grp, access, &m.df.w };
         const char* pre = nm.ckpt("%s.%lld", dp, (long long)i);
         const char* scope = nm.f("dfly.blk.%lld", (long long)i);
         const char* an = nm.f("%s.attn_norm.weight", scope);
@@ -431,13 +454,16 @@ static int drafter(RadBuilder* b, Model& m) {
         RAD_ARCH_TRY(map_copy(b, an, nm.ckpt("%s.input_layernorm.weight", pre)));
         RAD_ARCH_TRY(map_copy(b, fnorm, nm.ckpt("%s.post_attention_layernorm.weight", pre)));
         RAD_ARCH_TRY(d.f32(an, { s.n_embd }));
-        RAD_ARCH_TRY(attention(d, nm, s, s.sparse, scope, nm.ckpt("%s.self_attn", pre)));
+        int post_on = 1;
+        RAD_ARCH_TRY(attention(d, nm, s, s.sparse, scope, nm.ckpt("%s.self_attn", pre), &post_on));
+        m.df.post.push_back(post_on);
         RAD_ARCH_TRY(d.f32(fnorm, { s.n_embd }));
         /* The config does not state the drafter's MLP width; the checkpoint's down projection
          * does (9216, three times the hidden size, in the release). */
         RAD_ARCH_TRY(mlp(d, nm, s, scope, nm.ckpt("%s.mlp", pre), 0, false, 3 * s.n_embd));
+        if (i == 0) m.df.ff = d.extent(nm.f("%s.ffn_down.weight", scope), 1, 3 * s.n_embd);
     }
-    Decl d{ b, m, (int)(s.n_layer + s.dfly_layers), RAD_ACCESS_RARE };
+    Decl d{ b, m, (int)(s.n_layer + s.dfly_layers), access, &m.df.w };
     const int64_t E = s.n_embd;
     struct { const char* name; const char* src; bool gain; int64_t rows, cols; } one[] = {
         { "dfly.fusion.weight", "mtp_fusion.eh_proj.weight", false, E, 2 * E },
@@ -459,7 +485,24 @@ static int drafter(RadBuilder* b, Model& m) {
         if (w.gain) RAD_ARCH_TRY(d.f32(name, { w.rows }));
         else RAD_ARCH_TRY(d.mat(name, { w.rows, w.cols }));
     }
+    /* A draft-owned embedding (vLLM loads `dfly_layers.embed_tokens` where the checkpoint has
+     * one, else shares the target's). Declared only where the model has it. */
+    {
+        const char* name = nm.f("dfly.token_embd.weight");
+        RAD_ARCH_TRY(map_copy(b, name, nm.ckpt("%s.embed_tokens.weight", dp)));
+        RadEncoding e{};
+        m.df.own_embed = weight_enc(b, name, &e);
+        if (m.df.own_embed) RAD_ARCH_TRY(d.mat(name, { s.n_vocab, s.n_embd }));
+    }
     return RAD_OK;
+}
+
+/* "25 29 .." -> "25/25, 29/29": each draft layer's cache layer / selection layer. */
+static std::string dfly_layers_str(const Dfly& d) {
+    std::string r;
+    for (size_t i = 0; i < d.kv.size() && i < d.idx.size(); ++i)
+        r += (i ? ", " : "") + std::to_string(d.kv[i]) + "/" + std::to_string(d.idx[i]);
+    return r;
 }
 
 /* ------------------------------------------------------------------ declare */
@@ -594,6 +637,7 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
         }
         RAD_ARCH_TRY(lay.ix.declare(b, nm, s, g, l, m.iw, m.tr.xn, lay.attn.w.qa, m.kv_index,
                                     m.kv_tail, kv, ap, first_ix));
+        RAD_ARCH_TRY(m.df.declare_snap(b, nm, s, g, l, m.iw));
     }
     RAD_ARCH_TRY(lay.attn.declare_core(b, nm, ap, lay.sliding ? 0 : m.iw.sel,
                                        lay.sliding ? 0 : m.iw.len, lay.sliding ? 0 : m.iw.nsel));
@@ -681,6 +725,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(read_shape(s, meta));
     RAD_ARCH_TRY(split_ranks(s, ctx->world_size ? ctx->world_size : 1, ctx->rank));
     RAD_ARCH_TRY(geom_from(g, meta, ctx, "bf16", RAD_BF16));
+    m.df.configure(b, meta, s, ctx);   /* before the trunk: the snapshots follow its indexers */
     /* The producers write bf16 planes only: a bf16 trunk linear reads them, an int8 one quantises
      * its input itself into the rank's code pair (Lin), declared at the first one. */
     g.w_bf16 = true;
@@ -843,6 +888,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * leaves the drafter out). Neither is served by this build. */
     const bool dfly = s.dfly_layers > 0 && ctx->max_spec > 0;
     if (dfly) RAD_ARCH_TRY(drafter(b, m));
+    if (dfly && m.df.served)
+        RAD_ARCH_TRY(m.df.declare(b, nm, s, g, m.token, m.head, m.final_hidden, m.kv_sparse, m.iw));
+    if (dfly && !m.df.served && ctx->rank == 0)
+        fprintf(stderr, "radiance: hyv4flash: DFly2 is declared and not served: %s; speculation "
+                        "falls back to prompt lookup\n", m.df.why.c_str());
     if (vit_weights) {
         RAD_ARCH_TRY(m.vision.declare(b, nm, s, ctx, (int)(s.n_layer + s.dfly_layers + 1), vit));
         if (why_not) rad_note(b, "the vision tower is declared and not served: %s", why_not);
@@ -862,7 +912,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              (long long)(s.n_layer - n_sparse), (long long)s.window, (long long)s.dense_limit,
              (long long)n_moe, (long long)s.n_expert, (long long)s.top_k, s.engram_layers.size(),
              s.engram_layers.empty() ? 0.0 : engram_eps(),
-             dfly ? "declared (not served)" : "left out",
+             !dfly         ? "left out"
+             : m.df.served ? nm.f("served (depth %lld, block %lld, %lld layer(s) over trunk layers "
+                                  "%s, greedy proposals)",
+                                  (long long)m.df.depth, (long long)m.df.block,
+                                  (long long)m.df.layers, dfly_layers_str(m.df).c_str())
+                           : "declared (not served)",
              vit ? "served" : vit_weights ? "declared (not served)" : "left out",
              s.world, s.rank, (long long)s.sparse_r.heads, (long long)s.sparse.heads,
              (long long)s.sliding_r.heads, (long long)s.sliding.heads,
@@ -907,13 +962,24 @@ static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = *models[rad_slot(c)];
     const auto& s = m.s;
     const int64_t T = batch->n_tok, E = s.n_embd;
+    /* DFly2's passes: the context pass has nothing to do (the drafter keeps no cache; what it
+     * reads the trunk step left in final_hidden and the selection snapshots), the query pass
+     * drafts. */
+    if (batch->draft_pass) {
+        if (!m.df.served) {
+            rad_step_fail(c, "hyv4flash: a drafter pass, and DFly2 is not served");
+            return;
+        }
+        if (batch->draft_pass > 0) m.df.query(c, batch);
+        return;
+    }
     if (batch->enc) {
         m.vision.step(c, batch);
         return;
     }
-    if (batch->draft_pass || batch->gen) {
-        rad_step_fail(c, "hyv4flash serves the text trunk and its tower; the DFly2 drafter and "
-                         "generator passes are not built (WP13)");
+    if (batch->gen) {
+        rad_step_fail(c, "hyv4flash serves the text trunk, its tower and DFly2; generator passes "
+                         "are not built");
         return;
     }
     const int64_t nmm = batch->n_mm_rows;
@@ -954,6 +1020,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
         StepPlan lp = p;
         if (!l.sliding && !lp.select && l.attn.ring_bound(c, batch)) lp.select = true;
         if (!l.sliding && !l.ix.step(c, batch, lp)) return;
+        if (!l.sliding) m.df.snap_step(c, (int)i, m.iw, T, lp.select);
         l.attn.core(c, batch, lp, m.iw.sel, m.iw.len, m.iw.nsel);
         m.calib.after_attn(c, (int)i, T);
         l.hc_attn.post_add(c, m.tr.y, m.tr.post, m.tr.h, T);
@@ -987,7 +1054,11 @@ static void step(RadCtx* c, const RadBatch* batch) {
  * have a chained form (GEMM, norm, rope, kv_store, add, silu_mul, MoE, gather) chain; the others
  * keep their barrier. Bit-identical: the same kernels launched with the barrier bit (WP16.1a).
  * The sparse latent group can stream (--kv-resident): the attention declares the streamed store
- * and the resolve (hyv4flash_attn.h). */
+ * and the resolve (hyv4flash_attn.h).
+ *
+ * No draft depth: DFly2 serves 1 to 5 (hyv4flash_dfly.h), but what a draft pass costs against a
+ * verify row is not measured (kernels/dfly2.md §9, R-2), so `--num-speculative-tokens auto` keeps
+ * speculation off and a deployment asks for the depth it wants. */
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
     out->chain_pays = RAD_CHAIN_ALWAYS;
@@ -1005,6 +1076,9 @@ static uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t*) {
     if (!c || !batch) return 0;
     /* Prefill and mixed passes split their KV by the live context, which no key here carries:
      * unrecorded, as they were without this callback. */
+    /* A DFly2 pass issues the same ops whatever the context (the table carries the trunk's
+     * dense-or-selecting choice on the card); the context pass issues none. */
+    if (batch->draft_pass) return batch->draft_pass > 0 ? 9u : 17u;
     if (batch->phase != RAD_PHASE_DECODE) return 0;
     const StepPlan p = plan(*models[rad_slot(c)], batch);
     return 1u | (p.select ? 2u : 0u) | (p.nonabs ? 4u : 0u);

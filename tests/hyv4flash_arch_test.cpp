@@ -1095,4 +1095,297 @@ TEST(quantised_experts_are_sliced_at_more_ranks) {
     CHECK_EQ(Declared(nl, 2, 0, true).rc, RAD_E_UNSUPPORTED);
 }
 
+/* ================================================================== DFly2 (WP13.3) */
+namespace {
+/* mini with its drafter configured as ref/minicfg.py writes it: one draft layer over trunk layer
+ * 2 (sparse) for both the cache and the selection, mask id V - 1, the selection width
+ * group_topk * ratio. `two` is mini6d2's shape on mini's trunk: two draft layers, both over layer
+ * 2 for the selection and layers 2 and 0 for the cache (0 is refused, so `two` uses 2 twice for
+ * the selection and the test that wants distinct caches edits the keys). */
+MetaKV dfly_meta(int layers = 1) {
+    MetaKV k = mini_meta();
+    k.set("dfly_num_hidden_layers", std::to_string(layers).c_str());
+    k.set("dfly_target_kv_layers", layers == 1 ? "2" : "2 2");
+    k.set("dfly_target_index_layer", layers == 1 ? "2" : "2 2");
+    k.set("dfly_mask_token_id", "319");
+    k.set("dfly_target_index_topk", "16");
+    return k;
+}
+struct DeclDfly {
+    MetaKV mk;
+    RadBuilder b;
+    RadBuildCtx ctx;
+    int rc = 0;
+    std::string err;
+    explicit DeclDfly(int depth = 5, MetaKV m = dfly_meta(), int world = 1, int rank = 0)
+        : mk(std::move(m)) {
+        bf16_encs(&b);
+        ctx = spec_ctx(rank, world, depth);
+        err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
+        if (rc != RAD_OK && std::getenv("HY4_TEST_STDERR")) fputs(err.c_str(), stderr);
+    }
+    const hyv4flash::Dfly& df() const { return hyv4flash::models[0]->df; }
+};
+/* The core's query pass for `n` sequences at `block` rows each, anchored past contexts 40, 47, ..
+ * (kit's decode contexts), the anchor rows the trunk step's rows of the committed ends. */
+struct Query {
+    std::unique_ptr<Kit> k;
+    std::vector<int32_t> anchors;
+    Query(const RadBuilder& b, int64_t n, int64_t block, int64_t depth) {
+        k = query_pass(b, n, block, depth);
+        for (int64_t s = 0; s < n; ++s) anchors.push_back((int32_t)s);
+        k->b.anchor_rows = anchors.data();
+        k->b.positions_h = k->pos.data();
+    }
+};
+const char* kTrunkOnly[] = { "qsa_work", "qsa_tail_store", "idx_pool_gated", "idx_score",
+                             "qsa_select", "engram_ids", "ihc_pre", "ihc_post", "idx_pool_gated_fp8",
+                             "dsa_score", "attn_kv_sink", "mla_attn_paged_sink" };
+}  // namespace
+
+/* kernels/dfly2.md §3.1: a block drafter of block depth + 1 (the anchor predicts nothing), no cache
+ * of its own and window 1 (§3.5 point 1), its proposals at the depth's pitch, the trunk's mask id. */
+TEST(dfly2_is_a_block_drafter_of_block_depth_plus_one_with_window_1) {
+    for (int depth : { 5, 3, 1 }) {
+        DeclDfly d(depth);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        const RadDrafterDecl& dd = d.b.drafter;
+        CHECK_EQ(d.b.drafter_name, std::string("dfly2"));
+        CHECK_EQ(dd.kind, (int)RAD_DRAFT_BLOCK);
+        CHECK_EQ(dd.depth, depth);
+        CHECK_EQ(dd.block, (int64_t)depth + 1);
+        CHECK_EQ(dd.window, (int64_t)1);
+        CHECK_EQ(dd.mask_token, 319);
+        CHECK_EQ(dd.proposal_pitch, (int64_t)depth);
+        CHECK(dd.proposal != 0);
+        CHECK(!d.b.drafter_shared && d.b.drafter_parents == 0);
+        /* No KV group of its own; the snapshots and the proposal persist. */
+        for (const auto& g : d.b.kv_groups) CHECK(g.name.find("dfly") == std::string::npos);
+        for (const char* n : { "dfly.sel_snap.2", "dfly.nsel_snap.2", "dfly.tokens" }) {
+            const RecBuf* bb = find_b(d.b, n);
+            REQUIRE(bb != nullptr);
+            CHECK_EQ(bb->d.kind, (int)RAD_BUF_PERSIST);
+        }
+        /* The served weights are read every step; nothing is renamed or fused anew. */
+        const RecWeight* qb = find_w(d.b, "dfly.blk.0.attn_q_b.weight");
+        REQUIRE(qb != nullptr);
+        CHECK_EQ(qb->d.access, (int)RAD_ACCESS_PER_TOKEN);
+        CHECK(find_w(d.b, "dfly.blk.0.attn_q_nope.weight") == nullptr);
+        CHECK(find_w(d.b, "dfly.correct_gate.weight") != nullptr);
+        CHECK(find_w(d.b, "dfly.correct_up.weight") != nullptr);
+    }
+    /* Without the drafter's config keys (the convert fixture's case) the manifest is declared and
+     * nothing is served. */
+    MetaKV m = mini_meta();
+    m.set("dfly_num_hidden_layers", "1");
+    DeclDfly d(5, m);
+    REQUIRE_EQ(d.rc, RAD_OK);
+    CHECK_EQ(d.b.drafter.kind, (int)RAD_DRAFT_NONE);
+    const RecWeight* qb = find_w(d.b, "dfly.blk.0.attn_q_b.weight");
+    REQUIRE(qb != nullptr);
+    CHECK_EQ(qb->d.access, (int)RAD_ACCESS_RARE);
+    CHECK(d.err.find("DFly2 is declared and not served") != std::string::npos);
+    CHECK_EQ(count_op(d.b, "dfly_sel"), 0);
+}
+
+/* §3.3 / §6: one engine step -- the trunk step (with its snapshots), the empty context pass, the
+ * query pass at depth 5, 3 and 1 -- is lint clean as a whole; the context pass issues nothing; the
+ * query pass none of the trunk's key-side, selection, Engram or hyper-connection ops; and it
+ * stores every block row before its attention. */
+TEST(an_engine_step_with_dfly2_is_lint_clean_and_the_query_pass_touches_no_trunk_state) {
+    for (int depth : { 5, 3, 1 }) {
+        DeclDfly d(depth);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        RadBuilder& b = d.b;
+        const int64_t block = depth + 1;
+        auto trunk = kit(b, std::vector<int>(2, (int)block), {});
+        trunk->b.positions_h = trunk->pos.data();
+        auto ctxp = context_pass(b, *trunk);
+        Query qp(b, 2, block, depth);
+        auto ps = run_passes(b, hyv4flash::step, { trunk.get(), ctxp.get(), qp.k.get() });
+        for (const auto& c : ps) {
+            if (!c->step_fail.empty()) fprintf(stderr, "%s\n", c->step_fail.c_str());
+            CHECK(c->step_fail.empty());
+        }
+        CHECK_LINT(b, ps[0].get(), ps[1].get(), ps[2].get());
+        CHECK_EQ(ps[1]->issues.size(), (size_t)0);
+        const auto q = issued_ops(b, *ps[2]);
+        for (const char* op : kTrunkOnly) CHECK_EQ(std::count(q.begin(), q.end(), std::string(op)), 0);
+        CHECK_EQ(std::count(q.begin(), q.end(), std::string("dfly_sel")), 1);
+        CHECK_EQ(std::count(q.begin(), q.end(), std::string("mla_attn_sel_sink")), 1);
+        CHECK_EQ(std::count(q.begin(), q.end(), std::string("logits_gemm")), depth);
+        CHECK_EQ(std::count(q.begin(), q.end(), std::string("row_topk")), depth);
+        const auto& df = d.df();
+        size_t store = SIZE_MAX, attn = SIZE_MAX;
+        for (size_t i = 0; i < ps[2]->issues.size(); ++i) {
+            if (ps[2]->issues[i].op == df.lay[0].op_store && store == SIZE_MAX) store = i;
+            if (ps[2]->issues[i].op == df.lay[0].op_attn) attn = i;
+        }
+        REQUIRE(store != SIZE_MAX && attn != SIZE_MAX);
+        CHECK(store < attn);
+        /* The trunk step (contexts 40+ pass mini's dense limit of 16) snapshots its selection. */
+        const auto t = issued_ops(b, *ps[0]);
+        int snap = 0;
+        for (const auto& is : ps[0]->issues) snap += is.op == df.snap[0].op_sel;
+        CHECK_EQ(snap, 1);
+    }
+}
+
+/* §3.2: a dense trunk step clears the snapshot's counts (nsel 0: the row attended densely) instead
+ * of copying, and a selecting one copies after qsa_select and before the layer's attention. */
+TEST(the_trunk_snapshots_its_selection_after_qsa_select_and_clears_it_on_a_dense_step) {
+    DeclDfly d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const auto& m = *hyv4flash::models[0];
+    const auto& sn = m.df.snap[0];
+    for (int dense = 0; dense < 2; ++dense) {
+        auto k = kit(d.b, { 1 }, {});
+        if (dense) { k->pos[0] = 5; k->used[0] = 6; k->ctxl[0] = 5; k->b.max_ctx_len = 6; }
+        k->b.positions_h = k->pos.data();
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(d.b, &c);
+        size_t sel = SIZE_MAX, cp = SIZE_MAX, zero = SIZE_MAX, attn = SIZE_MAX;
+        for (size_t i = 0; i < c.issues.size(); ++i) {
+            const rad_op op = c.issues[i].op;
+            if (op == m.layers[2].ix.op_select) sel = i;
+            if (op == sn.op_sel) cp = i;
+            if (op == sn.op_zero) zero = i;
+            if (op == m.layers[2].attn.op_sel || op == m.layers[2].attn.op_paged) attn = i;
+        }
+        REQUIRE(attn != SIZE_MAX);
+        if (dense) {
+            CHECK(zero != SIZE_MAX && zero < attn);
+            CHECK_EQ(cp, SIZE_MAX);
+        } else {
+            CHECK(sel != SIZE_MAX && cp != SIZE_MAX && sel < cp && cp < attn);
+            CHECK_EQ(zero, SIZE_MAX);
+        }
+    }
+}
+
+/* Under streaming (WP14) the query pass resolves its table between the draft rows' store and the
+ * attention, with dfly_sel's entry count, as the trunk resolves its selection. */
+TEST(a_streamed_sparse_group_resolves_the_draft_table_too) {
+    DeclDfly d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const auto& m = *hyv4flash::models[0];
+    const auto& L = m.df.lay[0];
+    REQUIRE(L.op_resolve != 0);
+    REQUIRE(L.op_store_stream != 0);
+    const int64_t blocks = 64, slots = 16, bbytes = 320;
+    std::vector<uint8_t> host((size_t)(blocks * bbytes * 3));
+    std::vector<int32_t> res((size_t)(blocks * 3)), slot_block((size_t)(slots * 3)),
+        slot_state((size_t)(slots * 6)), ctl(16);
+    RadKVStream st{};
+    st.host = host.data(); st.res = res.data(); st.slot_block = slot_block.data();
+    st.slot_state = slot_state.data(); st.ctl = ctl.data(); st.block_bytes = bbytes;
+    st.host_layer_stride = bbytes * blocks; st.slots = slots; st.host_bytes = (int64_t)host.size();
+    Query qp(d.b, 1, 6, 5);
+    qp.k->kv[(size_t)m.kv_sparse - 1].stream = &st;
+    RadCtx c{ .b = &d.b, .batch = &qp.k->b };
+    hyv4flash::step(&c, &qp.k->b);
+    if (!c.step_fail.empty()) fprintf(stderr, "%s\n", c.step_fail.c_str());
+    CHECK(c.step_fail.empty());
+    CHECK_LINT(d.b, &c);
+    size_t store = SIZE_MAX, res_i = SIZE_MAX, attn = SIZE_MAX, plain = SIZE_MAX;
+    for (size_t i = 0; i < c.issues.size(); ++i) {
+        const rad_op op = c.issues[i].op;
+        if (op == L.op_store_stream) store = i;
+        if (op == L.op_store) plain = i;
+        if (op == L.op_resolve) res_i = i;
+        if (op == L.op_attn) attn = i;
+    }
+    REQUIRE(store != SIZE_MAX && res_i != SIZE_MAX && attn != SIZE_MAX);
+    CHECK(store < res_i && res_i < attn);
+    CHECK_EQ(plain, SIZE_MAX);
+    CHECK_EQ(c.issues[res_i].opd[0].handle, L.tab);
+    CHECK_EQ(c.issues[res_i].opd[1].handle, L.cnt);
+}
+
+/* §2: what the drafter cannot serve declares the manifest, names the reason, and declares no
+ * drafter (prompt lookup remains). */
+TEST(dfly2_configurations_it_cannot_serve_are_refused_by_name) {
+    struct Case { const char* key; const char* val; const char* says; int depth; int world; };
+    const Case cases[] = {
+        { "dfly_mask_token_id", "320", "outside the vocabulary", 5, 1 },
+        { "dfly_mask_token_id", "-1", "outside the vocabulary", 5, 1 },
+        { "dfly_target_kv_layers", "1", "not a sparse layer", 5, 1 },          /* sliding */
+        { "dfly_target_index_layer", "0", "not a sparse layer", 5, 1 },
+        { "dfly_target_index_topk", "2048", "group_topk * ratio", 5, 1 },
+        { "dfly_context_local_window", "4", "local window", 5, 1 },
+        { nullptr, nullptr, "trained at 5 proposals", 6, 1 },
+        { nullptr, nullptr, "one rank", 5, 2 },
+    };
+    for (const Case& cs : cases) {
+        MetaKV m = dfly_meta();
+        if (cs.key) m.set(cs.key, cs.val);
+        DeclDfly d(cs.depth, m, cs.world);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        if (d.err.find(cs.says) == std::string::npos) fprintf(stderr, "%s: %s\n", cs.says, d.err.c_str());
+        CHECK(d.err.find(cs.says) != std::string::npos);
+        CHECK_EQ(d.b.drafter.kind, (int)RAD_DRAFT_NONE);
+        CHECK_EQ(count_op(d.b, "dfly_sel"), 0);
+        CHECK(find_w(d.b, "dfly.fusion.weight") != nullptr);
+    }
+    /* Two draft layers over one cache layer: duplicate Lkv. */
+    MetaKV two = dfly_meta(2);
+    DeclDfly d(5, two);
+    REQUIRE_EQ(d.rc, RAD_OK);
+    CHECK(d.err.find("names layer 2 twice") != std::string::npos);
+    /* RADIANCE_HY4_DFLY=0: prompt lookup alone, as --spec-ngram needs. */
+    setenv("RADIANCE_HY4_DFLY", "0", 1);
+    DeclDfly off;
+    unsetenv("RADIANCE_HY4_DFLY");
+    CHECK_EQ(off.b.drafter.kind, (int)RAD_DRAFT_NONE);
+}
+
+/* The core records draft passes too: their ops do not depend on the context, so the key is fixed
+ * a kind (the context pass and the query pass apart). */
+TEST(the_draft_passes_carry_their_own_pass_keys) {
+    DeclDfly d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    auto trunk = kit(d.b, { 1 }, {});
+    auto ctxp = context_pass(d.b, *trunk);
+    Query qp(d.b, 1, 6, 5);
+    RadCtx c1{ .b = &d.b, .batch = &ctxp->b }, c2{ .b = &d.b, .batch = &qp.k->b };
+    const uint64_t kc = hyv4flash::pass_key(&c1, &ctxp->b, nullptr);
+    const uint64_t kq = hyv4flash::pass_key(&c2, &qp.k->b, nullptr);
+    CHECK(kc != 0 && kq != 0 && kc != kq);
+    qp.k->b.max_ctx_len = 4000;
+    CHECK_EQ(hyv4flash::pass_key(&c2, &qp.k->b, nullptr), kq);
+}
+
+/* The debug taps of a query pass: the reference's dump keys (ref/dfly_ref.py), PERSIST, and the
+ * trunk's rotated key part (dbg.attn_kv_rope.<l>, every layer). */
+TEST(the_dfly2_taps_are_the_references_keys) {
+    setenv("RADIANCE_HY4_TAPS", "1", 1);
+    DeclDfly d;
+    unsetenv("RADIANCE_HY4_TAPS");
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const char* names[] = { "dbg.dfly.embed", "dbg.dfly.fused", "dbg.dfly.final", "dbg.dfly.tokens",
+                            "dbg.dfly.attn_in_norm.0", "dbg.dfly.attn_q_resid.0",
+                            "dbg.dfly.attn_kv_row.0", "dbg.dfly.attn_gate_logits.0",
+                            "dbg.dfly.attn_o_proj.0", "dbg.dfly.attn_out.0", "dbg.dfly.resid_mid.0",
+                            "dbg.dfly.ffn_in_norm.0", "dbg.dfly.mlp_out.0", "dbg.dfly.resid.0",
+                            "dbg.dfly.sel_ids.0", "dbg.dfly.len.0", "dbg.dfly.corrected.4",
+                            "dbg.dfly.logits.0", "dbg.dfly.cand_idx.4", "dbg.dfly.cand_val.0",
+                            "dbg.dfly.slot", "dbg.dfly.pos", "dbg.dfly.anchor",
+                            "dbg.attn_kv_rope.0", "dbg.attn_kv_rope.1", "dbg.attn_kv_rope.2" };
+    for (const char* n : names) {
+        const RecBuf* bb = find_b(d.b, n);
+        if (!bb) fprintf(stderr, "missing %s\n", n);
+        REQUIRE(bb != nullptr);
+        CHECK_EQ(bb->d.kind, (int)RAD_BUF_PERSIST);
+    }
+    auto trunk = kit(d.b, { 6, 6 }, {});
+    trunk->b.positions_h = trunk->pos.data();
+    auto ctxp = context_pass(d.b, *trunk);
+    Query qp(d.b, 2, 6, 5);
+    auto ps = run_passes(d.b, hyv4flash::step, { trunk.get(), ctxp.get(), qp.k.get() });
+    for (const auto& c : ps) CHECK(c->step_fail.empty());
+    CHECK_LINT(d.b, ps[0].get(), ps[1].get(), ps[2].get());
+}
+
 RAD_TEST_MAIN()

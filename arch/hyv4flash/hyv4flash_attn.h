@@ -112,7 +112,7 @@ struct Attn {
     rad_op op_absorb = 0, op_paged = 0, op_sel = 0, op_expand = 0;
     rad_op op_lat_copy = 0, op_kvb = 0, op_split = 0, op_qn_copy = 0, op_qr_copy = 0, op_dense = 0, op_rebase = 0;
     rad_op op_gate = 0, op_post_norm = 0, op_ar = 0;
-    Tap t_in_norm{}, t_q_resid{}, t_kv_latent{}, t_gate{}, t_o_proj{}, t_out{};
+    Tap t_in_norm{}, t_q_resid{}, t_kv_latent{}, t_kv_rope{}, t_gate{}, t_o_proj{}, t_out{};
 
     /* `ap` is the checkpoint's `model.layers.<l>.self_attn`. `group` is the layer's latent KV
      * group, declared by the caller right before this (its block size is this layer's ops'). */
@@ -241,6 +241,8 @@ struct Attn {
         RAD_ARCH_TRY(t_in_norm.declare(b, nm, T, "attn_in_norm", l, RAD_BF16, s.n_embd, xa));
         RAD_ARCH_TRY(t_q_resid.declare(b, nm, T, "attn_q_resid", l, RAD_BF16, s.q_lora, w.qa));
         RAD_ARCH_TRY(t_kv_latent.declare(b, nm, T, "attn_kv_latent", l, RAD_BF16, L, w.row));
+        /* The cache row's rotated key part (what a DFly2 draft layer reads back, WP13). */
+        RAD_ARCH_TRY(t_kv_rope.declare(b, nm, T, "attn_kv_rope", l, RAD_BF16, R, w.row));
         /* The gate's logits are the rank's heads only: tapped at one rank. */
         if (s.world == 1)
             RAD_ARCH_TRY(t_gate.declare(b, nm, T, "attn_gate_logits", l, RAD_BF16, a.v_width(),
@@ -365,6 +367,7 @@ struct Attn {
         const RadOperand rpos = rope_pos_of(s, batch, T);
         RAD_ISSUE_N(c, op_q_rope, T, brows(w.q_rope, T), rpos);
         RAD_ISSUE_N(c, op_k_rope, T, bcol(w.row, L, R, T), rpos);
+        t_kv_rope.step(c, bcol(w.row, L, R, T), T);
         const int64_t half = (L + R) / 2;
         if (!kb->stream) {
             RAD_ISSUE_N(c, op_store, T, bcol(w.row, 0, half, T), bcol(w.row, half, half, T),

@@ -25,12 +25,16 @@ constexpr int EHEADS = 10, EHD = 8, EROWS = 264; /* 11+13+17+19+23 + 29+31+37+41
 constexpr int DFF = 192, VE = 32, VF = 64, VP = 4, VM = 2, VPOS = 17;
 
 struct Fixture {
-    tiny::TempDir dir{ "hyv4flash_convert" };
+    tiny::TempDir dir;
     std::string ckpt;
     std::map<std::string, std::string> src;
     bool ok = false;
 
-    Fixture() {
+    /* `dfly_cfg`: the drafter's full config (its target layers, mask id and selection width), so
+     * that declare serves it (hyv4flash_dfly.h); without, the drafter is declared only. The
+     * tensors are the same either way. */
+    explicit Fixture(bool dfly_cfg = false)
+        : dir(dfly_cfg ? "hyv4flash_convert_dfly" : "hyv4flash_convert") {
         if (!dir.ok()) return;
         ckpt = dir / "model";
         if (!std::filesystem::create_directory(ckpt)) return;
@@ -206,6 +210,14 @@ struct Fixture {
             mat("vit.perceive.proj.2.bias", { H });
             mat("vit.perceive.image_newline", { H });
         }
+        if (dfly_cfg) {
+            config["dfly_target_kv_layers"] = { 2 };
+            config["dfly_target_index_layer"] = { 2 };
+            config["dfly_mask_token_id"] = V - 1;
+            config["dfly_target_index_topk"] = 16;
+            config["dfly_context_local_window"] = nullptr;
+            config["dfly_mtp_fusion"] = "slot0";
+        }
         if (!tiny::write_checkpoint(ckpt, config, ts)) return;
         for (const auto& t : ts) src[t.name] = std::string(t.bytes.begin(), t.bytes.end());
         ok = true;
@@ -225,6 +237,10 @@ struct Fixture {
 
 const Fixture& fixture() {
     static const Fixture f;
+    return f;
+}
+const Fixture& fixture_dfly() {
+    static const Fixture f(true);
     return f;
 }
 
@@ -357,6 +373,57 @@ TEST(max_spec_0_leaves_the_drafter_out) {
     REQUIRE_EQ(f.open(out.c_str()), RAD_OK);
     CHECK(f.find("dfly.blk.0.attn_q_a.weight") == nullptr);
     CHECK(f.find("blk.2.attn_q_a.weight") != nullptr);
+}
+
+/* WP13.3: serving DFly2 changes nothing stored. The same checkpoint with the drafter's full config
+ * (declare then builds its passes, at rad-convert's default max_spec) and without (the manifest
+ * alone, as before WP13.3) gives the same `dfly.*` entries: names, shapes, groups, encodings and
+ * bytes, each the checkpoint's tensor as shipped. */
+TEST(serving_the_drafter_leaves_its_stored_tensors_as_the_manifest_declared_them) {
+    const Fixture& a = fixture();
+    const Fixture& d = fixture_dfly();
+    REQUIRE(a.ok && d.ok);
+    std::string la, ld;
+    const std::string oa = a.dir / "manifest.rad", od = d.dir / "served.rad";
+    REQUIRE_EQ(a.convert(oa, {}, &la), 0);
+    REQUIRE_EQ(d.convert(od, {}, &ld), 0);
+    CHECK(la.find("DFly2 is declared and not served") != std::string::npos);
+    CHECK(ld.find("DFly2 is declared and not served") == std::string::npos);
+    CHECK(ld.find("are read by no declared weight") == std::string::npos);
+    RadFile fa, fd;
+    REQUIRE_EQ(fa.open(oa.c_str()), RAD_OK);
+    REQUIRE_EQ(fd.open(od.c_str()), RAD_OK);
+    auto dfly = [](const RadFile& f) {
+        std::map<std::string, const RadFileEntry*> m;
+        for (int64_t i = 0; i < f.entry_count(); ++i) {
+            const RadFileEntry& e = f.entry(i);
+            const std::string n = f.str(e.name);
+            if (n.rfind("dfly.", 0) == 0) m[n] = &e;
+        }
+        return m;
+    };
+    const auto ma = dfly(fa), md = dfly(fd);
+    CHECK_EQ(ma.size(), (size_t)26);   /* 14 a layer + 12 model-level (the confidence head too) */
+    CHECK_EQ(ma.size(), md.size());
+    for (const auto& [n, ea] : ma) {
+        auto it = md.find(n);
+        if (it == md.end()) { fprintf(stderr, "'%s' missing when served\n", n.c_str()); CHECK(false); continue; }
+        const RadFileEntry& eb = *it->second;
+        CHECK_EQ(ea->rank, eb.rank);
+        for (uint32_t k = 0; k < ea->rank; ++k) CHECK_EQ(ea->shape[k], eb.shape[k]);
+        CHECK_EQ(ea->layer, eb.layer);
+        CHECK_EQ(ea->n_planes, eb.n_planes);
+        CHECK_EQ(ea->bytes, eb.bytes);
+        CHECK(std::string(fa.str(ea->quantizer)) == fd.str(eb.quantizer));
+        if (ea->n_planes == 1 && eb.n_planes == 1) CHECK(plain(fa, n) == plain(fd, n));
+    }
+    auto at = [&](const std::string& n) { return d.src.at(n); };
+    const std::string p = "model.dfly_layers.";
+    CHECK(plain(fd, "dfly.blk.0.attn_q_b.weight") == at(p + "0.self_attn.q_b_proj.weight"));
+    CHECK(plain(fd, "dfly.correct_gate.weight") == at(p + "hidden_correction.gate_proj.weight"));
+    CHECK(plain(fd, "dfly.correct_up.weight") == at(p + "hidden_correction.up_proj.weight"));
+    CHECK(plain(fd, "dfly.confidence.weight") == at(p + "confidence_head.proj.weight"));
+    CHECK(fd.find("dfly.token_embd.weight") == nullptr);   /* the release shares the trunk's */
 }
 
 TEST(the_bf16_recipe_stores_the_engram_table_as_e4m3_rows) {
