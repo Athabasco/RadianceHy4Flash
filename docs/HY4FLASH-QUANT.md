@@ -21,6 +21,29 @@ Recipe patterns must use the new names: `blk.*.attn_q_nope.weight`, not `attn_q_
 Engram tables, DFly2 and the tower keep their names. Router, iHC, sinks, indexer pooling and the
 position parameters are not quantisable (a recipe naming one is refused at declare).
 
+## What changed since "ready" (6dcaa5c8)
+
+- **Update the engine.** A decode or verify step that crossed the 2048 dense limit was refused as issued
+  differently from its recording (the pass key now carries whether the step selects; 2528faf5, with the
+  WP13.0 rollback gate in b72b7994). Anything older fails the second step of a request that crosses 2048.
+- **Re-convert for the vision tower only.** The tower is served now, with its weights re-declared: fused
+  `v.blk.N.attn_qkv.{weight,bias}`, `v.position.weight` without the cls row (rows 1..side^2), and
+  `v.merger.newline` as `[1, E]`. The text trunk's names are unchanged, so a container made for text needs
+  the tower weights re-converted, nothing else. It is served only when the config has the M-RoPE sections,
+  the vision heads and the media ids, and `--mm-max-patches` is given.
+- **Media decoding needs ffmpeg at build time**: configure with `-DRAD_WITH_FFMPEG=ON` and
+  `PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig`. The default AUTO configure finds none and the server refuses
+  every picture or video part.
+- **Streamed sparse KV** (`--kv-resident N`, [KV-STREAMING.md](KV-STREAMING.md)): the sparse latent group lives
+  in host memory and a ring of N tokens x max_seqs stays on the card; only worth it past the ring floor
+  (32768 tokens a sequence). Bit-identical to resident on gpu-mini.
+- **Optional FP8 indexer**: `RADIANCE_HY4_INDEXER=fp8` (default `exact`; other values refused). Opt-in and
+  not part of "ready": on dummies its selection differs from the exact path (Jaccard ~0.97-0.99), so your KL
+  with real weights decides whether to use it.
+- **Chained launches are on** for Hy4-flash decode (about 8 % faster on gpu-mini); nothing to set.
+- **TP4 and `tcq_rows`**: unchanged, already in the section on tensor parallelism below (128 rows on the
+  gate_ups, 256 on the attention projections); a trellis container with other runs is refused at TP4.
+
 ## The commands
 
 ```sh
@@ -113,8 +136,8 @@ listed as OPEN with the command that decides them.
   (bf16 activation rounding), TP4 against TP1 to 2 %.
 - The indexer's selection ties (relu scores of 0) and the router's near-ties break differently from HF's `topk`;
   a parity comparison on random weights needs the conditioned reference of `ref/` (README there).
-- DFly2 (speculation), the vision tower and the reply format (tool calls, reasoning markers) are not served;
-  `--max-spec 0` is a `rad-convert` flag.
+- DFly2 (speculation) is not served; `--max-spec 0` is a `rad-convert` flag. Pictures and video are served on the
+  dummies only (no real tower weight has run).
 - `gpu-mini` does not start on a card in some builds (Engram round trip kernels); the real-geometry card
   numbers are not measured.
 - Engram E4M3 rows are not exact against the port in bf16 (2.9 % of codes differ by one step: the port divides in
