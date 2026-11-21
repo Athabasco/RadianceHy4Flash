@@ -34026,6 +34026,149 @@ static void hy4_ihc_junction_case(const Plugin& pl) {
     }
 }
 
+/* ------------------------------------------------------------------ ar_rmsnorm_ihc_junction */
+/* The all-reduce twin of the iHC junction (WP16.2) at two and four ranks. Each rank's message is
+ * its own `a` (with the add, bf16(a + b) of its own b); the streams, the weights and the write
+ * weights are replicated, as in the model. The oracle: the exact fold of the messages on the host
+ * (two ranks: mine + peer in f32, rounded as __hip_bfloat16 rounds; four: from 0.0f in ascending
+ * rank), then rmsnorm_ihc_junction_bf16 on the card over that sum -- which the case above holds
+ * to the five unfused rows byte for byte. Every rank must leave those bytes in every operand. The
+ * two-rank row is run plain and coded (the launch's `coded` pin) on the same instance, a decode
+ * row to past the coded floor (192 x 3072 is 1.1 MiB). */
+struct ArIj {
+    const RadKernelInfo* row = nullptr;
+    int rank = 0, dev = 0, world = 2;
+    IjCase c;
+    IjData d;
+    std::vector<int> coded_seq;
+    void* inst = nullptr;
+    int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
+    std::vector<IjData> out;   /* one a launch */
+};
+static void ar_ij_worker(ArIj* t) {
+    if (st_set_device(t->dev) != hipSuccess) { t->rc_init = RAD_E_DEVICE; return; }
+    std::vector<RadParam> ps = ij_params(t->c);
+    ps.push_back(PI("world_size", t->world));
+    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, t->world, &t->inst);
+    if (t->rc_init != RAD_OK) return;
+    const size_t rounds = t->coded_seq.empty() ? 1 : t->coded_seq.size();
+    for (size_t r = 0; r < rounds && t->rc_launch == RAD_OK; ++r) {
+        IjDev d;
+        if (!d.up(t->c, t->d)) { t->rc_launch = RAD_E_NOMEM; d.free_all(); break; }
+        std::vector<RadTensor> ts = d.ts(t->c, t->c.add);
+        std::vector<RadParam> lp = ps;
+        if (!t->coded_seq.empty()) lp.push_back(PI("coded", t->coded_seq[r]));
+        RadArgs a{};
+        a.t = ts.data(); a.n_t = (int)ts.size(); a.p = lp.data(); a.n_p = (int)lp.size();
+        a.instance = t->inst; a.rank = t->rank; a.world_size = t->world;
+        t->rc_launch = t->row->launch(&a, nullptr);
+        if (st_stream_sync(nullptr) != hipSuccess && t->rc_launch == RAD_OK) t->rc_launch = RAD_E_DEVICE;
+        IjData o = t->d;
+        d.down(o);
+        t->out.push_back(std::move(o));
+        d.free_all();
+    }
+}
+static uint16_t ij_rne_nan(float f) {
+    uint32_t u; std::memcpy(&u, &f, 4);
+    if (f != f) return (uint16_t)((u | 0x400000u) >> 16);
+    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+static void ar_ihc_junction_case(const Plugin& pl, const std::vector<int>& devs, const char* name,
+                                 int world) {
+    const RadKernelInfo* row = find(pl, name);
+    const RadKernelInfo* plain = find(pl, "rmsnorm_ihc_junction_bf16");
+    if (!row || !plain) { ok(name, false, "row absent"); return; }
+    if ((int)devs.size() < world) {
+        skip(name, (std::string("needs ") + std::to_string(world) + " gfx1201 cards").c_str());
+        return;
+    }
+    if (!ar_peer_path_ok(devs, world)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
+    const bool host = std::strstr(name, "_host") != nullptr;
+    std::vector<IjCase> cs;
+    auto C = [&](int64_t M, int64_t n, bool add, bool ys, bool xs, bool tail, bool head) {
+        IjCase c; c.M = M; c.n = n; c.hc = 4; c.add = add; c.ys = ys; c.xs = xs; c.tail = tail; c.head = head;
+        cs.push_back(c);
+    };
+    C(1, 3072, false, false, false, true, false); C(1, 3072, true, true, true, true, false);
+    C(6, 3072, true, false, false, true, false);  C(17, 512, false, true, false, true, true);
+    C(3, 512, true, false, false, false, false);
+    if (world == 2) { C(192, 3072, true, false, false, true, false); C(96, 3072, false, true, true, true, false); }
+    else C(32, 3072, true, false, false, true, false);
+    for (const IjCase& c : cs) {
+        const std::string at = fmt(" M=%lld n=%lld%s%s%s%s", (long long)c.M, (long long)c.n,
+                                   c.add ? ", add" : "", c.tail ? "" : ", tail 0", c.head ? ", head form" : "",
+                                   c.ys || c.xs ? ", y / x stored" : "");
+        const bool big = c.M * c.n * 2 >= 512 * 1024;
+        std::vector<ArIj> t((size_t)world);
+        IjData shared = ij_data(c, (uint32_t)(c.M * 17 + c.n + c.add));
+        for (int r = 0; r < world; ++r) {
+            ArIj& x = t[(size_t)r];
+            x.row = row; x.rank = r; x.dev = devs[(size_t)r]; x.world = world; x.c = c;
+            x.d = shared;
+            IjData own = ij_data(c, (uint32_t)(1000 + r * 7919 + c.M * 3 + c.n));
+            x.d.a = own.a;
+            x.d.b = own.b;
+            if (world == 2 && !host) x.coded_seq = big ? std::vector<int>{ 0, 1, 1, 0 } : std::vector<int>{ 0, 1 };
+        }
+        std::vector<std::thread> th;
+        for (ArIj& x : t) th.emplace_back(ar_ij_worker, &x);
+        for (std::thread& x : th) x.join();
+        bool up = true, ran = true;
+        std::string rcs;
+        for (const ArIj& x : t) {
+            up = up && x.rc_init == RAD_OK; ran = ran && x.rc_launch == RAD_OK;
+            rcs += std::to_string(x.rc_init) + "/" + std::to_string(x.rc_launch) + " ";
+        }
+        ok((std::string(name) + at + " init (peer rendezvous)").c_str(), up, "init/launch rc " + rcs);
+        if (!up) continue;
+        ok((std::string(name) + at + " launch").c_str(), ran, "init/launch rc " + rcs);
+        if (ran) {
+            /* the reference: the host fold, then the plain junction on card 0 */
+            IjData ref = shared;
+            for (int64_t i = 0; i < c.M * c.n; ++i) {
+                float m[4];
+                for (int r = 0; r < world; ++r) {
+                    const IjData& dr = t[(size_t)r].d;
+                    m[r] = c.add ? h_bf16(h_to_bf16(h_bf16(dr.a[(size_t)i]) + h_bf16(dr.b[(size_t)i])))
+                                 : h_bf16(dr.a[(size_t)i]);
+                }
+                float acc;
+                if (world == 2) acc = m[0] + m[1];
+                else { acc = 0.0f; for (int r = 0; r < world; ++r) acc += m[r]; }
+                ref.a[(size_t)i] = ij_rne_nan(acc);
+            }
+            st_set_device(devs[0]);
+            IjDev d;
+            IjCase cr = c;
+            cr.add = false;
+            int rc = d.up(cr, ref) ? RAD_OK : RAD_E_NOMEM;
+            if (rc == RAD_OK) {
+                std::vector<RadTensor> ts = d.ts(cr, false);
+                std::vector<RadParam> p = ij_params(cr);
+                rc = ij_run_row(plain, ts, p);
+                d.down(ref);
+            }
+            d.free_all();
+            int64_t bad = 0;
+            std::string first;
+            for (const ArIj& x : t)
+                for (size_t k = 0; k < x.out.size(); ++k) {
+                    std::string f;
+                    const int64_t b = ij_diff(c, x.out[k], ref, &f);
+                    if (b && first.empty()) first = fmt("rank %d launch %zu%s: %s", x.rank, k,
+                                                         x.coded_seq.empty() ? "" : x.coded_seq[k] ? " (coded)" : " (plain)",
+                                                         f.c_str());
+                    bad += b;
+                }
+            ok((std::string(name) + at + ": every rank, every launch, the fold + rmsnorm_ihc_junction's bytes").c_str(),
+               rc == RAD_OK && bad == 0, fmt("reference rc %d; %lld values differ%s%s", rc, (long long)bad,
+                                             first.empty() ? "" : "; first ", first.c_str()));
+        }
+        if (row->fini) for (ArIj& x : t) if (x.inst) row->fini(x.inst);
+    }
+}
+
 static void hy4_gate_mul_case(const Plugin& pl) {
     if (!sel("gate_mul_bf16")) return;
     struct G { int64_t M, n, pad; };
@@ -37758,6 +37901,14 @@ static void device_phase(const Plugin& pl) {
                 ar_hc_coded_case(pl, devs, n.c_str(), std::strstr(base, "gather") != nullptr);
             }
         }
+    }
+    /* Hy4-flash's iHC junction behind the exact all-reduce, two and four ranks, and the twins. */
+    for (const char* n : { "ar_rmsnorm_ihc_junction", "ar_rmsnorm_ihc_junction_host",
+                           "ar_rmsnorm_ihc_junction_4rank", "ar_rmsnorm_ihc_junction_4rank_host" }) {
+        if (!sel(n)) continue;
+        if (!g_case) std::printf("\ncross-rank, fused with the iHC junction\n");
+        std::printf("  %s\n", n);
+        ar_ihc_junction_case(pl, devs, n, std::strstr(n, "4rank") ? 4 : 2);
     }
     /* The wide rows at every width are dispatched above and skip themselves, naming the width
      * they need, on a box with fewer cards. */

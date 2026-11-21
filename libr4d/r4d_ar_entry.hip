@@ -22,6 +22,7 @@
 #include "r4d.h"
 #include "r4d_ar_shards.h"
 #include "r4d_ar_links.h"
+#include "r4d_ihc.h"         // ar_rmsnorm_ihc_junction's operands
 
 #include <condition_variable>
 #include <cstdio>
@@ -1659,6 +1660,69 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_i8_4rank(const RadArgs* a, RadStream s) 
         r4d_geti_or(a, "chain", 0) != 0 ? 1 : 0, in->host ? 0 : (int)sp);
     if (e != 0) return RAD_E_SHAPE;
     return early ? RAD_LINK_ENDED : RAD_OK;
+}
+
+/* ar_rmsnorm_ihc_junction (WP16.2): the exact all-reduce of `a` [after the add] and Hy4-flash's iHC
+ * junction over the reduced sum (r4d_ar_ihc_junction.hip). The operands are rmsnorm_ihc_junction's,
+ * checked by the same function; `a` is the message, so it must be tight. A block owns whole rows:
+ * one a row up to 256 blocks, as ar_rmsnorm_quant_i8's two-rank form. The exact wire's push is
+ * coded (r4d_ar_arc2.h, lossless) from the fused writes' floor on P2P instances, rows of whole 256
+ * values; the norms read the sum, so no lossy wire. The chained form at decode heights only. */
+static int ar_ihc_junction_common(const RadArgs* a, const ArInst* in, r4d_ihc::R4dIhcJunction* j,
+                                  R4dArCfg* cfgv, int* nblocks) {
+    if (in->dtype != 0) return RAD_E_DTYPE;
+    const int rc = r4d_ihc_junction_args(a, j);
+    if (rc != RAD_OK) return rc;
+    if (j->hc != 2 && j->hc != 4 && j->hc != 8) return RAD_E_UNSUPPORTED;
+    if (j->ap != (long long)j->r.n) return RAD_E_STRIDE;
+    if (j->M * (long long)j->r.n > in->max_numel) return RAD_E_SHAPE;
+    r4d_cfg_ar(a, cfgv);
+    int nb = cfgv->nblocks > 0 ? cfgv->nblocks : (int)j->M;
+    if (nb > (int)j->M) nb = (int)j->M;
+    if (nb > 256) nb = 256;
+    if (nb > in->max_blocks) nb = in->max_blocks;
+    *nblocks = nb < 1 ? 1 : nb;
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_ar_rmsnorm_ihc_junction(const RadArgs* a, RadStream s) {
+    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+    if (!in) return RAD_E_STATE;
+    if (in->world != 2) return RAD_E_SHAPE;
+    r4d_ihc::R4dIhcJunction j;
+    R4dArCfg cfgv;
+    int nblocks = 1;
+    const int rc = ar_ihc_junction_common(a, in, &j, &cfgv, &nblocks);
+    if (rc != RAD_OK) return rc;
+    const long words16 = (long)(j.M * (long long)j.r.n / 8);
+    const long coded = j.r.n % 256 == 0 ? ar_coded(a, in, words16) : 0;
+    const int chain = r4d_geti_or(a, "chain", 0) != 0 && j.M <= 64 ? 1 : 0;
+    const int e = r4d_ar_ihc_junction_2rank(in->peer_scratch[0], in->my_scratch, in->peer_flags[0],
+                                            in->my_flags, in->my_seq, in->slot16, &j,
+                                            (long)(uintptr_t)s, nblocks, cfgv.drain, cfgv.acq,
+                                            in->my_stage, chain, coded ? 1 : 0);
+    return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
+/* Four ranks, on the wide one-shot (r4d_rad_ar_hc_wide_init's instance, shared with
+ * ar_rmsnorm_quant_i8_4rank's key rule). One-shot only: a caller issues it at decode heights and
+ * the unfused pair above them, whose all_reduce goes two-shot. */
+extern "C" int r4d_rad_ar_rmsnorm_ihc_junction_4rank(const RadArgs* a, RadStream s) {
+    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+    if (!in) return RAD_E_STATE;
+    if (in->world != 4) return RAD_E_SHAPE;
+    r4d_ihc::R4dIhcJunction j;
+    R4dArCfg cfgv;
+    int nblocks = 1;
+    const int rc = ar_ihc_junction_common(a, in, &j, &cfgv, &nblocks);
+    if (rc != RAD_OK) return rc;
+    const int chain = r4d_geti_or(a, "chain", 0) != 0 && j.M <= 64 ? 1 : 0;
+    const int e = r4d_ar_ihc_junction_4rank(
+        in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2], in->peer_flags[0],
+        in->peer_flags[1], in->peer_flags[2], in->my_scratch, in->my_flags, in->my_seq,
+        in->slot16, &j, (int)in->rank, (long)(uintptr_t)s, nblocks, cfgv.drain, cfgv.acq,
+        cfgv.pub, chain);
+    return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
 /* The all-reduce with the gated residual write: `all_reduce` of `y`, then `hc_write` of the reduced

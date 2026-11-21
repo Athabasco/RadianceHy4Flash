@@ -497,6 +497,8 @@ int r4d_rad_mhc_contract(const RadArgs*, RadStream);
 int r4d_rad_ihc_pre(const RadArgs*, RadStream);
 int r4d_rad_ihc_post(const RadArgs*, RadStream);
 int r4d_rad_rmsnorm_ihc_junction(const RadArgs*, RadStream);
+int r4d_rad_ar_rmsnorm_ihc_junction(const RadArgs*, RadStream);
+int r4d_rad_ar_rmsnorm_ihc_junction_4rank(const RadArgs*, RadStream);
 int r4d_rad_gate_mul(const RadArgs*, RadStream);
 int r4d_rad_mla_project_kv(const RadArgs*, RadStream);
 int r4d_rad_mla_expand_gate(const RadArgs*, RadStream);
@@ -1130,6 +1132,7 @@ int r4d_fuse_qk_norm_rope_gate_kv_store_streamed(const RadParam*, int, uint64_t,
 int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_ar_gather_hc_write  (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_rmsnorm_ihc_junction (const RadParam*, int, uint64_t, int, RadFuseStep*);
+int r4d_fuse_ar_rmsnorm_ihc_junction(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_attn_paged_gate_quant(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_attn_paged_gate_had_quant(const RadParam*, int, uint64_t, int, RadFuseStep*);
 

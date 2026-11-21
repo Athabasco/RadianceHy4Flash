@@ -1,6 +1,7 @@
 // r4d_ihc.h -- the independent hyper-connection's device pieces, shared by ihc_pre
-// (r4d_ihc_bf16.hip) and the fused junction rmsnorm_ihc_junction (same unit). One summation order
-// for both, so the fused row is ihc_pre's bytes.
+// (r4d_ihc_bf16.hip), the fused junction rmsnorm_ihc_junction (same unit) and its all-reduce twin
+// ar_rmsnorm_ihc_junction (r4d_ar_ihc_junction.hip). One summation order for all of them, so the
+// fused rows are ihc_pre's bytes.
 //
 // ihc_pre's order (WP16.2; the scalar kernel it replaced strided single columns by 256 threads):
 // a workgroup of kIhcThreads = 512 a token row. The row's W = hc * n values are pieces of eight

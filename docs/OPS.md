@@ -2638,6 +2638,7 @@ device code.
 | `ar_rmsnorm_quant_i8` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt `sp`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `ar_rmsnorm_quant_i8g` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `ar_hc_write` | `M`(range) `n` `hc` `world_size` `dtype` `wire`/opt | `y`:inout, `inj`, `h`:inout |
+| `ar_rmsnorm_ihc_junction` | `M`(range) `n` `hc` `rows` `eps`:f64 `ihc_eps`:f64/opt `hc_eps`:f64/opt `post_mag`:f64/opt `tail`/opt `world_size` `dtype` | as `rmsnorm_ihc_junction`; `a` is the message (see "Hy4-flash") |
 | `ar_gather_hc_write` | `M`(range) `n` `hc` `top_k` `world_size` `dtype` `act`/opt `wire`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout, `inj`, `h`:inout |
 | `ar_ln_had_quant_i8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gdn_gated_norm_had_quant_i8` | `M` `n` `head_dim` `group` `eps`:f64 `dtype` `zgrp`/opt `zblk`/opt | `x`, `z`, `w`w → `q`, `scale` |
@@ -3799,7 +3800,7 @@ post[j]  = post_mag * sigmoid(c[hc+j] * scale[1] + base[hc+j]) + hc_eps     with
   from 0.0f in order, the sum of squares in f32 the same way. It agrees with libref within the
   op's bound (`x` one bf16 ulp, `post` 2e-4 relative) and its bytes depend on the row alone.
 
-### `rmsnorm_ihc_junction`
+### `rmsnorm_ihc_junction`, `ar_rmsnorm_ihc_junction`
 
 The junction between two blocks of an iHC model in one op. In sequence:
 
@@ -3817,6 +3818,13 @@ weights into `post` (which ihc_post read first); `rows` hc is the head's collaps
 `post`. `tail` 0 stops behind ihc_post (fn .. xn absent): an Engram writes h in front of the next
 layer. `y` and `x` are the chain's intermediates, stored only when passed (the debug taps).
 
+`ar_rmsnorm_ihc_junction` (device-only, `world_size` 2 or 4, plus the junction's parameters and
+operands) is the exact `all_reduce` of `a` (after the add, which each rank applies to its own
+partial) followed by the junction over the reduced sum, which lands in `a`; byte-identical to
+`[add ->] all_reduce (exact) -> rmsnorm_ihc_junction`. The norms and a calibration read the sum,
+so there is no lossy wire; at two ranks the exact wire's push is coded losslessly (about 12.1 bits
+a value, the fused writes' form) from 512 KiB on rows of whole 256 values. At four ranks it is a
+one-shot, for decode and verify heights; a caller issues the chain above them.
 
 ### `mla_project_kv`
 

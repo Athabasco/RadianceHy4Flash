@@ -653,10 +653,15 @@ static const RadOperandSpec oIhcPost[] = {
     {"y", RAD_OPD_IN, 0}, {"post", RAD_OPD_IN, 0}, {"h", RAD_OPD_INOUT, 0},
 };
 /* rmsnorm_ihc_junction: `[add] -> rmsnorm -> ihc_post -> [ihc_pre -> rmsnorm]` in one launch
- * (WP16.2). `tail` 0 stops behind ihc_post (no fn .. xn). */
+ * (WP16.2); ar_rmsnorm_ihc_junction the same behind the exact all-reduce of `a`. `tail` 0 stops
+ * behind ihc_post (no fn .. xn). */
 static const RadParamSpec pIhcJunction[] = {
     P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("rows"), P_F64("eps"), P_F64O("ihc_eps"),
     P_F64O("hc_eps"), P_F64O("post_mag"), P_INTO("tail"), P_STR("dtype"),
+};
+static const RadParamSpec pArIhcJunction[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("rows"), P_F64("eps"), P_F64O("ihc_eps"),
+    P_F64O("hc_eps"), P_F64O("post_mag"), P_INTO("tail"), P_INT("world_size"), P_STR("dtype"),
 };
 static const RadOperandSpec oIhcJunction[] = {
     {"a", RAD_OPD_INOUT, 0}, {"b", RAD_OPD_IN, 1}, {"w_post", RAD_OPD_WEIGHT, 0},
@@ -4205,6 +4210,9 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("ar_rmsnorm_had_quant_i8g", pArRmsNormQuantFp8, oArRmsNormQuantFp8,
            "the two-rank all-reduce of x and rmsnorm_had_quant_i8g after it, in one kernel; "
            "either wire, as ar_rmsnorm_quant_fp8."),
+    SCHEMA("ar_rmsnorm_ihc_junction", pArIhcJunction, oIhcJunction,
+           "the exact all-reduce of `a` (after the add, when `b` is passed) and rmsnorm_ihc_junction "
+           "over the reduced sum, in one kernel; the reduced sum lands in `a`."),
     SCHEMA("ar_hc_write", pArHcWrite, oArHcWrite,
            "the all-reduce and the gated residual's write that follows it, in one kernel. Both "
            "wires at two ranks, the exact one at four."),
@@ -5273,6 +5281,18 @@ static const RadConstraint cIhcPre[] = {
 static const RadConstraint cIhcJunction[] = {
     C_GE("M", 1), C_LE("M", 65535), C_GE("n", 8), C_LE("n", 16384), C_DIV("n", 8),
     C_GE("hc", 2), C_LE("hc", 8), C_GE("rows", 2), C_LE("rows", 16), C_IN("dtype", "bf16"),
+};
+/* The twin: two ranks (the coded push from 512 KiB, rows of whole 256 values), and four on the
+ * wide one-shot. hc 2, 4 or 8 are built. */
+static const RadConstraint cArIhcJunction2[] = {
+    C_GE("M", 1), C_LE("M", 65535), C_GE("n", 8), C_LE("n", 16384), C_DIV("n", 8),
+    C_GE("hc", 2), C_LE("hc", 8), C_GE("rows", 2), C_LE("rows", 16), C_IN("dtype", "bf16"),
+    C_EQ("world_size", 2), C_P2P,
+};
+static const RadConstraint cArIhcJunction4[] = {
+    C_GE("M", 1), C_LE("M", 65535), C_GE("n", 8), C_LE("n", 16384), C_DIV("n", 8),
+    C_GE("hc", 2), C_LE("hc", 8), C_GE("rows", 2), C_LE("rows", 16), C_IN("dtype", "bf16"),
+    C_EQ("world_size", 4), C_P2P,
 };
 static const RadConstraint cGateMul[] = { C_GE("M", 1), C_LE("M", 65535), C_GE("n", 1),
                                           C_IN("dtype", "bf16") };
@@ -10296,6 +10316,33 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   r4d_rad_ar_ln_init, r4d_rad_ar_fini, r4d_rad_ar_rmsnorm_had_quant_i8g, nullptr, nullptr, nullptr,
   r4d_shape_ar_rmsnorm_had_quant_i8g },
 
+{ "ar_rmsnorm_ihc_junction", "ar_rmsnorm_ihc_junction", "norm",
+  "the two-rank exact all-reduce of a block's output and the iHC junction after it in one kernel: "
+  "a block owns whole rows, pushes them, folds the peer's in (the standalone exact one-shot's "
+  "f32 sum rounded once) and runs rmsnorm_ihc_junction's row over the sum",
+  "exactly 2 ranks; a unpitched (it is the message), the rest as rmsnorm_ihc_junction; hc 2, 4 or "
+  "8; exact wire, its push coded losslessly (about 12.1 bits a value) from 512 KiB on rows of "
+  "whole 256 values",
+  "bf16 activations, f32 gains and tables; byte-identical to [add_bf16,] the exact all_reduce "
+  "and rmsnorm_ihc_junction's chain",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cArIhcJunction2), ROW(tAr), nullptr,
+  r4d_rad_ar_ln_init, r4d_rad_ar_fini, r4d_rad_ar_rmsnorm_ihc_junction, nullptr, nullptr, nullptr,
+  r4d_shape_rmsnorm_ihc_junction, nullptr, r4d_fuse_ar_rmsnorm_ihc_junction },
+
+{ "ar_rmsnorm_ihc_junction_4rank", "ar_rmsnorm_ihc_junction", "norm",
+  "the four-rank exact one-shot all-reduce of a block's output and the iHC junction after it in "
+  "one kernel, on the wide family's transport; a block owns whole rows",
+  "exactly 4 ranks, all peer-accessible; a unpitched; hc 2, 4 or 8; exact wire; one-shot ((ranks "
+  "- 1) x the message a rank): for decode heights",
+  "bf16 activations, f32 gains and tables; the sum in fp32 in ascending rank order rounded as the "
+  "four-rank exact all-reduce stores it; byte-identical to [add_bf16,] all_reduce and "
+  "rmsnorm_ihc_junction's chain",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cArIhcJunction4), ROW(tAr), nullptr,
+  r4d_rad_ar_hc_wide_init, r4d_rad_ar_fini, r4d_rad_ar_rmsnorm_ihc_junction_4rank, nullptr,
+  nullptr, nullptr, r4d_shape_rmsnorm_ihc_junction, nullptr, r4d_fuse_ar_rmsnorm_ihc_junction },
+
 { "ar_hc_write", "ar_hc_write", "norm",
   "the two-rank all-reduce and the gated residual's write that always follows it, in one kernel: "
   "h[s] += inj[s] * y over the reduced y",
@@ -11634,9 +11681,10 @@ extern "C" int rad_kernel_chain(int i) {
          * tail form (the two-shot with the junction after it) only */
         "ar_rmsnorm_quant_i8", "ar_rmsnorm_quant_i8g", "ar_rmsnorm_quant_i8_4rank",
         "ar_rmsnorm_had_quant_i8g", "ar_rmsnorm_had_quant_iq8r",
-        /* Hy4-flash's iHC read and its fused junction (the read's scalar-load form for odd
-         * widths stays plain) */
-        "ihc_pre_bf16", "rmsnorm_ihc_junction_bf16",
+        /* Hy4-flash's iHC read and its fused junction, plain and with the all-reduce at two and
+         * four ranks (the read's scalar-load form for odd widths stays plain) */
+        "ihc_pre_bf16", "rmsnorm_ihc_junction_bf16", "ar_rmsnorm_ihc_junction",
+        "ar_rmsnorm_ihc_junction_4rank",
         /* the 31B's full layers: the windowed attention and its merge (r4d_attn_paged_window.hip,
          * at decode heights) and the int8 quantiser before o_proj; h512 at every TP's gqa */
         "attn_qrow_h512_gqa2_i8kv", "attn_qrow_h512_gqa2_bf16kv",

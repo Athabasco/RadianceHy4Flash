@@ -920,3 +920,11 @@ extern "C" int r4d_fuse_rmsnorm_ihc_junction(const RadParam* p, int n_p, uint64_
                                              int step, RadFuseStep* out) {
     return fuse_ihc_junction(p, n_p, present, step, out, false);
 }
+
+/* ar_rmsnorm_ihc_junction -- [add] -> the exact all_reduce of `a` -> rmsnorm_ihc_junction's chain.
+ * (kernels: libr4d/r4d_ar_ihc_junction.hip; shims: r4d_ar_entry.hip.) The all_reduce step is
+ * ar_rmsnorm_quant_fp8's on the exact wire: `numel` M * n, `exact` 1, in place. */
+extern "C" int r4d_fuse_ar_rmsnorm_ihc_junction(const RadParam* p, int n_p, uint64_t present,
+                                                int step, RadFuseStep* out) {
+    return fuse_ihc_junction(p, n_p, present, step, out, true);
+}
