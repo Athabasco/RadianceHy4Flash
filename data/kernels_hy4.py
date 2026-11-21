@@ -18,7 +18,22 @@ hy4_mla_sink.rkb is WP6b's (notes/wp6b-mkfix.py, rerecorded). The vision rows (W
   rad-kbench -m gpu-mini-vis.rad --kernels libref --max-ctx 4096 --max-tok 1024 --mm-max-patches 4096 --record vis.rkb
   python3 data/kernels_hy4.py vis data/kernels_hy4.rkb vis.rkb data/kernels_hy4.rkb
 
-WP16.3 appended mla_project_kv points at 16 / 8 heads (`wp163`, `append` below). Check a card with
+WP16.3 appended mla_project_kv points at 16 / 8 heads (`wp163`, `append` below).
+
+WP16.2 appended the iHC junction
+(rmsnorm_ihc_junction: the gpu-mini graph's points, n = 3072 clones, M = 6 and 16) and ihc_pre /
+ihc_post at n = 3072 M = 16, from a recording of the graph with the junction declared:
+
+  rad-kbench -m gpu-mini.rad --kernels libref --max-ctx 4096 --max-tok 1024 --record gpumini2.rkb
+  python3 data/kernels_hy4.py junction gpumini2.rkb raw_junction.rkb
+  rad-kbench --fixture raw_junction.rkb --kernels libref --rerecord junction.rkb
+  python3 data/kernels_hy4.py append data/kernels_hy4.rkb junction.rkb appended.rkb
+  rad-kbench --fixture appended.rkb --kernels libref --rerecord data/kernels_hy4.rkb
+
+(The last rerecord matters: rad-kbench draws a weight by position, dtype and extents, so a case
+recorded alone can draw different bytes inside the whole fixture.)
+
+Check a card with
   rad-kbench --fixture data/kernels_hy4.rkb --kernels libr4d:libref [--bench]
 """
 import copy, struct, sys
@@ -87,7 +102,7 @@ def par(c, k):
     for p in c['params']:
         if p[0] == k: return p[2] if p[1] == 1 else (p[3] if p[1] == 4 else p[4])
     return None
-HY = ['ihc_pre', 'ihc_post', 'gate_mul', 'mla_project_kv', 'mla_kv_split', 'mla_attn_paged_sink', 'mla_attn_sel_sink',
+HY = ['ihc_pre', 'ihc_post', 'rmsnorm_ihc_junction', 'gate_mul', 'mla_project_kv', 'mla_kv_split', 'mla_attn_paged_sink', 'mla_attn_sel_sink',
       'attn_kv_sink', 'idx_pool_gated', 'idx_score', 'engram_norm', 'engram_gate', 'embed_lookup_q', 'quant_act_fp8',
       'dequant', 'qsa_select', 'qsa_work', 'qsa_tail_store', 'swiglu_clamped', 'router_sigmoid_topk']
 HEADS = ['mla_project_kv', 'mla_kv_split', 'mla_attn_paged_sink', 'mla_attn_sel_sink', 'attn_kv_sink', 'gate_mul']
@@ -192,6 +207,29 @@ def append(base, extra, out):
     fx['cases'] += add
     save(fx, out); print(len(add), 'cases added,', len(fx['cases']), '->', out)
 
+def junction(src, out):
+    """The junction's graph points (n = 512) as recorded, their n = 3072 clones at M 1, 8, 64, 1024,
+    and M 6 / 16 clones of the n = 3072 M 8 points of the junction, ihc_pre and ihc_post."""
+    fx = load(src)
+    new, salt = [], 7001
+    for c in fx['cases']:
+        if c['op'] == 'rmsnorm_ihc_junction': new.append(fresh(c, salt)); salt += 1
+    wide = []
+    for c in fx['cases']:
+        if c['op'] in ('rmsnorm_ihc_junction', 'ihc_pre', 'ihc_post') and par(c, 'n') == 512 and c['m'] in (1, 8, 64, 1024):
+            w = wide_clone(c, 3072, salt); salt += 1
+            if c['op'] == 'rmsnorm_ihc_junction': new.append(w)
+            if c['m'] == 8: wide.append(w)
+    for w in wide:
+        for M2 in ((6, 16) if w['op'] == 'rmsnorm_ihc_junction' else (16,)):
+            new.append(m_clone(w, M2, salt)); salt += 1
+    seen, uniq = set(), []
+    for c in new:
+        k = (c['op'], repr(c['params']), repr([(o['role'], o['dtype'], o['shape']) for o in c['opd']]))
+        if k not in seen: seen.add(k); uniq.append(c)
+    x = dict(fx, source='hy4-flash iHC junction / ihc at n 3072 (WP16.2, the gpu-mini graph and clones)', cases=uniq)
+    save(x, out); print(len(uniq), 'cases')
+
 def merge(*paths):
     out = paths[-1]; cases = []
     for i, p in enumerate(paths[:-1]):
@@ -233,4 +271,4 @@ def vis(base, rec, out):
     save(fx, out); print(len(add), 'vision cases added ->', out, len(fx['cases']), 'in all')
 
 if __name__ == '__main__':
-    {'raw': raw, 'merge': merge, 'vis': vis, 'wp163': wp163, 'append': append}[sys.argv[1]](*sys.argv[2:])
+    {'raw': raw, 'merge': merge, 'vis': vis, 'wp163': wp163, 'junction': junction, 'append': append}[sys.argv[1]](*sys.argv[2:])
