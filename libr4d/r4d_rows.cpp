@@ -638,6 +638,61 @@ static const RadOperandSpec oMhcPost[] = {
 static const RadOperandSpec oMhcContract[] = {
     {"h", RAD_OPD_IN, 0}, {"x", RAD_OPD_OUT, 0},
 };
+/* ---- Hy4-flash's small ops (r4d_ihc_bf16.hip, r4d_engram_bf16.hip, r4d_mla_kv_bf16.hip). The
+ * lists are libref's (libref/ref_registry.cpp) and docs/OPS.md "Hy4-flash". */
+static const RadParamSpec pIhcPre[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("rows"), P_F64("eps"), P_F64("hc_eps"),
+    P_F64O("post_mag"), P_STR("dtype"),
+};
+static const RadOperandSpec oIhcPre[] = {
+    {"h", RAD_OPD_IN, 0}, {"fn", RAD_OPD_WEIGHT, 0}, {"scale", RAD_OPD_WEIGHT, 0},
+    {"base", RAD_OPD_WEIGHT, 0}, {"x", RAD_OPD_OUT, 0}, {"post", RAD_OPD_OUT, 1},
+};
+static const RadParamSpec pIhcPost[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype") };
+static const RadOperandSpec oIhcPost[] = {
+    {"y", RAD_OPD_IN, 0}, {"post", RAD_OPD_IN, 0}, {"h", RAD_OPD_INOUT, 0},
+};
+static const RadOperandSpec oGateMul[] = {
+    {"a", RAD_OPD_IN, 0}, {"g", RAD_OPD_IN, 0}, {"y", RAD_OPD_OUT, 0},
+};
+static const RadParamSpec pMlaProjectKv[] = {
+    P_INT("M"), P_INT("heads"), P_INT("k_dim"), P_INT("v_dim"), P_INT("latent_dim"),
+    P_STR("mode"), P_STR("dtype"),
+};
+static const RadOperandSpec oMlaProjectKv[] = {
+    {"x", RAD_OPD_IN, 0}, {"w", RAD_OPD_WEIGHT, 0}, {"y", RAD_OPD_OUT, 0},
+};
+static const RadParamSpec pMlaKvSplit[] = {
+    P_INT("M"), P_INT("heads"), P_INT("k_dim"), P_INT("v_dim"), P_INT("rope_dim"), P_STR("dtype"),
+};
+static const RadOperandSpec oMlaKvSplit[] = {
+    {"kvb", RAD_OPD_IN, 0}, {"k_rope", RAD_OPD_IN, 0}, {"k", RAD_OPD_OUT, 0}, {"v", RAD_OPD_OUT, 0},
+};
+static const RadParamSpec pEngramIds[] = {
+    P_INT("M"), P_INT("heads"), P_INT("ngram"), P_INT("pad"), P_INT("map_size"),
+    P_INTO("image"), P_INTO("video"),
+};
+static const RadOperandSpec oEngramIds[] = {
+    {"tok", RAD_OPD_IN, 0}, {"state", RAD_OPD_INOUT, 0}, {"cu", RAD_OPD_IN, 0},
+    {"pos", RAD_OPD_IN, 0}, {"token_map", RAD_OPD_WEIGHT, 0}, {"mult", RAD_OPD_WEIGHT, 0},
+    {"vocab_sizes", RAD_OPD_WEIGHT, 0}, {"offsets", RAD_OPD_WEIGHT, 0},
+    {"num_accepted", RAD_OPD_IN, 1}, {"cache_idx", RAD_OPD_IN, 1}, {"ids", RAD_OPD_OUT, 0},
+    {"mask", RAD_OPD_OUT, 0},
+};
+static const RadParamSpec pEngramNorm[] = {
+    P_INT("M"), P_INT("heads"), P_INT("n"), P_F64("eps"), P_STR("dtype"),
+};
+static const RadOperandSpec oEngramNorm[] = {
+    {"e", RAD_OPD_IN, 0}, {"gain", RAD_OPD_WEIGHT, 0}, {"y", RAD_OPD_OUT, 0},
+};
+static const RadParamSpec pEngramGate[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("eps"), P_STR("dtype"),
+};
+static const RadOperandSpec oEngramGate[] = {
+    {"key", RAD_OPD_IN, 0}, {"val", RAD_OPD_IN, 0}, {"mask", RAD_OPD_IN, 0},
+    {"w_key", RAD_OPD_WEIGHT, 0}, {"w_query", RAD_OPD_WEIGHT, 0}, {"w_val", RAD_OPD_WEIGHT, 0},
+    {"w_branch", RAD_OPD_WEIGHT, 0}, {"h", RAD_OPD_INOUT, 0},
+};
 static const RadParamSpec pKdaUpdate[] = {
     P_INT("M"), P_INT("heads"), P_INT("head_k"), P_INT("head_v"), P_F64("lower_bound"),
     P_F64("scale"), P_F64("l2_eps"), P_STR("mode"), P_STR("dtype"),
@@ -3409,7 +3464,8 @@ static const RadOpSchema kSchemas[] = {
            "ranks reconstructs x, so the caller follows this with an exact all_reduce."),
     SCHEMA("embed_lookup_q", pEmbed, oEmbedQ,
            "the same gather from a table quantised with ONE scale for all of it: x[m] = "
-           "wte[id] * scale[0], an absent scale being one. Padding and bounds behave exactly as "
+           "wte[id] * scale[0], an absent scale being one; with a scale entry for every table row "
+           "(n_vocab entries) x[m] = wte[id] * scale[id] (Hy4-flash's Engram table). Padding and bounds behave exactly as "
            "embed_lookup's. `ahead` is the next prompt's ids, for a reader that fetches rows ahead "
            "of the step; a kernel that reads its table in place ignores it."),
     SCHEMA("ple_gate", pPleGate, oPleGate,
@@ -3628,6 +3684,38 @@ static const RadOpSchema kSchemas[] = {
            "out[dst,i] = post[dst]*x[i] + sum_src comb[src,dst]*h[src,i]; separate output."),
     SCHEMA("mhc_contract", pHcPlain, oMhcContract,
            "Mean over the hc residual streams, rounded once to dtype."),
+    SCHEMA("ihc_pre", pIhcPre, oIhcPre,
+           "Independent hyper-connection read (Hy4-flash; no mixing matrix, no Sinkhorn). f = f32(h); r = "
+           "rsqrt(sum f^2 / (hc*n) + eps); c[j] = (fn[j] . f) * r; pre[j] = sigmoid(c[j]*scale[0] + base[j]) "
+           "+ hc_eps; x = round(sum_j pre[j] f[j]). With `post` present (rows == 2*hc, scale has two "
+           "entries, post_mag required): post[j] = post_mag * sigmoid(c[hc+j]*scale[1] + base[hc+j]) + "
+           "hc_eps, f32. Without it (rows == hc, one scale entry) the head's collapse."),
+    SCHEMA("ihc_post", pIhcPost, oIhcPost,
+           "h[j][i] = round(post[j] * f32(y[i]) + f32(h[j][i])), in place on the hc streams; the product is "
+           "rounded to f32 before the add. Nothing normalises the stream."),
+    SCHEMA("gate_mul", pMnDtype, oGateMul,
+           "y = round(f32(a) * sigmoid(f32(g))): one rounding. act_mul's sigmoid form rounds the sigmoid "
+           "first, which is a different bf16 result."),
+    SCHEMA("mla_project_kv", pMlaProjectKv, oMlaProjectKv,
+           "Per-head absorption or expansion through the checkpoint's kv_b, rows head-major with each head's "
+           "k_dim key rows then its v_dim value rows. absorb: [M,heads,k_dim] -> [M,heads,latent]; expand: "
+           "[M,heads,latent] -> [M,heads,v_dim]. mla_project with unequal K and V widths."),
+    SCHEMA("mla_kv_split", pMlaKvSplit, oMlaKvSplit,
+           "kvb [N, heads*(k_dim+v_dim)] and k_rope [N, rope_dim] -> k [N, heads, k_dim+rope_dim] (the rope "
+           "part shared by every head) and v [N, heads, v_dim]. A copy."),
+    SCHEMA("engram_ids", pEngramIds, oEngramIds,
+           "Engram's hash ids: c_k = map[tok_k] (pad before the document start and for an id at or past "
+           "map_size), m_k = c_k * mult[k] in wrapping int64, mix_g = m_0 ^ .. ^ m_{g-1}, head i of order g: "
+           "floor_mod(mix_g, vocab_sizes[i]) + offsets[i]; mask = tok not in {pad, image, video}. `state` is "
+           "ngram_ids' window of committed ids."),
+    SCHEMA("engram_norm", pEngramNorm, oEngramNorm,
+           "One rms norm a head over the gathered rows: y[i] = round(gain[i] * x[i] * rsqrt(mean_head(x^2) + "
+           "eps)). eps is a parameter: 0.0078125 (HF in bf16) or 1.19e-7."),
+    SCHEMA("engram_gate", pEngramGate, oEngramGate,
+           "Engram's gate and its add into the hc streams: main = w_val * val * rsqrt(mean(val^2) + eps); per "
+           "stream c, d = (sum kn*qn) n^-0.5 over kn = w_key*key*rsqrt(..), qn = w_query*h_c*rsqrt(..); g = "
+           "sigmoid(sign(d) sqrt(max(|d|, 1e-6))); h_c += round(g*main + w_branch[c]*main). Rows with mask 0 "
+           "are untouched."),
     SCHEMA("kda_update", pKdaUpdate, oKdaUpdate,
            "Bounded per-channel KDA recurrence. verify stores candidate states; prefill commits final state. "
            "Absolute cu offsets, accepted-prefix read slot, optional cold initialization, no output norm."),
@@ -5033,6 +5121,29 @@ static const RadConstraint cMhcPre[] = {
     C_LE("n", 16384),      C_GE("hc", 2),         C_LE("hc", 8),
     C_IN("dtype", "bf16"), C_GE("iterations", 1), C_LE("iterations", 256),
 };
+/* Hy4-flash's small ops state exactly the geometry compiled. ihc_pre keeps rows+1 partial sums a
+ * thread (one instantiation per hc 2..8, with and without `post`); the rest are as the shims check. */
+static const RadConstraint cIhcPre[] = {
+    C_GE("M", 1), C_LE("M", 65535), C_GE("n", 1), C_LE("n", 16384), C_GE("hc", 2), C_LE("hc", 8),
+    C_GE("rows", 2), C_LE("rows", 16), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cGateMul[] = { C_GE("M", 1), C_LE("M", 65535), C_GE("n", 1),
+                                          C_IN("dtype", "bf16") };
+static const RadConstraint cMlaProjectKv[] = {
+    C_GE("M", 1), C_LE("M", 65535), C_GE("heads", 1), C_LE("heads", 64), C_EQ("k_dim", 192),
+    C_EQ("v_dim", 256), C_EQ("latent_dim", 512), C_IN("mode", "absorb expand"),
+    C_IN("dtype", "bf16"),
+};
+static const RadConstraint cMlaKvSplit[] = {
+    C_GE("M", 1), C_GE("heads", 1), C_GE("k_dim", 1), C_GE("v_dim", 1), C_GE("rope_dim", 1),
+    C_IN("dtype", "bf16"),
+};
+static const RadConstraint cEngramIds[] = { C_GE("M", 1), C_GE("ngram", 2), C_LE("ngram", 8),
+                                            C_GE("heads", 1) };
+static const RadConstraint cEngramNorm[] = { C_GE("M", 1), C_GE("heads", 1), C_GE("n", 1),
+                                             C_IN("dtype", "bf16") };
+static const RadConstraint cEngramGate[] = { C_GE("M", 1), C_GE("n", 1), C_GE("hc", 1),
+                                             C_LE("hc", 8), C_IN("dtype", "bf16") };
 static const RadConstraint cDsaPool[] = { C_GE("M", 1), C_EQ("n", 128), C_EQ("ratio", 4),
                                           C_IN("dtype", "bf16") };
 static const RadConstraint cDsaQuery[] = { C_GE("M", 1), C_LE("M", 2147483644), C_EQ("n", 128),
@@ -8259,6 +8370,53 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMhcPlain), NOTUNE,
   nullptr, nullptr, r4d_rad_mhc_contract, nullptr, nullptr, nullptr,
   r4d_shape_mhc_contract },
+
+/* ---------------------------------------------------------------- Hy4-flash's small ops --------
+ * r4d_ihc_bf16.hip, r4d_mla_kv_bf16.hip, r4d_engram_bf16.hip (kernels/ihc.md, engram.md). */
+{ "ihc_pre_bf16", "ihc_pre", "norm", "independent hyper-connection read, one workgroup a token row",
+  "M 1..65535, n 1..16384, hc 2..8, rows hc (the head) or 2 hc (with post)",
+  "bf16 activation, f32 weights and coefficients",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cIhcPre), NOTUNE,
+  nullptr, nullptr, r4d_rad_ihc_pre, nullptr, nullptr, nullptr,
+  r4d_shape_ihc_pre },
+{ "ihc_post_bf16", "ihc_post", "norm", "write of a block's output into the hc streams, in place",
+  "M 1..65535, n 1..16384, hc 2..8", "bf16 activation, f32 post",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMhcPlain), NOTUNE,
+  nullptr, nullptr, r4d_rad_ihc_post, nullptr, nullptr, nullptr,
+  r4d_shape_ihc_post },
+{ "gate_mul_bf16", "gate_mul", "elem", "a * sigmoid(g) with one rounding, eight entries a thread",
+  "M 1..65535, any n", "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cGateMul), NOTUNE,
+  nullptr, nullptr, r4d_rad_gate_mul, nullptr, nullptr, nullptr,
+  r4d_shape_gate_mul },
+{ "mla_project_kv_bf16", "mla_project_kv", "attn",
+  "absorbed MLA's per-head projections, K and V widths apart",
+  "heads 1..64, k_dim 192, v_dim 256, latent 512, M 1..65535", "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaProjectKv), NOTUNE,
+  nullptr, nullptr, r4d_rad_mla_project_kv, nullptr, nullptr, nullptr,
+  r4d_shape_mla_project_kv },
+{ "mla_kv_split_bf16", "mla_kv_split", "attn", "kv_b output split into k and v heads, a copy",
+  "any heads and widths; 16-byte accesses when the widths and pitches are multiples of 8",
+  "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaKvSplit), NOTUNE,
+  nullptr, nullptr, r4d_rad_mla_kv_split, nullptr, nullptr, nullptr,
+  r4d_shape_mla_kv_split },
+{ "engram_ids_i32", "engram_ids", "vocab", "Engram's hash ids and mask, one thread a (row, head)",
+  "ngram 2..8, heads a multiple of ngram-1; ids i32 or i64",
+  "i32 tokens, positions, map, state and mask; i64 multipliers, vocabulary sizes and offsets",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cEngramIds), NOTUNE,
+  nullptr, nullptr, r4d_rad_engram_ids, nullptr, nullptr, nullptr,
+  r4d_shape_engram_ids },
+{ "engram_norm_bf16", "engram_norm", "norm", "one rms norm a head of the gathered rows, one wave a head",
+  "any heads and n", "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cEngramNorm), NOTUNE,
+  nullptr, nullptr, r4d_rad_engram_norm, nullptr, nullptr, nullptr,
+  r4d_shape_engram_norm },
+{ "engram_gate_bf16", "engram_gate", "norm", "Engram's gate and its add into the hc streams, one workgroup a row",
+  "hc 1..8, any n", "bf16 activations and gains, i32 mask",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cEngramGate), NOTUNE,
+  nullptr, nullptr, r4d_rad_engram_gate, nullptr, nullptr, nullptr,
+  r4d_shape_engram_gate },
 
 /* ---------------------------------------------------------------- the gated residual --------
  * r4d_hc_bf16.hip. Three rows; the read is two launches behind one entry point, because `x`

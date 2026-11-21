@@ -527,8 +527,9 @@ extern "C" int r4d_rad_unrelayout_mtp_e4m3(const RadParam* p, int n_p, int opera
 /* ================================================================= embed_lookup_q's table
  *
  * The gather reads the table as stored, so this hook only checks that it can: E4M3 codes with one
- * bf16 scale for the whole table (`fp8_e4m3*bf16[*x*]`, the n-gram table's recipe), or plain bf16
- * as the checkpoint ships it. libavx's host gather (avx_layout_ngram) accepts the same two forms
+ * bf16 scale for the whole table (`fp8_e4m3*bf16[*x*]`, the n-gram table's recipe) or one bf16
+ * scale a row (`bf16[1x*]`, Hy4-flash's Engram: the scale plane is read at the row's index, so it
+ * stays resident beside the codes), or plain bf16 as the checkpoint ships it. libavx's host gather (avx_layout_ngram) accepts the same two forms
  * with the same checks, so neither refuses at declare a table the other reads. */
 extern "C" int r4d_rad_layout_embed_q(const RadParam* p, int n_p, int operand,
                                       const RadEncoding* enc, const int* sel,
@@ -546,12 +547,13 @@ extern "C" int r4d_rad_layout_embed_q(const RadParam* p, int n_p, int operand,
     }
     const RadEncPlane* sc = rad_enc_plane(enc, "scale");
     if (!rad_enc_is(enc, "affine") || enc->n_planes != 2 || enc->transform[0] ||
-        enc->plane[0].dtype != RAD_F8E4M3 || !sc || sc->dtype != RAD_BF16 || sc->block[0] != 0 ||
-        sc->block[1] != 0)
+        enc->plane[0].dtype != RAD_F8E4M3 || !sc || sc->dtype != RAD_BF16 || sc->block[1] != 0 ||
+        (sc->block[0] != 0 && sc->block[0] != 1))
         return RAD_E_DTYPE;
+    const bool per_row = sc->block[0] == 1;
     if (n != 1 || !pl || !sel) return RAD_E_SHAPE;
     if (!r4d_enc::selects(enc, sel, n, operand == EQ_WTE ? "codes" : "scale")) return RAD_E_SHAPE;
-    if (!r4d_enc::dims(pl[0], operand == EQ_WTE ? rows : 1, operand == EQ_WTE ? dim : 1))
+    if (!r4d_enc::dims(pl[0], operand == EQ_WTE || per_row ? rows : 1, operand == EQ_WTE ? dim : 1))
         return RAD_E_SHAPE;
     return RAD_E_UNSUPPORTED;
 }

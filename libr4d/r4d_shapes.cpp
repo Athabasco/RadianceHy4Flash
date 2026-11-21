@@ -485,6 +485,87 @@ extern "C" int r4d_shape_mhc_contract(const RadParam* p, int n_p, int operand, R
     R4D_PICK(l);
 }
 
+/* ---- Hy4-flash's small ops (r4d_ihc_bf16.hip, r4d_mla_kv_bf16.hip, r4d_engram_bf16.hip). Each is
+ * libref's description (ref_shapes.cpp) of the same op; the divergence check of rad-kbench reports
+ * a difference. */
+extern "C" int r4d_shape_ihc_pre(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc"),
+                  rows = pi(p, n_p, "rows");
+    if (hc < 1 || (rows != hc && rows != 2 * hc)) return RAD_E_UNSUPPORTED;
+    const bool post = rows == 2 * hc;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, hc * n), opd((uint32_t)RAD_F32, rows, hc * n),
+        opd((uint32_t)RAD_F32, post ? 2 : 1), opd((uint32_t)RAD_F32, rows), opd(D, M, n),
+        post ? opd((uint32_t)RAD_F32, M, hc) : opd_none() };
+    R4D_PICK(l);
+}
+extern "C" int r4d_shape_ihc_post(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, n), opd((uint32_t)RAD_F32, M, hc), opd(D, M, hc * n) };
+    R4D_PICK(l);
+}
+extern "C" int r4d_shape_gate_mul(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, n), opd(D, M, n), opd(D, M, n) };
+    R4D_PICK(l);
+}
+extern "C" int r4d_shape_mla_project_kv(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), h = pi(p, n_p, "heads"), kd = pi(p, n_p, "k_dim"),
+                  vd = pi(p, n_p, "v_dim"), l = pi(p, n_p, "latent_dim");
+    const char* mode = rad_param_gets(p, n_p, "mode", "");
+    const bool absorb = !std::strcmp(mode, "absorb");
+    if (!absorb && std::strcmp(mode, "expand")) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc d[] = { opd(D, M, h, absorb ? kd : l), opd(D, h * (kd + vd), l),
+        opd(D, M, h, absorb ? l : vd) };
+    R4D_PICK(d);
+}
+extern "C" int r4d_shape_mla_kv_split(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), h = pi(p, n_p, "heads"), kd = pi(p, n_p, "k_dim"),
+                  vd = pi(p, n_p, "v_dim"), r = pi(p, n_p, "rope_dim");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, h * (kd + vd)), opd(D, M, r), opd(D, M, h, kd + r),
+        opd(D, M, h, vd) };
+    R4D_PICK(l);
+}
+/* One sequence, a decode step as for ngram_ids: warm state read at the deepest offset. Token ids are
+ * drawn below `map_size`; the multipliers are the constant 1000003 so a draw cannot wrap. */
+extern "C" int r4d_shape_engram_ids(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), heads = pi(p, n_p, "heads"), ngram = pi(p, n_p, "ngram"),
+                  msize = pi(p, n_p, "map_size");
+    if (ngram < 2 || ngram > 8 || heads < 1 || heads % (ngram - 1) || msize < 1)
+        return RAD_E_UNSUPPORTED;
+    const int64_t ctx = ngram - 1, depth = ctx - 1 + M;
+    auto idx64 = [](int64_t n, int64_t max, int64_t konst) {
+        RadOpdDesc d = opd((uint32_t)RAD_I64, n);
+        d.fill = RAD_FILL_INDEX;
+        d.idx_max = max;
+        d.idx_const = konst;
+        return d;
+    };
+    const RadOpdDesc l[] = { opd_idx(M, 0, msize), opd_idx(1, depth, msize),
+        opd_idx(2, 0, M, -1, RAD_OPD_F_IDX_CU), opd_idx(M, 0, 0, 1 << 20),
+        opd_idx(msize, 0, 1000), idx64(ngram, 0, 1000003), idx64(heads, 0, 997),
+        idx64(heads, 0, -1), opd_idx(1, 0, 0, M), opd_none(), opd((uint32_t)RAD_I32, M, heads),
+        opd((uint32_t)RAD_I32, M) };
+    R4D_PICK(l);
+}
+extern "C" int r4d_shape_engram_norm(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), H = pi(p, n_p, "heads"), n = pi(p, n_p, "n");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, H * n), opd(D, H * n), opd(D, M, H * n) };
+    R4D_PICK(l);
+}
+extern "C" int r4d_shape_engram_gate(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, hc * n), opd(D, M, n), opd_idx(M, 0, 0, 1), opd(D, hc * n),
+        opd(D, hc * n), opd(D, n), opd(D, hc * n), opd(D, M, hc * n) };
+    R4D_PICK(l);
+}
+
 /* ---- the gated residual (r4d_hc_bf16.hip's three shims). `inject` and `group` default on, so a
  * query naming neither describes what every trunk connection runs; 0 for either describes one of
  * the two exceptions: the final mixer, and a read whose consumer wants bf16. */

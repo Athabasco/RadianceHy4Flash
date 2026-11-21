@@ -122,6 +122,11 @@ set(R4D_UNITS
   # needs a grid-wide barrier.
   "r4d_hc_bf16|"
   "r4d_mhc|"
+  # Hy4-flash's independent hyper-connections and gate_mul, its kv_b projections and split, and
+  # Engram (kernels/ihc.md, kernels/engram.md).
+  "r4d_ihc_bf16|"
+  "r4d_mla_kv_bf16|"
+  "r4d_engram_bf16|"
   "r4d_glm|"
   "r4d_dsa|"
   "r4d_mla|"

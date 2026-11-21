@@ -33117,6 +33117,493 @@ static void lora_perf(const Plugin& pl, int64_t M, int64_t K, int64_t N, int64_t
     }
 }
 
+/* ------------------------------------------------------------------ Hy4-flash's small ops
+ *
+ * ihc_pre, ihc_post, gate_mul, mla_project_kv, mla_kv_split, engram_ids, engram_norm, engram_gate
+ * and embed_lookup_q's per-row scale, each against libref's op (libref/ref_hy4.cpp) on the same
+ * bytes: libref runs on a host copy, the row on a device copy bracketed by poisoned red zones.
+ * Integer outputs, copies and ihc_post compare byte for byte; the rest within the stated bound,
+ * the one bf16 ulp a different summation order or a libm exp can move a rounded result by. Row
+ * padding of a pitched operand must come back untouched. */
+struct Hy4Opd {
+    uint32_t dt = RAD_BF16;
+    std::vector<int64_t> shape;
+    int64_t pitch = 0;               /* rank 2: elements between rows, 0 for tight */
+    std::vector<uint8_t> bytes;      /* the initial bytes, padding included */
+    bool absent = false, out = false;
+    double rtol = 0, atol = 0;       /* an output's bound; 0 and 0 is exact */
+    RadTensor tensor(void* data) const {
+        RadTensor t = T(data, dt, shape);
+        if (shape.size() == 2 && pitch) t.stride[0] = pitch;
+        if (absent) t.data = nullptr;
+        return t;
+    }
+    int64_t elements() const {
+        if (shape.size() == 2 && pitch) return shape[0] * pitch;
+        int64_t n = 1;
+        for (int64_t e : shape) n *= e;
+        return n;
+    }
+};
+
+struct Hy4Rng {
+    uint32_t s;
+    explicit Hy4Rng(uint32_t seed) : s(seed * 2654435761u + 12345u) {}
+    float u() { s = st_mix32(s + 0x9e3779b9u); return (float)(s >> 8) / 8388608.0f - 1.0f; }
+    float n() { return (u() + u() + u() + u()) * 0.866f; }
+    uint32_t r(uint32_t m) { s = st_mix32(s + 0x9e3779b9u); return s % m; }
+};
+
+static Hy4Opd hy_opd(uint32_t dt, std::vector<int64_t> shape, int64_t pitch = 0) {
+    Hy4Opd o;
+    o.dt = dt;
+    o.shape = std::move(shape);
+    o.pitch = pitch;
+    o.bytes.assign((size_t)o.elements() * esz(dt), 0x7e);
+    return o;
+}
+static Hy4Opd hy_absent() { Hy4Opd o; o.absent = true; return o; }
+
+/* Logical element offsets (in elements) of a tensor of rank 1 to 3. */
+static std::vector<int64_t> hy_offsets(const RadTensor& t) {
+    std::vector<int64_t> o;
+    const int64_t d0 = t.shape[0], d1 = t.rank > 1 ? t.shape[1] : 1, d2 = t.rank > 2 ? t.shape[2] : 1;
+    for (int64_t i = 0; i < d0; ++i)
+        for (int64_t j = 0; j < d1; ++j)
+            for (int64_t k = 0; k < d2; ++k)
+                o.push_back(i * t.stride[0] + (t.rank > 1 ? j * t.stride[1] : 0) +
+                            (t.rank > 2 ? k * t.stride[2] : 0));
+    return o;
+}
+template <class F>
+static void hy_fill(Hy4Opd& o, F f) {
+    const RadTensor t = o.tensor(o.bytes.data());
+    int64_t idx = 0;
+    for (int64_t off : hy_offsets(t)) {
+        const double v = f(idx++);
+        if (o.dt == RAD_BF16) ((uint16_t*)o.bytes.data())[off] = h_to_bf16((float)v);
+        else if (o.dt == RAD_F32) ((float*)o.bytes.data())[off] = (float)v;
+        else if (o.dt == RAD_I32) ((int32_t*)o.bytes.data())[off] = (int32_t)v;
+        else if (o.dt == RAD_I64) ((int64_t*)o.bytes.data())[off] = (int64_t)v;
+        else ((uint8_t*)o.bytes.data())[off] = (uint8_t)v;
+    }
+}
+static double hy_get(uint32_t dt, const uint8_t* p, int64_t off) {
+    switch (dt) {
+        case RAD_BF16: return h_bf16(((const uint16_t*)p)[off]);
+        case RAD_F32:  return ((const float*)p)[off];
+        case RAD_I32:  return ((const int32_t*)p)[off];
+        case RAD_I64:  return (double)((const int64_t*)p)[off];
+        default:       return ((const uint8_t*)p)[off];
+    }
+}
+
+/* The oracle on host copies, the row on device copies; every output within its bound, padding and
+ * red zones intact. Returns false when a launch failed. */
+static bool hy_check(const Plugin& pl, const char* row_name, const std::string& what,
+                     std::vector<RadParam> ps, std::vector<Hy4Opd>& ops) {
+    const RadKernelInfo* row = find(pl, row_name);
+    if (!row) { ok(what.c_str(), false, "row absent"); return false; }
+    const RadKernelInfo* oracle = usel_libref_row(row->op);
+    if (!oracle) { ok(what.c_str(), false, "libref's op unavailable"); return false; }
+    const size_t n = ops.size();
+    std::vector<std::vector<uint8_t>> host(n);
+    std::vector<RadTensor> ht(n), dt(n);
+    std::vector<void*> dev(n, nullptr);
+    for (size_t i = 0; i < n; ++i) {
+        host[i] = ops[i].bytes;
+        ht[i] = ops[i].tensor(ops[i].absent ? nullptr : host[i].data());
+        if (ops[i].absent) { dt[i] = ht[i]; continue; }
+        const size_t b = ops[i].bytes.size();
+        dev[i] = dalloc(b + 256);
+        if (!dev[i]) { ok(what.c_str(), false, "allocation failed"); return false; }
+        st_memset(dev[i], 0xa5, b + 256);
+        st_memcpy((char*)dev[i] + 128, ops[i].bytes.data(), b, hipMemcpyHostToDevice);
+        dt[i] = ops[i].tensor((char*)dev[i] + 128);
+    }
+    RadArgs ao{};
+    ao.t = ht.data(); ao.n_t = (int)n; ao.p = ps.data(); ao.n_p = (int)ps.size(); ao.world_size = 1;
+    const int rr = oracle->launch(&ao, nullptr);
+    if (rr != RAD_OK) { ok(what.c_str(), false, "libref refused: rc=" + std::to_string(rr)); return false; }
+    RadArgs ad{};
+    ad.t = dt.data(); ad.n_t = (int)n; ad.p = ps.data(); ad.n_p = (int)ps.size(); ad.world_size = 1;
+    const int rc = row->launch(&ad, nullptr);
+    const hipError_t he = (hipError_t)st_stream_sync(nullptr);
+    if (rc != RAD_OK || he != hipSuccess) {
+        ok(what.c_str(), false, "launch rc=" + std::to_string(rc) +
+           (he != hipSuccess ? std::string(" hip=") + hipGetErrorString(he) : std::string()));
+        return false;
+    }
+    int64_t bad = 0, total = 0;
+    double worst = 0;
+    bool zones = true, padding = true;
+    std::string where;
+    for (size_t i = 0; i < n; ++i) {
+        if (ops[i].absent) continue;
+        const size_t b = ops[i].bytes.size();
+        std::vector<uint8_t> got(b + 256);
+        st_memcpy(got.data(), dev[i], b + 256, hipMemcpyDeviceToHost);
+        for (size_t j = 0; j < 128; ++j) zones = zones && got[j] == 0xa5 && got[b + 128 + j] == 0xa5;
+        if (!ops[i].out) {      /* an input must come back as it went */
+            zones = zones && std::memcmp(got.data() + 128, ops[i].bytes.data(), b) == 0;
+            continue;
+        }
+        std::vector<char> live(b / esz(ops[i].dt), 0);
+        for (int64_t off : hy_offsets(ht[i])) {
+            live[(size_t)off] = 1;
+            const double e = hy_get(ops[i].dt, host[i].data(), off);
+            const double g = hy_get(ops[i].dt, got.data() + 128, off);
+            const double tol = ops[i].atol + ops[i].rtol * std::fabs(e);
+            ++total;
+            const bool same = std::isfinite(g) && std::fabs(g - e) <= tol;
+            if (!same) {
+                if (!bad) where = fmt("operand %zu element %lld: got %.9g want %.9g", i, (long long)off, g, e);
+                ++bad;
+            }
+            worst = std::max(worst, std::fabs(g - e) / (std::fabs(e) + 1e-6));
+        }
+        const size_t es = esz(ops[i].dt);
+        for (size_t off = 0; off < live.size(); ++off)
+            if (!live[off] && std::memcmp(got.data() + 128 + off * es, ops[i].bytes.data() + off * es, es))
+                padding = false;
+    }
+    char msg[300];
+    std::snprintf(msg, sizeof msg, "%lld of %lld outputs out of bound, worst relative error %.3g%s%s%s%s",
+                  (long long)bad, (long long)total, worst, where.empty() ? "" : "; ", where.c_str(),
+                  zones ? "" : "; red zone or input overwritten", padding ? "" : "; row padding written");
+    ok(what.c_str(), bad == 0 && zones && padding, msg);
+    if (bad == 0 && zones && padding) std::printf("        %s\n", msg);
+    return true;
+}
+
+/* ihc_pre at the real stream (4 x 3072), a narrow one, two streams, pitched rows, the head form
+ * (rows == hc, no post) and a saturated-low gate whose post must equal hc_eps. */
+static void hy4_ihc_pre_case(const Plugin& pl) {
+    if (!sel("ihc_pre_bf16")) return;
+    struct G { int64_t hc, n, M; bool post; int64_t pad; double scale; };
+    const G gs[] = { { 4, 3072, 1, true, 0, 1.0 },  { 4, 3072, 5, true, 8, 3.0 },
+                     { 4, 512, 37, true, 0, 3.0 },  { 2, 128, 9, true, 0, 1.0 },
+                     { 4, 3072, 3, false, 0, 1.0 }, { 8, 200, 4, true, 6, 2.0 },
+                     { 3, 131, 2, false, 0, 1.0 },  { 4, 256, 3, true, 0, -40.0 } };
+    for (const G& g : gs) {
+        const int64_t W = g.hc * g.n, rows = g.post ? 2 * g.hc : g.hc;
+        Hy4Rng rng((uint32_t)(g.hc * 1000 + g.n + g.M));
+        std::vector<Hy4Opd> ops;
+        ops.push_back(hy_opd(RAD_BF16, { g.M, W }, g.pad ? W + g.pad : 0));
+        hy_fill(ops[0], [&](int64_t) { return rng.n() * 2.0; });
+        ops.push_back(hy_opd(RAD_F32, { rows, W }));
+        hy_fill(ops[1], [&](int64_t) { return rng.n() * 0.02; });
+        ops.push_back(hy_opd(RAD_F32, { g.post ? 2 : 1 }));
+        hy_fill(ops[2], [&](int64_t i) { return i ? g.scale * 0.7 : g.scale; });
+        ops.push_back(hy_opd(RAD_F32, { rows }));
+        hy_fill(ops[3], [&](int64_t) { return rng.n() * 0.7; });
+        ops.push_back(hy_opd(RAD_BF16, { g.M, g.n }, g.pad ? g.n + g.pad : 0));
+        ops[4].out = true; ops[4].rtol = 0.0079; ops[4].atol = 1e-5;
+        if (g.post) {
+            ops.push_back(hy_opd(RAD_F32, { g.M, g.hc }, g.pad ? g.hc + 3 : 0));
+            ops[5].out = true; ops[5].rtol = 2e-4; ops[5].atol = 1e-6;
+        } else {
+            ops.push_back(hy_absent());
+        }
+        std::vector<RadParam> ps = { PI("M", g.M), PI("n", g.n), PI("hc", g.hc), PI("rows", rows),
+                                     PF("eps", 1e-5), PF("hc_eps", 1e-6), PS("dtype", "bf16") };
+        if (g.post) ps.push_back(PF("post_mag", 2.0));
+        hy_check(pl, "ihc_pre_bf16",
+                 fmt("ihc_pre vs libref: hc %lld n %lld M %lld%s%s%s", (long long)g.hc, (long long)g.n,
+                     (long long)g.M, g.post ? "" : ", head form", g.pad ? ", pitched rows" : "",
+                     g.scale < 0 ? ", saturated-low gate" : ""), ps, ops);
+    }
+}
+
+/* ihc_post: byte for byte, vector and scalar paths, in place, pitched rows. */
+static void hy4_ihc_post_case(const Plugin& pl) {
+    if (!sel("ihc_post_bf16")) return;
+    struct G { int64_t hc, n, M, pad; };
+    const G gs[] = { { 4, 3072, 1, 0 }, { 4, 3072, 7, 8 }, { 4, 512, 33, 0 }, { 2, 128, 9, 0 },
+                     { 4, 131, 5, 0 }, { 8, 64, 3, 16 }, { 3, 1000, 4, 0 }, { 4, 3072, 2, 3 } };
+    for (const G& g : gs) {
+        Hy4Rng rng((uint32_t)(g.hc * 77 + g.n + g.M));
+        std::vector<Hy4Opd> ops;
+        ops.push_back(hy_opd(RAD_BF16, { g.M, g.n }, g.pad ? g.n + g.pad : 0));
+        hy_fill(ops[0], [&](int64_t) { return rng.n() * 3.0; });
+        ops.push_back(hy_opd(RAD_F32, { g.M, g.hc }));
+        hy_fill(ops[1], [&](int64_t) { return 0.5 + rng.u() * 1.4; });
+        ops.push_back(hy_opd(RAD_BF16, { g.M, g.hc * g.n }, g.pad ? g.hc * g.n + g.pad : 0));
+        hy_fill(ops[2], [&](int64_t) { return rng.n() * 2.0; });
+        ops[2].out = true;
+        std::vector<RadParam> ps = { PI("M", g.M), PI("n", g.n), PI("hc", g.hc), PS("dtype", "bf16") };
+        hy_check(pl, "ihc_post_bf16",
+                 fmt("ihc_post vs libref, to the bit: hc %lld n %lld M %lld%s", (long long)g.hc,
+                     (long long)g.n, (long long)g.M, g.pad ? ", pitched rows" : ""), ps, ops);
+    }
+}
+
+static void hy4_gate_mul_case(const Plugin& pl) {
+    if (!sel("gate_mul_bf16")) return;
+    struct G { int64_t M, n, pad; };
+    const G gs[] = { { 1, 4096, 0 }, { 7, 2048, 8 }, { 33, 131, 0 }, { 5, 8, 0 }, { 3, 3000, 5 } };
+    for (const G& g : gs) {
+        Hy4Rng rng((uint32_t)(g.M * 31 + g.n));
+        std::vector<Hy4Opd> ops;
+        for (int i = 0; i < 2; ++i) {
+            ops.push_back(hy_opd(RAD_BF16, { g.M, g.n }, g.pad ? g.n + g.pad : 0));
+            hy_fill(ops[(size_t)i], [&](int64_t) { return rng.n() * (i ? 4.0 : 2.0); });
+        }
+        ops.push_back(hy_opd(RAD_BF16, { g.M, g.n }, g.pad ? g.n + g.pad : 0));
+        ops[2].out = true; ops[2].rtol = 0.0079; ops[2].atol = 1e-30;
+        std::vector<RadParam> ps = { PI("M", g.M), PI("n", g.n), PS("dtype", "bf16") };
+        hy_check(pl, "gate_mul_bf16", fmt("gate_mul vs libref: M %lld n %lld%s", (long long)g.M,
+                 (long long)g.n, g.pad ? ", pitched rows" : ""), ps, ops);
+    }
+}
+
+/* mla_project_kv through the checkpoint's kv_b, both modes, 8 to 64 heads, M across the group sizes. */
+static void hy4_mla_project_kv_case(const Plugin& pl) {
+    if (!sel("mla_project_kv_bf16")) return;
+    for (const char* mode : { "absorb", "expand" })
+        for (int64_t H : { 8, 16, 32, 64 })
+            for (int64_t M : { 1, 3, 9 }) {
+                if (H == 64 && M == 3) continue;
+                const bool ab = !std::strcmp(mode, "absorb");
+                const int64_t kd = 192, vd = 256, L = 512, xw = ab ? kd : L, yw = ab ? L : vd;
+                Hy4Rng rng((uint32_t)(H * 13 + M + (ab ? 0 : 99)));
+                std::vector<Hy4Opd> ops;
+                ops.push_back(hy_opd(RAD_BF16, { M, H, xw }));
+                hy_fill(ops[0], [&](int64_t) { return rng.n(); });
+                ops.push_back(hy_opd(RAD_BF16, { H * (kd + vd), L }));
+                hy_fill(ops[1], [&](int64_t) { return rng.n() * 0.05; });
+                ops.push_back(hy_opd(RAD_BF16, { M, H, yw }));
+                ops[2].out = true; ops[2].rtol = 0.0079; ops[2].atol = 2e-5;
+                std::vector<RadParam> ps = { PI("M", M), PI("heads", H), PI("k_dim", kd),
+                                             PI("v_dim", vd), PI("latent_dim", L), PS("mode", mode),
+                                             PS("dtype", "bf16") };
+                hy_check(pl, "mla_project_kv_bf16",
+                         fmt("mla_project_kv %s vs libref: heads %lld M %lld", mode, (long long)H,
+                             (long long)M), ps, ops);
+            }
+    /* a row's bytes do not depend on the batch it is in: the same row alone and among nine */
+    for (const char* mode : { "absorb", "expand" }) {
+        const bool ab = !std::strcmp(mode, "absorb");
+        const int64_t H = 16, kd = 192, vd = 256, L = 512, xw = ab ? kd : L, yw = ab ? L : vd;
+        const RadKernelInfo* row = find(pl, "mla_project_kv_bf16");
+        if (!row) { ok("mla_project_kv row", false, "row absent"); return; }
+        Hy4Rng rng(4242);
+        std::vector<uint16_t> hx((size_t)(9 * H * xw)), hw((size_t)(H * (kd + vd) * L));
+        for (auto& v : hx) v = h_to_bf16(rng.n());
+        for (auto& v : hw) v = h_to_bf16(rng.n() * 0.05f);
+        void* dx = dalloc(hx.size() * 2); void* dw = dalloc(hw.size() * 2);
+        void* y9 = dalloc((size_t)(9 * H * yw) * 2); void* y1 = dalloc((size_t)(H * yw) * 2);
+        st_memcpy(dx, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(dw, hw.data(), hw.size() * 2, hipMemcpyHostToDevice);
+        int64_t last = 8;   /* the ninth row's bytes, alone */
+        std::vector<RadTensor> t9 = { T(dx, RAD_BF16, { 9, H, xw }), T(dw, RAD_BF16, { H * (kd + vd), L }),
+                                      T(y9, RAD_BF16, { 9, H, yw }) };
+        std::vector<RadTensor> t1 = { T((char*)dx + last * H * xw * 2, RAD_BF16, { 1, H, xw }),
+                                      T(dw, RAD_BF16, { H * (kd + vd), L }), T(y1, RAD_BF16, { 1, H, yw }) };
+        std::vector<RadParam> p9 = { PI("M", 9), PI("heads", H), PI("k_dim", kd), PI("v_dim", vd),
+                                     PI("latent_dim", L), PS("mode", mode), PS("dtype", "bf16") };
+        std::vector<RadParam> p1 = p9;
+        p1[0] = PI("M", 1);
+        run_case(row, t9, p9);
+        run_case(row, t1, p1);
+        std::vector<uint8_t> a((size_t)(H * yw) * 2), b((size_t)(H * yw) * 2);
+        st_memcpy(a.data(), (char*)y9 + last * H * yw * 2, a.size(), hipMemcpyDeviceToHost);
+        st_memcpy(b.data(), y1, b.size(), hipMemcpyDeviceToHost);
+        ok(fmt("mla_project_kv %s: a row's bytes do not depend on the batch", mode).c_str(), a == b);
+    }
+}
+
+/* mla_kv_split: a copy, byte for byte; the 16-byte path, a pitched one and the scalar path. */
+static void hy4_mla_kv_split_case(const Plugin& pl) {
+    if (!sel("mla_kv_split_bf16")) return;
+    struct G { int64_t M, H, kd, vd, rd, pad; };
+    const G gs[] = { { 5, 8, 192, 256, 64, 0 }, { 17, 64, 192, 256, 64, 0 },
+                     { 3, 16, 192, 256, 64, 8 }, { 4, 3, 13, 10, 6, 0 }, { 2, 2, 24, 16, 8, 3 } };
+    for (const G& g : gs) {
+        Hy4Rng rng((uint32_t)(g.M * 7 + g.H));
+        std::vector<Hy4Opd> ops;
+        const int64_t bw = g.H * (g.kd + g.vd), kw = g.H * (g.kd + g.rd), vw = g.H * g.vd;
+        ops.push_back(hy_opd(RAD_BF16, { g.M, bw }, g.pad ? bw + g.pad : 0));
+        hy_fill(ops[0], [&](int64_t) { return rng.n(); });
+        ops.push_back(hy_opd(RAD_BF16, { g.M, g.rd }, g.pad ? g.rd + g.pad : 0));
+        hy_fill(ops[1], [&](int64_t) { return rng.n(); });
+        ops.push_back(hy_opd(RAD_BF16, { g.M, kw }, g.pad ? kw + g.pad : 0));
+        ops.push_back(hy_opd(RAD_BF16, { g.M, vw }, g.pad ? vw + g.pad : 0));
+        ops[2].out = ops[3].out = true;
+        std::vector<RadParam> ps = { PI("M", g.M), PI("heads", g.H), PI("k_dim", g.kd),
+                                     PI("v_dim", g.vd), PI("rope_dim", g.rd), PS("dtype", "bf16") };
+        hy_check(pl, "mla_kv_split_bf16",
+                 fmt("mla_kv_split vs libref, to the bit: M %lld heads %lld widths %lld/%lld/%lld%s",
+                     (long long)g.M, (long long)g.H, (long long)g.kd, (long long)g.vd,
+                     (long long)g.rd, g.pad ? ", pitched" : ""), ps, ops);
+    }
+}
+
+/* engram_ids: prefill and decode forms, a document start inside the chunk, ids at and past the
+ * map, pad / image / video tokens, a slot permutation with a dropped slot, i32 and i64 ids, and the
+ * window after the step. Everything is an integer, so everything is exact. */
+static void hy4_engram_ids_case(const Plugin& pl) {
+    if (!sel("engram_ids_i32")) return;
+    const int64_t heads = 16, ngram = 3, ctx = ngram - 1, pad = 120002, msize = 120818,
+                  image = 120815, video = 120816;
+    for (int form = 0; form < 4; ++form) {
+        const bool decode = form & 1, wide = form & 2;
+        const int64_t S = 4, W = decode ? 5 : 2;
+        const std::vector<int64_t> T_s = decode ? std::vector<int64_t>{ 3, 1, 4, 2 }
+                                                : std::vector<int64_t>{ 5, 1, 9, 3 };
+        int64_t M = 0;
+        for (int64_t t : T_s) M += t;
+        Hy4Rng rng((uint32_t)(form + 5));
+        std::vector<Hy4Opd> ops;
+        ops.push_back(hy_opd(RAD_I32, { M }));
+        hy_fill(ops[0], [&](int64_t i) {
+            const uint32_t r = rng.r(40);
+            return r == 0 ? pad : r == 1 ? image : r == 2 ? video : r == 3 ? msize + 5 + (double)(i % 7)
+                                                              : (double)rng.r((uint32_t)msize);
+        });
+        ops.push_back(hy_opd(RAD_I32, { 6, W }));
+        hy_fill(ops[1], [&](int64_t) { return (double)rng.r((uint32_t)msize); });
+        ops[1].out = true;
+        std::vector<int32_t> cu = { 0 };
+        for (int64_t t : T_s) cu.push_back(cu.back() + (int32_t)t);
+        ops.push_back(hy_opd(RAD_I32, { S + 1 }));
+        hy_fill(ops[2], [&](int64_t i) { return cu[(size_t)i]; });
+        ops.push_back(hy_opd(RAD_I32, { M }));   /* pos: sequence 0 and 3 start the document in the chunk */
+        {
+            int64_t i = 0;
+            for (int64_t s = 0; s < S; ++s)
+                for (int64_t t = 0; t < T_s[(size_t)s]; ++t, ++i) {
+                    const int64_t base = (s == 0 || s == 3) && !decode ? 0 : 1000 + s;
+                    ((int32_t*)ops[3].bytes.data())[i] = (int32_t)(base + t);
+                }
+        }
+        ops.push_back(hy_opd(RAD_I32, { msize }));
+        hy_fill(ops[4], [&](int64_t) { return (double)rng.r(60000); });
+        ops.push_back(hy_opd(RAD_I64, { ngram }));
+        { const int64_t m[3] = { 1000003, 7919000117ll, 0x5851F42D4C957F2Dll };
+          hy_fill(ops[5], [&](int64_t i) { return (double)m[i]; });
+          for (int i = 0; i < 3; ++i) ((int64_t*)ops[5].bytes.data())[i] = m[i]; }
+        ops.push_back(hy_opd(RAD_I64, { heads }));
+        hy_fill(ops[6], [&](int64_t i) { return (double)(100003 + 17 * i); });
+        ops.push_back(hy_opd(RAD_I64, { heads }));
+        hy_fill(ops[7], [&](int64_t i) { return (double)(i * 200003); });
+        if (decode) {
+            ops.push_back(hy_opd(RAD_I32, { S }));
+            hy_fill(ops[8], [&](int64_t i) { return (double)(1 + i % 3); });
+        } else {
+            ops.push_back(hy_absent());
+        }
+        ops.push_back(hy_opd(RAD_I32, { S }));          /* cache_idx: a permutation with a dropped slot */
+        { const int32_t slots[4] = { 4, 0, -1, 2 };
+          hy_fill(ops[9], [&](int64_t i) { return (double)slots[i]; }); }
+        ops.push_back(hy_opd(wide ? RAD_I64 : RAD_I32, { M, heads }, 0));
+        ops.push_back(hy_opd(RAD_I32, { M }));
+        ops[10].out = ops[11].out = true;
+        std::vector<RadParam> ps = { PI("M", M), PI("heads", heads), PI("ngram", ngram), PI("pad", pad),
+                                     PI("map_size", msize), PI("image", image), PI("video", video) };
+        (void)ctx;
+        hy_check(pl, "engram_ids_i32",
+                 fmt("engram_ids vs libref, to the bit: %s step, ids %s, 4 sequences (slots 4 0 -1 2)",
+                     decode ? "decode" : "prefill", wide ? "i64" : "i32"), ps, ops);
+    }
+}
+
+static void hy4_engram_norm_case(const Plugin& pl) {
+    if (!sel("engram_norm_bf16")) return;
+    struct G { int64_t M, heads, n, pad; double eps; };
+    const G gs[] = { { 1, 16, 96, 0, 0.0078125 }, { 33, 16, 96, 0, 1.19e-7 }, { 5, 16, 96, 7, 0.0078125 },
+                     { 3, 4, 37, 0, 1e-6 } };
+    for (const G& g : gs) {
+        Hy4Rng rng((uint32_t)(g.M + g.n));
+        const int64_t W = g.heads * g.n;
+        std::vector<Hy4Opd> ops;
+        ops.push_back(hy_opd(RAD_BF16, { g.M, W }, g.pad ? W + g.pad : 0));
+        hy_fill(ops[0], [&](int64_t) { return rng.n() * 3.0; });
+        ops.push_back(hy_opd(RAD_BF16, { W }));
+        hy_fill(ops[1], [&](int64_t) { return 1.0 + rng.n() * 0.3; });
+        ops.push_back(hy_opd(RAD_BF16, { g.M, W }, g.pad ? W + g.pad : 0));
+        ops[2].out = true; ops[2].rtol = 0.0079; ops[2].atol = 1e-30;
+        std::vector<RadParam> ps = { PI("M", g.M), PI("heads", g.heads), PI("n", g.n), PF("eps", g.eps),
+                                     PS("dtype", "bf16") };
+        hy_check(pl, "engram_norm_bf16", fmt("engram_norm vs libref: M %lld heads %lld n %lld eps %g%s",
+                 (long long)g.M, (long long)g.heads, (long long)g.n, g.eps, g.pad ? ", pitched" : ""),
+                 ps, ops);
+    }
+}
+
+/* engram_gate: masked rows untouched, a row whose key is zero (d == 0, sign 0, gate one half), the
+ * real stream (4 x 3072) and smaller ones. */
+static void hy4_engram_gate_case(const Plugin& pl) {
+    if (!sel("engram_gate_bf16")) return;
+    struct G { int64_t M, hc, n, pad; double eps; };
+    const G gs[] = { { 1, 4, 3072, 0, 0.0078125 }, { 6, 4, 3072, 8, 1.19e-7 }, { 9, 4, 768, 0, 0.0078125 },
+                     { 5, 2, 96, 0, 0.0078125 }, { 3, 1, 131, 0, 1e-6 }, { 4, 8, 64, 0, 0.0078125 } };
+    for (const G& g : gs) {
+        Hy4Rng rng((uint32_t)(g.M * 3 + g.n));
+        const int64_t W = g.hc * g.n;
+        std::vector<Hy4Opd> ops;
+        ops.push_back(hy_opd(RAD_BF16, { g.M, W }, g.pad ? W + g.pad : 0));        /* key */
+        hy_fill(ops[0], [&](int64_t i) { return i / W == 1 ? 0.0 : rng.n() * 2.0; });
+        ops.push_back(hy_opd(RAD_BF16, { g.M, g.n }, g.pad ? g.n + g.pad : 0));    /* val */
+        hy_fill(ops[1], [&](int64_t) { return rng.n(); });
+        ops.push_back(hy_opd(RAD_I32, { g.M }));                                   /* mask */
+        hy_fill(ops[2], [&](int64_t i) { return (i % 3 == 2) ? 0.0 : 1.0; });
+        for (int k = 0; k < 4; ++k) {                                              /* w_key w_query w_val w_branch */
+            ops.push_back(hy_opd(RAD_BF16, { k == 2 ? g.n : W }));
+            hy_fill(ops.back(), [&](int64_t) { return 1.0 + rng.n() * 0.2; });
+        }
+        ops.push_back(hy_opd(RAD_BF16, { g.M, W }, g.pad ? W + g.pad : 0));       /* h */
+        hy_fill(ops[7], [&](int64_t) { return rng.n() * 2.0; });
+        ops[7].out = true; ops[7].rtol = 0.0079 * 2; ops[7].atol = 0.016;
+        std::vector<RadParam> ps = { PI("M", g.M), PI("n", g.n), PI("hc", g.hc), PF("eps", g.eps),
+                                     PS("dtype", "bf16") };
+        hy_check(pl, "engram_gate_bf16", fmt("engram_gate vs libref: M %lld hc %lld n %lld eps %g%s",
+                 (long long)g.M, (long long)g.hc, (long long)g.n, g.eps, g.pad ? ", pitched" : ""),
+                 ps, ops);
+    }
+}
+
+/* embed_lookup_q with a scale a table row: an E4M3 table and a plain bf16 one, bf16 and f32 scale
+ * planes, ids below, at and past the table, against libref to the bit. */
+static void hy4_embed_row_scale_case(const Plugin& pl) {
+    if (!sel("embed_lookup_q_bf16")) return;
+    struct G { bool e4m3; uint32_t sdt; int64_t ne, voff; };
+    const G gs[] = { { true, RAD_BF16, 96, 0 }, { true, RAD_F32, 96, 0 }, { false, RAD_BF16, 96, 0 },
+                     { true, RAD_BF16, 13, 0 }, { true, RAD_BF16, 96, 10 }, { false, RAD_F32, 13, 10 } };
+    for (const G& g : gs) {
+        const int64_t NV = 257, M = 41;
+        Hy4Rng rng((uint32_t)(g.ne + g.sdt));
+        std::vector<Hy4Opd> ops;
+        ops.push_back(hy_opd(RAD_I32, { M }));
+        /* libref refuses an id past the table unless the table is a slice (vocab_offset), where it is
+         * another rank's token and a zero row, as it is here. */
+        hy_fill(ops[0], [&](int64_t i) {
+            if (i == 3) return -1.0;
+            if (g.voff) return (double)rng.r((uint32_t)(NV + 2 * g.voff)) - (i % 5 == 0 ? 3.0 : 0.0);
+            return (double)rng.r((uint32_t)NV);
+        });
+        ops.push_back(hy_opd(g.e4m3 ? RAD_F8E4M3 : RAD_BF16, { NV, g.ne }));
+        hy_fill(ops[1], [&](int64_t) {
+            if (!g.e4m3) return (double)(rng.n() * 0.01f);
+            uint8_t c = (uint8_t)rng.r(256);
+            if ((c & 0x7f) == 0x7f) c ^= 1;
+            return (double)c;
+        });
+        ops.push_back(hy_opd(g.sdt, { NV }));
+        hy_fill(ops[2], [&](int64_t) { return 1e-4 * (1.0 + rng.u() * 0.9); });
+        ops.push_back(hy_opd(RAD_BF16, { M, g.ne }));
+        ops[3].out = true;
+        ops.push_back(hy_absent());
+        std::vector<RadParam> ps = { PI("M", M), PI("n_embd", g.ne), PI("n_vocab", NV), PS("dtype", "bf16") };
+        if (g.voff) ps.push_back(PI("vocab_offset", g.voff));
+        hy_check(pl, "embed_lookup_q_bf16",
+                 fmt("embed_lookup_q per-row scale vs libref, to the bit: %s table, %s scale, width %lld%s",
+                     g.e4m3 ? "E4M3" : "bf16", g.sdt == RAD_F32 ? "f32" : "bf16", (long long)g.ne,
+                     g.voff ? ", a vocabulary slice" : ""),
+                 ps, ops);
+    }
+}
+
 static void device_phase(const Plugin& pl) {
     int n = 0;
     if (hipGetDeviceCount(&n) != hipSuccess || n < 1) {
@@ -33142,6 +33629,15 @@ static void device_phase(const Plugin& pl) {
     ngram_ahead_case(pl);
     ngram_hint_case(pl);
     embed_lookup_q_case(pl);
+    hy4_embed_row_scale_case(pl);
+    hy4_ihc_pre_case(pl);
+    hy4_ihc_post_case(pl);
+    hy4_gate_mul_case(pl);
+    hy4_mla_project_kv_case(pl);
+    hy4_mla_kv_split_case(pl);
+    hy4_engram_ids_case(pl);
+    hy4_engram_norm_case(pl);
+    hy4_engram_gate_case(pl);
     lora_case(pl);
 
     /* --- a weight read into the cache (prefetch): it runs, and takes any stored form --- */

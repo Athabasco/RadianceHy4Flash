@@ -114,8 +114,8 @@ __global__ __launch_bounds__(kThreads) void r4dchain_embed_lookup(R4D_EL_PARAMS)
 template <uint32_t V, bool Q>
 __global__ __launch_bounds__(kThreads) void embed_lookup_q_kernel(
     const int32_t* __restrict__ tok, const void* __restrict__ wte, const void* __restrict__ sc,
-    uint32_t sc_f32, uint16_t* __restrict__ x, uint32_t M, uint32_t n_embd, int32_t n_vocab,
-    int32_t vocab_off, uint32_t x_ld) {
+    uint32_t sc_f32, uint32_t sc_row, uint16_t* __restrict__ x, uint32_t M, uint32_t n_embd,
+    int32_t n_vocab, int32_t vocab_off, uint32_t x_ld) {
     const uint32_t per_row = n_embd / V;
     const uint64_t g = (uint64_t)blockIdx.x * kThreads + threadIdx.x;
     if (g >= (uint64_t)M * per_row) return;
@@ -127,7 +127,10 @@ __global__ __launch_bounds__(kThreads) void embed_lookup_q_kernel(
         else                  dst[0] = 0;
         return;
     }
-    const float s = !sc ? 1.0f : sc_f32 ? *(const float*)sc : bf16_to_f32(*(const uint16_t*)sc);
+    /* `sc_row`: one scale an entry of the table (a row scale plane, Hy4's Engram), read at the
+     * row's own index; otherwise the table's single scale. */
+    const uint32_t si = sc_row ? (uint32_t)id : 0u;
+    const float s = !sc ? 1.0f : sc_f32 ? ((const float*)sc)[si] : bf16_to_f32(((const uint16_t*)sc)[si]);
     const size_t at = (size_t)id * n_embd + j;
     float v[V];
     if constexpr (Q && V == 4) {
@@ -1021,7 +1024,7 @@ extern "C" int r4d_embed_lookup_bf16(long tok, long wte, long x, int M, int n_em
 /* The quad walk when width, pitch and both bases allow its 4- and 8-byte accesses (a bf16 quad is
  * 8 bytes); otherwise one entry per thread. */
 static int embed_lookup_q_emit(const int32_t* tok, const void* wte, bool q, const void* sc,
-                               bool sc_f32, uint16_t* x, long long M, int n_embd, int n_vocab,
+                               bool sc_f32, bool sc_row, uint16_t* x, long long M, int n_embd, int n_vocab,
                                int vocab_off, long long x_ld, RadStream stream) {
     const bool quad = n_embd % 4 == 0 && x_ld % 4 == 0 && r4d_aligned(x, 8) &&
                       r4d_aligned(wte, q ? 4 : 8);
@@ -1029,7 +1032,7 @@ static int embed_lookup_q_emit(const int32_t* tok, const void* wte, bool q, cons
     const dim3 grid((uint32_t)((threads + kThreads - 1) / kThreads));
 #define R4D_ELQ(V, Q)                                                                             \
     R4D_EMIT(stream, (embed_lookup_q_kernel<V, Q>), grid, dim3(kThreads), 0, tok, wte, sc,      \
-             (uint32_t)(sc_f32 ? 1u : 0u), x, (uint32_t)M, (uint32_t)n_embd, (int32_t)n_vocab,   \
+             (uint32_t)(sc_f32 ? 1u : 0u), (uint32_t)(sc_row ? 1u : 0u), x, (uint32_t)M, (uint32_t)n_embd, (int32_t)n_vocab,   \
              (int32_t)vocab_off, (uint32_t)x_ld)
     const int rc = quad ? (q ? R4D_ELQ(4, true) : R4D_ELQ(4, false))
                         : (q ? R4D_ELQ(1, true) : R4D_ELQ(1, false));
@@ -1799,6 +1802,11 @@ extern "C" int r4d_rad_embed_lookup_q(const RadArgs* a, RadStream stream) {
     const long long voff = r4d_geti_or(a, "vocab_offset", 0);
     if (n_embd <= 0 || n_vocab <= 0 || voff < 0) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(wte) < n_vocab * n_embd) return R4D_NO(RAD_E_SHAPE);
+    /* One scale entry a table row (n_vocab of them, indexed by the row after the vocabulary
+     * offset), or a single entry for the table; any other count is libref's E_SHAPE too. */
+    const bool sc_row = sc && n_vocab > 1 && r4d_numel(sc) == n_vocab;
+    if (sc && r4d_numel(sc) > 1 && !sc_row) return R4D_NO(RAD_E_SHAPE);
+    if (sc_row && !r4d_contig(sc)) return R4D_NO(RAD_E_STRIDE);
 
     long long M = 0;
     const long long x_ld = r4d_rows_pitch(x, n_embd, &M);
@@ -1807,7 +1815,7 @@ extern "C" int r4d_rad_embed_lookup_q(const RadArgs* a, RadStream stream) {
 
     return embed_lookup_q_emit((const int32_t*)r4d_addr(tok), (const void*)r4d_addr(wte), q,
                                sc ? (const void*)r4d_addr(sc) : nullptr,
-                               sc && sc->dtype == RAD_F32, (uint16_t*)r4d_addr(x), M,
+                               sc && sc->dtype == RAD_F32, sc_row, (uint16_t*)r4d_addr(x), M,
                                (int)n_embd, (int)n_vocab, (int)voff, x_ld, stream) == 0
                ? RAD_OK : RAD_E_DEVICE;
 }
