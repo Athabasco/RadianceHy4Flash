@@ -90,13 +90,15 @@ __device__ __forceinline__ void ihc_pre_body(
     const uint16_t* __restrict__ h, const float* __restrict__ fn, const float* __restrict__ scale, \
     const float* __restrict__ base, uint16_t* __restrict__ x, float* __restrict__ post,            \
     uint32_t n, float eps, float heps, float pmag, uint64_t hp, uint64_t fp, uint64_t xp,          \
-    uint64_t pp
-// CH `r4dchain`: the chained form (r4d_chain.h); no block returns early. Scale and base are read
-// through scalar loads, so the wait is the full one.
+    uint64_t pp, uint32_t M
+// CH `r4dchain`: the chained form (r4d_chain.h); every block reaches the done. Scale and base are
+// read through scalar loads, so the wait is the full one. Rows at or past M are the ones the launch
+// adds to step off the full-card cliff (r4d_cliff_rows: 16 waves a row lands every 128th M on it).
 template <int HC, bool POST, bool VEC, class CH>
 __global__ __launch_bounds__(kThreads) void ihc_pre_kernel(R4D_IHC_PRE_PARAMS) {
     if (CH::on) r4d_chain_wait();
-    ihc_pre_body<HC, POST, VEC>(h, fn, scale, base, x, post, n, eps, heps, pmag, hp, fp, xp, pp);
+    if (blockIdx.x < M)
+        ihc_pre_body<HC, POST, VEC>(h, fn, scale, base, x, post, n, eps, heps, pmag, hp, fp, xp, pp);
     if (CH::on) r4d_chain_done();
 }
 
@@ -105,11 +107,10 @@ __global__ __launch_bounds__(kThreads) void ihc_pre_kernel(R4D_IHC_PRE_PARAMS) {
 // ihc_post_bf16, ihc_pre_bf16 and rmsnorm_bf16 in sequence. ADD: the row is bf16(a + b), stored
 // back into `a` as add_bf16 stores it. TAIL 0 stops behind the write (an Engram in front of the
 // next layer writes h between). LDS: n bf16 (the row, then x) + about 0.9 KiB; no scratch.
-template <int HC, bool POST, bool TAIL, bool ADD, class CH>
-__global__ __launch_bounds__(kThreads) void ihc_junction_kernel(
+template <int HC, bool POST, bool TAIL, bool ADD>
+__device__ __forceinline__ void ihc_junction_body(
     uint16_t* __restrict__ a, const uint16_t* __restrict__ b, JuncRow r, uint64_t ap, uint64_t bp,
     uint64_t pp, uint64_t hp, uint64_t xnp, uint64_t yp, uint64_t xp) {
-    if (CH::on) r4d_chain_wait();
     R4D_DYN_LDS(uint4, jbuf);
     __shared__ JuncLds<HC, POST> L;
     uint16_t* const ybuf = (uint16_t*)jbuf;
@@ -135,9 +136,16 @@ __global__ __launch_bounds__(kThreads) void ihc_junction_kernel(
     if (r.yr) r.yr += row * yp;
     if (r.xr) r.xr += row * xp;
     junction_row<HC, POST, TAIL>(L, ybuf, r);
-    if (CH::on) r4d_chain_done();
 }
 
+template <int HC, bool POST, bool TAIL, bool ADD, class CH>
+__global__ __launch_bounds__(kThreads) void ihc_junction_kernel(
+    uint16_t* __restrict__ a, const uint16_t* __restrict__ b, JuncRow r, uint64_t ap, uint64_t bp,
+    uint64_t pp, uint64_t hp, uint64_t xnp, uint64_t yp, uint64_t xp, uint32_t M) {
+    if (CH::on) r4d_chain_wait();
+    if (blockIdx.x < M) ihc_junction_body<HC, POST, TAIL, ADD>(a, b, r, ap, bp, pp, hp, xnp, yp, xp);
+    if (CH::on) r4d_chain_done();
+}
 // h[j][i] = bf16(post[j] * y[i] + h[j][i]). The product is its own f32 rounding, as libref's.
 // Eight columns of every stream a thread when rows and pointers allow 16-byte accesses.
 template <bool VEC>
@@ -263,12 +271,13 @@ extern "C" int r4d_rad_ihc_pre(const RadArgs* a, RadStream s) {
                      ((uintptr_t)fn->data & 15) == 0 && fn->stride[0] % 4 == 0;
     /* The chained form at the vector form only (the real geometry); the scalar one stays plain. */
     const bool ch = vec && r4d_geti_or(a, "chain", 0) != 0;
+    const uint32_t grid = r4d_cliff_rows((uint32_t)M, 1, kWaves);
 #define R4D_IHC_K(HC_, POST_, VEC_, CH_)                                                           \
-    R4D_EMIT(s, (ihc_pre_kernel<HC_, POST_, VEC_, CH_>), dim3((uint32_t)M), dim3(kThreads), 0,     \
+    R4D_EMIT(s, (ihc_pre_kernel<HC_, POST_, VEC_, CH_>), dim3(grid), dim3(kThreads), 0,            \
              (const uint16_t*)h->data, (const float*)fn->data, (const float*)sc->data,            \
              (const float*)bs->data, (uint16_t*)x->data, (float*)(has_post ? post->data : nullptr), \
              (uint32_t)n, eps, heps, pmag, (uint64_t)hp, (uint64_t)fn->stride[0], (uint64_t)xp,   \
-             (uint64_t)pp)
+             (uint64_t)pp, (uint32_t)M)
 #define R4D_IHC(HC_, POST_)                                                                        \
     (ch ? R4D_IHC_K(HC_, POST_, true, r4dchain)                                                    \
         : vec ? R4D_IHC_K(HC_, POST_, true, R4dUnchained) : R4D_IHC_K(HC_, POST_, false, R4dUnchained))
@@ -432,10 +441,11 @@ extern "C" int r4d_rad_rmsnorm_ihc_junction(const RadArgs* a, RadStream s) {
     const bool add = j.b != nullptr;
     const bool ch = r4d_geti_or(a, "chain", 0) != 0;
     const uint32_t lds = j.r.n * 2u;
+    const uint32_t grid = r4d_cliff_rows((uint32_t)j.M, 1, kWaves);   /* see ihc_pre_kernel */
 #define R4D_IJ_K(HC_, PO_, TA_, AD_, CH_)                                                          \
-    R4D_EMIT(s, (ihc_junction_kernel<HC_, PO_, TA_, AD_, CH_>), dim3((uint32_t)j.M),              \
+    R4D_EMIT(s, (ihc_junction_kernel<HC_, PO_, TA_, AD_, CH_>), dim3(grid),                       \
              dim3(kThreads), lds, j.a, j.b, j.r, (uint64_t)j.ap, (uint64_t)j.bp, (uint64_t)j.pp,  \
-             (uint64_t)j.hp, (uint64_t)j.xnp, (uint64_t)j.yp, (uint64_t)j.xp)
+             (uint64_t)j.hp, (uint64_t)j.xnp, (uint64_t)j.yp, (uint64_t)j.xp, (uint32_t)j.M)
 #define R4D_IJ_C(HC_, PO_, TA_, AD_)                                                               \
     (ch ? R4D_IJ_K(HC_, PO_, TA_, AD_, r4dchain) : R4D_IJ_K(HC_, PO_, TA_, AD_, R4dUnchained))
 #define R4D_IJ_A(HC_, PO_, TA_) (add ? R4D_IJ_C(HC_, PO_, TA_, true) : R4D_IJ_C(HC_, PO_, TA_, false))

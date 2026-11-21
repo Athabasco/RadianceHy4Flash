@@ -34093,7 +34093,9 @@ static void ar_ihc_junction_case(const Plugin& pl, const std::vector<int>& devs,
     C(1, 3072, false, false, false, true, false); C(1, 3072, true, true, true, true, false);
     C(6, 3072, true, false, false, true, false);  C(17, 512, false, true, false, true, true);
     C(3, 512, true, false, false, false, false);
-    if (world == 2) { C(192, 3072, true, false, false, true, false); C(96, 3072, false, true, true, true, false); }
+    /* 256 rows: 256 blocks of 16 waves would sit on the full-card cliff, so the launch takes 255 */
+    if (world == 2) { C(192, 3072, true, false, false, true, false); C(96, 3072, false, true, true, true, false);
+                      C(256, 3072, false, false, false, true, false); }
     else C(32, 3072, true, false, false, true, false);
     for (const IjCase& c : cs) {
         const std::string at = fmt(" M=%lld n=%lld%s%s%s%s", (long long)c.M, (long long)c.n,

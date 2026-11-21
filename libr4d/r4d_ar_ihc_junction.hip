@@ -258,6 +258,14 @@ __global__ __launch_bounds__(kThreads) void ar_ihc_junction_4rank_kernel(
     if (CH::on) r4d_chain_done();
 }
 
+// A block count off the full-card cliff (r4d_cliff_rows): one block fewer where the grid's waves
+// would land on it. Blocks own whole rows by an even split, so the bytes do not depend on the count,
+// and every rank derives the same count from the same M.
+inline int arij_off_cliff(int nb) {
+    while (nb > 1 && r4d_cliff_rows((uint32_t)nb, 1, kWaves) != (uint32_t)nb) --nb;
+    return nb;
+}
+
 }  // namespace
 
 // The two-rank launch: the IPC arguments are r4d_ar_rmsnorm_quant_i8's, `j` the checked operands
@@ -277,6 +285,7 @@ extern "C" int r4d_ar_ihc_junction_2rank(long peer_scratch, long my_scratch, lon
     if (nb > M) nb = M;
     const int nbw = r4d_ar_max_blocks();
     if (nb > nbw) nb = nbw;
+    nb = arij_off_cliff(nb);
     const bool ch = chain != 0;
     const bool add = j.b != nullptr;
     const uint32_t lds = j.r.n * 2u;
@@ -338,6 +347,7 @@ extern "C" int r4d_ar_ihc_junction_4rank(long peer_scratch0, long peer_scratch1,
     int nb = nblocks < 1 ? 1 : nblocks;
     if (nb > M) nb = M;
     if (nb > R4D_AR_WIDE_MAX_BLOCKS) nb = R4D_AR_WIDE_MAX_BLOCKS;
+    nb = arij_off_cliff(nb);
     try {
         const long slot_bytes = 2L * WS * slot_stride16 * 16;
         const long flag_bytes = (long)nb * WS * (long)sizeof(unsigned int);
