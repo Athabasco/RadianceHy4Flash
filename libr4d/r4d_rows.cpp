@@ -1493,6 +1493,36 @@ static const RadOperandSpec oQsaScore[] = {
     { "score", RAD_OPD_OUT, 0 },
 };
 
+/* `idx_pool_gated` and `idx_score`, the Hy4-flash compressed indexer's two ops: libref's spelling,
+ * field for field (libref/ref_registry.cpp). */
+static const RadParamSpec pIdxPoolGated[] = {
+    P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("rotary_dim"), P_F64("eps"), P_F64("theta"),
+    P_STR("mode"), P_STRO("sections"), P_INTO("block_size"), P_STR("dtype"),
+};
+static const RadOperandSpec oIdxPoolGated[] = {
+    { "k",     RAD_OPD_IN,     0 },
+    { "wv",    RAD_OPD_WEIGHT, 0 },
+    { "wg",    RAD_OPD_WEIGHT, 0 },
+    { "ape",   RAD_OPD_WEIGHT, 0 },
+    { "gain",  RAD_OPD_WEIGHT, 0 },
+    { "pos",   RAD_OPD_IN,     0 },
+    { "page",  RAD_OPD_IN,     1 },
+    { "cache", RAD_OPD_INOUT,  1 },
+    { "out",   RAD_OPD_OUT,    1 },
+};
+static const RadParamSpec pIdxScore[] = {
+    P_INT("M"), P_INT("n"), P_INT("heads"), P_INT("blocks"), P_INT("seqs"), P_STR("dtype"),
+};
+static const RadOperandSpec oIdxScore[] = {
+    { "q",     RAD_OPD_IN,  0 },
+    { "gate",  RAD_OPD_IN,  0 },
+    { "k",     RAD_OPD_IN,  0 },
+    { "bt",    RAD_OPD_IN,  0 },
+    { "cu",    RAD_OPD_IN,  0 },
+    { "nc",    RAD_OPD_IN,  0 },
+    { "score", RAD_OPD_OUT, 0 },
+};
+
 /* `rmsnorm_quant_fp8` and `gated_quant_fp8`, new ops whose schemas this plugin fixes. Each is its
  * producer's operand list with the quantiser's two outputs added and the producer's bf16 output
  * made optional, so an architecture that fuses changes only the op name and adds `q` and `scale`.
@@ -3863,7 +3893,19 @@ static const RadOpSchema kSchemas[] = {
            "nowhere else, so the effective query position is (nsel-1)*ratio + pos%ratio. Ties "
            "break to the LOWER block index through a prefix count, never through atomic order. "
            "`signed` 1 ranks signed finite scores; absent or 0 ranks max(score, 0). `own` 1 keeps the "
-           "query's own block out of the candidates and appends it, complete or not."),
+           "query's own block out of the candidates and appends it last, complete or not."),
+    SCHEMA("idx_pool_gated", pIdxPoolGated, oIdxPoolGated,
+           "The compressed indexer's group key (Hy4-flash). Per group of `ratio` token keys, in "
+           "f32: val_s = wv x_s; gat_s = wg x_s + ape[s]; softmax over the slots per channel; y = "
+           "sum_s val_s p_s; z = round(gain * (y * rsqrt(mean y^2 + eps))); then the last "
+           "`rotary_dim` channels rotated as adjacent pairs at the group's first position (mode "
+           "gptj, or imrope_gptj with `sections`, pos [3, W]) and rounded again. Written to "
+           "cache[page[w]] and/or out[w]."),
+    SCHEMA("idx_score", pIdxScore, oIdxScore,
+           "Group scores of the compressed indexer: w_h = gate[m][h] * (heads*n)^-0.5, d_h = "
+           "q[m][h] . key, score = (sum_{h < heads/2} w_h relu(d_h)) + (sum_{h >= heads/2} w_h "
+           "relu(d_h)). A block past nc[seq], with a page < 0 or out of range, or past the table: "
+           "-inf."),
     SCHEMA("kv_resolve", pKvResolve, oKvResolve,
            "make every block the selections name resident and rewrite them as ring slots: bump "
            "the epoch, take a hit or make a single claim (-1 -> -2) per distinct block, compact "
@@ -5330,6 +5372,19 @@ static const RadConstraint cQsaTailStore[] = {
 
 /* No dtype: every operand is f32 or i32. */
 static const RadConstraint cQsaSelect[] = { C_GE("blocks", 1), C_GE("topk", 1), C_GE("ratio", 1) };
+
+/* Pooling is built for the indexer's key width and group size; the rotary width is a runtime value
+ * (even, inside the key). */
+static const RadConstraint cIdxPoolGated[] = {
+    C_EQ("n", 128), C_EQ("ratio", 4), C_GE("rotary_dim", 2), C_LE("rotary_dim", 128),
+    C_DIV("rotary_dim", 2), C_IN("mode", "gptj imrope_gptj"), C_IN("dtype", "bf16"),
+};
+/* One wave scores a row against 16 keys with the 16 heads as the WMMA's rows; the grid's key axis
+ * is 64 keys a workgroup and 16 bits wide. */
+static const RadConstraint cIdxScore[] = {
+    C_EQ("n", 128), C_EQ("heads", 16), C_GE("blocks", 1), C_LE("blocks", 1048576),
+    C_IN("dtype", "bf16"),
+};
 
 /* The two byte planes are read by pitch, so only positivity is fixed: any block extent and any
  * ring depth the device can address. */
@@ -9233,6 +9288,31 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cQsaSelect), NOTUNE,
   nullptr, nullptr, r4d_rad_qsa_select, r4d_rad_qsa_select_scratch, nullptr, nullptr,
   r4d_shape_qsa_select },
+
+/* The Hy4-flash indexer's group key. 128 threads, a channel each; 4 groups a workgroup from 16
+ * groups up so a weight row read serves four. Byte-equal to libref (the same order of every sum, f64
+ * exp, trig and norm). */
+{ "idx_pool_gated_f32", "idx_pool_gated", "attn",
+  "pool 4 token keys into one indexer key: gated softmax pool in f32, norm, rotary at the group's "
+  "first position, bf16",
+  "n 128, ratio 4, any even rotary_dim up to 128, mode gptj or imrope_gptj",
+  "bf16 keys, f32 wv/wg/ape, f32 or bf16 gain, i32 positions and pages, bf16 cache and output",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cIdxPoolGated), NOTUNE,
+  nullptr, nullptr, r4d_rad_idx_pool_gated, nullptr, nullptr, nullptr,
+  nullptr },
+
+/* The Hy4-flash indexer's score: 16 heads of relu(q . key) per group key, one wave a row against 16
+ * keys on WMMA (heads as the tile's rows), summed in libref's order. */
+{ "idx_score_bf16", "idx_score", "attn",
+  "the compressed indexer's group score: sum over heads of gate-weighted relu(q . key), the two "
+  "halves of the heads added",
+  "n 128, 16 heads, up to 2^20 groups a row, any M (a row's bytes do not depend on M)",
+  "bf16 queries, gates and keys, an i32 page table, f32 scores; a group without a page scores -inf",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cIdxScore), NOTUNE,
+  nullptr, nullptr, r4d_rad_idx_score, nullptr, nullptr, nullptr,
+  nullptr },
 
 /* The residency map of a streamed KV group, in one workgroup: the CLOCK hand is serial state and
  * the phases are barriers. The copies run in the same launch. */

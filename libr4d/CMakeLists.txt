@@ -176,6 +176,8 @@ set(R4D_UNITS
   "r4d_kv_resolve|"
   "r4d_qsa_tail_store_bf16|"
   "r4d_qsa_work_bf16|"
+  "r4d_idx_pool_gated_f32|"
+  "r4d_idx_score_bf16|"
   "r4d_sample_chain_f32|"
   "r4d_model_bf16|"
   "r4d_sample_stages_f32|"

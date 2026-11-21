@@ -685,6 +685,8 @@ int64_t r4d_rad_kv_resolve_scratch(const RadArgs*);
 int r4d_rad_kv_store_streamed(const RadArgs*, RadStream);
 int r4d_rad_qsa_tail_store  (const RadArgs*, RadStream);
 int r4d_rad_qsa_work        (const RadArgs*, RadStream);
+int r4d_rad_idx_pool_gated  (const RadArgs*, RadStream);
+int r4d_rad_idx_score       (const RadArgs*, RadStream);
 int r4d_rad_sample_chain    (const RadArgs*, RadStream);
 
 /* -- what each weight-reading kernel stores, from a weight's canonical planes --
