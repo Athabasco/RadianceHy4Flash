@@ -126,6 +126,17 @@ release structure (fetches the 148 headers once, ~10 MB), the host parity harnes
 at four fake ranks, the KL round trip, the chat tests. Items that need a card or a package not yet merged are
 listed as OPEN with the command that decides them.
 
+## TP4 safety (junction twin, kernel arguments)
+
+- The fused `ar_rmsnorm_ihc_junction` (the all-reduce, sandwich norm, iHC post/pre and the next
+  input norm in one launch) has run on two cards only. At world 2 the plugin uses it by default; at
+  world 4 it issues the tested chain (add, standalone exact `all_reduce`, plain
+  `rmsnorm_ihc_junction`) unless `RADIANCE_HY4_JUNCTION_TP4=1`. `RADIANCE_HY4_JUNCTION=0` keeps the
+  whole unfused chain at every world. Try the flag on your four cards and compare greedy output
+  with and without it before relying on it.
+- Kernel arguments passed by value (peers, row and gather structs of the all-reduce family) carry
+  no padding (`static_assert`s in libr4d), since a recorded pass's audit compares argument bytes.
+
 ## Known limits
 
 - The quantised forms above serve on the host (libref, libavx) at one, two and four (fake) ranks; on the

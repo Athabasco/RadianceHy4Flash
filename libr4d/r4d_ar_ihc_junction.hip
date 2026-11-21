@@ -29,6 +29,7 @@
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_emit.h"
+#include <type_traits>
 #include "r4d_chain.h"
 #include "r4d_ar_seq.h"
 #include "r4d_ar_wide.h"
@@ -205,6 +206,9 @@ struct ArijPeers {
     unsigned int* flags[3];
     int rank[4];
 };
+static_assert(sizeof(ArijPeers) == sizeof(R4DArWidePeers<int4, 3>) &&
+                  std::has_unique_object_representations_v<ArijPeers>,
+              "ArijPeers is a kernel argument by value and carries no padding");
 template <int HC, bool POST, bool TAIL, bool ADD, class CH>
 __global__ __launch_bounds__(kThreads) void ar_ihc_junction_4rank_kernel(
     R4D_ARIJ_ROWPARAMS, ArijPeers pa, const int4* __restrict__ my_base,

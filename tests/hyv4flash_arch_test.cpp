@@ -1518,4 +1518,23 @@ TEST(the_dfly2_taps_are_the_references_keys) {
     CHECK_LINT(d.b, ps[0].get(), ps[1].get(), ps[2].get());
 }
 
+/* The four-rank twin ar_rmsnorm_ihc_junction is untested on four cards: at world 4 the plugin
+ * declares the chain (standalone all_reduce + plain rmsnorm_ihc_junction) unless
+ * RADIANCE_HY4_JUNCTION_TP4=1; world 2 declares the twin by default. */
+TEST(the_four_rank_junction_twin_is_opt_in) {
+    unsetenv("RADIANCE_HY4_JUNCTION_TP4");
+    for (int world : { 1, 2, 4 }) {
+        Declared d(bf16_encs, world, 0, true);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        CHECK(count_op(d.b, "rmsnorm_ihc_junction") > 0);
+        CHECK_EQ(count_op(d.b, "ar_rmsnorm_ihc_junction") > 0, world == 2);
+        if (world == 4) CHECK(count_op(d.b, "all_reduce") > 0);
+    }
+    setenv("RADIANCE_HY4_JUNCTION_TP4", "1", 1);
+    Declared d(bf16_encs, 4, 0, true);
+    unsetenv("RADIANCE_HY4_JUNCTION_TP4");
+    REQUIRE_EQ(d.rc, RAD_OK);
+    CHECK(count_op(d.b, "ar_rmsnorm_ihc_junction") > 0);
+}
+
 RAD_TEST_MAIN()

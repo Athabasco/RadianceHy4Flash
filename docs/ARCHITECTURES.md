@@ -3438,6 +3438,12 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   and never streams; the indexer's key cache is read whole every step and stays resident
   (`rad_kv_group_dense_read`). Like every streamed model, a context under the ring's floor of
   32 768 tokens does not stream.
+- **iHC junction at TP4** (WP16.2). `ar_rmsnorm_ihc_junction` (the all-reduce fused into the
+  junction) is used at world 1..2 by default (`rmsnorm_ihc_junction` at world 1). It has not run on
+  four cards, so at world 4 the plugin issues the tested chain (add, standalone exact `all_reduce`,
+  plain `rmsnorm_ihc_junction`) unless `RADIANCE_HY4_JUNCTION_TP4=1`; `RADIANCE_HY4_JUNCTION=0`
+  keeps the unfused chain everywhere. By-value kernel-argument structs of the wide all-reduce
+  family are padding-free (a recorded pass's audit compares argument bytes).
 - **The FP8 indexer** (`RADIANCE_HY4_INDEXER=fp8`; `exact`, the default, is HF's numerics). The
   key cache and the score take vLLM's IndexPool numerics on GLM's forms: `idx_pool_gated_fp8`
   keeps the pooled, normed, rotated group key in f32 and writes its 128-wide Hadamard into E4M3

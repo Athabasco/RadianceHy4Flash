@@ -432,10 +432,18 @@ struct Trunk {
  *
  * RADIANCE_HY4_JUNCTION=0 keeps the unfused chain; so does a calibration run (its hooks read
  * between the ops). Where the fused all-reduce is not served (a library without it, four ranks
- * above decode heights) the step issues [add,] the standalone exact all_reduce and the plain row. */
+ * above decode heights, and four ranks at all unless RADIANCE_HY4_JUNCTION_TP4=1) the step issues [add,] the standalone exact all_reduce and the plain row. */
 inline bool junction_on() {
     const char* e = std::getenv("RADIANCE_HY4_JUNCTION");
     return !(e && *e && std::strcmp(e, "0") == 0);
+}
+
+/* The four-rank twin (ar_rmsnorm_ihc_junction _4rank) has not run on four cards yet (the dev box
+ * has two). At world 4 the plugin therefore issues the tested chain (add, standalone exact
+ * all_reduce, plain junction) unless RADIANCE_HY4_JUNCTION_TP4=1. World 2 is unaffected. */
+inline bool junction_tp4() {
+    const char* e = std::getenv("RADIANCE_HY4_JUNCTION_TP4");
+    return e && *e && std::strcmp(e, "0") != 0;
 }
 
 struct Junction {
@@ -492,7 +500,7 @@ struct Junction {
         };
         /* The twin first: at more ranks the plain row is the fallback behind the standalone
          * reduction. Two ranks at every height, four at decode and verify heights. */
-        if (world == 2 || world == 4) {
+        if (world == 2 || (world == 4 && junction_tp4())) {
             ar_rows = world == 2 ? g.max_tok : ar_wide_write_rows(g);
             std::vector<RadParam> pa = ps;
             pa[0] = RAD_RANGE("M", 1, ar_rows);
