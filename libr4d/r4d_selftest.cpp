@@ -28253,10 +28253,13 @@ static void idx_pool_fp8_case(const Plugin& pl) {
             const int64_t comps = imrope ? 3 : 1, pages = W + 6;
             std::vector<int32_t> pos((size_t)(comps * W)), page((size_t)W);
             for (int64_t w = 0; w < W; ++w) {
-                pos[(size_t)w] = (int32_t)(4 * (w * 7919 + 3));
                 if (imrope) {
-                    pos[(size_t)(W + w)] = (int32_t)(w * 3 + 1);
-                    pos[(size_t)(2 * W + w)] = (int32_t)(w * 5 + 2);
+                    /* [W, 3]: a group's components side by side (WP15) */
+                    pos[(size_t)(3 * w)] = (int32_t)(4 * (w * 7919 + 3));
+                    pos[(size_t)(3 * w + 1)] = (int32_t)(w * 3 + 1);
+                    pos[(size_t)(3 * w + 2)] = (int32_t)(w * 5 + 2);
+                } else {
+                    pos[(size_t)w] = (int32_t)(4 * (w * 7919 + 3));
                 }
                 page[(size_t)w] = (int32_t)(pages - 1 - w);
             }
@@ -28292,7 +28295,7 @@ static void idx_pool_fp8_case(const Plugin& pl) {
                     T(k_, RAD_BF16, { W * ratio, n }), T(wv_, RAD_F32, { n, n }),
                     T(wg_, RAD_F32, { n, n }), T(ape_, RAD_F32, { ratio, n }),
                     T(gain_, RAD_F32, { n }),
-                    imrope ? T(pos_, RAD_I32, { 3, W }) : T(pos_, RAD_I32, { W }),
+                    imrope ? T(pos_, RAD_I32, { W, 3 }) : T(pos_, RAD_I32, { W }),
                     T(page_, RAD_I32, { W }), c, T(q_, RAD_F8E4M3, { W, n }),
                     T(sc_, RAD_F32, { W, 1 }) };
             };
