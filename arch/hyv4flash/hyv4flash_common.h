@@ -442,6 +442,15 @@ inline bool junction_on() {
     return !(e && *e && std::strcmp(e, "0") == 0);
 }
 
+/* The latent cache row's front in one launch (mla_row_norm_rope_store, WP16.5): the row's norm, the
+ * rotary of its key part and the paged store, byte-identical to the three ops. RADIANCE_HY4_CACHE_ROW=0
+ * keeps the three; so do the debug taps (they read between the ops) and a streamed sparse group
+ * (its store is kv_store_streamed). */
+inline bool cache_row_on() {
+    const char* e = std::getenv("RADIANCE_HY4_CACHE_ROW");
+    return !(e && *e && std::strcmp(e, "0") == 0);
+}
+
 /* The four-rank twin (ar_rmsnorm_ihc_junction _4rank) has not run on four cards yet (the dev box
  * has two). At world 4 the plugin therefore issues the tested chain (add, standalone exact
  * all_reduce, plain junction) unless RADIANCE_HY4_JUNCTION_TP4=1. World 2 is unaffected. */

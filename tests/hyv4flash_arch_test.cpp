@@ -367,6 +367,40 @@ TEST(the_pass_key_tells_a_selecting_step_from_a_dense_one) {
     CHECK_EQ(hyv4flash::pass_key(&pc, &pf->b, nullptr), (uint64_t)0);
 }
 
+/* The latent cache row's front (WP16.5): where a library declares mla_row_norm_rope_store the step
+ * issues it once a layer instead of the row's norm, its rotary and the store; RADIANCE_HY4_CACHE_ROW=0,
+ * the debug taps and a library without the op keep the three. Taps need the unfused ops (they
+ * read between them). */
+TEST(the_cache_row_front_is_one_launch_where_a_library_has_it) {
+    auto run = [&](const char* env, bool undeclared, int* fused, int* norm, int* krope, int* store) {
+        if (env) setenv("RADIANCE_HY4_CACHE_ROW", env, 1);
+        Declared d;
+        unsetenv("RADIANCE_HY4_CACHE_ROW");
+        REQUIRE_EQ(d.rc, RAD_OK);
+        (void)undeclared;
+        auto k = kit(d.b, { 1 }, {}, 0);
+        k->pos[0] = 5; k->used[0] = 6; k->ctxl[0] = 5;
+        k->b.positions_h = k->pos.data();
+        k->b.max_ctx_len = 6;
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK_LINT(d.b, &c);
+        CHECK(c.step_fail.empty());
+        *fused = count_issued(d.b, c, "mla_row_norm_rope_store");
+        *norm = count_issued(d.b, c, "rmsnorm");
+        *krope = count_issued(d.b, c, "rope");
+        *store = count_issued(d.b, c, "kv_store");
+    };
+    int f1, n1, r1, s1, f0, n0, r0, s0;
+    run(nullptr, false, &f1, &n1, &r1, &s1);
+    run("0", false, &f0, &n0, &r0, &s0);
+    CHECK_EQ(f0, 0);
+    CHECK_EQ(f1, 3);                    /* every layer: the sparse and the sliding */
+    CHECK_EQ(s0 - s1, 3);               /* a store a layer folded in */
+    CHECK_EQ(n0 - n1, 3);               /* ...and the latent's norm */
+    CHECK_EQ(r0 - r1, 3);               /* ...and the key part's rotary (q_rope stays) */
+}
+
 /* RADIANCE_HY4_TAPS=1: the harness's buffers (ref/README.md "Tap contract"), PERSIST, and a step
  * that writes them stays lint clean. */
 TEST(the_debug_taps_are_persistent_buffers_and_lint_clean) {
@@ -453,7 +487,9 @@ TEST(a_streamed_sparse_group_stores_to_its_mirror_and_resolves_between_select_an
         CHECK(c.step_fail.empty());
         for (const auto& l : m.layers) {
             if (l.sliding) {
-                CHECK(find_issue(c, l.attn.op_store) != SIZE_MAX);
+                /* the window group never streams: its row front is the one launch */
+                CHECK(find_issue(c, l.attn.op_store) != SIZE_MAX ||
+                      find_issue(c, l.attn.op_row_front) != SIZE_MAX);
                 continue;
             }
             const size_t store = find_issue(c, l.attn.op_store_stream);

@@ -111,6 +111,7 @@ struct Attn {
     rad_weight qa_gain = 0, kv_gain = 0, post_gain = 0, kv_b = 0, sinks = 0;
     rad_op op_qa_norm = 0, op_kv_norm = 0, op_q_rope = 0, op_k_rope = 0, op_store = 0;
     rad_op op_store_stream = 0, op_resolve = 0;   /* a streamed sparse group (--kv-resident) */
+    rad_op op_row_front = 0;   /* the cache row's norm, rotary and store in one launch (WP16.5) */
     /* The latent attention twice (WP16 perf.md 3.4.1): decode-class rows (decode and verify,
      * [0, DT)) with `stable 1`, whose bytes do not depend on the step's other rows or streams, and
      * prefill rows ([DT, T)) with `stable 0`, the fast form. */
@@ -203,6 +204,26 @@ struct Attn {
                         RAD_STR("kv_dtype", "bf16") },
                       {}, { w.row }, {});
         HY4_NEED(op_store, "kv_store");
+        /* The row's norm, the key part's rotary and the store as one op, where a library has it and
+         * nothing reads between them (the taps); declared after kv_store, whose block size the group
+         * takes. The streamed store and the staged pass keep the three. */
+        if (cache_row_on() && !taps_on() && rad_op_declared(b, "mla_row_norm_rope_store")) {
+            op_row_front =
+                sec && *sec
+                    ? mk(b, "mla_row_norm_rope_store",
+                         { RAD_RANGE("M", 1, T), RAD_INT("latent", L), RAD_INT("rope_dim", R),
+                           RAD_F64("eps", s.eps), RAD_F64("theta", theta), RAD_F64("scale", 1.0),
+                           RAD_STR("mode", "imrope_gptj"), RAD_STR("sections", sec),
+                           RAD_INT("block_size", bs), RAD_STR("dtype", "bf16") },
+                         { kv_gain }, { w.row }, { w.row })
+                    : mk(b, "mla_row_norm_rope_store",
+                         { RAD_RANGE("M", 1, T), RAD_INT("latent", L), RAD_INT("rope_dim", R),
+                           RAD_F64("eps", s.eps), RAD_F64("theta", theta), RAD_F64("scale", 1.0),
+                           RAD_STR("mode", "gptj"), RAD_INT("block_size", bs),
+                           RAD_STR("dtype", "bf16") },
+                         { kv_gain }, { w.row }, { w.row });
+            if (op_row_front && !rad_op_resolved(b, op_row_front)) op_row_front = 0;
+        }
         /* The streamed store: kv_store's operands plus the residency map and the layer's mirror
          * row, added at issue. Declared only when the architecture can stream and --kv-resident
          * asks for a ring (rad_op_declared); the sliding window never streams. */
@@ -394,17 +415,26 @@ struct Attn {
         q_nope.step(c, act(w.qa), w.q_nope, T);
         q_rope.step(c, act(w.qa), w.q_rope, T);
         kv_a.step(c, act(xa), w.row, T);
-        RAD_ISSUE_N(c, op_kv_norm, T, bcol(w.row, 0, L, T), RAD_W(kv_gain), bcol(w.row, 0, L, T));
-        t_kv_latent.step(c, bcol(w.row, 0, L, T), T);
         const RadOperand rpos = rope_pos_of(s, batch, T);
-        RAD_ISSUE_N(c, op_q_rope, T, brows(w.q_rope, T), rpos);
-        RAD_ISSUE_N(c, op_k_rope, T, bcol(w.row, L, R, T), rpos);
-        t_kv_rope.step(c, bcol(w.row, L, R, T), T);
         const int64_t half = (L + R) / 2;
-        if (!kb->stream) {
-            RAD_ISSUE_N(c, op_store, T, bcol(w.row, 0, half, T), bcol(w.row, half, half, T),
+        /* The row's front in one launch (byte-identical to the norm, the rotary and the store). */
+        const bool fused = op_row_front && !kb->stream;
+        if (fused) {
+            RAD_ISSUE_N(c, op_row_front, T, brows(w.row, T), RAD_W(kv_gain), rpos,
                         praw(kb->slot_mapping, RAD_I32, T), kv_cache(kv, layer));
         } else {
+            RAD_ISSUE_N(c, op_kv_norm, T, bcol(w.row, 0, L, T), RAD_W(kv_gain), bcol(w.row, 0, L, T));
+            t_kv_latent.step(c, bcol(w.row, 0, L, T), T);
+        }
+        RAD_ISSUE_N(c, op_q_rope, T, brows(w.q_rope, T), rpos);
+        if (!fused) {
+            RAD_ISSUE_N(c, op_k_rope, T, bcol(w.row, L, R, T), rpos);
+            t_kv_rope.step(c, bcol(w.row, L, R, T), T);
+        }
+        if (!fused && !kb->stream) {
+            RAD_ISSUE_N(c, op_store, T, bcol(w.row, 0, half, T), bcol(w.row, half, half, T),
+                        praw(kb->slot_mapping, RAD_I32, T), kv_cache(kv, layer));
+        } else if (!fused) {
             /* The mirror always, the ring slot where the block is resident; the stage wait goes
              * right before the store (core/kvstream/stage.h), and a staged pass also stores at
              * block-id identity, which is how the stage is read. */
