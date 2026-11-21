@@ -2903,8 +2903,9 @@ static const RadOperandSpec oLoraExpand[] = {
     { "y",      RAD_OPD_INOUT, 0 },
 };
 
-/* attn_kv_sink: libref's spelling (libref/ref_registry.cpp pAttnKvSink, oAttnKvSink). */
-static const RadParamSpec pAttnKvSink[] = { P_INT("M"), P_INT("N"), P_INT("heads"),
+/* attn_kv_sink: libref's spelling (libref/ref_registry.cpp pAttnKvSink, oAttnKvSink). N is a
+ * capacity: attn_kv_sink_h256 launches by the k / v and cu operands' extents. */
+static const RadParamSpec pAttnKvSink[] = { P_INT("M"), { "N", RAD_P_INT, RAD_REQUIRED, RAD_PROLE_CAPACITY }, P_INT("heads"),
                                             P_INT("head_dim"), P_INT("window"), P_F64("scale"),
                                             P_STR("dtype") };
 static const RadOperandSpec oAttnKvSink[] = { { "q", RAD_OPD_IN, 0 },     { "k", RAD_OPD_IN, 0 },
