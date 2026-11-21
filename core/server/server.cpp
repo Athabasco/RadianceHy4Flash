@@ -326,7 +326,7 @@ std::vector<std::string> Server::probe_reasoning_efforts() {
     std::string plain;
     if (!render("", &plain) || render("radiance-probe-not-a-level", nullptr)) return {};
     std::vector<std::string> set, same;
-    for (const char* w : { "low", "medium", "high", "xhigh", "max" }) {
+    for (const char* w : { "low", "medium", "high", "xhigh", "max", "no_think" }) {
         std::string text;
         if (!render(w, &text)) continue;
         set.push_back(w);

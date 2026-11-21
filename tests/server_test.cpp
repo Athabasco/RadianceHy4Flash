@@ -1113,6 +1113,66 @@ TEST(an_effort_the_template_refuses_is_answered_with_the_set_it_takes) {
     CHECK_EQ(caps[2].get<std::string>(), std::string("low"));
 }
 
+/* Hy4-flash's template takes `no_think` and `high` and nothing else, and has no enable_thinking:
+ * the server's own ways of saying "do not think" must reach it as `no_think`, and every level it
+ * does not take is refused with the set it does. */
+TEST(a_template_taking_no_think_and_high_gets_every_thinking_off_as_no_think) {
+    Fixture f;
+    f.tmpl.efforts = { "\"high\"", "\"no_think\"" };
+    const std::vector<std::string> set = f.srv->probe_reasoning_efforts();
+    REQUIRE_EQ(set.size(), 2u);
+    CHECK_EQ(set[0], std::string("high"));
+    CHECK_EQ(set[1], std::string("no_think"));
+    OaiLimits lim = f.limits();
+    lim.reasoning_efforts = set;
+    auto prompt = [&](const std::string& extra) {
+        return chat_with(f, lim, extra).prompts.at(0).text;
+    };
+    /* Thinking on is the template's default: nothing is added. */
+    CHECK(!has(prompt(""), "reasoning_effort"));
+    CHECK(has(prompt(R"("reasoning_effort":"high")"), "[reasoning_effort=\"high\"]"));
+    CHECK(has(prompt(R"("enable_thinking":true)"), "<user>") &&
+          !has(prompt(R"("enable_thinking":true)"), "reasoning_effort"));
+    /* Every spelling of "off". */
+    for (const char* off : { R"("reasoning_effort":"none")", R"("reasoning_effort":"minimal")",
+                             R"("reasoning_effort":"no_think")", R"("enable_thinking":false)",
+                             R"("chat_template_kwargs":{"enable_thinking":false})",
+                             R"("chat_template_kwargs":{"reasoning_effort":"no_think"})",
+                             R"("thinking":{"type":"disabled"})",
+                             R"("reasoning":{"enabled":false})" }) {
+        const std::string p = prompt(off);
+        CHECK(has(p, "[reasoning_effort=\"no_think\"]"));
+        CHECK(!has(p, "\"high\""));
+    }
+    /* Off beside a level: off wins, since the other reading would think after being told not to. */
+    CHECK(has(prompt(R"("enable_thinking":false,"reasoning_effort":"high")"),
+              "[reasoning_effort=\"no_think\"]"));
+    /* A deployment default of `high` does not outvote a request that turns thinking off. */
+    lim.default_reasoning_effort = "high";
+    CHECK(has(prompt(R"("enable_thinking":false)"), "[reasoning_effort=\"no_think\"]"));
+    CHECK(has(prompt(""), "[reasoning_effort=\"high\"]"));
+    lim.default_reasoning_effort.clear();
+
+    /* The rest of the ladder is refused in OpenAI's shape, naming the two words the template takes. */
+    for (const char* bad : { "low", "medium", "xhigh", "max" }) {
+        OaiRequest r;
+        ApiError e;
+        const std::string body = std::string(R"({"messages":[{"role":"user","content":"hi"}],)") +
+                                 R"("reasoning_effort":")" + bad + "\"}";
+        CHECK(parse_chat_request(body, f.odeps(), lim, &r, &e) < 0);
+        CHECK_EQ(e.status, 400);
+        CHECK_EQ(e.param, std::string("reasoning_effort"));
+        CHECK_EQ(e.code, std::string("unsupported_value"));
+        CHECK(has(e.message, std::string("'") + bad + "'"));
+        CHECK(has(e.message, "'high' and 'no_think'"));
+        CHECK(!has(e.message, "Jinja"));
+    }
+    /* ... and a map the operator writes translates a level instead. */
+    lim.reasoning_effort_map = { { "low", "no_think" }, { "max", "high" } };
+    CHECK(has(prompt(R"("reasoning_effort":"low")"), "[reasoning_effort=\"no_think\"]"));
+    CHECK(has(prompt(R"("reasoning_effort":"max")"), "[reasoning_effort=\"high\"]"));
+}
+
 /* A template that takes any word has no set to publish or refuse with, and a template refusing
  * for another reason keeps blaming `messages` with its own sentence. */
 TEST(a_template_that_takes_any_effort_publishes_no_set) {
