@@ -3436,8 +3436,15 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   codes at a power-of-two scale in `dsa_pool`'s packed page (136 bytes a group instead of 256),
   the rotated query goes through `dsa_query` a head at a time, and `dsa_score` (16 heads, the
   head weights cast to f32 as its gates) scores the pages; `qsa_select` is unchanged. Selection is
-  discrete, so FP8 moves near-ties: measured on `gpu-mini` below. The HF parity harness compares
-  the exact path; the FP8 path is compared with it.
+  discrete, so FP8 moves near-ties. On `gpu-mini` (random weights, many near-ties) at 3000 tokens:
+  recalled sets Jaccard 0.988 (first sparse layer) / 0.971 (second), logits KL to the exact path
+  1.2e-2 mean, top-1 agreement 94.8 %, at TP1 and TP2; every tensor but the scores stays within
+  the HF tolerance when HF is conditioned on the FP8 selection. The HF parity harness compares the
+  exact path; the FP8 path is compared with it.
+- **Streamed KV on the cards** (`gpu-mini`, 60000-token prompt, `--kv-resident 32768`: a ring of
+  8192 blocks under a 15104-block context): greedy tokens and logprobs are bit-identical to the
+  resident run at TP1 and TP2, and with the FP8 indexer; a request's 48 decode steps resolve 94
+  times with about 25 700 misses.
 - **The Engram norms' eps** is `finfo(dtype).eps` in the reference (DECISIONS U1):
   `RADIANCE_HY4_ENGRAM_EPS=bf16` (0.0078125, the default), `f32` (1.19e-7, the harness's parity
   mode) or a number.
