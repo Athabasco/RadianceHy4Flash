@@ -193,6 +193,8 @@ AVX_KERNEL(ihc_post) {
  * composition of libref's ops. */
 extern "C" int AVX_FN(avx_add)(const RadArgs*, RadStream);
 extern "C" int AVX_FN(avx_rmsnorm)(const RadArgs*, RadStream);
+extern "C" int AVX_FN(avx_swiglu_clamped)(const RadArgs*, RadStream);
+extern "C" int AVX_FN(avx_had_quant_act_i8g)(const RadArgs*, RadStream);
 AVX_KERNEL(rmsnorm_ihc_junction) {
     if (!a || a->n_t < 5) return RAD_E_INVAL;
     auto opd = [&](int i) -> const RadTensor* { return i < a->n_t ? rad_arg_in(a, i) : nullptr; };
@@ -266,7 +268,14 @@ AVX_KERNEL(rmsnorm_ihc_junction) {
     P(0, "M", M);
     P(1, "n", n);
     PF(2, "eps", e);
-    return run(AVX_FN(avx_rmsnorm), { X, wn, xn }, 3);
+    if ((rc = run(AVX_FN(avx_rmsnorm), { X, wn, xn }, 3)) != RAD_OK) return rc;
+    /* G-3b: the codes of the next block's input norm, had_quant_act_i8g over xn */
+    const RadTensor *xq = opd(12), *xs = opd(13);
+    if (!xq) return RAD_OK;
+    if (!xs || p_int(a, "group", 128) != 128) return RAD_E_INVAL;
+    P(2, "group", 128);
+    pm[3] = RadParam{}; pm[3].key = "dtype"; pm[3].kind = RAD_P_STR; pm[3].sval = p_str(a, "dtype", "bf16");
+    return run(AVX_FN(avx_had_quant_act_i8g), { xn, xq, xs }, 4);
 }
 
 /* ================================================================== mla_project_kv */
@@ -650,6 +659,80 @@ AVX_KERNEL(mla_expand_gate) {
     RadArgs g = *a;
     g.t = tg; g.n_t = 3; g.p = pg; g.n_p = 2;
     return AVX_FN(avx_gate_mul)(&g, stream);
+}
+
+/* ================================================================== swiglu_clamped_had_quant_i8g */
+
+/* swiglu_clamped into the bf16 product (`out_bf16`, or a scratch plane), then had_quant_act_i8g over
+ * it: the pair itself, on libavx's two kernels (libref's fused op's chain). Operands: gate_up
+ * [M, 2n], q [M, n], scale [M, n / group], out_bf16? [M, n]. */
+AVX_KERNEL(swiglu_clamped_had_quant_i8g) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const int64_t n = p_int(a, "n", 0);
+    if (n < 1 || a->t[0].rank != 2 || a->t[0].shape[1] != 2 * n) return RAD_E_SHAPE;
+    const int64_t M = a->t[0].shape[0];
+    std::vector<uint16_t> tmp;
+    RadTensor y{};
+    if (a->n_t > 3 && a->t[3].data) {
+        y = a->t[3];
+    } else {
+        tmp.resize((size_t)(M * n));
+        y.data = tmp.data(); y.dtype = RAD_BF16; y.rank = 2;
+        y.shape[0] = M; y.shape[1] = n; y.stride[0] = n; y.stride[1] = 1;
+    }
+    RadTensor tc[2] = { a->t[0], y };
+    RadArgs c = *a;
+    c.t = tc; c.n_t = 2;
+    const int rc = AVX_FN(avx_swiglu_clamped)(&c, stream);
+    if (rc != RAD_OK) return rc;
+    RadTensor tq[3] = { y, a->t[1], a->t[2] };
+    RadArgs q = *a;
+    q.t = tq; q.n_t = 3;
+    return AVX_FN(avx_had_quant_act_i8g)(&q, stream);
+}
+
+
+/* mla_expand_gate_had_quant_i8g: mla_expand_gate into the bf16 product (`out_bf16`, or a scratch plane), then
+ * had_quant_act_i8g over it as [M, heads * v_dim]: the chain itself. Operands: x, w, g [M, heads *
+ * v_dim], q [M, heads * v_dim], scale [M, heads * v_dim / group], out_bf16? */
+AVX_KERNEL(mla_expand_gate_had_quant_i8g) {
+    if (!rad_args_have(a, 5)) return RAD_E_INVAL;
+    const int64_t H = p_int(a, "heads", 0), vd = p_int(a, "v_dim", 0);
+    if (H < 1 || vd < 1) return RAD_E_SHAPE;
+    const int64_t M = a->t[0].shape[0], n = H * vd;
+    std::vector<uint16_t> tmp;
+    int64_t pitch = n;
+    uint16_t* yd = nullptr;
+    if (a->n_t > 5 && a->t[5].data) {
+        const RadTensor& o = a->t[5];
+        if (o.shape[o.rank - 1] != vd && (o.rank != 2 || o.shape[1] != n)) return RAD_E_SHAPE;
+        if (o.stride[o.rank - 1] != 1) return RAD_E_STRIDE;
+        yd = (uint16_t*)o.data;
+        pitch = o.rank == 3 ? o.stride[0] : o.stride[0];
+    } else {
+        tmp.resize((size_t)(M * n));
+        yd = tmp.data();
+    }
+    RadTensor y3{};
+    y3.data = yd; y3.dtype = RAD_BF16; y3.rank = 3;
+    y3.shape[0] = M; y3.shape[1] = H; y3.shape[2] = vd;
+    y3.stride[0] = pitch; y3.stride[1] = vd; y3.stride[2] = 1;
+    RadTensor te[4] = { a->t[0], a->t[1], a->t[2], y3 };
+    RadArgs e = *a;
+    e.t = te; e.n_t = 4;
+    int rc = AVX_FN(avx_mla_expand_gate)(&e, stream);
+    if (rc != RAD_OK) return rc;
+    RadTensor y2 = y3;
+    y2.rank = 2; y2.shape[1] = n; y2.stride[1] = 1;
+    RadTensor tq[3] = { y2, a->t[3], a->t[4] };
+    RadParam pq[4] = {};
+    pq[0].key = "M"; pq[0].kind = RAD_P_INT; pq[0].ival = M;
+    pq[1].key = "n"; pq[1].kind = RAD_P_INT; pq[1].ival = n;
+    pq[2].key = "group"; pq[2].kind = RAD_P_INT; pq[2].ival = p_int(a, "group", 128);
+    pq[3].key = "dtype"; pq[3].kind = RAD_P_STR; pq[3].sval = "bf16";
+    RadArgs q = *a;
+    q.t = tq; q.n_t = 3; q.p = pq; q.n_p = 4;
+    return AVX_FN(avx_had_quant_act_i8g)(&q, stream);
 }
 
 /* ================================================================== the compressed indexer */

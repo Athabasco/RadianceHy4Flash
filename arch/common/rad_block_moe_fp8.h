@@ -198,6 +198,9 @@ struct MoeFP8 {
         /* With `swiglu_limit`: the clamped product and its quantiser as one launch
          * (GateQuantFP8::fuse_clamped), for the routed and the shared arm. */
         int     swiglu_quant = 0;
+        /* With `swiglu_limit`: the same for the rotated int8 codes of an int8 / IQR down projection
+         * (GateQuantFP8::fuse_clamped_i8, swiglu_clamped_had_quant_i8g), the routed arm only. */
+        int     swiglu_quant_i8 = 0;
         /* A shared arm without its sigmoid gate: the gate plane is filled with 1. */
         int     shared_ungated = 0;
         /* At TP1 the caller may fill the ungated arm's ones plane once for the whole step,
@@ -1335,6 +1338,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * which takes the codes alone (no bf16 product is written), so the gated quantiser resolves to
      * the rotated op at no extra launch. */
     gq_exp.fuse_clamped = c.swiglu_quant != 0;
+    gq_exp.fuse_clamped_i8 = c.swiglu_quant_i8 != 0 && !c.calib;
     /* Gate_up and down are separate GEMMs. A trellis gate uses int8 input while a codebook (W5NL,
      * W6NL) down reads rotated E4M3: select the latter pair only for the gated intermediate. */
     ActFP8 down_eff = w.eff;

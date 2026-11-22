@@ -1059,6 +1059,12 @@ int ref_rmsnorm_ihc_junction_shape(const RadParam* p, int n_p, int operand, RadO
     o.t(D, { M, n });                                 /* y */
     if (tail) o.t(D, { M, n });                       /* x */
     else o.skip();
+    if (tail && gi(p, n_p, "group", 0) == 128) {      /* G-3b: the next norm's codes */
+        o.t((uint32_t)RAD_I8, { M, n });              /* xq */
+        o.t((uint32_t)RAD_F32, { M, n / 128 });       /* xs */    } else {
+        o.skip();
+        o.skip();
+    }
     return o.finish("rmsnorm_ihc_junction", operand, out);
 }
 
@@ -1157,6 +1163,34 @@ int ref_mla_expand_gate_shape(const RadParam* p, int n_p, int operand, RadOpdDes
     o.t(RAD_BF16, { M, h * vd });           /* g */
     o.t(RAD_BF16, { M, h, vd });            /* y */
     return o.finish("mla_expand_gate", operand, out);
+}
+
+int ref_swiglu_clamped_had_quant_i8g_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t ng = scale_groups(n, gi(p, n_p, "group", 0));
+    if (M < 1 || n < 1) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, { M, 2 * n });                   /* gate_up, gate half first */
+    o.t((uint32_t)RAD_I8, { M, n });        /* q */
+    o.t((uint32_t)RAD_F32, { M, ng });      /* scale (amax / 127) */
+    o.t((uint32_t)RAD_BF16, { M, n });      /* out_bf16 -- what the codes were taken over */
+    return o.finish("swiglu_clamped_had_quant_i8g", operand, out);
+}
+
+int ref_mla_expand_gate_had_quant_i8g_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), h = gi(p, n_p, "heads", 0), kd = gi(p, n_p, "k_dim", 0),
+                  vd = gi(p, n_p, "v_dim", 0), l = gi(p, n_p, "latent_dim", 0);
+    const int64_t ng = scale_groups(h * vd, gi(p, n_p, "group", 0));
+    if (M < 1 || h < 1 || kd < 1 || vd < 1 || l < 1) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(RAD_BF16, { M, h, l });             /* x */
+    o.t(RAD_BF16, { h * (kd + vd), l });    /* w */
+    o.t(RAD_BF16, { M, h * vd });           /* g */
+    o.t((uint32_t)RAD_I8, { M, h * vd });   /* q */
+    o.t((uint32_t)RAD_F32, { M, ng });      /* scale (amax / 127) */
+    o.t(RAD_BF16, { M, h * vd });           /* out_bf16 */
+    return o.finish("mla_expand_gate_had_quant_i8g", operand, out);
 }
 
 int ref_gate_mul_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

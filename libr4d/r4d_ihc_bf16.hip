@@ -133,6 +133,7 @@ __device__ __forceinline__ void ihc_junction_body(
     r.post_row += row * pp;
     r.hr += row * hp;
     if (TAIL) r.xnr += row * xnp;
+    if (r.cq) { r.cq += row * r.cqp; r.cs += row * r.csp; }
     if (r.yr) r.yr += row * yp;
     if (r.xr) r.xr += row * xp;
     junction_row<HC, POST, TAIL>(L, ybuf, r);
@@ -371,12 +372,13 @@ extern "C" int r4d_rad_gate_mul(const RadArgs* a, RadStream s) {
  *   [7] base w?  [8] w_next w?  [9] xn?  [10] y?  [11] x?
  * `tail` 1 needs fn, scale, base, w_next and xn; `rows` 2 hc (post_mag given) writes the next
  * write weights into `post`, `rows` hc (the head) leaves it. */
-enum { IJ_A = 0, IJ_B, IJ_WPOST, IJ_POST, IJ_H, IJ_FN, IJ_SCALE, IJ_BASE, IJ_WNEXT, IJ_XN, IJ_Y, IJ_X };
+enum { IJ_A = 0, IJ_B, IJ_WPOST, IJ_POST, IJ_H, IJ_FN, IJ_SCALE, IJ_BASE, IJ_WNEXT, IJ_XN, IJ_Y, IJ_X,
+       IJ_XQ, IJ_XS };
 
 int r4d_ihc_junction_args(const RadArgs* a, r4d_ihc::R4dIhcJunction* o) {
     *o = R4dIhcJunction{};
-    const RadTensor* t[12];
-    for (int i = 0; i < 12; ++i) t[i] = r4d_opt(a, i);
+    const RadTensor* t[14];
+    for (int i = 0; i < 14; ++i) t[i] = r4d_opt(a, i);
     const long long n = r4d_geti_or(a, "n", 0), hc = r4d_geti_or(a, "hc", 0),
                     rows = r4d_geti_or(a, "rows", 0), tail = r4d_geti_or(a, "tail", 1);
     if (!t[IJ_A] || !t[IJ_WPOST] || !t[IJ_POST] || !t[IJ_H]) return RAD_E_INVAL;
@@ -388,6 +390,14 @@ int r4d_ihc_junction_args(const RadArgs* a, r4d_ihc::R4dIhcJunction* o) {
     for (int i : { IJ_WPOST, IJ_POST, IJ_FN, IJ_SCALE, IJ_BASE, IJ_WNEXT })
         if (t[i] && !ihc_f32(t[i])) return RAD_E_DTYPE;
     if (n < 8 || n > 16384 || n % 8 || hc < 2 || hc > 8) return RAD_E_SHAPE;
+    /* G-3b: the next norm's rotated int8 codes, 128-column groups (xq [M, n] i8, xs [M, n / 128] f32) */
+    const bool codes = t[IJ_XQ] != nullptr;
+    if (codes) {
+        if (!t[IJ_XS] || !tail || n % 128 || r4d_geti_or(a, "group", 128) != 128) return RAD_E_SHAPE;
+        if (t[IJ_XQ]->dtype != RAD_I8 || t[IJ_XS]->dtype != RAD_F32) return RAD_E_DTYPE;
+    } else if (t[IJ_XS]) {
+        return RAD_E_INVAL;
+    }
     const bool post = rows == 2 * hc;
     if (tail && !post && rows != hc) return RAD_E_SHAPE;
     const float eps = (float)r4d_getf(a, "eps", 0), ieps = (float)r4d_getf(a, "ihc_eps", 0),
@@ -422,6 +432,14 @@ int r4d_ihc_junction_args(const RadArgs* a, r4d_ihc::R4dIhcJunction* o) {
         pitch(i, i == IJ_H ? W : n, &pv);
         if (!ihc_vec(t[i]->data, (uint64_t)pv)) return RAD_E_ALIGN;
     }
+    long long cqp = 0, csp = 0;
+    if (codes) {
+        long long mq = 0, ms = 0;
+        cqp = r4d_rows_pitch(t[IJ_XQ], n, &mq);
+        csp = r4d_rows_pitch(t[IJ_XS], n / 128, &ms);
+        if (cqp < 0 || csp < 0 || mq != M || ms != M) return RAD_E_SHAPE;
+        if (cqp % 4 || ((uintptr_t)t[IJ_XQ]->data & 3)) return RAD_E_ALIGN;
+    }
     if (r4d_numel(t[IJ_WPOST]) != n || !r4d_contig(t[IJ_WPOST]) ||
         ((uintptr_t)t[IJ_WPOST]->data & 15))
         return RAD_E_SHAPE;
@@ -453,6 +471,9 @@ int r4d_ihc_junction_args(const RadArgs* a, r4d_ihc::R4dIhcJunction* o) {
     r.xnr = tail ? (uint16_t*)t[IJ_XN]->data : nullptr;
     r.yr = t[IJ_Y] ? (uint16_t*)t[IJ_Y]->data : nullptr;
     r.xr = t[IJ_X] ? (uint16_t*)t[IJ_X]->data : nullptr;
+    r.cq = codes ? (signed char*)t[IJ_XQ]->data : nullptr;
+    r.cs = codes ? (float*)t[IJ_XS]->data : nullptr;
+    r.cqp = (uint64_t)cqp; r.csp = (uint64_t)csp;
     o->M = M; o->hc = (int)hc; o->post = post; o->tail = tail != 0;
     o->ap = ap; o->bp = bp; o->pp = pp; o->hp = hp; o->xnp = xnp; o->yp = yp; o->xp = xp;
     return RAD_OK;

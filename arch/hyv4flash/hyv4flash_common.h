@@ -304,6 +304,17 @@ inline bool chain_q8_on() {
     return !(e && *e && std::strcmp(e, "0") == 0);
 }
 
+/* The G-3 launch fusions (levers-general.md L3), each behind its own switch, on by default:
+ * RADIANCE_HY4_FUSE_SWIGLU (the routed arm's clamped SwiGLU with its rotated int8 quantiser),
+ * RADIANCE_HY4_FUSE_EXPAND_QUANT (the expansion with the gate and the quantiser of attn_output's
+ * input), RADIANCE_HY4_FUSE_JUNCTION_Q (the junction writes the codes its consumers read),
+ * RADIANCE_HY4_FUSE_QPROJ (q_nope and q_rope in one launch). Off with 0; each is byte-identical to
+ * the chain it replaces. */
+inline bool fuse_on(const char* name) {
+    const char* e = std::getenv(name);
+    return !(e && *e && std::strcmp(e, "0") == 0);
+}
+
 /* MoeFP8's fused selection and sort (Config::router_fuse). Off: RADIANCE_HY4_ROUTER_FUSE=0. */
 inline bool router_fuse_on() {
     const char* e = std::getenv("RADIANCE_HY4_ROUTER_FUSE");
@@ -417,8 +428,8 @@ struct Lin : LinearFP8 {
                                   max_rows, row_parts, span_lo, span_hi);
     }
     void step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0 = 0, int64_t rows = 0,
-              int64_t y0 = -1) const {
-        LinearFP8::step(c, with_codes(a), y, T, r0, rows, y0);
+              int64_t y0 = -1, bool codes_ready = false) const {
+        LinearFP8::step(c, with_codes(a), y, T, r0, rows, y0, codes_ready);
     }
 };
 
@@ -563,15 +574,22 @@ struct Junction {
     bool tail = true;
     rad_buf a = 0, b = 0, post = 0, h = 0, xn = 0, y = 0, x = 0;
     rad_weight w_post = 0, fn = 0, scale = 0, base = 0, w_next = 0;
+    /* G-3b: the rotated int8 codes of the next block's input norm (had_quant_act_i8g's, group 128)
+     * this junction writes beside `xn`, so the readers of `xn` issue no quantiser; unset (q8 0) where
+     * the chain runs or the junction does not write them. */
+    ActFP8 codes{};
     explicit operator bool() const { return op != 0; }
+    /* The codes the readers of xn find, or null. */
+    const ActFP8* codes_if() const { return op && codes.q8 ? &codes : nullptr; }
 
     /* `a` the block's output (`b` the addend in front, 0 for none), `w_post` its sandwich norm's
      * gain; `next` the next connection (0 for tail 0) and `w_next` the next block's input norm,
      * whose output is `xn`. `op_add` / `op_reduce` are the chain's own ops (0 where absent). Leaves
-     * `op` 0 (the chain runs) where no library serves the row. */
+     * `op` 0 (the chain runs) where no library serves the row. `pair` (tail only, G-3b): the code
+     * pair the junction writes of `xn` (n % 128 == 0), read by the linears that accept it. */
     int declare(RadBuilder* bl, const Shape& s, const Geom& g, int64_t T, const Trunk& tr,
                 rad_buf a_, rad_buf b_, rad_weight w_post_, const Hyper* next, rad_weight w_next_,
-                rad_buf xn_, rad_op add_, rad_op reduce_) {
+                rad_buf xn_, rad_op add_, rad_op reduce_, const Codes::Pair* pair = nullptr) {
         *this = Junction{};
         if (!junction_on() || calib_dir() != nullptr) return RAD_OK;
         if (s.n_embd % 8) return RAD_OK;
@@ -595,6 +613,12 @@ struct Junction {
         std::vector<rad_buf> rd = { a, post, h }, wr = { a, post, h };
         if (b) rd.push_back(b);
         if (xn) wr.push_back(xn);
+        const bool qc = tail && pair && pair->q8 && pair->s8 && n % 128 == 0 && pair->g8 == 128;
+        if (qc) {
+            ps.push_back(RAD_INT("group", 128));
+            wr.push_back(pair->q8);
+            wr.push_back(pair->s8);
+        }
         if (y) wr.push_back(y);
         if (x) wr.push_back(x);
         /* An op no loaded library declares (the twin on a host-only deployment) is not declared at
@@ -619,6 +643,12 @@ struct Junction {
         op = decl("rmsnorm_ihc_junction", ps);
         if (!op) op_ar = 0;   /* one served without the other: keep the chain whole */
         if (world > 1 && !op_ar && !op_reduce) op = 0;
+        if (op && qc) {
+            codes.q8 = pair->q8;
+            codes.s8 = pair->s8;
+            codes.g8 = 128;
+            codes.q8_fed = codes.q8_rot = true;
+        }
         return RAD_OK;
     }
     void step(RadCtx* c, int64_t T) const {
@@ -628,7 +658,8 @@ struct Junction {
                         tail ? RAD_W(fn) : RAD_NONE, tail ? RAD_W(scale) : RAD_NONE,
                         tail ? RAD_W(base) : RAD_NONE, tail ? RAD_W(w_next) : RAD_NONE,
                         xn ? brows(xn, T) : RAD_NONE, y ? brows(y, T) : RAD_NONE,
-                        x ? brows(x, T) : RAD_NONE);
+                        x ? brows(x, T) : RAD_NONE, codes.q8 ? brows(codes.q8, T) : RAD_NONE,
+                        codes.s8 ? brows(codes.s8, T) : RAD_NONE);
         };
         if (op_ar && T <= ar_rows) { issue(op_ar, B); return; }
         if (world > 1) {

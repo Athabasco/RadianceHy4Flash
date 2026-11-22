@@ -35,7 +35,8 @@ struct GatedMlp {
     /* `feed`: gate_up reads the codes that linear wrote of the same input (Lin::feed). */
     int declare(RadBuilder* b, Names& nm, const Geom& g, const Shape& s, int l, const char* gu_name,
                 const char* dn_name, const char* mp, int64_t ff_w, rad_buf x, rad_buf y,
-                rad_buf gu_buf, rad_buf ff_buf, const Lin* feed = nullptr) {
+                rad_buf gu_buf, rad_buf ff_buf, const Lin* feed = nullptr,
+                const ActFP8* in_codes = nullptr) {
         gu = gu_buf;
         ff = ActFP8{};
         ff.x = ff_buf;
@@ -43,10 +44,12 @@ struct GatedMlp {
         in.x = x;
         const auto grp = grp_layer(l);
         gate_up.feed = feed;
+        gate_up.fed_codes = in_codes;   /* the junction's codes of x (G-3b), taken where the form matches */
         RAD_ARCH_TRY(gate_up.declare(b, nm, g, gu_name, 2 * ff_w, s.n_embd, RAD_SHARD_ROW, grp,
                                      { nm.ckpt("%s.gate_proj.weight", mp),
                                        nm.ckpt("%s.up_proj.weight", mp) },
                                      in, gu, 0, { ff_w, ff_w }));
+        gate_up.fed_codes = nullptr;
         const char* dw = nm.f("%s.weight", dn_name);
         RAD_ARCH_TRY(map_linear(b, dw, { nm.ckpt("%s.down_proj.weight", mp) }));
         down.mapped = true;
@@ -179,6 +182,9 @@ struct Ffn {
          * otherwise and on the host. Byte-identical (rad_block_moe_fp8.h), a launch fewer a layer.
          * RADIANCE_HY4_ROUTER_FUSE=0 keeps the pair. */
         c.router_fuse = router_fuse_on() ? 1 : 0;
+        /* The clamped SwiGLU and the rotated int8 quantiser its down projection reads in one launch
+         * (G-3a; RADIANCE_HY4_FUSE_SWIGLU=0 keeps the pair). */
+        c.swiglu_quant_i8 = fuse_on("RADIANCE_HY4_FUSE_SWIGLU") ? 1 : 0;
         c.norm_topk = s.norm_topk;
         c.route_scale = s.route_scale;
         c.n_group = 1;
@@ -251,9 +257,22 @@ struct Ffn {
         return c.expert_i8 || c.expert_iqr ? kArmI8 : kArmE4M3;
     }
 
+    /* G-3b: the mapped latent_in's code form (a MoE layer's first linear over the junction's xn),
+     * so the junction in front can decide to write the codes. */
+    CodeForm premap_in(RadBuilder* b, Names& nm, const Shape& s, int l) {
+        if (!s.is_moe[(size_t)l]) return CodeForm{};
+        const char* mp = nm.ckpt("model.layers.%d.mlp", l);
+        const char* wn = nm.f("blk.%d.ffn_latent_in.weight", l);
+        if (map_linear(b, wn, { nm.ckpt("%s.routed_expert_down_proj.weight", mp) }) != RAD_OK)
+            return CodeForm{};
+        lat_in.mapped = true;
+        return code_form(b, wn);
+    }
+
+    /* `in_codes` (G-3b): the rotated int8 codes of `x` the junction in front writes. */
     int declare(RadBuilder* b, Names& nm, const Shape& s, const Geom& geom, int l, rad_buf x,
                 rad_buf y, const MoeWire& wire, rad_buf dense_gu, rad_buf dense_ff,
-                rad_buf dense_out, MoeFP8::Src* src) {
+                rad_buf dense_out, MoeFP8::Src* src, const ActFP8* in_codes = nullptr) {
         g = geom;
         layer = l;
         n_embd = s.n_embd;
@@ -284,10 +303,12 @@ struct Ffn {
              * sum back. */
             /* The latent's and the shared expert's gate_up read x: one quantiser (Lin::feed). */
             lat_in.lead = "ffn_in";
+            lat_in.fed_codes = in_codes;
             RAD_ARCH_TRY(lat_in.declare(b, nm, g, nm.f("blk.%d.ffn_latent_in", l), s.latent,
                                         s.n_embd, RAD_SHARD_NONE, grp,
                                         { nm.ckpt("%s.routed_expert_down_proj.weight", mp) },
                                         act(xf), w.lat.x));
+            lat_in.fed_codes = nullptr;
             Geom ge = g;
             ge.n_embd = s.latent;
             ge.n_ff_all = s.n_ff_exp;
@@ -305,7 +326,7 @@ struct Ffn {
             RAD_ARCH_TRY(shared.declare(b, nm, g, s, l, nm.f("blk.%d.ffn_gate_up_shexp", l),
                                         nm.f("blk.%d.ffn_down_shexp", l),
                                         nm.ckpt("%s.shared_experts", mp), s.n_ff_shared_r, xf,
-                                        w.sout, w.sgu, w.sff, &lat_in));
+                                        w.sout, w.sgu, w.sff, &lat_in, in_codes));
             op_join = mk(b, "add",
                          { RAD_RANGE("M", 1, T), RAD_INT("n", s.n_embd), RAD_STR("dtype", "bf16") },
                          {}, { w.routed, w.sout }, { w.routed });

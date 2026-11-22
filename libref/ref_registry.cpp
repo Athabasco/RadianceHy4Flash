@@ -203,6 +203,12 @@ static const RadOperandSpec oLiliWalk[] = { OPD("edges"), OPD("aout"), OPD("cand
                                             OUT_O("scores") };
 
 static const RadParamSpec pSwigluClamped[] = { P_INT("M"), P_INT("n"), P_F64("limit"), P_STR("dtype") };
+static const RadParamSpec pSwigluClampedHadQuant[] = { P_INT("M"), P_INT("n"), P_F64("limit"),
+                                                        P_INT("group"), P_STR("dtype") };
+static const RadParamSpec pMlaExpandGateQuant[] = { P_INT("M"), P_INT("heads"), P_INT("k_dim"),
+    P_INT("v_dim"), P_INT("latent_dim"), P_INT("group"), P_STR("dtype") };
+static const RadOperandSpec oMlaExpandGateQuant[] = { OPD("x"), WGT("w"), OPD("g"), OUT("q"),
+                                                      OUT("scale"), OUT_O("out_bf16") };
 static const RadParamSpec pDsaPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_STR("dtype"), P_INTO("block_size") };
 /* `kv_dtype`: the latent cache's dtype when it is not the query's (fp8_e4m3, at descale 1). */
 static const RadParamSpec pMlaAttn[] = { P_INT("M"), P_INT("latent_dim"), P_INT("heads"),
@@ -224,10 +230,10 @@ static const RadOperandSpec oIhcPost[] = { OPD("y"), OPD("post"), INOUT("h") };
 /* rmsnorm_ihc_junction (WP16.2): the same lists as libr4d's (r4d_rows.cpp). */
 static const RadParamSpec pIhcJunction[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("rows"),
     P_F64("eps"), P_F64O("ihc_eps"), P_F64O("hc_eps"), P_F64O("post_mag"), P_INTO("tail"),
-    P_STR("dtype") };
+    P_STR("dtype"), P_INTO("group") };
 static const RadOperandSpec oIhcJunction[] = { INOUT("a"), OPD_O("b"), WGT("w_post"),
     INOUT("post"), INOUT("h"), WGT_O("fn"), WGT_O("scale"), WGT_O("base"), WGT_O("w_next"),
-    OUT_O("xn"), OUT_O("y"), OUT_O("x") };
+    OUT_O("xn"), OUT_O("y"), OUT_O("x"), OUT_O("xq"), OUT_O("xs") };
 static const RadParamSpec pMlaProjectKv[] = { P_INT("M"), P_INT("heads"), P_INT("k_dim"),
     P_INT("v_dim"), P_INT("latent_dim"), P_STR("mode"), P_STR("dtype") };
 static const RadParamSpec pMlaAttnPagedSink[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
@@ -1649,6 +1655,15 @@ static const RadOpSchema kSchemas[] = {
   "act(gate) * up over a packed [M, 2n] plane, gate half first, then the E4M3 quantiser. "
   "`act` is silu (down_proj's input) or sigmoid (a gated attention o_proj's) and defaults to "
   "silu, which is what docs/OPS.md's `silu_mul` names." },
+{ "swiglu_clamped_had_quant_i8g", ARR(pSwigluClampedHadQuant), ARR(oGatedQuantFp8),
+  "swiglu_clamped followed by had_quant_act_i8g in one op (the routed arm's clamped product and the "
+  "quantiser its rotated int8 down projection reads): the product silu(min(gate, limit)) * "
+  "clamp(up, -limit, limit) rounded to bf16, then a `group`-wide Walsh-Hadamard and int8 codes at "
+  "amax / 127 per group. `out_bf16` holds the unrotated product the codes were taken over." },
+{ "mla_expand_gate_had_quant_i8g", ARR(pMlaExpandGateQuant), ARR(oMlaExpandGateQuant),
+  "mla_expand_gate followed by had_quant_act_i8g over its product [M, heads * v_dim] in one op (the "
+  "codes attn_output's rotated int8 GEMM reads): the pair's bytes then a `group`-wide Walsh-Hadamard "
+  "and int8 codes at amax / 127 per group. `out_bf16` holds the unrotated product." },
 { "gemm_nt_q_gated", ARR(pGemmQGated), ARR(oGemmQGated),
   "gemm_nt_q over a [N, K] gate_up plane with gated_quant_fp8's pass in the epilogue, so the "
   "[M, N] bf16 tensor between them is never written. `N` is the WEIGHT's rows, twice the fused "
@@ -2730,6 +2745,12 @@ SIMPLE("ref_rmsnorm_quant_fp8", "rmsnorm_quant_fp8", "quant",
 SIMPLE("ref_gated_quant_fp8", "gated_quant_fp8", "quant",
        "act(gate) * up over a packed [M, 2n] plane, then the E4M3 quantiser",
        "bf16 in, fp8_e4m3 out, f32 scale", ref_gated_quant_fp8),
+SIMPLE("ref_swiglu_clamped_had_quant_i8g", "swiglu_clamped_had_quant_i8g", "quant",
+       "swiglu_clamped, then the rotated int8 quantiser, the pair itself",
+       "bf16 in, i8 out, f32 scale, bf16 out_bf16", ref_swiglu_clamped_had_quant_i8g),
+SIMPLE("ref_mla_expand_gate_had_quant_i8g", "mla_expand_gate_had_quant_i8g", "attn",
+       "the expansion, gate_mul and the rotated int8 quantiser, the chain itself",
+       "bf16 in, i8 out, f32 scale, bf16 out_bf16", ref_mla_expand_gate_had_quant_i8g),
 SIMPLE("ref_gemm_nt_q_gated", "gemm_nt_q_gated", "gemm",
        "gemm_nt_q over a gate_up plane with the gated quantiser in the epilogue",
        "fp8_e4m3 operands, fp8_e4m3 out, f32 scale", ref_gemm_nt_q_gated),

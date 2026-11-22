@@ -296,5 +296,76 @@ def dfly(base, rec, out):
     fx = dict(fx, source=fx['source'] + ' + DFly2 draft pass (WP13.7)', cases=fx['cases'] + add)
     save(fx, out); print(len(add), 'draft cases added ->', out, len(fx['cases']), 'in all')
 
+# G-3 (levers-general.md L3): the fused rows' cases, written by hand (the gpu-mini graph declares none of
+# them), recorded by libref (the fused ops run their chain there) and appended:
+#   python3 data/kernels_hy4.py g3 raw_g3.rkb
+#   rad-kbench --fixture raw_g3.rkb --kernels libref --rerecord g3.rkb
+#   python3 data/kernels_hy4.py append data/kernels_hy4.rkb g3.rkb data/kernels_hy4.rkb
+BF16, F32, I32, I8 = 3, 1, 11, 8
+IN_, OUT_, W_ = 0, 1, 3
+PINT, PSTR, PF64 = 1, 2, 4
+def mkcase(op, M, params, opds, band, seed):
+    c = dict(op=op, seed=seed, m=M, band=band, params=[], opd=[])
+    for k, v in params:
+        if isinstance(v, str): c['params'].append([k, PSTR, 0, 0.0, v])
+        elif isinstance(v, float): c['params'].append([k, PF64, 0, v, ''])
+        else: c['params'].append([k, PINT, v, 0.0, ''])
+    for role, dt, shape, *rest in opds:
+        c['opd'].append(dict(role=role, dtype=dt, shape=list(shape), absent=1 if rest and rest[0] == 'absent' else 0,
+                             fill=0, flags=0, idx_max=0, idx_const=-1, fill_chunk=0, has_enc=0))
+    return c
+def g3a_cases(base):
+    """swiglu_clamped_had_quant_i8g: the routed arm's rows (decode: 1..8 tokens x top_k 8 slots; a 128-column
+    group count of the TP2 / TP4 widths 768 / 384 and a narrow row), with and without the bf16 plane."""
+    out = []
+    salt = base
+    for n, lim in ((768, 10.0), (768, 0.75), (384, 0.75), (128, 0.5), (256, 10.0)):
+        for M in (1, 8, 17, 64, 65, 200):
+            for plane in (False, True):
+                if n != 768 and M not in (8, 65): continue
+                p = [('M', M), ('n', n), ('limit', lim), ('group', 128), ('dtype', 'bf16')]
+                ops = [(IN_, BF16, (M, 2 * n)), (OUT_, I8, (M, n)), (OUT_, F32, (M, n // 128)),
+                       (OUT_, BF16, (M, n)) if plane else (OUT_, BF16, (M, n), 'absent')]
+                out.append(mkcase('swiglu_clamped_had_quant_i8g', M, p, ops,
+                                  f"g3a swiglu_clamped_had_quant_i8g M={M} n={n} limit={lim}{' +plane' if plane else ''}", salt)); salt += 1
+    return out
+def g3c_cases(base):
+    """mla_expand_gate_had_quant_i8g at the TP2 / TP4 head shares (16 / 8 sparse, 32 / 16 sliding heads) and the
+    decode-class heights (1, 6 a verify, 8, 16, 17, 64), with and without the bf16 plane."""
+    out, salt = [], base
+    for H in (16, 8, 32):
+        for M in (1, 6, 8, 16, 17, 64):
+            for plane in (False, True):
+                if H != 16 and M not in (1, 17, 64): continue
+                p = [('M', M), ('heads', H), ('k_dim', 192), ('v_dim', 256), ('latent_dim', 512), ('group', 128), ('dtype', 'bf16')]
+                ops = [(IN_, BF16, (M, H, 512)), (W_, BF16, (H * 448, 512)), (IN_, BF16, (M, H * 256)),
+                       (OUT_, I8, (M, H * 256)), (OUT_, F32, (M, H * 2)),
+                       (OUT_, BF16, (M, H * 256)) if plane else (OUT_, BF16, (M, H * 256), 'absent')]
+                out.append(mkcase('mla_expand_gate_had_quant_i8g', M, p, ops,
+                                  f"g3c mla_expand_gate_had_quant_i8g M={M} H={H}{' +plane' if plane else ''}", salt)); salt += 1
+    return out
+def g3b_cases(src, base):
+    """rmsnorm_ihc_junction with the next norm's rotated int8 codes (`group` 128, xq / xs operands): the recorded
+    tail junction points (gpu-mini n 512, the n 3072 clones) at M 1, 6, 8, 16, 64, with and without the addend."""
+    fx = load(src)
+    out, salt = [], base
+    for c in fx['cases']:
+        if c['op'] != 'rmsnorm_ihc_junction' or c['m'] not in (1, 6, 8, 16, 64): continue
+        if par(c, 'tail') == 0 or par(c, 'n') % 128: continue
+        d = fresh(c, salt); salt += 1
+        M, n = c['m'], par(c, 'n')
+        d['params'].append(['group', PINT, 128, 0.0, ''])
+        for dt, shape in ((I8, [M, n]), (F32, [M, n // 128])):
+            d['opd'].append(dict(role=OUT_, dtype=dt, shape=shape, absent=0, fill=0, flags=0, idx_max=0,
+                                 idx_const=-1, fill_chunk=0, has_enc=0))
+        d['band'] = c['band'] + ' +codes'
+        out.append(d)
+    return out
+def g3(out, src='data/kernels_hy4.rkb'):
+    cases = g3a_cases(0x93a00000) + g3b_cases(src, 0x93b00000) + g3c_cases(0x93c00000)
+    fx = dict(version=6, samples=1024, source='hy4-flash G-3 fused launches (levers-general L3)', oracle='libref',
+              recorded='2026-11-22', cases=cases)
+    save(fx, out); print(len(cases), 'cases ->', out)
+
 if __name__ == '__main__':
-    {'raw': raw, 'merge': merge, 'vis': vis, 'wp163': wp163, 'junction': junction, 'append': append, 'dfly': dfly}[sys.argv[1]](*sys.argv[2:])
+    {'raw': raw, 'merge': merge, 'vis': vis, 'wp163': wp163, 'junction': junction, 'append': append, 'dfly': dfly, 'g3': g3}[sys.argv[1]](*sys.argv[2:])

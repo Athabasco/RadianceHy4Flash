@@ -676,9 +676,17 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
      * declared its tail 0 form behind the previous layer). */
     if (l > 0 && lay.engram < 0) {
         Layer& pv = m.layers[(size_t)l - 1];
+        /* G-3b: the junction writes the rotated int8 codes the attention's three input linears read,
+         * where their weights take them (q_a's form; each linear checks its own). */
+        const Codes::Pair* jp = nullptr;
+        if (fuse_on("RADIANCE_HY4_FUSE_JUNCTION_Q") && E % 128 == 0) {
+            const CodeForm f = lay.attn.premap_in(b, nm, s, l, ap);
+            Codes* cs = codes_of(b);
+            if (cs && f.i8 && f.rot && f.g8 == RAD_FP8_BLOCK) jp = cs->get(E, f.g8, "junc_attn_in");
+        }
         RAD_ARCH_TRY(pv.j_end.declare(b, s, g, T, m.tr, pv.ffn.junction_a(), pv.ffn.junction_b(),
                                       pv.ffn.post_gain, &lay.hc_attn, lay.attn_gain, m.tr.xn,
-                                      pv.ffn.op_join, pv.ffn.op_ar));
+                                      pv.ffn.op_join, pv.ffn.op_ar, jp));
     }
 
     /* The layer's latent group, declared before its first store; a sparse layer's indexer
@@ -691,7 +699,9 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
     const int64_t block = lay.sliding ? (int64_t)RAD_KV_BLOCK : s.ix_pool;
     RAD_ARCH_TRY(lay.attn.declare(b, nm, s, g, l, lay.sliding,
                                   lay.sliding ? m.aw_sliding : m.aw_sparse, m.tr.xn, m.tr.y, kv,
-                                  block, ap, first_kv));
+                                  block, ap, first_kv,
+                                  l > 0 && lay.engram < 0 ? m.layers[(size_t)l - 1].j_end.codes_if()
+                                                          : nullptr));
     if (!lay.sliding) {
         if (!m.kv_tail) {
             RadKVGroupDecl d{};
@@ -744,11 +754,19 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
     if (!lay.ffn_gain) return RAD_E_INVAL;
     lay.op_ffn_norm = decl_rmsnorm(b, T, E, s.eps, lay.ffn_gain, m.tr.x, m.tr.xn);
     HY4_NEED(lay.op_ffn_norm, "rmsnorm");
+    /* G-3b: the codes of the feed-forward's input a MoE layer's latent_in (and the shared expert's
+     * gate_up) read. */
+    const Codes::Pair* jq = nullptr;
+    if (fuse_on("RADIANCE_HY4_FUSE_JUNCTION_Q") && E % 128 == 0) {
+        const CodeForm f = lay.ffn.premap_in(b, nm, s, l);
+        Codes* cs = codes_of(b);
+        if (cs && f.i8 && f.rot && f.g8 == RAD_FP8_BLOCK) jq = cs->get(E, f.g8, "junc_ffn_in");
+    }
     RAD_ARCH_TRY(lay.j_mid.declare(b, s, g, T, m.tr, lay.attn.w.o, 0, lay.attn.post_gain,
-                                   &lay.hc_ffn, lay.ffn_gain, m.tr.xn, 0, lay.attn.op_ar));
+                                   &lay.hc_ffn, lay.ffn_gain, m.tr.xn, 0, lay.attn.op_ar, jq));
     RAD_ARCH_TRY(lay.t_ffn_in.declare(b, nm, T, "ffn_in_norm", l, RAD_BF16, E, m.tr.xn));
     RAD_ARCH_TRY(lay.ffn.declare(b, nm, s, g, l, m.tr.xn, m.tr.y, m.mw, m.dense_gu, m.dense_ff,
-                                 m.dense_out, msrc));
+                                 m.dense_out, msrc, lay.j_mid.codes_if()));
     RAD_ARCH_TRY(lay.hc_ffn.declare_post(b, s, T, m.tr.h, m.tr.post, m.tr.y));
     /* An Engram opens the next layer: the junction stops behind the write (tail 0). */
     for (int e : s.engram_layers)

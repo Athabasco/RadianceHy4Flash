@@ -657,17 +657,19 @@ static const RadOperandSpec oIhcPost[] = {
  * behind ihc_post (no fn .. xn). */
 static const RadParamSpec pIhcJunction[] = {
     P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("rows"), P_F64("eps"), P_F64O("ihc_eps"),
-    P_F64O("hc_eps"), P_F64O("post_mag"), P_INTO("tail"), P_STR("dtype"),
+    P_F64O("hc_eps"), P_F64O("post_mag"), P_INTO("tail"), P_STR("dtype"), P_INTO("group"),
 };
 static const RadParamSpec pArIhcJunction[] = {
     P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("rows"), P_F64("eps"), P_F64O("ihc_eps"),
     P_F64O("hc_eps"), P_F64O("post_mag"), P_INTO("tail"), P_INT("world_size"), P_STR("dtype"),
+    P_INTO("group"),
 };
 static const RadOperandSpec oIhcJunction[] = {
     {"a", RAD_OPD_INOUT, 0}, {"b", RAD_OPD_IN, 1}, {"w_post", RAD_OPD_WEIGHT, 0},
     {"post", RAD_OPD_INOUT, 0}, {"h", RAD_OPD_INOUT, 0}, {"fn", RAD_OPD_WEIGHT, 1},
     {"scale", RAD_OPD_WEIGHT, 1}, {"base", RAD_OPD_WEIGHT, 1}, {"w_next", RAD_OPD_WEIGHT, 1},
     {"xn", RAD_OPD_OUT, 1}, {"y", RAD_OPD_OUT, 1}, {"x", RAD_OPD_OUT, 1},
+    {"xq", RAD_OPD_OUT, 1}, {"xs", RAD_OPD_OUT, 1},
 };
 static const RadOperandSpec oGateMul[] = {
     {"a", RAD_OPD_IN, 0}, {"g", RAD_OPD_IN, 0}, {"y", RAD_OPD_OUT, 0},
@@ -685,6 +687,15 @@ static const RadParamSpec pMlaExpandGate[] = {
 };
 static const RadOperandSpec oMlaExpandGate[] = {
     {"x", RAD_OPD_IN, 0}, {"w", RAD_OPD_WEIGHT, 0}, {"g", RAD_OPD_IN, 0}, {"y", RAD_OPD_OUT, 0},
+};
+/* mla_expand_gate_had_quant_i8g (G-3c): mla_expand_gate with had_quant_act_i8g over its product. */
+static const RadParamSpec pMlaExpandGateQuant[] = {
+    P_INT("M"), P_INT("heads"), P_INT("k_dim"), P_INT("v_dim"), P_INT("latent_dim"), P_INT("group"),
+    P_STR("dtype"),
+};
+static const RadOperandSpec oMlaExpandGateQuant[] = {
+    {"x", RAD_OPD_IN, 0}, {"w", RAD_OPD_WEIGHT, 0}, {"g", RAD_OPD_IN, 0}, {"q", RAD_OPD_OUT, 0},
+    {"scale", RAD_OPD_OUT, 0}, {"out_bf16", RAD_OPD_OUT, 1},
 };
 /* mla_row_norm_rope_store: Hy4-flash's latent cache row, [latent | rotary key]: rmsnorm of the first
  * `latent` columns, rope (gptj, or imrope_gptj with `sections`) of the last `rope_dim`, and kv_store of
@@ -2110,6 +2121,9 @@ static const RadParamSpec pSwigluClamped[] = { P_INT("M"), P_INT("n"), P_F64("li
                                                P_STR("dtype") };
 static const RadParamSpec pSwigluClampedQuant[] = { P_INT("M"), P_INT("n"), P_F64("limit"),
                                                     P_INT("group"), P_STR("dtype") };
+/* swiglu_clamped_had_quant_i8g (G-3a): swiglu_clamped's parameters and the quantiser's group. */
+static const RadParamSpec pSwigluClampedHadQuant[] = { P_INT("M"), P_INT("n"), P_F64("limit"),
+                                                       P_INT("group"), P_STR("dtype") };
 static const RadParamSpec pDsaPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_STR("dtype"),
                                          P_INTO("block_size") };
 /* `kv_dtype` is the latent cache's: absent or bf16, or fp8_e4m3 (kv_store_fp8 at descale 1). */
@@ -3866,6 +3880,11 @@ static const RadOpSchema kSchemas[] = {
            "mla_project_kv's expand followed by gate_mul in one launch: y = round(f32(round(sum_j "
            "x[m,h,j] * w[h*(k_dim+v_dim) + k_dim + c][j])) * sigmoid(f32(g[m, h*v_dim + c]))). "
            "Byte-identical to the two ops it replaces."),
+    SCHEMA("mla_expand_gate_had_quant_i8g", pMlaExpandGateQuant, oMlaExpandGateQuant,
+           "mla_expand_gate and had_quant_act_i8g in one launch: the expansion's gated bf16 product "
+           "[M, heads * v_dim], a 128-wide Hadamard along it and the int8 quantiser (the codes "
+           "attn_output's rotated int8 GEMM reads); `out_bf16` receives the UNROTATED product. "
+           "Byte-identical to mla_project_kv (expand), gate_mul and had_quant_act_i8g."),
     SCHEMA("mla_row_norm_rope_store", pMlaRowFront, oMlaRowFront,
            "Hy4-flash's latent cache row [latent | rotary key] in one launch: rmsnorm over the first "
            "`latent` columns, rope (gptj, or imrope_gptj with `sections`) over the last `rope_dim`, "
@@ -4111,6 +4130,12 @@ static const RadOpSchema kSchemas[] = {
            "and had_quant_act_i8g's quantiser, in one pass. `out_bf16` receives the UNROTATED "
            "product. Pairs only with an i8 weight stored rotated (dtype i8a8h); byte-identical "
            "to the product and had_quant_act_i8g."),
+    SCHEMA("swiglu_clamped_had_quant_i8g", pSwigluClampedHadQuant, oGatedQuantFp8,
+           "swiglu_clamped and had_quant_act_i8g in one pass (the routed arm's clamped product and "
+           "the quantiser its rotated int8 down projection reads): silu(min(gate,limit)) * "
+           "clamp(up,-limit,limit) rounded to bf16, a `group`-wide Hadamard and the int8 quantiser. "
+           "`out_bf16` receives the UNROTATED product. Byte-identical to swiglu_clamped followed by "
+           "had_quant_act_i8g."),
     SCHEMA("gemm_nt_q_gated", pGemmNtQGated, oGemmNtQGated,
            "gemm_nt_q over a [2n, K] gate_up plane with gated_quant_fp8's pass folded into the "
            "epilogue: the outputs are the quantiser's E4M3 codes, its scale per (row, `group` "
@@ -5361,6 +5386,11 @@ static const RadConstraint cMlaExpandGate[] = {
     C_GE("M", 1), C_LE("M", 65535), C_GE("heads", 1), C_LE("heads", 64), C_EQ("k_dim", 192),
     C_EQ("v_dim", 256), C_EQ("latent_dim", 512), C_IN("dtype", "bf16"),
 };
+/* A workgroup a token tile of 16 reads kv_b's value rows once, so decode-class heights only. */
+static const RadConstraint cMlaExpandGateQuant[] = {
+    C_GE("M", 1), C_LE("M", 64), C_GE("heads", 1), C_LE("heads", 64), C_EQ("k_dim", 192),
+    C_EQ("v_dim", 256), C_EQ("latent_dim", 512), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
+};
 static const RadConstraint cMlaRowFront[] = {
     C_GE("M", 1), C_LE("M", 65535), C_GE("latent", 8), C_GE("rope_dim", 2), C_GE("block_size", 1),
     C_IN("dtype", "bf16"),
@@ -5888,6 +5918,11 @@ static const RadConstraint cSwigluClampedQuant[] = {
 /* n divisible by the group, as in cHadQuantActFp8. */
 static const RadConstraint cGatedHadQuantFp8[] = {
     C_DIV("n", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
+};
+/* swiglu_clamped_had_quant_i8g: whole 128-column groups, up to a decode step's routed slots. */
+static const RadConstraint cSwigluClampedHadQuant[] = {
+    C_GE("M", 1), C_LE("M", 65535), C_DIV("n", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK),
+    C_IN("dtype", "bf16"),
 };
 /* The narrow GEMM's row plus the fold's own constraints. `N DIV 256` is `nout DIV 128` on the
  * weight's extent: a block emits exactly one 128-column scale group. `act IN silu` because only
@@ -8760,6 +8795,14 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaExpandGate), ROW(tMlaKv), nullptr,
   nullptr, nullptr, r4d_rad_mla_expand_gate, nullptr, nullptr, nullptr,
   r4d_shape_mla_expand_gate, nullptr, r4d_fuse_mla_expand_gate },
+{ "mla_expand_gate_had_quant_i8g", "mla_expand_gate_had_quant_i8g", "attn",
+  "the expansion with the gate and the rotated int8 quantiser of attn_output's input in one launch, "
+  "a workgroup a (token tile of 16, head, 128-column group)",
+  "heads 1..64, k_dim 192, v_dim 256, latent 512, group 128, M 1..64; 16-byte rows",
+  "bf16 in, int8 codes with an f32 scale per (row, 128 columns), an optional bf16 product",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaExpandGateQuant), NOTUNE,
+  nullptr, nullptr, r4d_rad_mla_expand_gate_had_quant_i8g, nullptr, nullptr, nullptr,
+  r4d_shape_mla_expand_gate_had_quant_i8g, nullptr, r4d_fuse_mla_expand_gate_had_quant_i8g },
 { "mla_row_norm_rope_store_bf16", "mla_row_norm_rope_store", "attn",
   "the latent cache row's norm, rotary and paged store, one workgroup a token",
   "latent and rope_dim even, M 1..65535, a bf16 cache of one head; plain or imrope positions",
@@ -10123,6 +10166,19 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cGatedHadQuantFp8), NOTUNE,
   nullptr, nullptr, r4d_rad_gated_had_quant_i8g, nullptr, nullptr, nullptr,
   r4d_shape_gated_had_quant_i8g },
+
+/* The clamped SwiGLU (Hy4-flash's routed arm) with had_quant_act_i8g's quantiser on its pass (G-3a). */
+{ "swiglu_clamped_had_quant_i8g", "swiglu_clamped_had_quant_i8g", "quant",
+  "swiglu_clamped, a 128-wide Hadamard along n, and the per-(row, 128) int8 quantiser, in one pass",
+  "n a multiple of 128, group 128, a positive finite limit; the gated operand is [M][2n], gate then "
+  "up; no reduction across the row, so no barrier; strides in elements",
+  "bf16 in, int8 out with an f32 scale per (row, 128 columns) and an optional bf16 out that "
+  "receives the UNROTATED clamped product; the codes are taken over the rotated BF16-ROUNDED "
+  "product, byte-identical to swiglu_clamped + had_quant_act_i8g",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cSwigluClampedHadQuant), NOTUNE,
+  nullptr, nullptr, r4d_rad_swiglu_clamped_had_quant_i8g, nullptr, nullptr, nullptr,
+  r4d_shape_gated_had_quant_i8g, nullptr, r4d_fuse_swiglu_clamped_had_quant_i8g },
 
 { "gated_had_quant_iq8r", "gated_had_quant_i8g", "quant",
   "gated_had_quant_i8g at IQ8R's group: one int8 scale per 256 columns, each 128-wide half rotated "
@@ -11867,6 +11923,8 @@ extern "C" int rad_kernel_chain(int i) {
          * quantisers (the gated one for E4M3 codes too, which the w4 experts read) */
         "hc_read_e4m3", "router_gemm_topk_scatter_bf16", "moe_gemm_iqr", "moe_gemm_iqr_mod4",
         "gemm_iqr_nt_m64", "gemm_iqr_gated", "gated_had_quant_i8g", "gate_had_quant_i8g",
+        /* G-3: the clamped SwiGLU with the rotated int8 quantiser on its pass */
+        "swiglu_clamped_had_quant_i8g",
                 "gdn_conv_recurrent_update_k128_v128_bf16", "gdn_conv_recurrent_update_had_k128_v128_bf16",
         /* ...and the connection's write folded into the two-rank all-reduce, alone and behind
          * the routed gather (the exact wire's kernels; the rotated wire's stay plain) */
@@ -11928,7 +11986,7 @@ extern "C" int rad_kernel_chain(int i) {
         "kv_store_i8",
         /* Hy4-flash's kv_b projections at decode heights (M <= 64; r4d_mla_kv_bf16.hip), the
          * absorption and the expansion, alone or with the gate folded in */
-        "mla_project_kv_bf16", "mla_expand_gate_bf16",
+        "mla_project_kv_bf16", "mla_expand_gate_bf16", "mla_expand_gate_had_quant_i8g",
         /* the rest of Hy4-flash's decode pass (WP16.1b), at decode heights (the launches decline
          * above 64 rows): the connection's write and the gate product, the latent attention's
          * rows kernel and its merge, the indexer's pool and score, the f32 router GEMM, the

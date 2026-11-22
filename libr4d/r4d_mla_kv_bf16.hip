@@ -43,6 +43,8 @@
 #include "r4d_chain.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
+#include "r4d_fwht.h"
+#include "r4d_q8.h"
 #include <cstdint>
 
 namespace {
@@ -236,6 +238,121 @@ __global__ __launch_bounds__(kvp_threads(ABSORB)) void kv_project_wmma(const uin
     if constexpr (CH::on) r4d_chain_done();
 }
 
+// ---------------------------------------------------------------- mla_expand_gate_had_quant_i8g
+// The expansion with the gate folded in (GATE, above) and, behind it, had_quant_act_i8g over the
+// [M, heads * v_dim] gated product: the codes attn_output's rotated int8 GEMM reads, in the launch that
+// computes them (G-3c). The quantiser's group is 128 columns of a head's 256, so a workgroup takes
+// both the column tiles of one group, not one: eight column tiles x the four contraction quarters is
+// 32 waves (1024 threads), one token tile of 16, one group. Every wave runs expand's body as it is
+// (S 4, NC 1, MB 1): the same fragments, the same WMMA chain over its quarter, the quarters added in
+// wave order ((p0 + p1) + p2) + p3 in f32, the same rounding to bf16 and the same gate product. Then
+// the bf16 product of the group goes through LDS (16 tokens x 128) to one wave a token, which runs
+// had_quant_act_i8g's pass on it (quant_act_fp8_body at ROT, I8: r4d_fwht_wave<128> over the four
+// values a lane owns, the wave's absmax, scale amax / 127 and the rounded codes), so the codes are the
+// chain's bytes and, like the expansion's, a token's depend on its own row only (not on M, on the
+// token tile or on the grid). `y`, when given, receives the bf16 product (the plane the chain stores).
+struct KvQuantMeta {
+    long xr, wp, gr, qr, sr, yr;
+    int rows;
+};
+constexpr int kQG = 128;          // the quantiser's group: the rotation width and the scale's
+constexpr int kQTiles = kQG / 16; // column tiles of a group
+constexpr int kQThreads = 32 * kQTiles * 4;   // 8 tiles x 4 quarters of the contraction = 1024
+
+__device__ __forceinline__ void kvq_body(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
+                                         const uint16_t* __restrict__ g, signed char* __restrict__ q,
+                                         float* __restrict__ sc, uint16_t* __restrict__ y,
+                                         const KvQuantMeta& m) {
+    constexpr int S = 4, K = kLatent / S, KS = K / 16, KC = kvp_chunk<false, 1, 1>(), NCH = KS / KC;
+    static_assert(KS % (2 * KC) == 0, "chunks in pairs");
+    __shared__ float part[S][kQTiles][32][8];
+    __shared__ uint16_t ag[16][kQG];
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, head = blockIdx.y;
+    const int ct = wave % kQTiles, quarter = wave / kQTiles;
+    const int o0 = (int)blockIdx.x * kQG + ct * 16, t0 = (int)blockIdx.z * 16, kq = quarter * K;
+    const uint16_t* const wb = w + ((long)head * kRows + kKd) * m.wp + kq;
+    const int tl = min(t0 + (lane & 15), m.rows - 1);
+    const uint16_t* const xp = x + (long)tl * m.xr + (long)head * kLatent + kq + 8 * (lane >> 4);
+    v8f acc;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) acc[e] = 0.0f;
+    v8s a0[KC], b0[KC], a1[KC], b1[KC];
+    auto load = [&](v8s (&a)[KC], v8s (&b)[KC], int c) {
+#pragma unroll
+        for (int qq = 0; qq < KC; ++qq) {
+            const int k0 = 16 * (c * KC + qq);
+            a[qq] = kvp_wfrag<false, true>(wb, m.wp, o0, k0, lane);
+            b[qq] = kvp_ld8<true>(xp + k0);
+        }
+    };
+    auto step = [&](const v8s (&a)[KC], const v8s (&b)[KC]) {
+#pragma unroll
+        for (int qq = 0; qq < KC; ++qq) acc = kvp_wmma(a[qq], b[qq], acc);
+    };
+    load(a0, b0, 0);
+#pragma unroll 1
+    for (int c = 0; c < NCH; c += 2) {
+        load(a1, b1, c + 1);
+        step(a0, b0);
+        if (c + 2 < NCH) load(a0, b0, c + 2);
+        step(a1, b1);
+    }
+#pragma unroll
+    for (int e = 0; e < 8; ++e) part[quarter][ct][lane][e] = acc[e];
+    __syncthreads();
+    if (quarter == 0) {
+        // lane l holds token t0 + l % 16 at the group's columns 16 ct + 8 (l / 16) + e
+        const int tt = lane & 15;
+        const long t = t0 + tt;
+        const int cg = ct * 16 + 8 * (lane >> 4);
+        const v8s gv = kvp_ld8<true>(g + min(t, (long)m.rows - 1) * m.gr + (long)head * kVd +
+                                     (long)blockIdx.x * kQG + cg);
+        uint16_t o[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            float v = part[0][ct][lane][e];
+#pragma unroll
+            for (int qq = 1; qq < S; ++qq) v += part[qq][ct][lane][e];
+            o[e] = f32_to_bf16(v);
+            o[e] = f32_to_bf16(bf16_to_f32(o[e]) * kvp_sigmoid(bf16_to_f32((uint16_t)gv[e])));
+            ag[tt][cg + e] = o[e];
+        }
+        if (y && t < m.rows) {
+            uint4 v;
+            v.x = (uint32_t)o[0] | (uint32_t)o[1] << 16;
+            v.y = (uint32_t)o[2] | (uint32_t)o[3] << 16;
+            v.z = (uint32_t)o[4] | (uint32_t)o[5] << 16;
+            v.w = (uint32_t)o[6] | (uint32_t)o[7] << 16;
+            *(uint4*)(y + t * m.yr + (long)head * kVd + (long)blockIdx.x * kQG + cg) = v;
+        }
+    }
+    __syncthreads();
+    if (wave < 16) {
+        const long t = t0 + wave;
+        if (t < m.rows) {
+            float v[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) v[j] = bf16_to_f32(ag[wave][lane * 4 + j]);
+            r4d_fwht_wave<kQG>(v, lane);
+            float mx = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+            mx = r4d_wave_max(mx);
+            const float s = mx > 0.0f ? mx * (1.0f / q8_top<true>()) : 1.0f;
+            if (lane == 0) sc[t * m.sr + head * 2 + blockIdx.x] = s;
+            *(uint32_t*)(q + t * m.qr + (long)head * kVd + (long)blockIdx.x * kQG + lane * 4) =
+                q8_pack4<true>(v[0], v[1], v[2], v[3], 1.0f / s);
+        }
+    }
+}
+
+template <typename CH>
+__global__ __launch_bounds__(kQThreads) void kv_expand_gate_quant(
+    const uint16_t* __restrict__ x, const uint16_t* __restrict__ w, const uint16_t* __restrict__ g,
+    signed char* __restrict__ q, float* __restrict__ sc, uint16_t* __restrict__ y, KvQuantMeta m) {
+    if constexpr (CH::on) r4d_chain_wait();
+    kvq_body(x, w, g, q, sc, y, m);
+    if constexpr (CH::on) r4d_chain_done();
+}
+
 /* The launch: grid (column blocks, heads, token groups of 16 MB). */
 template <bool ABSORB, int MB, int NC, bool VEC, bool GATE, typename CH>
 int kvp_emit(RadStream s, unsigned heads, const uint16_t* x, const uint16_t* w, const uint16_t* g,
@@ -375,6 +492,47 @@ extern "C" int r4d_rad_mla_expand_gate(const RadArgs* a, RadStream s) {
     const RadTensor *x = r4d_opt(a, 0), *w = r4d_opt(a, 1), *g = r4d_opt(a, 2), *y = r4d_opt(a, 3);
     if (!x || !w || !g || !y) return R4D_NO(RAD_E_INVAL);
     return kvp_launch(a, s, x, w, g, y, false);
+}
+
+/* Operands: [0] x (the latent attention's output) [1] w (kv_b) [2] g (the gate's logits) [3] q
+ * (int8 [M, heads * v_dim]) [4] scale (f32 [M, heads * v_dim / 128]) [5] out_bf16? (the gated product,
+ * [M, heads, v_dim] or [M, heads * v_dim]). */
+extern "C" int r4d_rad_mla_expand_gate_had_quant_i8g(const RadArgs* a, RadStream s) {
+    const RadTensor *x = r4d_opt(a, 0), *w = r4d_opt(a, 1), *g = r4d_opt(a, 2), *q = r4d_opt(a, 3),
+                    *sc = r4d_opt(a, 4), *y = r4d_opt(a, 5);
+    if (!x || !w || !g || !q || !sc) return R4D_NO(RAD_E_INVAL);
+    if (x->dtype != RAD_BF16 || w->dtype != RAD_BF16 || g->dtype != RAD_BF16 || q->dtype != RAD_I8 ||
+        sc->dtype != RAD_F32 || (y && y->dtype != RAD_BF16))
+        return R4D_NO(RAD_E_DTYPE);
+    const long h = r4d_geti_or(a, "heads", 0);
+    if (h < 1 || h > 64 || r4d_geti_or(a, "k_dim", 0) != kKd || r4d_geti_or(a, "v_dim", 0) != kVd ||
+        r4d_geti_or(a, "latent_dim", 0) != kLatent || r4d_geti_or(a, "group", kQG) != kQG)
+        return R4D_NO(RAD_E_SHAPE);
+    long long M = 0, Mg = 0, Mq = 0, Ms = 0, My = 0;
+    const long long xr = r4d_rows_pitch(x, h * kLatent, &M), gr = r4d_rows_pitch(g, h * kVd, &Mg),
+                    qr = r4d_rows_pitch(q, h * kVd, &Mq), sr = r4d_rows_pitch(sc, h * kVd / kQG, &Ms),
+                    yr = y ? r4d_rows_pitch(y, h * kVd, &My) : 0;
+    if (xr < 0 || gr < 0 || qr < 0 || sr < 0 || yr < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M < 1 || M > 65535 || Mg != M || Mq != M || Ms != M || (y && My != M)) return R4D_NO(RAD_E_SHAPE);
+    if (w->rank != 2 || w->shape[0] != h * kRows || w->shape[1] != kLatent || w->stride[1] != 1 ||
+        w->stride[0] < kLatent)
+        return R4D_NO(RAD_E_SHAPE);
+    const auto* xp = (const uint16_t*)x->data;
+    const auto* wp = (const uint16_t*)w->data;
+    const auto* gp = (const uint16_t*)g->data;
+    auto* yp = y ? (uint16_t*)y->data : nullptr;
+    /* 16-byte fragments, load_tr's row pieces, 16-byte stores and the 4-byte code stores */
+    if (xr % 8 || gr % 8 || yr % 8 || w->stride[0] % 8 || qr % 4 || !r4d_aligned(xp, 16) ||
+        !r4d_aligned(wp, 16) || !r4d_aligned(gp, 16) || (yp && !r4d_aligned(yp, 16)) ||
+        !r4d_aligned(q->data, 4))
+        return R4D_NO(RAD_E_ALIGN);
+    const KvQuantMeta m{ (long)xr, (long)w->stride[0], (long)gr, (long)qr, (long)sr, (long)yr, (int)M };
+    const dim3 grid(kVd / kQG, (unsigned)h, (unsigned)((M + 15) / 16));
+    if (r4d_geti_or(a, "chain", 0) != 0 && M <= 64)
+        return R4D_EMIT(s, (kv_expand_gate_quant<r4dchain>), grid, dim3(kQThreads), 0, xp, wp, gp,
+                        (signed char*)q->data, (float*)sc->data, yp, m);
+    return R4D_EMIT(s, (kv_expand_gate_quant<R4dUnchained>), grid, dim3(kQThreads), 0, xp, wp, gp,
+                    (signed char*)q->data, (float*)sc->data, yp, m);
 }
 
 extern "C" int r4d_rad_mla_kv_split(const RadArgs* a, RadStream s) {

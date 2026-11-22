@@ -515,11 +515,14 @@ extern "C" int r4d_shape_rmsnorm_ihc_junction(const RadParam* p, int n_p, int op
                   rows = pi(p, n_p, "rows"), tail = pi(p, n_p, "tail", 1);
     if (hc < 1 || (tail && rows != hc && rows != 2 * hc)) return RAD_E_UNSUPPORTED;
     const bool post = rows == 2 * hc;
+    const bool codes = pi(p, n_p, "group", 0) == R4D_FP8_BLOCK;   /* G-3b: xq, xs described */
     const uint32_t D = dt_act(p, n_p, "dtype"), F = (uint32_t)RAD_F32;
     const RadOpdDesc l[] = { opd(D, M, n), opd(D, M, n), opd(F, n), opd(F, M, hc), opd(D, M, hc * n),
         tail ? opd(F, rows, hc * n) : opd_none(), tail ? opd(F, post ? 2 : 1) : opd_none(),
         tail ? opd(F, rows) : opd_none(), tail ? opd(F, n) : opd_none(),
-        tail ? opd(D, M, n) : opd_none(), opd(D, M, n), tail ? opd(D, M, n) : opd_none() };
+        tail ? opd(D, M, n) : opd_none(), opd(D, M, n), tail ? opd(D, M, n) : opd_none(),
+        tail && codes ? opd((uint32_t)RAD_I8, M, n) : opd_none(),
+        tail && codes ? opd((uint32_t)RAD_F32, M, n / R4D_FP8_BLOCK) : opd_none() };
     R4D_PICK(l);
 }
 extern "C" int r4d_shape_gate_mul(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
@@ -545,6 +548,17 @@ extern "C" int r4d_shape_mla_expand_gate(const RadParam* p, int n_p, int operand
     const uint32_t D = dt_act(p, n_p, "dtype");
     const RadOpdDesc d[] = { opd(D, M, h, l), opd(D, h * (kd + vd), l), opd(D, M, h * vd),
         opd(D, M, h, vd) };
+    R4D_PICK(d);
+}
+extern "C" int r4d_shape_mla_expand_gate_had_quant_i8g(const RadParam* p, int n_p, int operand,
+                                                       RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), h = pi(p, n_p, "heads"), kd = pi(p, n_p, "k_dim"),
+                  vd = pi(p, n_p, "v_dim"), l = pi(p, n_p, "latent_dim"),
+                  g = pi(p, n_p, "group", R4D_FP8_BLOCK);
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    if (g != R4D_FP8_BLOCK || (h * vd) % g) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc d[] = { opd(D, M, h, l), opd(D, h * (kd + vd), l), opd(D, M, h * vd),
+        opd((uint32_t)RAD_I8, M, h * vd), opd((uint32_t)RAD_F32, M, h * vd / g), opd(D, M, h * vd) };
     R4D_PICK(d);
 }
 extern "C" int r4d_shape_mla_kv_split(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

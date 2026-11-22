@@ -114,6 +114,7 @@ __device__ __forceinline__ void arij_rows(JuncLds<HC, POST>& L, uint16_t* ybuf, 
         t.post_row += (size_t)row * pp;
         t.hr += (size_t)row * hp;
         if (TAIL) t.xnr += (size_t)row * xnp;
+        if (t.cq) { t.cq += (size_t)row * t.cqp; t.cs += (size_t)row * t.csp; }
         if (t.yr) t.yr += (size_t)row * yp;
         if (t.xr) t.xr += (size_t)row * xp;
         junction_row<HC, POST, TAIL>(L, ybuf, t);

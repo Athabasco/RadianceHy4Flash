@@ -127,13 +127,36 @@ struct Attn {
     rad_op op_lat_copy = 0, op_kvb = 0, op_split = 0, op_qn_copy = 0, op_qr_copy = 0, op_dense = 0, op_rebase = 0;
     rad_op op_gate = 0, op_post_norm = 0, op_ar = 0;
     rad_op op_expand_gate = 0;   /* the expansion with the gate folded in, where a library has it */
+    /* G-3c: the expansion, the gate and the rotated int8 codes attn_output reads, in one launch, for
+     * decode-class steps (at most kFuseRows rows, every row absorbed); `out` then issues no quantiser. */
+    rad_op op_expand_quant = 0;
+    static constexpr int64_t kFuseRows = 64;
     Tap t_in_norm{}, t_q_resid{}, t_kv_latent{}, t_kv_rope{}, t_gate{}, t_o_proj{}, t_out{};
 
+    /* G-3b: maps the three linears that read the attention norm's output (q_a, kv_a, the gate) and
+     * returns the code form of q_a's weight, so the junction in front can decide whether to write the
+     * codes they read (the form comes from the mapped weight). Declare then skips the mapping. */
+    CodeForm premap_in(RadBuilder* bld, Names& nm, const Shape& shape, int l, const char* ap) {
+        q_a.mapped = kv_a.mapped = gate.mapped = false;
+        if (map_linear(bld, nm.f("blk.%d.attn_q_a.weight", l), { nm.ckpt("%s.q_a_proj.weight", ap) }) !=
+                RAD_OK ||
+            map_linear(bld, nm.f("blk.%d.attn_kv_a.weight", l),
+                       { nm.ckpt("%s.kv_a_proj_with_mqa.weight", ap) }) != RAD_OK ||
+            map_linear(bld, nm.f("blk.%d.attn_gate.weight", l), { nm.ckpt("%s.linear_gate.weight", ap) }) !=
+                RAD_OK)
+            return CodeForm{};
+        q_a.mapped = kv_a.mapped = gate.mapped = true;
+        (void)shape;
+        return code_form(bld, nm.f("blk.%d.attn_q_a.weight", l));
+    }
+
     /* `ap` is the checkpoint's `model.layers.<l>.self_attn`. `group` is the layer's latent KV
-     * group, declared by the caller right before this (its block size is this layer's ops'). */
+     * group, declared by the caller right before this (its block size is this layer's ops').
+     * `in_codes` (G-3b): the rotated int8 codes of `in` the junction in front writes. */
     int declare(RadBuilder* b, Names& nm, const Shape& shape, const Geom& geom, int l,
                 bool is_sliding, AttnWire& wire, rad_buf in, rad_buf outb, rad_kvgroup group,
-                int64_t block, const char* ap, bool first_of_group) {
+                int64_t block, const char* ap, bool first_of_group,
+                const ActFP8* in_codes = nullptr) {
         s = shape;
         g = geom;
         layer = l;
@@ -194,6 +217,7 @@ struct Attn {
         w.qa_raw = qfuse ? wire.qa_raw : 0;
         qa_out = qfuse ? w.qa_raw : w.qa;
         q_a.lead = "attn_in";
+        q_a.fed_codes = kv_a.fed_codes = gate.fed_codes = in_codes;   /* each takes them by its form */
         RAD_ARCH_TRY(q_a.declare(b, nm, g, nm.f("blk.%d.attn_q_a", l), s.q_lora, s.n_embd,
                                  RAD_SHARD_NONE, grp, { nm.ckpt("%s.q_a_proj.weight", ap) },
                                  act(xa), qa_out));
@@ -316,6 +340,7 @@ struct Attn {
                                   RAD_SHARD_ROW, grp, { nm.ckpt("%s.linear_gate.weight", ap) },
                                   act(xa), w.gate));
 
+        q_a.fed_codes = kv_a.fed_codes = gate.fed_codes = nullptr;
         RAD_ARCH_TRY(t_in_norm.declare(b, nm, T, "attn_in_norm", l, RAD_BF16, s.n_embd, xa));
         RAD_ARCH_TRY(t_q_resid.declare(b, nm, T, "attn_q_resid", l, RAD_BF16, s.q_lora, w.qa));
         RAD_ARCH_TRY(t_kv_latent.declare(b, nm, T, "attn_kv_latent", l, RAD_BF16, L, w.row));
@@ -430,6 +455,20 @@ struct Attn {
         RAD_ARCH_TRY(out.declare(b, nm, g, nm.f("blk.%d.attn_output", l), s.n_embd, a.v_width(),
                                  RAD_SHARD_COL, grp, { nm.ckpt("%s.o_proj.weight", ap) },
                                  act(w.ag), w.o));
+        /* G-3c (RADIANCE_HY4_FUSE_EXPAND_QUANT=0 keeps the expansion and the quantiser apart). Only
+         * where o_proj reads rotated int8 codes of the 128 group its own quantiser writes, and no tap
+         * or calibration reads the gated plane between. */
+        if (fuse_on("RADIANCE_HY4_FUSE_EXPAND_QUANT") && op_expand_gate && out.i8 && out.i8_rot &&
+            !out.fed && out.op_q && out.g8 == RAD_FP8_BLOCK && out.q8 && out.s8 &&
+            calib_dir() == nullptr && rad_op_declared(b, "mla_expand_gate_had_quant_i8g")) {
+            op_expand_quant =
+                mk(b, "mla_expand_gate_had_quant_i8g",
+                   { RAD_RANGE("M", 1, std::min<int64_t>(T, kFuseRows)), RAD_INT("heads", H),
+                     RAD_INT("k_dim", N), RAD_INT("v_dim", a.v), RAD_INT("latent_dim", L),
+                     RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "bf16") },
+                   { kv_b }, { w.lat, w.gate }, { out.q8, out.s8 });
+            if (op_expand_quant && !rad_op_resolved(b, op_expand_quant)) op_expand_quant = 0;
+        }
         int rc = RAD_OK;
         op_ar = decl_all_reduce(b, g, s.n_embd, w.o, &rc);
         RAD_ARCH_TRY(rc);
@@ -605,6 +644,8 @@ struct Attn {
         };
         const bool selecting = !sliding && p.select;
         const int64_t abs_rows = selecting ? T : p.nonabs ? p.DT : T;
+        /* G-3c: every row of a small step is absorbed, so one launch gives o_proj its codes. */
+        const bool fused_q = op_expand_quant && abs_rows == T && T > 0 && T <= kFuseRows;
         if (abs_rows > 0) {
             RAD_ISSUE_N(c, op_absorb, abs_rows, brows(w.q_nope, abs_rows), RAD_W(kv_b),
                         brows(w.q_lat, abs_rows));
@@ -623,7 +664,10 @@ struct Attn {
                 selected(c, p, sel, len);
             else
                 paged(c, batch, p, !p.nonabs);
-            if (op_expand_gate)
+            if (fused_q)
+                RAD_ISSUE_N(c, op_expand_quant, T, brows(w.lat, T), RAD_W(kv_b), brows(w.gate, T),
+                            brows(out.q8, T), brows(out.s8, T));
+            else if (op_expand_gate)
                 RAD_ISSUE_N(c, op_expand_gate, abs_rows, brows(w.lat, abs_rows), RAD_W(kv_b),
                             brows(w.gate, abs_rows), brows(w.ag, abs_rows));
             else
@@ -638,7 +682,7 @@ struct Attn {
             RAD_ISSUE_N(c, op_gate, T - g0, brow_slice(w.ao, g0, T - g0, vw),
                         brow_slice(w.gate, g0, T - g0, vw), brow_slice(w.ag, g0, T - g0, vw));
         }
-        out.step(c, act(w.ag), w.o, T);
+        out.step(c, act(w.ag), w.o, T, 0, 0, -1, fused_q);
         if (fused_tail) return;
         issue_all_reduce(c, op_ar, w.o, T, s.n_embd);
         t_o_proj.step(c, brows(w.o, T), T);

@@ -109,6 +109,19 @@ RadEncoding enc_trellis(uint32_t codes, bool colf) {
     return e;
 }
 
+/* G-3's launch fusions are declared only by the tests that ask (g3_fusions); every other test keeps
+ * the unfused chains its assertions count. */
+bool g3_fusions = false;
+struct G3Env {
+    std::vector<const char*> set;
+    G3Env() {
+        if (g3_fusions) return;
+        for (const char* k : { "RADIANCE_HY4_FUSE_SWIGLU", "RADIANCE_HY4_FUSE_EXPAND_QUANT",
+                               "RADIANCE_HY4_FUSE_JUNCTION_Q", "RADIANCE_HY4_FUSE_QPROJ" })
+            if (!std::getenv(k)) { setenv(k, "0", 1); set.push_back(k); }
+    }
+    ~G3Env() { for (const char* k : set) unsetenv(k); }
+};
 struct Declared {
     MetaKV mk;
     RadBuilder b;
@@ -119,6 +132,7 @@ struct Declared {
         : mk(mini_meta(wide, ff_exp)) {
         encs(&b);
         ctx = build_ctx(rank, world);
+        G3Env g3env;
         std::string err;
         err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
         if (rc != RAD_OK && std::getenv("HY4_TEST_STDERR")) fputs(err.c_str(), stderr);
@@ -1177,6 +1191,7 @@ TEST(a_sizing_declare_matches_the_real_one_and_leaves_its_model_alone) {
         RadBuildCtx pc = build_ctx();
         pc.max_tok = 64;
         pc.shape_probe = 1;
+        G3Env g3env;
         REQUIRE_EQ(hyv4flash::declare(&pb, d.mk.meta(), &pc), RAD_OK);
         REQUIRE_EQ(pb.ops.size(), d.b.ops.size());
         for (size_t k = 0; k < pb.ops.size(); ++k) CHECK_EQ(pb.ops[k].op, d.b.ops[k].op);
@@ -1948,3 +1963,30 @@ TEST(the_four_rank_junction_twin_is_opt_in) {
 }
 
 RAD_TEST_MAIN()
+
+/* G-3: with the fusions on, the junctions write the codes of the next norm (their `group` 128 and the
+ * pair's buffers), the readers of that norm declare no quantiser of their own, and with each switch
+ * off the unfused chain is back. */
+TEST(g3_junctions_write_the_codes_their_readers_take) {
+    /* the step reads the model the last declare built, so each graph is stepped before the next */
+    g3_fusions = true;
+    Declared on(int8_trunk_encs);
+    g3_fusions = false;
+    REQUIRE_EQ(on.rc, RAD_OK);
+    auto with_codes = [](const RadBuilder& b) {
+        int n = 0;
+        for (const auto& o : b.ops)
+            if (o.op == "rmsnorm_ihc_junction" || o.op == "ar_rmsnorm_ihc_junction")
+                for (const auto& p : o.p) n += p.key == "group";
+        return n;
+    };
+    CHECK(with_codes(on.b) > 0);
+    every_weight_read(on.b);
+    steps_clean_at(on.b, 0, 1);
+    const int had_on = count_op(on.b, "had_quant_act_i8g");
+    Declared off(int8_trunk_encs);
+    REQUIRE_EQ(off.rc, RAD_OK);
+    CHECK_EQ(with_codes(off.b), 0);
+    /* every junction that writes codes removes the quantiser behind it */
+    CHECK(had_on < count_op(off.b, "had_quant_act_i8g"));
+}

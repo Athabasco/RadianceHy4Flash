@@ -40,6 +40,7 @@
 #include "r4d_common.h"   // r4d_act_threads: the workgroup width, shared with the int8 path
 #include "r4d_fwht.h"     // the in-register rotation the `_had_` forms put before the absmax
 #include "r4d_q8.h"       // the 8-bit codes: E4M3, or int8 for an int8 trunk linear
+#include <cmath>
 
 namespace {
 
@@ -273,7 +274,7 @@ __global__ __launch_bounds__(THR) void r4dchain_rmsnorm_quant(R4D_RQ_PARAMS) {
 // early.
 #define R4D_GQ_PARAMS const uint16_t* __restrict__ gu, uint16_t* __restrict__ y,                 \
     uint8_t* __restrict__ q, float* __restrict__ s, uint32_t n, uint32_t nkb, uint32_t gu_ld,     \
-    uint32_t y_ld, uint32_t q_ld, uint32_t s_ld
+    uint32_t y_ld, uint32_t q_ld, uint32_t s_ld, float lim
 template <int ACT, bool ROT = false, bool I8 = false, uint32_t SUB = 1>
 __device__ __forceinline__ void gated_quant_fp8_body(R4D_GQ_PARAMS) {
     const uint32_t row = blockIdx.x;
@@ -300,6 +301,16 @@ __device__ __forceinline__ void gated_quant_fp8_body(R4D_GQ_PARAMS) {
                 }
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
+                    if constexpr (ACT == 3) {
+                        // swiglu_clamped_kernel's expression (r4d_glm.hip): the gate clipped above,
+                        // the up both ways, then the product rounded once.
+                        const float g = fminf(bf2f(gb[j]), lim);
+                        const float u = fminf(fmaxf(bf2f(ub[j]), -lim), lim);
+                        const uint16_t h = f2bf((g / (1.0f + expf(-g))) * u);
+                        if (yr) yr[c0[b] + j] = h;
+                        v[b][j] = bf2f(h);
+                        continue;
+                    }
                     const float g = bf2f(gb[j]);
                     const float a = ACT == 0 ? g / (1.0f + expf(-g)) : 1.0f / (1.0f + expf(-g));
                     const uint16_t h = f2bf(a * bf2f(ub[j]));
@@ -315,12 +326,12 @@ __device__ __forceinline__ void gated_quant_fp8_body(R4D_GQ_PARAMS) {
 }
 template <int ACT, bool ROT = false, bool I8 = false, uint32_t SUB = 1>
 __global__ __launch_bounds__(1024) void gated_quant_fp8_kernel(R4D_GQ_PARAMS) {
-    gated_quant_fp8_body<ACT, ROT, I8, SUB>(gu, y, q, s, n, nkb, gu_ld, y_ld, q_ld, s_ld);
+    gated_quant_fp8_body<ACT, ROT, I8, SUB>(gu, y, q, s, n, nkb, gu_ld, y_ld, q_ld, s_ld, lim);
 }
 template <int ACT, bool ROT = false, bool I8 = false, uint32_t SUB = 1>
 __global__ __launch_bounds__(1024) void r4dchain_gated_quant(R4D_GQ_PARAMS) {
     r4d_chain_wait_vec();
-    gated_quant_fp8_body<ACT, ROT, I8, SUB>(gu, y, q, s, n, nkb, gu_ld, y_ld, q_ld, s_ld);
+    gated_quant_fp8_body<ACT, ROT, I8, SUB>(gu, y, q, s, n, nkb, gu_ld, y_ld, q_ld, s_ld, lim);
     r4d_chain_done();
 }
 #undef R4D_GQ_PARAMS
@@ -926,12 +937,14 @@ extern "C" int r4d_rmsnorm_had_quant_i8g(long x, long res, long w, long y, long 
 static int gated_quant_fp8_launch(long gu, long y, long q, long s, int M, int n, int mode,
                                   int gu_ld, int y_ld, int q_ld, int s_ld, RadStream stream,
                                   bool rot, bool i8 = false, bool wide = false,
-                                  bool chain = false) {
+                                  bool chain = false, float limit = 0.0f) {
     int emit_rc = RAD_OK;
     if (!gu || !q || !s) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (n % 4) return -3;
-    if (mode != 0 && mode != 1) return -5;
+    if (mode != 0 && mode != 1 && mode != 3) return -5;
+    /* mode 3 is swiglu_clamped's product (swiglu_clamped_had_quant_i8g): rotated int8 only. */
+    if (mode == 3 && (!rot || !i8 || !std::isfinite(limit) || limit <= 0.0f)) return -5;
     if (rot && (n % (int)kGroup)) return -6;
     if (wide && (!rot || !i8 || n % (2 * (int)kGroup))) return -6;
     if (!gu_ld) gu_ld = 2 * n;
@@ -948,7 +961,7 @@ static int gated_quant_fp8_launch(long gu, long y, long q, long s, int M, int n,
     emit_rc = R4D_EMIT(stream, K_, dim3((uint32_t)M), dim3(thr),                                 \
                        0, (const uint16_t*)gu, (uint16_t*)y, (uint8_t*)q,                      \
                        (float*)s, (uint32_t)n, (uint32_t)nkb, (uint32_t)gu_ld, (uint32_t)y_ld,  \
-                       (uint32_t)q_ld, (uint32_t)s_ld)
+                       (uint32_t)q_ld, (uint32_t)s_ld, limit)
 #define R4D_GQ_R(a, R, I, SUB) R4D_GQ_K((gated_quant_fp8_kernel<a, R, I, SUB>))
 /* The rotated forms (int8 codes or E4M3), plain or chained. */
 #define R4D_GQ_C(a, I, SUB)                                                                     \
@@ -961,7 +974,8 @@ static int gated_quant_fp8_launch(long gu, long y, long q, long s, int M, int n,
          else if (i8) R4D_GQ_R(a, false, true, 1u);                                             \
          else R4D_GQ_R(a, false, false, 1u); } while (0)
     if (mode == 0) R4D_GQ(0);
-    else           R4D_GQ(1);
+    else if (mode == 1) R4D_GQ(1);
+    else           R4D_GQ(3);
 #undef R4D_GQ
 #undef R4D_GQ_C
 #undef R4D_GQ_R
@@ -1244,7 +1258,8 @@ static int act_mode(const RadArgs* a, int dflt) {
 }
 
 /* `hi8` (with `rot`): gated_had_quant_i8g, int8 codes only. */
-static int rad_gated_quant_fp8(const RadArgs* a, RadStream stream, bool rot, bool hi8 = false) {
+static int rad_gated_quant_fp8(const RadArgs* a, RadStream stream, bool rot, bool hi8 = false,
+                               bool clamped = false) {
     const RadTensor* gu = r4d_opt(a, GQ_GU);
     const RadTensor* q  = r4d_opt(a, GQ_Q);
     const RadTensor* sc = r4d_opt(a, GQ_S);
@@ -1271,12 +1286,14 @@ static int rad_gated_quant_fp8(const RadArgs* a, RadStream stream, bool rot, boo
     const long long gp = r4d_row_pitch(gu), qp = r4d_row_pitch(q), sp = r4d_row_pitch(sc);
     const long long yp = y ? r4d_row_pitch(y) : 0;
     if (gp < 0 || qp < 0 || sp < 0 || yp < 0) return R4D_NO(RAD_E_STRIDE);
-    const int mode = act_mode(a, 0);                 /* silu: the gated MLP */
+    /* silu: the gated MLP; clamped (swiglu_clamped_had_quant_i8g): mode 3 with the `limit`. */
+    const int mode = clamped ? 3 : act_mode(a, 0);
     if (mode < 0) return R4D_NO(RAD_E_UNSUPPORTED);
+    const float limit = clamped ? (float)r4d_getf(a, "limit", 0.0) : 0.0f;
     const int e = gated_quant_fp8_launch(r4d_addr(gu), y ? r4d_addr(y) : 0, r4d_addr(q),
                                          r4d_addr(sc), (int)M, (int)K, mode, (int)gp, (int)yp,
                                          (int)qp, (int)sp, stream, rot, q->dtype == RAD_I8, wide,
-                                         r4d_geti_or(a, "chain", 0) != 0);
+                                         r4d_geti_or(a, "chain", 0) != 0, limit);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
@@ -1291,6 +1308,12 @@ extern "C" int r4d_rad_gated_had_quant_fp8(const RadArgs* a, RadStream stream) {
 /* Its int8 twin, had_quant_act_i8g's codes: pairs only with a weight stored at dtype i8a8h. */
 extern "C" int r4d_rad_gated_had_quant_i8g(const RadArgs* a, RadStream stream) {
     return rad_gated_quant_fp8(a, stream, true, true);
+}
+
+/* swiglu_clamped, then had_quant_act_i8g, in one pass (G-3a): the clamped product rounded to bf16
+ * (`out_bf16` the unrotated product when given), the 128-wide Hadamard and the int8 quantiser. */
+extern "C" int r4d_rad_swiglu_clamped_had_quant_i8g(const RadArgs* a, RadStream stream) {
+    return rad_gated_quant_fp8(a, stream, true, true, true);
 }
 
 /* Elements between consecutive `width`-wide rows, as r4d_gdn.cpp's gn_row_pitch: a

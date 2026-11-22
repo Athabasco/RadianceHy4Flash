@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdint>
 #include "r4d_common.h"
+#include "r4d_q8.h"   // q8_row_had_i8g: the next norm's rotated int8 codes (G-3b)
 
 namespace r4d_ihc {
 
@@ -193,11 +194,14 @@ struct JuncRow {
     uint16_t* xnr;            // [n] the next block's normed input (TAIL)
     uint16_t* yr;             // [n] the post norm's output, when asked
     uint16_t* xr;             // [n] the collapse, when asked
+    signed char* cq;          // [n] the next block's input norm's rotated int8 codes (TAIL), when asked
+    float* cs;                // [n / 128] their scales
+    uint64_t cqp, csp;        // the row pitches of cq and cs
     uint32_t n;
     float eps, ieps, heps, pmag, wadd, mult;
     uint32_t pad_ = 0;
 };
-static_assert(sizeof(JuncRow) == 11 * 8 + 8 * 4, "JuncRow carries no padding");
+static_assert(sizeof(JuncRow) == 15 * 8 + 8 * 4, "JuncRow carries no padding");
 
 template <int HC, bool POST, bool TAIL>
 __device__ __forceinline__ void junction_row(JuncLds<HC, POST>& L, uint16_t* ybuf, const JuncRow& r) {
@@ -242,8 +246,16 @@ __device__ __forceinline__ void junction_row(JuncLds<HC, POST>& L, uint16_t* ybu
             if (r.xr) *(uint4*)(r.xr + 8u * q) = w;
         });
         __syncthreads();
-        norm_row(ybuf, r.w_next, n, r.eps, r.wadd, r.mult, L.red2,
-                 [&](uint32_t q, uint4 w) { *(uint4*)(r.xnr + 8u * q) = w; });
+        norm_row(ybuf, r.w_next, n, r.eps, r.wadd, r.mult, L.red2, [&](uint32_t q, uint4 w) {
+            *(uint4*)(r.xnr + 8u * q) = w;
+            if (r.cq) *(uint4*)(ybuf + 8u * q) = w;   // each thread its own words, read before
+        });
+        // G-3b: had_quant_act_i8g's codes over the bf16 row just stored (q8_row_had_i8g, a wave a
+        // 128-column group), so the consumers of xn read them and no quantiser follows.
+        if (r.cq) {
+            __syncthreads();
+            q8_row_had_i8g<kThreads>(ybuf, r.cq, r.cs, n);
+        }
     }
 }
 

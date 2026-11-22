@@ -544,6 +544,11 @@ struct GateQuantFP8 {
      * library declares it and it resolves (E4M3 codes only). Byte-identical to the pair. */
     bool fuse_clamped = false;
     bool clamped_fused = false;
+    /* Set before declare: the same for rotated int8 codes (`a.q8_fed` with `a.q8_rot`, a rotated
+     * int8 down projection's input): one `swiglu_clamped_had_quant_i8g` where a loaded library
+     * declares it, in place of swiglu_clamped then had_quant_act_i8g (G-3a). It writes the bf16
+     * plane only where `bf16_out` asked. Byte-identical to the pair. */
+    bool fuse_clamped_i8 = false;
     /* Whether the bf16 product is written. A consumer of the bf16 value must request it
      * (docs/OPS.md), but a block-fp8 down_proj reads only codes and scales; only one that reads
      * the bf16 plane (LinearFP8::reads_x) needs it. Skipping it saves [T, n_ff] per layer (18.2 GB
@@ -638,6 +643,20 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("limit", limit),
                                   RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
                        RAD_NOWEIGHTS);
+            if (op) {
+                const rad_buf wr[3] = { a.cq(), a.cs(), a.x };
+                rad_op_reads(b, op, &gate_up, 1);
+                rad_op_writes(b, op, wr, want_x ? 3 : 2);
+                clamped_fused = true;
+                return RAD_OK;
+            }
+        }
+        if (fuse_clamped_i8 && hi8 && !rot && !step && !bf16 && a.cq() && a.cs() &&
+            a.cg() == RAD_FP8_BLOCK && rad_op_declared(b, "swiglu_clamped_had_quant_i8g")) {
+            op = RAD_OP(b, "swiglu_clamped_had_quant_i8g",
+                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("limit", limit),
+                                   RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
+                        RAD_NOWEIGHTS);
             if (op) {
                 const rad_buf wr[3] = { a.cq(), a.cs(), a.x };
                 rad_op_reads(b, op, &gate_up, 1);
@@ -941,8 +960,10 @@ struct LinearFP8 {
                           RadWeightGroup grp);
     /* Rows [r0, r0 + rows) of the input into the same rows of `y`, or from row `y0` of `y` when
      * that is set: a rank's run of a step's rows written to a buffer sized for the run. */
+    /* `codes_ready`: an int8 linear's activation codes were written by a producer this step (a
+     * fused one chosen at run time), so its own quantiser is not issued. */
     void step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0 = 0,
-              int64_t rows = 0, int64_t y0 = -1) const;
+              int64_t rows = 0, int64_t y0 = -1, bool codes_ready = false) const;
     /* A span per stacked row part (rad_weight_shard_span_parts), in weight rows; the scale plane
      * gets the same spans in its rows. Call after declare(). With a 1/128 plane every span and
      * total must be whole scale blocks. */
@@ -1894,7 +1915,7 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
  * asymmetric integer and mxfp4 grids) are passed as RAD_NONE when unused, since the runtime checks
  * the operand count against the schema (core/runtime/issue.cpp). */
 inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0,
-                            int64_t rows, int64_t y0) const {
+                            int64_t rows, int64_t y0, bool codes_ready) const {
     if (rows <= 0) rows = T - r0;
     const int64_t yr = y0 < 0 ? r0 : y0;
     if (bf16) {
@@ -1902,7 +1923,7 @@ inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, in
         return;
     }
     if (i8) {
-        if (op_q)
+        if (op_q && !codes_ready)
             RAD_ISSUE_N(c, op_q, rows, brow_slice(a.x, r0, rows, K), brow_slice(a.q8, r0, rows, K),
                         brow_slice(a.s8, r0, rows, K / a.g8));
         RAD_ISSUE_N(c, op, rows, brow_slice(a.q8, r0, rows, K),

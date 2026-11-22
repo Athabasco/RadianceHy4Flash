@@ -16573,6 +16573,44 @@ static void fused_quant_fp8_numeric(const Plugin& pl) {
                               PS("act", "silu") });
             ok("gated_had_quant_i8g refuses E4M3 codes", rc != RAD_OK, "rc=" + std::to_string(rc));
         }
+        /* G-3a: the clamped product's rotated int8 codes in one pass, against swiglu_clamped_bf16
+         * then had_quant_act_i8g, byte for byte (the bf16 plane too), at limits that clip the gate
+         * above and the up both ways. */
+        const RadKernelInfo* sc = find(pl, "swiglu_clamped_bf16");
+        if (const RadKernelInfo* sq = find(pl, "swiglu_clamped_had_quant_i8g")) {
+            for (double lim : { 0.1, 0.75, 2.0, 10.0 }) {
+                rc = sc ? launch_row(sc, { T(d_gu, RAD_BF16, { M, 2 * K }), T(d_y[0], RAD_BF16, { M, K }) },
+                                     { PI("M", M), PI("n", K), PF("limit", lim), PS("dtype", "bf16") })
+                        : RAD_E_NOKERNEL;
+                if (rc == RAD_OK)
+                    rc = launch_row(qh, { T(d_y[0], RAD_BF16, { M, K }), T(d_q[0], RAD_I8, { M, K }),
+                                          T(d_s[0], RAD_F32, { M, nkb }) },
+                                    { PI("M", M), PI("n", K), PI("group", 128), PS("dtype", "bf16") });
+                if (rc == RAD_OK)
+                    rc = launch_row(sq, { T(d_gu, RAD_BF16, { M, 2 * K }), T(d_q[1], RAD_I8, { M, K }),
+                                          T(d_s[1], RAD_F32, { M, nkb }), T(d_y[1], RAD_BF16, { M, K }) },
+                                    { PI("M", M), PI("n", K), PF("limit", lim), PI("group", 128),
+                                      PS("dtype", "bf16") });
+                const std::string what = "swiglu_clamped_had_quant_i8g (limit " + std::to_string(lim) +
+                                         ") is byte-identical to swiglu_clamped + had_quant_act_i8g";
+                if (rc != RAD_OK) ok(what.c_str(), false, "rc=" + std::to_string(rc));
+                else same(what.c_str());
+            }
+            /* without the bf16 plane the codes and scales do not move */
+            rc = launch_row(sq, { T(d_gu, RAD_BF16, { M, 2 * K }), T(d_q[1], RAD_I8, { M, K }),
+                                  T(d_s[1], RAD_F32, { M, nkb }), T(nullptr, RAD_BF16, {}) },
+                            { PI("M", M), PI("n", K), PF("limit", 10.0), PI("group", 128),
+                              PS("dtype", "bf16") });
+            ok("swiglu_clamped_had_quant_i8g without the bf16 plane is served", rc == RAD_OK,
+               "rc=" + std::to_string(rc));
+            rc = launch_row(sq, { T(d_gu, RAD_BF16, { M, 2 * K }), T(d_q[1], RAD_F8E4M3, { M, K }),
+                                  T(d_s[1], RAD_F32, { M, nkb }) },
+                            { PI("M", M), PI("n", K), PF("limit", 10.0), PI("group", 128),
+                              PS("dtype", "bf16") });
+            ok("swiglu_clamped_had_quant_i8g refuses E4M3 codes", rc != RAD_OK, "rc=" + std::to_string(rc));
+        } else {
+            ok("swiglu_clamped_had_quant_i8g is registered", false, "row absent");
+        }
     }
 
     /* --- add + rmsnorm + quant_act_fp8, against the same three fused ---
@@ -34460,7 +34498,8 @@ static void hy4_misc_case(const Plugin& pl) {
 /* mla_project_kv through the checkpoint's kv_b, both modes, 8 to 64 heads, M across the tile sizes and
  * the mb law (1, then 4 token tiles a wave past 16 rows). */
 static void hy4_mla_project_kv_case(const Plugin& pl) {
-    const bool sp = sel("mla_project_kv_bf16"), sf = sel("mla_expand_gate_bf16");
+    const bool sp = sel("mla_project_kv_bf16"), sf = sel("mla_expand_gate_bf16") ||
+                                                            sel("mla_expand_gate_had_quant_i8g");
     if (!sp && !sf) return;
     for (const char* mode : { "absorb", "expand" })
         for (int64_t H : { 8, 16, 32, 64 })
@@ -34591,6 +34630,61 @@ static void hy4_mla_project_kv_case(const Plugin& pl) {
             if (!std::equal(o9.begin(), o9.end(), want.begin())) { fsame = false; where = "M 9 chained"; }
             ok(fmt("mla_expand_gate heads %lld == mla_project_kv expand + gate_mul, bit for bit", (long long)H).c_str(),
                fsame, where);
+            /* G-3c: the gated product's rotated int8 codes in the same launch, against gate_mul's bytes
+             * then had_quant_act_i8g, byte for byte (codes, scales and the bf16 plane), at ragged
+             * heights, chained or not, and every row of a launch equal to the token launched alone. */
+            if (const RadKernelInfo* fq = find(pl, "mla_expand_gate_had_quant_i8g")) {
+                const RadKernelInfo* qh = find(pl, "had_quant_act_i8g");
+                if (!qh) { ok("mla_expand_gate_had_quant_i8g needs had_quant_act_i8g", false, "row absent"); }
+                else {
+                    const int64_t NG = GW / 128;
+                    int8_t* dq0 = (int8_t*)dalloc((size_t)(M * GW));
+                    float* ds0 = (float*)dalloc((size_t)(M * NG) * 4);
+                    {
+                        std::vector<RadTensor> ts = { T2(dag, M, GW, GW), T(dq0, RAD_I8, { M, GW }),
+                                                      T(ds0, RAD_F32, { M, NG }) };
+                        std::vector<RadParam> ps = { PI("M", M), PI("n", GW), PI("group", 128), PS("dtype", "bf16") };
+                        run_case(qh, ts, ps);
+                    }
+                    std::vector<int8_t> wq((size_t)(M * GW));
+                    std::vector<float> wsc((size_t)(M * NG));
+                    st_memcpy(wq.data(), dq0, wq.size(), hipMemcpyDeviceToHost);
+                    st_memcpy(wsc.data(), ds0, wsc.size() * 4, hipMemcpyDeviceToHost);
+                    bool qsame = true;
+                    std::string qwhere;
+                    int nz = 0;
+                    for (int8_t c : wq) nz += c != 0;
+                    for (const long long chain : { 0, 1 })
+                        for (const int64_t m : { M, (int64_t)64, (int64_t)17, (int64_t)9, (int64_t)1 })
+                            for (const bool plane : { false, true }) {
+                                int8_t* dq = (int8_t*)dalloc((size_t)(m * GW));
+                                float* dsc = (float*)dalloc((size_t)(m * NG) * 4);
+                                uint16_t* dy = plane ? (uint16_t*)dalloc((size_t)(m * GW) * 2) : nullptr;
+                                std::vector<RadTensor> ts = { T2(dx, m, XW, XW), T2(dw, WR, L, L), T2(dg, m, GW, GW),
+                                                              T(dq, RAD_I8, { m, GW }), T(dsc, RAD_F32, { m, NG }),
+                                                              plane ? T2(dy, m, GW, GW) : T(nullptr, RAD_BF16, {}) };
+                                std::vector<RadParam> ps = { PI("M", m), PI("heads", H), PI("k_dim", kd),
+                                                             PI("v_dim", vd), PI("latent_dim", L), PI("group", 128),
+                                                             PS("dtype", "bf16"), PI("chain", chain) };
+                                run_case(fq, ts, ps);
+                                std::vector<int8_t> gq((size_t)(m * GW));
+                                std::vector<float> gs((size_t)(m * NG));
+                                st_memcpy(gq.data(), dq, gq.size(), hipMemcpyDeviceToHost);
+                                st_memcpy(gs.data(), dsc, gs.size() * 4, hipMemcpyDeviceToHost);
+                                bool bad = !std::equal(gq.begin(), gq.end(), wq.begin()) ||
+                                           std::memcmp(gs.data(), wsc.data(), gs.size() * 4) != 0;
+                                if (plane) {
+                                    std::vector<uint16_t> gy((size_t)(m * GW));
+                                    st_memcpy(gy.data(), dy, gy.size() * 2, hipMemcpyDeviceToHost);
+                                    bad = bad || !std::equal(gy.begin(), gy.end(), want.begin());
+                                }
+                                if (bad) { qsame = false; qwhere = fmt("M %lld chain %lld%s", (long long)m, chain, plane ? " +plane" : ""); }
+                            }
+                    ok(fmt("mla_expand_gate_had_quant_i8g heads %lld == expansion + gate_mul + had_quant_act_i8g, "
+                           "bit for bit (%d nonzero codes)", (long long)H, nz).c_str(),
+                       qsame && nz > (int)wq.size() / 2, qwhere);
+                }
+            }
         }
 }
 
@@ -38080,7 +38174,7 @@ static void device_phase(const Plugin& pl) {
      * rows. */
     if (sel("rmsnorm_quant_fp8") || sel("gated_quant_fp8") || sel("gate_quant_fp8") ||
         sel("gated_had_quant_fp8") || sel("rmsnorm_had_quant_i8g") ||
-        sel("gated_had_quant_i8g")) {
+        sel("gated_had_quant_i8g") || sel("swiglu_clamped_had_quant_i8g")) {
         if (!g_case) std::printf("\nthe fp8 fusions, against the pair each one replaces\n");
         fused_quant_fp8_numeric(pl);
     }

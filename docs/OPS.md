@@ -733,6 +733,7 @@ for it. `residual` present is the `fused_add_rms_norm` form.
 |---|---|---|
 | `had_quant_act_i8g` | `M` `n` `group` `dtype` `chained`/opt | `x` → `q`, `scale` |
 | `gated_had_quant_i8g` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
+| `swiglu_clamped_had_quant_i8g` | `M`(range) `n` `limit`:f64 `group` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `rmsnorm_had_quant_i8g` | `M` `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt `chained`/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gate_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate`, `x` → `q`, `scale`, `out_bf16`? |
 | `gate_had_quant_i8g` | `M` `n` `group` `dtype` `act`:str/opt | `gate`, `x` → `q`, `scale`, `out_bf16`? |
@@ -3758,9 +3759,10 @@ refuses the graph rather than resolving a similar op.
 |---|---|---|
 | `ihc_pre` | `M`(range) `n` `hc` `rows` `eps`:f64 `hc_eps`:f64 `post_mag`:f64/opt `dtype` | `h`, `fn`w, `scale`w, `base`w → `x`, `post`? |
 | `ihc_post` | `M`(range) `n` `hc` `dtype` | `y`, `post`, `h`:inout |
-| `rmsnorm_ihc_junction` | `M`(range) `n` `hc` `rows` `eps`:f64 `ihc_eps`:f64/opt `hc_eps`:f64/opt `post_mag`:f64/opt `tail`/opt `dtype` | `a`:inout, `b`?, `w_post`w, `post`:inout, `h`:inout, `fn`w?, `scale`w?, `base`w?, `w_next`w?, `xn`?, `y`?, `x`? |
+| `rmsnorm_ihc_junction` | `M`(range) `n` `hc` `rows` `eps`:f64 `ihc_eps`:f64/opt `hc_eps`:f64/opt `post_mag`:f64/opt `tail`/opt `dtype` `group`/opt | `a`:inout, `b`?, `w_post`w, `post`:inout, `h`:inout, `fn`w?, `scale`w?, `base`w?, `w_next`w?, `xn`?, `y`?, `x`?, `xq`?, `xs`? |
 | `mla_project_kv` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `mode` `dtype` | `a`, `b`w → `y` |
 | `mla_expand_gate` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `dtype` | `x`, `w`w, `g` → `y` |
+| `mla_expand_gate_had_quant_i8g` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `group` `dtype` | `x`, `w`w, `g` → `q`, `scale`, `out_bf16`? |
 | `mla_attn_paged_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `block_size` `window` `scale`:f64 `dtype` `stable`/opt | `q`, `q_rope`, `kv`, `block_table`, `seqused`, `cu_seqlens`, `sinks`w → `out` |
 | `mla_attn_sel_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `blocks` `block_size` `scale`:f64 `dtype` `stable`/opt | `q`, `q_rope`, `kv`, `bt`, `length`, `sinks`w → `out` |
 | `mla_row_norm_rope_store` | `M`(range) `latent` `rope_dim` `eps`:f64 `theta`:f64 `scale`:f64/opt `mode`/opt `sections`/opt `block_size` `dtype` | `row`:inout, `w`w, `positions`, `slot_mapping`, `kv_cache`:inout |
@@ -3853,6 +3855,16 @@ bf16 before the product, as the pair stores and reads it. libref and libavx run 
 (their `mla_project_kv` expand, then their `gate_mul` in place); libr4d's fused row is held to its
 own pair byte for byte (rad-kbench's fusion oracle, `r4d_fuse.cpp`). A graph whose libraries lack
 the op issues the pair (`arch/hyv4flash`, `rad_op_declared`).
+
+`mla_expand_gate_had_quant_i8g` (G-3c, levers-general L3) is `mla_expand_gate` followed by
+`had_quant_act_i8g` over its `[M, heads * v_dim]` product (`group` 128): `q` int8 `[M, heads * v_dim]`,
+`scale` f32 `[M, heads * v_dim / 128]`, `out_bf16?` the unrotated product. libref and libavx run the chain
+itself; libr4d's row (M up to 64, a workgroup a token tile of 16 x head x 128-column group) is held to the
+three rows it replaces byte for byte (the fusion oracle). `swiglu_clamped_had_quant_i8g` (G-3a) is the
+same for `swiglu_clamped` then `had_quant_act_i8g` (the routed arm's clamped product and the rotated int8
+quantiser of its down projection). `rmsnorm_ihc_junction` / `ar_rmsnorm_ihc_junction` with `group` 128 and
+`xq`, `xs` (G-3b) additionally write `had_quant_act_i8g`'s codes of `xn` (tail 1 only), so the linears that
+read `xn` issue no quantiser; the chain gains the quantiser as its last step.
 
 `mla_row_norm_rope_store` (device-only) is Hy4-flash's latent cache row `[latent | rotary key]`,
 `latent + rope_dim` columns a token, in one launch: `rmsnorm` over the first `latent` columns in place
