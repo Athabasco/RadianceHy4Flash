@@ -5928,17 +5928,24 @@ static const RadConstraint cGatedQuantFp8[] = {
     C_DIV("n", 4), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cSwigluClampedQuant[] = {
-    C_GE("M", 1), C_LE("M", 65535), C_DIV("n", 4), C_EQ("group", R4D_FP8_BLOCK),
-    C_IN("dtype", "bf16"),
+    C_GE("M", 1), C_DIV("n", 4), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
 };
 /* n divisible by the group, as in cHadQuantActFp8. */
 static const RadConstraint cGatedHadQuantFp8[] = {
     C_DIV("n", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
 };
-/* swiglu_clamped_had_quant_i8g: whole 128-column groups, up to a decode step's routed slots. */
+/* swiglu_clamped_had_quant_i8g: whole 128-column groups, up to a decode step's routed slots.
+ *
+ * No row bound, and neither has its fp8 sibling above. Both were capped at M 65535 until a routed
+ * arm's band hit it: the band tops out at a step's routed slots (8192 tokens at top_k 8 is 65536,
+ * and with `prefill-span: 2` on an 8192-token budget 131072), so the declare resolved to no kernel
+ * and every rank refused to start ("41 device band(s) resolved to no kernel"). Nothing in the row
+ * needs the cap: both halves take any M (`swiglu_clamped` is cBf16Row, `had_quant_act_i8g` and
+ * `gated_quant_fp8` carry no row bound), the launch is a block a row over `dim3((uint32_t)M)`, and
+ * the fusion is a pass over the pair -- the prefill hash is byte-identical with it on above the old
+ * cap (448a9473ec over 10948 tokens at M 65536, and again at 131072). */
 static const RadConstraint cSwigluClampedHadQuant[] = {
-    C_GE("M", 1), C_LE("M", 65535), C_DIV("n", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK),
-    C_IN("dtype", "bf16"),
+    C_GE("M", 1), C_DIV("n", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
 };
 /* The narrow GEMM's row plus the fold's own constraints. `N DIV 256` is `nout DIV 128` on the
  * weight's extent: a block emits exactly one 128-column scale group. `act IN silu` because only
