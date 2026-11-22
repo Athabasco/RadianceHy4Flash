@@ -45,6 +45,8 @@ models:
     max-num-seqs: 8
     mm-max-patches: 0                 # no vision
     prefix-resume: nearest
+    prefix-cache-mib: 16384           # host tier: finished conversations' KV moves to host RAM,
+                                      # so the VRAM goes back to the experts
     busy-prefill-chunk: auto          # 512 halves decode stalls when long prompts arrive under load,
                                       # at about +60 % time to first token for those prompts
     checkpoint-slots: 128             # for many concurrent agentic sessions (default 64)
