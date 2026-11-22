@@ -1320,6 +1320,10 @@ TEST(dfly2_coupled_draws_each_chain_step_from_its_shortlist_law) {
             REQUIRE_EQ(plain.rc, RAD_OK);
             CHECK_EQ(count_op(plain.b, "mtp_couple_propose"), 0);
             CHECK(find_b(plain.b, "mtp_couple_state") == nullptr);
+            /* row_topk / row_topk_merge write `val` at f32 (the op's contract; libr4d's kernels
+             * write f32 whatever the plane is declared as) */
+            REQUIRE(find_b(plain.b, "dfly.cand_val") != nullptr);
+            CHECK_EQ(find_b(plain.b, "dfly.cand_val")->d.dtype, (uint32_t)RAD_F32);
             MetaKV mk = dfly_meta();
             RadBuilder b;
             bf16_encs(&b);

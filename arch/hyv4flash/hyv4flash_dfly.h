@@ -267,9 +267,9 @@ struct Dfly {
         rad_op op_rowk = 0, op_zk = 0, op_pe = 0, op_hn = 0, op_en = 0,
                op_silu = 0, op_add = 0, op_head = 0, op_lcast = 0, op_topk = 0,
                op_tok = 0, op_prev = 0, op_gcp = 0, op_ucp = 0;
-        /* --draft-coupling: the shortlist's values at f32, the sampled proposal (and, sabotaged, the
-         * shortlist's ids replaced first) */
-        rad_op op_vcast = 0, op_couple = 0, op_csab = 0;
+        /* --draft-coupling: the sampled proposal (and, sabotaged, the shortlist's ids replaced
+         * first) */
+        rad_op op_couple = 0, op_csab = 0;
         rad_op op_gather = 0, op_merge = 0;   /* TP: the vocabulary shards' merge; 0 at one rank */
         Tap t_corr{}, t_logits{}, t_idx{}, t_val{};
     };
@@ -286,9 +286,9 @@ struct Dfly {
     rad_buf zk = 0, pe = 0, ccat = 0, cg = 0, cup = 0, cgu = 0, cff = 0, cd = 0, zc = 0, logits = 0, lbf = 0,
             cidx = 0, cval = 0, prev = 0, tokens = 0;
     rad_buf pairs = 0, gath = 0;   /* TP: this rank's top-R as (id, value) pairs, every rank's */
-    /* --draft-coupling: the f32 shortlist values the law is built from, and the planes the engine
-     * binds by name (one draw a drafting row, one state a (chain step, row)) */
-    rad_buf cvalf = 0, couple_draws = 0, couple_state = 0;
+    /* --draft-coupling: the planes the engine binds by name (one draw a drafting row, one state a
+     * (chain step, row)) */
+    rad_buf couple_draws = 0, couple_state = 0;
     rad_op op_ar_o = 0, op_ar_y = 0;   /* TP: the layers' two reductions; 0 at one rank */
     rad_buf ident = 0;   /* taps: [max_seqs, P] the identity table */
     int64_t ident_w = 0;
@@ -447,17 +447,20 @@ struct Dfly {
         logits = decl_b(b, nm.f("dfly.logits"), RAD_F32, { S, Vr });
         lbf = bf("logits_bf16", { S, Vr });
         cidx = i32("cand_idx", { S, R });
-        cval = bf("cand_val", { S, R });
+        /* f32: row_topk's and row_topk_merge's `val` is f32 by the op's contract (docs/OPS.md,
+         * libref's shape hook), whatever the logits' dtype; libr4d's kernels write f32 there. A bf16
+         * plane here took the card's 4-byte values in 2-byte slots (rows overlapping, the last ones
+         * past the buffer): harmless to greedy proposals (ids only), fatal to a coupled law. */
+        cval = decl_b(b, nm.f("dfly.cand_val"), RAD_F32, { S, R });
         prev = i32("prev", { S });
         if (coupled) {
             /* The engine finds the two planes by these names (core/engine_draft.cpp) and stages
              * the draws in the query pass's sequence order, which is the chain's row order. */
-            cvalf = decl_b(b, nm.f("dfly.cand_val_f32"), RAD_F32, { S, R });
             couple_draws = decl_b(b, nm.f("mtp_couple_draws"), RAD_U32,
                                   { S, (int64_t)RAD_MTP_COUPLE_DRAW_WORDS }, RAD_BUF_PERSIST);
             couple_state = decl_b(b, nm.f("mtp_couple_state"), RAD_U32,
                                   { depth, S, (int64_t)RAD_MTP_COUPLE_STATE_WORDS }, RAD_BUF_PERSIST);
-            if (!cvalf || !couple_draws || !couple_state) return RAD_E_INVAL;
+            if (!couple_draws || !couple_state) return RAD_E_INVAL;
         }
         if (s.world > 1) {
             pairs = decl_b(b, nm.f("dfly.cand_pairs"), RAD_F32, { S, R, 2 });
@@ -778,10 +781,10 @@ struct Dfly {
                 HY4_NEED(st.op_merge, "row_topk_merge");
             }
             RAD_ARCH_TRY(st.t_idx.declare(b, nm, S, "dfly.cand_idx", ki, RAD_I32, R, cidx));
-            RAD_ARCH_TRY(st.t_val.declare(b, nm, S, "dfly.cand_val", ki, RAD_BF16, R, cval));
+            RAD_ARCH_TRY(st.t_val.declare(b, nm, S, "dfly.cand_val", ki, RAD_F32, R, cval));
             if (coupled) {
-                /* Q_k = the FP64 softmax (temperature 1) of the eight best logits, bf16-rounded as
-                 * the greedy chain ranks them and widened exactly; x_k ~ Q_k into column 0 and Q_k
+                /* Q_k = the FP64 softmax (temperature 1) of the eight best logits (bf16-rounded as
+                 * the greedy chain ranks them, f32 in `cval`); x_k ~ Q_k into column 0 and Q_k
                  * into state row (k, sequence). The shortlist is the merged global one at TP, the
                  * draw the one the engine staged on every rank, so x_k is the same on every rank.
                  * A greedy request (draw mode 0) keeps the argmax: greedy text is unchanged. */
@@ -796,15 +799,10 @@ struct Dfly {
                                     {}, {}, { cidx });
                     HY4_NEED(st.op_csab, "iota (period)");
                 }
-                st.op_vcast = mk(b, "cast",
-                                 { RAD_RANGE("M", 1, S), RAD_INT("n", R), RAD_STR("from", "bf16"),
-                                   RAD_STR("to", "f32") },
-                                 {}, { cval }, { cvalf });
                 st.op_couple = mk(b, "mtp_couple_propose",
                                   { RAD_RANGE("M", 1, S), RAD_INT("n_vocab", s.n_vocab),
                                     RAD_INT("round", k + 1), RAD_INT("max_rounds", depth) },
-                                  {}, { cidx, cvalf, couple_draws }, { cidx, couple_state });
-                HY4_NEED(st.op_vcast, "cast (bf16 -> f32)");
+                                  {}, { cidx, cval, couple_draws }, { cidx, couple_state });
                 HY4_NEED(st.op_couple, "mtp_couple_propose");
             }
             st.op_tok = decl_copy(b, S, 1, RAD_I32, cidx, tokens);
@@ -1037,8 +1035,7 @@ struct Dfly {
             st.t_val.step(c, brows(cval, n), n);
             if (st.op_couple) {
                 if (st.op_csab) RAD_ISSUE_N(c, st.op_csab, n * R, bcol_at(cidx, 0, R, 0, R, n));
-                RAD_ISSUE_N(c, st.op_vcast, n, brows(cval, n), brows(cvalf, n));
-                RAD_ISSUE_N(c, st.op_couple, n, brows(cidx, n), brows(cvalf, n),
+                RAD_ISSUE_N(c, st.op_couple, n, brows(cidx, n), brows(cval, n),
                             praw(batch->seq_ids, RAD_I32, batch->n_seq),
                             brows(couple_draws, n), RAD_B(couple_state));
             }
