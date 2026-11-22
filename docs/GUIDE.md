@@ -3462,7 +3462,7 @@ names, so tools built against llama-server (llama-swap's activity view, for one)
   "prompt_per_token_ms": 4.0, "prompt_per_second": 250.0,
   "predicted_n": 64, "predicted_ms": 711.0,
   "predicted_per_token_ms": 11.29, "predicted_per_second": 88.6,
-  "draft_n": 78, "draft_n_accepted": 37,
+  "draft_n": 78, "draft_n_accepted": 37, "draft_steps": 26,
   "ttft_ms": 297.5, "total_ms": 1008.5
 }
 ```
@@ -3477,6 +3477,7 @@ names, so tools built against llama-server (llama-swap's activity view, for one)
 | `predicted_ms` | from the first generated token to the last |
 | `predicted_per_second`, `predicted_per_token_ms` | the `predicted_n − 1` tokens after the first, over `predicted_ms` (the first token is the prefill's product). The same figure as `/metrics`' time per output token; with speculative decoding it counts every token a step accepts |
 | `draft_n`, `draft_n_accepted` | speculative tokens proposed for this request and how many were accepted. Present when any were proposed, as in llama.cpp |
+| `draft_steps` | the verify steps that carried those drafts; `draft_n / draft_steps` is the request's mean draft depth. Present with `draft_n`. The request's own, since it has left the `/stats` table by the time a client reads it |
 | `ttft_ms` | the server's time to first token: from having the whole request body to the first generated token, covering parsing, chat template rendering, tokenising, the wait for admission and the prefill. The time the body took to arrive is not in it, so a client on a slow link can separate the server's share from the network's. Not a llama.cpp field |
 | `total_ms` | from the same moment to the last generated token: `ttft_ms + predicted_ms`. Not a llama.cpp field |
 
@@ -4508,6 +4509,17 @@ is the cache working, not a leak.
 position is verified only when every earlier one passed. `draft_accept` on `/stats` and
 `radiance:draft_acceptance_ratio` on `/metrics` report accepted / drafted, the share of every drafted
 token that became text, since the process started, which is never the higher of the two.
+
+**Drafts by request**: each row of the request table (`requests` on `/stats`) carries
+`draft`, the drafts standing for its next step, and `draft_steps`, `draft_tokens` and
+`draft_accepted`, the verify steps that carried drafts for it, the drafts they carried and the drafts
+they accepted, since it arrived (kept across a preemption). Their growth between two reads, over the
+steps, is the request's drafts and accepted drafts a step: under `--draft-depth adaptive`, its mean
+depth over that time. `draft` alone is one step's. `draft_ceiling` on `/stats` is the deepest chain
+the latest step with a drafting row allowed: the head's depth after `--draft-depth-max`, 0 before the
+first such step and under a block drafter (DFly2), which never begins a serial chain. A finished
+request is gone from the table; its totals are `draft_n`, `draft_n_accepted` and `draft_steps` in the
+response's `timings` (§5).
 
 ### 6.2 The JSON behind it
 

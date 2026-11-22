@@ -3035,6 +3035,7 @@ json timings_json(const TimingsOut& t) {
     if (t.draft_n > 0) {
         o["draft_n"]          = t.draft_n;
         o["draft_n_accepted"] = t.draft_n_accepted;
+        o["draft_steps"]      = t.draft_steps;
     }
     return o;
 }

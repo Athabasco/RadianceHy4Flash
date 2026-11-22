@@ -34,6 +34,9 @@ struct StatsScheduler : FakeScheduler {
         r.kv_blocks = 120;
         r.kv_tokens = 960;
         r.n_draft = 3;
+        r.draft_steps = 5;
+        r.draft_tokens = 17;
+        r.draft_accepted = 9;
         r.slot = 2;
         r.age_s = 4.5;
         r.ttft_s = 0.25;
@@ -149,6 +152,7 @@ struct Dash {
         sched.m.hit_cut_resumed_below = 4;
         sched.m.prefix_restore_cuts = 1;
         sched.m.draft_depth_seen = 2;
+        sched.m.draft_ceiling = 6;
         sched.m.draft_pos_reached[0] = 10; sched.m.draft_pos_accepted[0] = 8;
         sched.m.draft_pos_reached[1] = 8;  sched.m.draft_pos_accepted[1] = 2;
         srv.reset(new Server(d, o));
@@ -191,6 +195,11 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
     const json& r = s["requests"][0];
     CHECK_EQ(r.value("state", ""), std::string("decode"));
     CHECK_EQ(r.value("kv_tokens", (int64_t)0), (int64_t)960);
+    CHECK_EQ(r.value("draft", (int64_t)-1), (int64_t)3);
+    CHECK_EQ(r.value("draft_steps", (int64_t)-1), (int64_t)5);
+    CHECK_EQ(r.value("draft_tokens", (int64_t)-1), (int64_t)17);
+    CHECK_EQ(r.value("draft_accepted", (int64_t)-1), (int64_t)9);
+    CHECK_EQ(s.value("draft_ceiling", (int64_t)-1), (int64_t)6);
     CHECK_NEAR(r.value("ttft_s", -1.0), 0.25, 1e-12);
     CHECK_NEAR(r.value("prefill_s", -1.0), 0.20, 1e-12);
     REQUIRE(s["cards"].size() == 1);
@@ -418,6 +427,7 @@ TEST(the_bridge_reads_the_binding_paged_group_and_sums_only_bytes) {
     m.hit_cut_resumed_below = 6;
     m.prefix_restore_cuts = 7;
     m.draft_depth_seen = 70;
+    m.draft_ceiling = 5;
     for (int j = 0; j < 64; ++j) { m.draft_pos_reached[j] = 100 - j; m.draft_pos_accepted[j] = j; }
 
     const server::SchedMetrics o = bridge_metrics(m);
@@ -430,6 +440,7 @@ TEST(the_bridge_reads_the_binding_paged_group_and_sums_only_bytes) {
     CHECK_EQ(o.kv_bytes_carved, (int64_t)(2000 + 400 + 1000 + 128));
     CHECK_EQ(o.kv_tokens_cached, o.kv_tokens_used);
     CHECK_EQ(o.draft_depth_seen, server::SchedMetrics::MAX_DRAFT_POS);
+    CHECK_EQ(o.draft_ceiling, 5);
     CHECK_EQ(o.draft_pos_reached[63], (int64_t)37);
     CHECK_EQ(o.hit_cut_resumed_below, (int64_t)6);
     CHECK_EQ(o.prefix_restore_cuts, (int64_t)7);

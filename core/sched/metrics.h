@@ -155,6 +155,10 @@ struct SchedMetrics {
     int64_t draft_refill_tokens = 0;
     float   draft_acceptance = 0.0f;
     int     draft_depth = 0;          /* what the controller would choose right now */
+    /* The deepest chain the latest step with a drafting row allowed (Scheduler::serial_begin's rounds, after every
+     * cut: the head's depth and --draft-depth-max); 0 before the first such step, and under a block drafter, which
+     * never begins a serial chain. */
+    int     draft_ceiling = 0;
     /* Per draft position: `reached` counts verifies where every earlier position was accepted,
      * `accepted` how often this one was then taken. Their ratio is the conditional acceptance,
      * which says what a deeper draft would buy. `draft_depth_seen` bounds the valid entries. */

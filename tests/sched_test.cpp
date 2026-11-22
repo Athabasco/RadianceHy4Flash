@@ -4686,9 +4686,11 @@ TEST(the_adaptive_window_is_per_sequence_and_the_rounds_follow_the_deepest) {
     /* The head runs for the deepest. */
     int rounds = 4;
     Scheduler::SerialRow rows[4];
+    CHECK_EQ(f.sch.metrics().draft_ceiling, 0);          /* before the first drafting step */
     CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 2);
     CHECK_EQ(rounds, 4);
     REQUIRE(f.sch.serial_batch(0, 1) != nullptr);
+    CHECK_EQ(f.sch.metrics().draft_ceiling, 4);
     for (int rd = 2; rd <= rounds; ++rd) REQUIRE(f.sch.serial_batch(rd, 1) != nullptr);
 
     /* The step issued ahead: `a` verifies one of the four rounds, `b` all four. */
@@ -5299,6 +5301,7 @@ TEST(the_adaptive_window_times_its_steps_and_the_next_cycle_reads_them) {
     Scheduler::SerialRow rows[4];
     CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 2);
     CHECK_EQ(rounds, 1);
+    CHECK_EQ(f.sch.metrics().draft_ceiling, 1);          /* after the cut to the head's depth */
     f.sch.serial_end(0);
     CHECK_NEAR(f.sch.metrics().draft_depth_adaptive, 1.0, 1e-6);
 }
@@ -6056,6 +6059,82 @@ TEST(a_preempted_request_comes_back_with_no_draft_window) {
     CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
     CHECK_EQ(f.sch.plan().e[0].n_spec, 0);
     CHECK_EQ(f.sch.find(a)->n_draft, 0);
+}
+
+/* A REQUEST'S OWN DRAFT COUNTERS, for the live request table (ReqStat::draft_steps, draft_tokens,
+ * draft_accepted). Counted at commit for a row that carried drafts, kept across a preemption, and
+ * cleared for a new request, including one that takes a recycled slot. */
+TEST(a_request_counts_its_own_verify_steps_drafts_and_accepts) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+
+    auto stat = [&](uint64_t id) {
+        std::vector<Scheduler::ReqStat> st(8);
+        const int n = f.sch.requests(st.data(), 8);
+        for (int i = 0; i < n; ++i)
+            if (st[(size_t)i].id == id) return st[(size_t)i];
+        CHECK(false);
+        return Scheduler::ReqStat();
+    };
+
+    uint64_t a = f.submit(40, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();                               /* the prefill: no drafts */
+    CHECK_EQ(stat(a).draft_steps, (int64_t)0);
+    CHECK_EQ(stat(a).draft_tokens, (int64_t)0);
+    CHECK_EQ(stat(a).draft_accepted, (int64_t)0);
+
+    int64_t steps = 0, drafted = 0, accepted = 0;
+    const int32_t acc_for[3] = { 3, 1, 4 };
+    for (int k = 0; k < 3; ++k) {
+        int32_t draft[4] = { 21, 22, 23, 24 };
+        CHECK_OK(f.sch.set_draft(a, draft, 4));
+        REQUIRE(f.sch.step() != nullptr);
+        const int32_t n_spec = f.sch.plan().e[0].n_spec;
+        CHECK_EQ(n_spec, 4);
+        CHECK_OK(f.commit(7, 0, [&](const StepEntry&) { return acc_for[k]; }));
+        ++steps;
+        drafted += n_spec;
+        accepted += acc_for[k];
+        CHECK_EQ(stat(a).draft_steps, steps);
+        CHECK_EQ(stat(a).draft_tokens, drafted);
+        CHECK_EQ(stat(a).draft_accepted, accepted);
+    }
+    CHECK_EQ(steps, (int64_t)3);
+    CHECK_EQ(drafted, (int64_t)12);
+    CHECK_EQ(accepted, (int64_t)8);
+
+    /* A plain decode step (no draft standing) adds nothing. */
+    REQUIRE(f.sch.step() != nullptr);
+    if (f.sch.plan().e[0].n_spec == 0) {
+        f.commit_plain();
+        CHECK_EQ(stat(a).draft_steps, steps);
+    } else {
+        f.commit_plain();
+        steps = stat(a).draft_steps;
+    }
+
+    /* Preemption keeps them: the text and the history of what was drafted for it are the same. */
+    CHECK_EQ(f.sch.preempt_until([] { return false; }), 1);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Preempted);
+    CHECK_EQ(stat(a).draft_steps, steps);
+    CHECK(stat(a).draft_tokens >= drafted);
+    CHECK_EQ(stat(a).draft_accepted >= accepted, true);
+    const int64_t kept_tokens = stat(a).draft_tokens;
+    REQUIRE(f.sch.step() != nullptr);               /* re-admitted by recompute */
+    f.commit_plain();
+    CHECK_EQ(stat(a).draft_steps, steps);
+    CHECK_EQ(stat(a).draft_tokens, kept_tokens);
+
+    /* A new request starts at zero, also in a slot a finished one held. */
+    CHECK_OK(f.sch.cancel(a));
+    CHECK_OK(f.sch.reap(a));
+    uint64_t b = f.submit(40, 64);
+    CHECK_EQ(stat(b).draft_steps, (int64_t)0);
+    CHECK_EQ(stat(b).draft_tokens, (int64_t)0);
+    CHECK_EQ(stat(b).draft_accepted, (int64_t)0);
 }
 
 /* Each terminal id is handed over once: take_completed swaps the list out under the lock. A

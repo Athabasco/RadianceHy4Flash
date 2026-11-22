@@ -96,7 +96,7 @@ public:
      * queue time is not counted as prefill. A preempted request keeps its first mark. */
     void mark_admitted();
     /* One verify step: `n` draft tokens proposed, `accepted` taken. Summed per request for
-     * /metrics' draft counters. */
+     * /metrics' draft counters; each call is one step, counted for `timings.draft_steps`. */
     void add_drafts(int32_t n, int32_t accepted);
     /* Prompt tokens processed of `total`, `cached` of them from the prefix cache. Set at
      * admission and after every prefill step; streamed as llama-server's `prompt_progress` when
@@ -135,6 +135,7 @@ public:
      * times on one axis. */
     int64_t t_start_ns() const { return t_start_ns_; }
 
+    int64_t n_draft_steps() const    { return n_draft_steps_.load(std::memory_order_acquire); }
     int64_t n_drafted() const        { return n_draft_.load(std::memory_order_acquire); }
     int64_t n_draft_accepted() const { return n_draft_acc_.load(std::memory_order_acquire); }
 
@@ -176,6 +177,7 @@ private:
     std::atomic<int64_t>  t_first_{-1};
     std::atomic<int64_t>  t_last_{-1};
     std::atomic<int64_t>  t_admit_{-1};
+    std::atomic<int64_t>  n_draft_steps_{0};
     std::atomic<int64_t>  n_draft_{0};
     std::atomic<int64_t>  n_draft_acc_{0};
     int64_t               t_start_ns_ = 0;

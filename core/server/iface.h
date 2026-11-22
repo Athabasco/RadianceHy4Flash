@@ -104,6 +104,8 @@ struct SchedMetrics {
     int64_t prefill_tokens = 0;
     int64_t decode_tokens = 0;
     double  draft_acceptance = 0.0;   /* 0..1, spec §10 */
+    /* The deepest chain the latest step with a drafting row allowed (rad::SchedMetrics::draft_ceiling). */
+    int     draft_ceiling = 0;
     /* The exact pair the ratio is computed from. */
     int64_t draft_tokens = 0;
     int64_t draft_accepted = 0;
@@ -234,6 +236,11 @@ struct RequestStat {
     /* Context held, on the token axis the paged groups share (not their sum). */
     int64_t     kv_tokens = 0;
     int32_t     n_draft = 0;
+    /* The verify steps that carried drafts for this request, the drafts they carried and the drafts they accepted,
+     * since it arrived (the scheduler's SchedReq::spec_steps, spec_tokens and spec_accepted). */
+    int64_t     draft_steps = 0;
+    int64_t     draft_tokens = 0;
+    int64_t     draft_accepted = 0;
     int32_t     slot = -1;
     /* The runtime LoRA this row runs under; "" for the base. */
     std::string lora;

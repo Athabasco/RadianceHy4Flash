@@ -365,6 +365,8 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["prefill_tps"]     = m.prefill_tps;
         o["decode_tps"]      = m.decode_tps;
         o["draft_accept"]    = m.draft_acceptance;
+        /* The deepest chain the latest step with a drafting row allowed; 0 before the first. */
+        o["draft_ceiling"]   = m.draft_ceiling;
         o["preemptions"]     = m.preemptions;
         o["total_requests"]  = m.total_requests;
         /* Work attributed per runtime LoRA, by slot, named. A model serving several adapters
@@ -431,6 +433,11 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             j["kv_tokens"] = q.kv_tokens;
             j["kv_blocks"] = q.kv_blocks;
             j["draft"]     = q.n_draft;
+            /* The verify steps that carried drafts for it, the drafts they carried and the drafts they accepted,
+             * since it arrived; their growth between two reads is its drafts and accepted drafts a step. */
+            j["draft_steps"]    = q.draft_steps;
+            j["draft_tokens"]   = q.draft_tokens;
+            j["draft_accepted"] = q.draft_accepted;
             j["slot"]      = q.slot;
             if (!q.lora.empty()) j["lora"] = q.lora;
             j["age_s"]     = q.age_s;

@@ -470,6 +470,10 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.arrived_us = mono_us();
     s.first_tok_us = 0;
     s.preempted_us = 0;
+    /* A new request's own drafted steps, never the last tenant's. */
+    s.spec_steps = 0;
+    s.spec_tokens = 0;
+    s.spec_accepted = 0;
     /* A recycled slot keeps its struct, and the prefill figure is computed from admitted_us
      * whenever it is non-zero: left standing, it would date this request's first token to the
      * admission of whichever request held the slot before. The re-admission guard below needs
@@ -1051,6 +1055,9 @@ int Scheduler::requests_locked(ReqStat* out, int max) const {
             if (held * bt > o.kv_tokens) o.kv_tokens = held * bt;
         }
         o.n_draft         = s.n_draft;
+        o.draft_steps     = (int64_t)s.spec_steps;
+        o.draft_tokens    = (int64_t)s.spec_tokens;
+        o.draft_accepted  = (int64_t)s.spec_accepted;
         o.slot            = s.slot;
         o.lora_slot       = r.lora_slot;
         o.age_s           = (double)(now - s.arrived_us) / 1e6;
@@ -3244,6 +3251,10 @@ int Scheduler::commit(StepResult& res) {
             step_decode_tok_ += 1 + a;
 
             if (e.n_spec > 0) {
+                /* This request's own, for the live request table (requests_locked). */
+                ++s.spec_steps;
+                s.spec_tokens += (uint64_t)e.n_spec;
+                s.spec_accepted += (uint64_t)a;
                 draft_.observe(e.n_spec, a);
                 /* And this sequence's own estimate under the adaptive window, only when the head
                  * drafted: a prompt-lookup proposal is accepted on different text by a different
@@ -3605,6 +3616,9 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
             ++n_draft_rows;
         }
     }
+    /* The deepest chain a step with a drafting row allows, after the cuts above and the engine's own
+     * (--draft-depth-max), for /stats `draft_ceiling`. */
+    if (n_draft_rows > 0) m_.draft_ceiling = *rounds;
     return n_draft_rows;
 }
 

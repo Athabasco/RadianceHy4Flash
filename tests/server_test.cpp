@@ -2089,6 +2089,9 @@ TEST(a_response_carries_its_requests_timings_and_draft_counts) {
         if (drafts) {
             CHECK_EQ(t["draft_n"].get<int64_t>(), (predicted - 1) * 3);
             CHECK_EQ(t["draft_n_accepted"].get<int64_t>(), predicted - 1);
+            CHECK_EQ(t["draft_steps"].get<int64_t>(), predicted - 1);
+        } else {
+            CHECK(!t.contains("draft_steps"));
         }
     };
     {
@@ -2165,6 +2168,15 @@ TEST(timings_rates_divide_the_tokens_by_the_time_that_produced_them) {
     CHECK_NEAR(j["predicted_per_second"].get<double>(), 100.0, 1e-9);
     CHECK_NEAR(j["predicted_per_token_ms"].get<double>(), 10.0, 1e-12);
     CHECK(!j.contains("draft_n"));
+    CHECK(!j.contains("draft_steps"));
+    t.draft_n = 12;
+    t.draft_n_accepted = 7;
+    t.draft_steps = 4;
+    j = timings_json(t);
+    CHECK_EQ(j["draft_n"].get<int64_t>(), (int64_t)12);
+    CHECK_EQ(j["draft_n_accepted"].get<int64_t>(), (int64_t)7);
+    CHECK_EQ(j["draft_steps"].get<int64_t>(), (int64_t)4);
+    t.draft_n = 0;
 
     t.decode_n = 0;
     t.predicted_ms = 0.0;
@@ -2246,6 +2258,7 @@ TEST(a_sink_keeps_its_first_admission_and_sums_its_drafts) {
     s.add_drafts(3, 3);
     CHECK_EQ(s.n_drafted(), (int64_t)7);
     CHECK_EQ(s.n_draft_accepted(), (int64_t)5);
+    CHECK_EQ(s.n_draft_steps(), (int64_t)2);
 }
 
 /* A request the scheduler refuses gets id 0 and a failed sink, so the HTTP thread waiting on the

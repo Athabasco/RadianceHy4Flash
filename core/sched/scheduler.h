@@ -53,6 +53,13 @@ struct SchedReq {
                                   * the wait for admission (GUIDE); this excludes it. */
     int64_t  preempted_us = 0;   /* when this state became Preempted; 0 otherwise. Bounds the
                                   * whole-recompute admission wait (--preempt-wait-ms). */
+    /* The verify steps that carried drafts for this request, the drafts they carried and the drafts they accepted,
+     * since it arrived (counted at commit, kept across a preemption), for the live request table: their growth
+     * between two reads is the request's drafts and accepted drafts a step, its depth under --draft-depth
+     * adaptive. Not drafter state: drafter_reset() keeps them; add_locked() clears them for a new request. */
+    uint64_t spec_steps = 0;
+    uint64_t spec_tokens = 0;
+    uint64_t spec_accepted = 0;
 
     /* The drafter's proposal for the next step, and the conv-window read cursor a rejection
      * moves rather than rolls back (§10). */
@@ -306,6 +313,9 @@ public:
         int64_t  kv_blocks = 0;
         int64_t  kv_tokens = 0;
         int32_t  n_draft = 0;          /* the proposal standing for the next step */
+        int64_t  draft_steps = 0;      /* SchedReq::spec_steps */
+        int64_t  draft_tokens = 0;     /* SchedReq::spec_tokens */
+        int64_t  draft_accepted = 0;   /* SchedReq::spec_accepted */
         int32_t  slot = -1;
         /* The runtime LoRA slot this row runs with, -1 for the base. The name is the caller's:
          * rad::Engine::lora_names() indexes by slot. */

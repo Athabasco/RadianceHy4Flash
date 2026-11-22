@@ -122,6 +122,7 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.prefill_tps = m.prefill_tps;
     o.decode_tps = m.decode_tps;
     o.draft_acceptance = m.draft_acceptance;
+    o.draft_ceiling = m.draft_ceiling;
     o.prefill_tokens = m.prefill_tokens;   o.decode_tokens = m.decode_tokens;
     o.draft_tokens = m.draft_tokens;       o.draft_accepted = m.draft_accepted;
     o.draft_refills = m.draft_refills;     o.draft_refill_tokens = m.draft_refill_tokens;
@@ -334,6 +335,9 @@ public:
             o.kv_blocks       = r.kv_blocks;
             o.kv_tokens       = r.kv_tokens;
             o.n_draft         = r.n_draft;
+            o.draft_steps     = r.draft_steps;
+            o.draft_tokens    = r.draft_tokens;
+            o.draft_accepted  = r.draft_accepted;
             o.slot            = r.slot;
             o.lora = r.lora_slot >= 0 && r.lora_slot < (int)lnames.size() ? lnames[(size_t)r.lora_slot]
                                                                            : std::string();
