@@ -3891,7 +3891,11 @@ int Engine::load_weights() {
         mc.turnover_adaptive = true;
         /* Expert streaming X1 (b), kernels/experts-streaming.md: RADIANCE_XS_PACE -1 spreads a
          * step's promotion copies over the next pass's routed layers, N > 0 sends N a layer, 0
-         * (the default) sends them as one list behind the pass. Bytes do not change. */
+         * sends them as one list behind the pass. Bytes do not change. Default: spread without a
+         * drafter (Hy4-flash TP2, eight distinct streams: +2-3 % decode, the in-place reads of
+         * the first routed layers no longer share the link with the copies); off with one, where
+         * verify passes measured 3-7 % slower with it (notes/xs-1.md). */
+        mc.pace_units = drafter_.kind == RAD_DRAFT_NONE ? -1 : 0;
         if (const char* e = std::getenv("RADIANCE_XS_PACE"); e && *e) mc.pace_units = std::atoi(e);
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool

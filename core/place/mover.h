@@ -338,7 +338,8 @@ struct MoverConfig {
      * next pass's routed layers' marks (pace_mark, behind each routed down GEMM), so they cross
      * the link between the routed GEMMs: -1 spreads them evenly over the pass's marks, N > 0 sends
      * at most N a mark. What a pass did not send goes out unpaced at the next dispatch. Demotions
-     * and every other move are never held. Bytes and their destinations do not change. */
+     * and every other move are never held. Bytes and their destinations do not change. The
+     * engine turns it on (-1) where no drafter runs (engine_bringup.cpp, RADIANCE_XS_PACE). */
     int pace_units = 0;
 };
 
