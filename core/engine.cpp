@@ -3426,6 +3426,10 @@ int Engine::run_server() {
                 s.experts.no_candidate      = (int64_t)hs.no_candidate;
                 s.experts.distinct_promoted = (int64_t)hs.distinct_promoted;
                 s.experts.readmits          = (int64_t)hs.readmits;
+                s.experts.readmit_16 = (int64_t)hs.readmit_16;
+                s.experts.readmit_128 = (int64_t)hs.readmit_128;
+                s.experts.readmit_1024 = (int64_t)hs.readmit_1024;
+                s.experts.heat_steps = (int64_t)hs.steps;
                 /* The routed hit rate: residency describes the plan, this describes the traffic. */
                 s.experts.routed            = (int64_t)hs.routed;
                 s.experts.routed_resident   = (int64_t)hs.routed_resident;

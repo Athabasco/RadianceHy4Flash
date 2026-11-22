@@ -80,6 +80,7 @@ struct ExpertPlane {
     int64_t promotions = 0, demotions = 0;
     /* Separate progress from thrash at the same move count; see HeatStats. */
     int64_t distinct_promoted = 0, readmits = 0;
+    int64_t readmit_16 = 0, readmit_128 = 0, readmit_1024 = 0, heat_steps = 0;
     /* Why a dispatch moved nothing. `refused` is the guard declining (the healthy steady state);
      * the starved counts mean the mover had nowhere to put the bytes. */
     int64_t dispatches = 0, refused = 0, no_candidate = 0;

@@ -503,6 +503,10 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             e["demotions"]  = s.experts.demotions;
             e["distinct_promoted"] = s.experts.distinct_promoted;
             e["readmits"]    = s.experts.readmits;
+            e["readmit_16"]   = s.experts.readmit_16;
+            e["readmit_128"]  = s.experts.readmit_128;
+            e["readmit_1024"] = s.experts.readmit_1024;
+            e["heat_steps"]   = s.experts.heat_steps;
             e["routed"]      = s.experts.routed;
             e["routed_res"]  = s.experts.routed_resident;
             e["dispatches"]  = s.experts.dispatches;

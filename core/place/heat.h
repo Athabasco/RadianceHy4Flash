@@ -114,6 +114,10 @@ struct HeatStats {
      * working set); `readmits` counts promotions of units demoted earlier, link traffic spent to
      * return to where it started. Readmits say whether the guards are set right. */
     uint64_t distinct_promoted = 0, readmits = 0;
+    /* `readmits` counts a unit demoted at ANY earlier time (cumulative over the server's life);
+     * these count the ping-pong proper: re-promoted within 16 / 128 / 1024 step() calls of its own
+     * demotion. `steps` is the step() count, the unit of those windows. */
+    uint64_t readmit_16 = 0, readmit_128 = 0, readmit_1024 = 0, steps = 0;
     /* Routed experts and how many were resident, counted on the histogram pass observe() already
      * makes. A miss does not stall: the GEMM reads the expert from its tier, which for a
      * host-pinned unit crosses the link on the step's critical path. `stream_bytes` is that
@@ -148,7 +152,8 @@ private:
  * the readers take. */
 struct HeatCounters {
     Relaxed<uint64_t> dispatches, proposed, promotions, demotions, refused, no_candidate,
-                      distinct_promoted, readmits, routed, routed_resident, stream_bytes;
+                      distinct_promoted, readmits, routed, routed_resident, stream_bytes,
+                      readmit_16, readmit_128, readmit_1024, steps;
 
     HeatStats snapshot() const {
         HeatStats s;
@@ -160,6 +165,8 @@ struct HeatCounters {
         s.no_candidate      = no_candidate;
         s.distinct_promoted = distinct_promoted;
         s.readmits          = readmits;
+        s.readmit_16 = readmit_16; s.readmit_128 = readmit_128; s.readmit_1024 = readmit_1024;
+        s.steps = steps;
         s.routed            = routed;
         s.routed_resident   = routed_resident;
         s.stream_bytes      = stream_bytes;
@@ -351,6 +358,7 @@ private:
     std::vector<int32_t> layer_of_;
     /* Bit 0: promoted before. Bit 1: demoted before. Feeds the readmit counters. */
     std::vector<uint8_t> ever_;
+    std::vector<uint64_t> dem_at_;   /* stats_.steps at the unit's last demotion */
 
     /* Resident units per layer. A layer starved of slots misses on nearly every token however
      * good the ranking inside it is. Most resident units are cold, so exact `heat == 0.0f` ties

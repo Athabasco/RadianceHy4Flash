@@ -28,6 +28,7 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     layer_of_.assign(n, -1);
     bytes_.assign(n, 0);
     ever_.assign(n, 0u);
+    dem_at_.assign(n, 0u);
 
     /* The movable units' slab classes as dense indices (heat.h: `cls_`). File-tier units with a
      * class join them: the hot VRAM cache admits one into a slab slot at run
@@ -277,11 +278,18 @@ void HeatEngine::set_tier(int32_t unit, Tier t) {
 
     if (was != Tier::VRAM && t == Tier::VRAM) {
         ++stats_.promotions;
-        if (ever_[(size_t)unit] & 2u) ++stats_.readmits;
+        if (ever_[(size_t)unit] & 2u) {
+            ++stats_.readmits;
+            const uint64_t gap = (uint64_t)stats_.steps - dem_at_[(size_t)unit];
+            if (gap <= 16) ++stats_.readmit_16;
+            if (gap <= 128) ++stats_.readmit_128;
+            if (gap <= 1024) ++stats_.readmit_1024;
+        }
         if (!(ever_[(size_t)unit] & 1u)) { ++stats_.distinct_promoted; ever_[(size_t)unit] |= 1u; }
     } else if (was == Tier::VRAM && t != Tier::VRAM) {
         ++stats_.demotions;
         ever_[(size_t)unit] |= 2u;
+        dem_at_[(size_t)unit] = (uint64_t)stats_.steps;
     }
 }
 
@@ -441,6 +449,7 @@ int HeatEngine::step(std::vector<Swap>* out) {
     if (!out) return RAD_E_INVAL;
     out->clear();
     if (!enabled_) return RAD_OK;
+    ++stats_.steps;
     const int k = params_.moves_per_step;
     if (k <= 0) return RAD_OK;
 
