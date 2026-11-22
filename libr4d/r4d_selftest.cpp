@@ -30432,6 +30432,7 @@ struct ArSweep {
     const RadKernelInfo* row;
     int rank, dev;
     void* inst = nullptr;
+    int64_t nblocks = -1;     /* -1 keeps the block rule; else the nblocks axis of tAr */
     int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
     int64_t bad = 0;
     int world = 2;
@@ -30793,6 +30794,7 @@ struct ArPattern {
      * rank that has not launched yet. */
     StBarrier* shared = nullptr;
     void* inst = nullptr;
+    int64_t nblocks = -1;     /* -1 keeps the block rule; else the nblocks axis of tAr */
     int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
     std::vector<std::vector<float>> out;
 };
@@ -31019,9 +31021,10 @@ static void ar_wide_pattern(const Plugin& pl, const std::vector<int>& devs, cons
         runs = {
             /* bf16: 524288 the one-shot band's top, 524352 the first message the two-shot's rows
              * take (numel % 64 == 0 either way, so both divide); the shipped chunk sizes; and
-             * 4194304 again to close the run on a size already folded. 86016, a 16-row verify at
-             * 5376, and 524288 are past the one-shot row's default ts_min, so that row hands them
-             * to the two-shot; 128 and 43008 (eight rows) stay on the one-shot. */
+             * 4194304 again to close the run on a size already folded. 43008 (eight rows), 86016
+             * (a 16-row verify at 5376) and 524288 are past the one-shot row's default ts_min
+             * (16384, five rows of 3072: a speculating decode's verify), so that row hands them to
+             * the two-shot; only 128 stays on the one-shot. */
             { "bf16", { 4194304, 128, 43008, 86016, 524288, 524352, 4196352, 20971520, 46137344,
                         4194304 }, 2 },
             /* fp32: words = numel / 4, whole groups of four either side of the same edge. */
@@ -31671,6 +31674,137 @@ static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dty
     }
 }
 
+/* --perfar4: the four-rank exact all-reduce timed at the shapes four ranks actually run, one
+ * thread a rank on its own card, every rank's launch on the default stream. A message is measured
+ * twice: the one-shot (each rank pushes the whole message to its three peers, 3N bytes sent, one
+ * handshake) and the exact two-shot (1.5N, two handshakes), which is the pair the adapter's
+ * `ts_min` picks between; pinning `nblocks` overrides the row's block rule. The reported period is the slowest rank's span over the launch count, because a
+ * step waits for its slowest rank; `us a launch` is the same divided out. `GB/s a rank` is what the
+ * board's link carries and is the number to hold against the duplex model (~30 GB/s a direction on
+ * a Gen4 x16 pair), `GB/s payload` is the message over that time (3x or 1.5x lower by design).
+ * Sizes: one sequence's depth-5 verify (6 rows of 3072), two and eight sequences at the same depth,
+ * a 512-row prefill chunk, and the two chunk sizes the engine ships (2048 and 4096 rows). */
+struct Ar4Perf {
+    const RadKernelInfo* row = nullptr;
+    int rank = 0, dev = 0;
+    int64_t numel = 0;
+    int iters = 50;
+    void* inst = nullptr;
+    int64_t nblocks = -1;     /* -1 keeps the block rule; else the nblocks axis of tAr */
+    int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
+    double us = 0.0;          /* the span over `iters` launches, divided out */
+    int64_t bad = 0;          /* elements that are not the ascending fold (rank r adds r+1) */
+};
+static void ar4_perf_worker(Ar4Perf* t) {
+    if (st_set_device(t->dev) != hipSuccess) { t->rc_init = RAD_E_DEVICE; return; }
+    std::vector<RadParam> ps = { PI("world_size", 4), PI("numel", t->numel),
+                                 PS("dtype", "bf16"), PI("exact", 1) };
+    if (t->nblocks >= 0) ps.push_back(PI("nblocks", t->nblocks));
+    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, 4, &t->inst);
+    if (t->rc_init != RAD_OK) return;
+    const size_t bytes = (size_t)t->numel * 2;
+    void* in = nullptr;
+    void* out = nullptr;
+    if (hipMalloc(&in, bytes) != hipSuccess || hipMalloc(&out, bytes) != hipSuccess ||
+        hipMemset(out, 0, bytes) != hipSuccess) {
+        t->rc_launch = RAD_E_NOMEM;
+        if (in) st_free(in);
+        if (out) st_free(out);
+        return;
+    }
+    {
+        std::vector<uint16_t> h((size_t)t->numel);
+        for (int64_t i = 0; i < t->numel; ++i) h[(size_t)i] = h_to_bf16((float)(t->rank + 1));
+        st_memcpy(in, h.data(), bytes, hipMemcpyHostToDevice);
+    }
+    RadTensor ts[2] = { T(in, RAD_BF16, { t->numel }), T(out, RAD_BF16, { t->numel }) };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts; a.n_t = 2;
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    a.instance = t->inst;
+    a.rank = t->rank;
+    a.world_size = 4;
+    /* One launch outside the timed span, so the first one's instance setup is not in it. */
+    if (t->row->launch(&a, nullptr) != RAD_OK) { t->rc_launch = RAD_E_STATE; goto done; }
+    st_stream_sync(nullptr);
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < t->iters; ++i)
+            if (t->row->launch(&a, nullptr) != RAD_OK) { t->rc_launch = RAD_E_STATE; break; }
+        st_stream_sync(nullptr);
+        t->us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0)
+                    .count() / (double)t->iters;
+    }
+    if (t->rc_launch != RAD_OK) goto done;
+    {
+        /* The fold check on one launch's output: 1 + 2 + 3 + 4, bit for bit. */
+        std::vector<uint16_t> h((size_t)t->numel);
+        st_memcpy(h.data(), out, bytes, hipMemcpyDeviceToHost);
+        for (int64_t i = 0; i < t->numel; ++i)
+            if (h_bf16(h[(size_t)i]) != 10.0f) ++t->bad;
+    }
+done:
+    st_free(in);
+    st_free(out);
+}
+
+static void ar4_perf(const Plugin& pl, const std::vector<int>& devs, int64_t numel, int iters,
+                     int64_t nblocks) {
+    if ((int)devs.size() < 4) { std::printf("--perfar4: needs 4 gfx1201 cards\n"); return; }
+    if (!ar_peer_path_ok(devs, 4)) { std::printf("--perfar4: no peer path between the cards\n"); return; }
+    if (iters <= 0) iters = 50;
+    /* 3072 wide is Hy4-flash's hidden size, so a row is 3072 elements: 6 rows is one sequence's
+     * depth-5 verify, 12 two, 48 eight, and 2048 / 4096 a prefill chunk. */
+    std::vector<int64_t> sizes = numel > 0 ? std::vector<int64_t>{ numel }
+        : std::vector<int64_t>{ 18432, 36864, 147456, 1572864, 6291456, 12582912 };
+    const char* names[2] = { "ar_oneshot_4rank_exact", "ar_twoshot_4rank_exact" };
+    std::printf("four-rank exact all-reduce, bf16, %d launches a point, the slowest rank's span%s\n",
+                iters, nblocks >= 0 ? fmt(", nblocks pinned to %lld", (long long)nblocks).c_str() : "");
+    for (int64_t n : sizes) {
+        const double bytes = (double)n * 2.0;
+        std::printf("  numel %lld (%.1f KiB, %lld rows of 3072)\n", (long long)n, bytes / 1024.0,
+                    (long long)(n / 3072));
+        for (int r = 0; r < 2; ++r) {
+            const RadKernelInfo* row = find(pl, names[r]);
+            if (!row) { std::printf("    %-22s rc=%d (row absent)\n", names[r], RAD_E_UNSUPPORTED); continue; }
+            std::vector<Ar4Perf> t((size_t)4);
+            std::vector<std::thread> th;
+            for (int k = 0; k < 4; ++k) {
+                t[(size_t)k].row = row;
+                t[(size_t)k].rank = k;
+                t[(size_t)k].dev = devs[(size_t)k];
+                t[(size_t)k].numel = n;
+                t[(size_t)k].iters = iters;
+                t[(size_t)k].nblocks = nblocks;
+                th.emplace_back(ar4_perf_worker, &t[(size_t)k]);
+            }
+            for (std::thread& x : th) x.join();
+            int rc = RAD_OK;
+            double us = 0.0;
+            int64_t bad = 0;
+            std::string per_rank;
+            for (const Ar4Perf& x : t) {
+                if (x.rc_init != RAD_OK || x.rc_launch != RAD_OK) rc = x.rc_init != RAD_OK ? x.rc_init : x.rc_launch;
+                us = std::max(us, x.us);
+                bad += x.bad;
+                per_rank += fmt(" %.1f", x.us);
+                if (x.inst && row->fini) row->fini(x.inst);
+            }
+            if (rc != RAD_OK) { std::printf("    %-22s rc=%d (not served)\n", names[r], rc); continue; }
+            /* What a rank puts on its links: the one-shot the whole message to three peers, the
+             * two-shot 1.5 of it (three halves, one to each peer). */
+            const double sent = r == 0 ? 3.0 * bytes : 1.5 * bytes;
+            std::printf("    %-22s %8.1f us a launch (%6.0f us for %d)  %6.2f GB/s a rank  %6.2f GB/s "
+                        "payload  %s\n", names[r], us, us * (double)iters, iters,
+                        us > 0 ? sent / (us * 1e3) : 0.0, us > 0 ? bytes / (us * 1e3) : 0.0,
+                        bad ? fmt("%lld elements differ from the fold", (long long)bad).c_str()
+                            : "= fold on every rank");
+            std::printf("      us by rank:%s\n", per_rank.c_str());
+        }
+    }
+}
+
 /* The four-rank two-shot's lane row (overlap 1: the prefill's reductions beside compute) in both
  * its forms, which the `coded` launch parameter picks: the narrow plain launch (0), and the coded
  * one (1), whose pushes carry ~12.2 bits a bf16 value. Each must equal the fp32 ascending-rank
@@ -31772,6 +31906,7 @@ struct ArTi8 {
     int world = 3;
     std::vector<int64_t> sizes;
     void* inst = nullptr;
+    int64_t nblocks = -1;     /* -1 keeps the block rule; else the nblocks axis of tAr */
     int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
     std::vector<std::vector<uint16_t>> out;
 };
@@ -32706,6 +32841,7 @@ struct ArQ8 {
     bool grp = false;                              /* quant_act_i8g's grid (ar_rmsnorm_quant_i8g) */
     bool alias = false;                            /* out_bf16 on x's own buffer */
     void* inst = nullptr;
+    int64_t nblocks = -1;     /* -1 keeps the block rule; else the nblocks axis of tAr */
     int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
     const std::vector<uint16_t>* r_in = nullptr;   /* the replicated residual, w and w_post */
     const std::vector<uint16_t>* w = nullptr;
@@ -34233,6 +34369,7 @@ struct ArIj {
     IjData d;
     std::vector<int> coded_seq;
     void* inst = nullptr;
+    int64_t nblocks = -1;     /* -1 keeps the block rule; else the nblocks axis of tAr */
     int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
     std::vector<IjData> out;   /* one a launch */
 };
@@ -38253,7 +38390,8 @@ static void device_phase(const Plugin& pl) {
         devs.size() < 8 && st_one_card() ? std::vector<int>(8, devs[0]) : devs;
     for (const char* base : { "ar_oneshot_2rank_exact", "ar_gather_2rank", "ar_oneshot_3rank_exact",
                               "ar_twoshot_3rank_exact", "ar_twoshot_3rank_ti8", "ar_gather_3rank",
-                              "ar_oneshot_4rank_exact", "ar_twoshot_4rank_exact",
+                              "ar_oneshot_4rank_exact", "ar_oneshot_4rank_exact_lane",
+                              "ar_twoshot_4rank_exact",
                               "ar_twoshot_4rank_ti8", "ar_gather_4rank", "ar_oneshot_8rank_exact",
                               "ar_twoshot_8rank_exact", "ar_gather_8rank" }) {
         for (const std::string& n : { std::string(base), std::string(base) + "_host" }) {
@@ -38317,7 +38455,9 @@ static void device_phase(const Plugin& pl) {
     }
     /* Hy4-flash's iHC junction behind the exact all-reduce, two and four ranks, and the twins. */
     for (const char* n : { "ar_rmsnorm_ihc_junction", "ar_rmsnorm_ihc_junction_host",
-                           "ar_rmsnorm_ihc_junction_4rank", "ar_rmsnorm_ihc_junction_4rank_host" }) {
+                           "ar_rmsnorm_ihc_junction_4rank", "ar_rmsnorm_ihc_junction_4rank_host",
+                           "ar_rmsnorm_ihc_junction_4rank_lane",
+                           "ar_rmsnorm_ihc_junction_4rank_lane_host" }) {
         if (!sel(n)) continue;
         if (!g_case) std::printf("\ncross-rank, fused with the iHC junction\n");
         std::printf("  %s\n", n);
@@ -38677,6 +38817,13 @@ static void usage(void) {
                 "             or runs (S contiguous runs). a=bf16 (default) or a=fp8_e4m3 (scale\n"
                 "             every 128); y=bf16 (default), y=f16 or y=f32. Each row's t and y are\n"
                 "             compared with the first row's; --cold applies.\n"
+                "  --perfar4 numel [iters] [nblocks]:  the four-rank exact all-reduce at four cards,\n"
+                "             one\n"
+                "             thread\n"
+                "             a rank: the one-shot (3N sent a rank) and the exact two-shot (1.5N),\n"
+                "             each checked against the fold, reported as the slowest rank's period and\n"
+                "             the GB/s a rank puts on its links; numel 0 runs 6/12/48 rows of 3072 and\n"
+                "             the 2048/4096-row prefill chunks.\n"
                 "  --perfar8 numel [iters] [dtype] [forms]:  the eight-rank exact all-reduce, one thread\n"
                 "             a card: one-shot and two-shot at the block rule and at 4..64 blocks,\n"
                 "             each checked against the rank-order fold; numel 0 runs the decode\n"
@@ -38770,6 +38917,9 @@ int main(int argc, char** argv) {
     uint32_t lo_ydt = RAD_BF16;
     long long ar8_n = -1;
     int ar8_it = 200;
+    long long ar4_n = -1;      /* --perfar4: numel, 0 runs the shipped sizes */
+    int ar4_it = 50;
+    long long ar4_nb = -1;     /* --perfar4: nblocks pin, -1 = the block rule */
     const char* ar8_dt = "bf16";
     long long lg_m = 0;
     int lg_it = 200;
@@ -38968,6 +39118,12 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) ar8_it = (int)std::strtol(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) ar8_dt = argv[++i];
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) ar8_forms = argv[++i];
+        } else if (!std::strcmp(argv[i], "--perfar4")) {
+            /* The four-rank exact all-reduce timed at four cards; numel 0 runs the shipped sizes. */
+            if (i + 1 >= argc) { usage(); return 2; }
+            ar4_n = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) ar4_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) ar4_nb = std::strtoll(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--ar8-weights")) {
             /* The eight-rank two-shot's shard weights for --perfar8: auto, off or eight integers. */
             int w8[8];
@@ -39205,6 +39361,27 @@ int main(int argc, char** argv) {
         dfree_all();
 #else
         skip("bf16 expert GEMM timing", "built without HIP");
+#endif
+        return 0;
+    }
+    if (ar4_n >= 0) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        {
+            int nd = 0;
+            std::vector<int> devs;
+            if (hipGetDeviceCount(&nd) == hipSuccess)
+                for (int d = 0; d < nd; ++d) {
+                    hipDeviceProp_t p;
+                    if (hipGetDeviceProperties(&p, d) == hipSuccess &&
+                        !std::strncmp(p.gcnArchName, "gfx1201", 7))
+                        devs.push_back(d);
+                }
+            ar4_perf(pl, devs, ar4_n, ar4_it, ar4_nb);
+            dfree_all();
+        }
+#else
+        skip("four-rank all-reduce timing", "built without HIP");
 #endif
         return 0;
     }

@@ -2645,7 +2645,7 @@ device code.
 | `ar_rmsnorm_quant_i8` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt `sp`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `ar_rmsnorm_quant_i8g` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `ar_hc_write` | `M`(range) `n` `hc` `world_size` `dtype` `wire`/opt | `y`:inout, `inj`, `h`:inout |
-| `ar_rmsnorm_ihc_junction` | `M`(range) `n` `hc` `rows` `eps`:f64 `ihc_eps`:f64/opt `hc_eps`:f64/opt `post_mag`:f64/opt `tail`/opt `world_size` `dtype` | as `rmsnorm_ihc_junction`; `a` is the message (see "Hy4-flash") |
+| `ar_rmsnorm_ihc_junction` | `M`(range) `n` `hc` `rows` `eps`:f64 `ihc_eps`:f64/opt `hc_eps`:f64/opt `post_mag`:f64/opt `tail`/opt `world_size` `dtype` `overlap`/opt | as `rmsnorm_ihc_junction`; `a` is the message (see "Hy4-flash") |
 | `ar_gather_hc_write` | `M`(range) `n` `hc` `top_k` `world_size` `dtype` `act`/opt `wire`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout, `inj`, `h`:inout |
 | `ar_ln_had_quant_i8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gdn_gated_norm_had_quant_i8` | `M` `n` `head_dim` `group` `eps`:f64 `dtype` `zgrp`/opt `zblk`/opt | `x`, `z`, `w`w → `q`, `scale` |
@@ -3834,6 +3834,12 @@ partial) followed by the junction over the reduced sum, which lands in `a`; byte
 so there is no lossy wire; at two ranks the exact wire's push is coded losslessly (about 12.1 bits
 a value, the fused writes' form) from 512 KiB on rows of whole 256 values. At four ranks it is a
 one-shot, for decode and verify heights; a caller issues the chain above them.
+
+`overlap` 1 asks for the launch that goes beside compute, on the step's second lane; it selects
+`ar_rmsnorm_ihc_junction_4rank_lane` at four ranks, which is the same kernel and the same
+arithmetic (the kernel takes whole rows a block, so one a row is already as narrow as a wide
+launch gets). A collective may only be issued on the second lane when the row it resolves to
+says `overlap` 1.
 
 ### `mla_project_kv`
 

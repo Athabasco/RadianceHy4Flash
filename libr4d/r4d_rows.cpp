@@ -663,6 +663,10 @@ static const RadParamSpec pArIhcJunction[] = {
     P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("rows"), P_F64("eps"), P_F64O("ihc_eps"),
     P_F64O("hc_eps"), P_F64O("post_mag"), P_INTO("tail"), P_INT("world_size"), P_STR("dtype"),
     P_INTO("group"),
+    /* 1 when issued on the caller's second lane, beside compute (rad_lane). At four ranks it picks
+     * ar_rmsnorm_ihc_junction_4rank_lane, which is the same kernel: the junction takes whole rows a
+     * block, so its one a row is already the narrow launch. */
+    P_INTO("overlap"),
 };
 static const RadOperandSpec oIhcJunction[] = {
     {"a", RAD_OPD_INOUT, 0}, {"b", RAD_OPD_IN, 1}, {"w_post", RAD_OPD_WEIGHT, 0},
@@ -5163,6 +5167,12 @@ static const RadConstraint cArExact4[] = {
     C_EQ("world_size", 4), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
     C_P2P,
 };
+/* ar_oneshot_4rank_exact at `overlap` 1 (tArLane). The wide row matches too (it says nothing about
+ * `overlap`), so the lane row takes the higher priority, as the two-rank pair does. */
+static const RadConstraint cArExact4Lane[] = {
+    C_EQ("world_size", 4), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"), C_EQ("overlap", 1),
+    C_P2P,
+};
 static const RadConstraint cArExact8[] = {
     C_EQ("world_size", 8), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
     C_P2P,
@@ -5374,6 +5384,12 @@ static const RadConstraint cArIhcJunction4[] = {
     C_GE("M", 1), C_LE("M", 65535), C_GE("n", 8), C_LE("n", 16384), C_DIV("n", 8),
     C_GE("hc", 2), C_LE("hc", 8), C_GE("rows", 2), C_LE("rows", 16), C_IN("dtype", "bf16"),
     C_EQ("world_size", 4), C_P2P,
+};
+/* The same kernel at `overlap` 1 (ar_rmsnorm_ihc_junction_4rank_lane). */
+static const RadConstraint cArIhcJunction4Lane[] = {
+    C_GE("M", 1), C_LE("M", 65535), C_GE("n", 8), C_LE("n", 16384), C_DIV("n", 8),
+    C_GE("hc", 2), C_LE("hc", 8), C_GE("rows", 2), C_LE("rows", 16), C_IN("dtype", "bf16"),
+    C_EQ("world_size", 4), C_EQ("overlap", 1), C_P2P,
 };
 static const RadConstraint cGateMul[] = { C_GE("M", 1), C_LE("M", 65535), C_GE("n", 1),
                                           C_IN("dtype", "bf16") };
@@ -6305,17 +6321,25 @@ static const RadTunable tAttnSplit[] = {
  *
  * On the fp8 fused row only drain and acq apply: it forces `nthreads` to the norm's width for
  * bit-exactness, and pinning `nblocks` would undo r4d_ar_entry.hip's cap. No axis changes the
- * result. */
-static const int64_t kArNblocks[]  = { 0, 2, 4, 8, 16, 24 };
+ * result.
+ * `nblocks` lists 1 as well: the decode verify is 36 KiB, and measured on four cards at 6 rows of
+ * 3072 the two-shot's block count 1 / 2 / 4 / 8 runs 13.4 / 14.1 / 17.0 / 23.5 us a launch
+ * (--perfar4), so each block's push is its own DMA burst and a tiny message wants few of them. The
+ * rule (0) lands within 4.5% of that; 1 is the floor a sweep should be able to reach. */
+static const int64_t kArNblocks[]  = { 0, 1, 2, 4, 8, 16, 24 };
 static const int64_t kArNthreads[] = { 256, 512, 1024 };
 static const int64_t kArDrain[]    = { 1, 3 };
 static const int64_t kArAcq[]      = { 0, 1 };
 /* `ts_min`: from this many elements the four-rank exact one-shot hands the message to the exact
  * two-shot on the same instance (the same per-element fold, so the same bytes): a rank then sends
- * 1.5x the message instead of 3x, for a second handshake. 32768 is about six rows of 5376, so an
- * 8-row DFlash2 verify's all-reduces take the two-shot too (on 4x R9700 the 31B decoded 2-3% faster
- * than at 65536, which kept them one-shot), as a 16-row verify's do. 0 keeps the one-shot to its
- * band's top. Read only by that adapter; declared by every all-reduce table so one
+ * 1.5x the message instead of 3x, for a second handshake. 16384 is about five rows of 3072, so a
+ * speculating decode's verify takes the two-shot from its first drafted block on: on 4x R9700
+ * behind PCIe switches at 210 W, Hy4-flash's DFly2 verify at depth 5 (6 rows of 3072, 18432
+ * elements) decoded 131.2 tok/s as a two-shot against 129.5 as a one-shot, 1.3% (greedy probes,
+ * three runs each, +-0.1%; 0 = 129.0, 65536 = 128.9, so the edge is the six rows and not the run).
+ * A 16-row verify's all-reduces take the two-shot too, as a 8-row one does at 5376 hidden (on 4x
+ * R9700 the 31B decoded 2-3% faster than at 65536, which kept them one-shot). 0 keeps the one-shot
+ * to its band's top. Read only by that adapter; declared by every all-reduce table so one
  * RADIANCE_TUNE=all_reduce:ts_min=N pin is legal for every row the op resolves to. */
 static const int64_t kArTsMin[]    = { 0, 16384, 32768, 65536, 131072, 262144 };
 static const RadTunable tAr[] = {
@@ -6323,7 +6347,7 @@ static const RadTunable tAr[] = {
   { "nthreads", kArNthreads, NELEM(kArNthreads), 1024, "threads per block; the fused fp8 row overrides this for bit-exactness" },
   { "drain",    kArDrain,    NELEM(kArDrain),    3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
   { "acq",      kArAcq,      NELEM(kArAcq),      0, "acquire fence after the flag read" },
-  { "ts_min",   kArTsMin,    NELEM(kArTsMin),    32768, "elements from which the four-rank one-shot takes the exact two-shot; 0 = never" },
+  { "ts_min",   kArTsMin,    NELEM(kArTsMin),    16384, "elements from which the four-rank one-shot takes the exact two-shot; 0 = never" },
 };
 /* The four-rank fused junction (ar_rmsnorm_quant_i8_4rank): tAr's axes with its own block counts,
  * and `tail`. A one-shot junction is bound by its handshakes, not its bytes (on 4x R9700 over PCIe
@@ -6358,12 +6382,23 @@ static const RadTunable tArTs4Lane[] = {
  * the card to itself; beside a GEMM it slows the GEMM by 1.45-2.1x. Eight blocks of 256 threads
  * still keep the link busy and were fastest on Qwen-Image's two-rank pass (ahead of 8 x 512 and
  * 24 x 256). */
+/* The iHC junction rows' axes: tAr's, except `nblocks`, which for these rows can only be 0. The
+ * kernel takes whole rows a block (ar_ihc_junction_4rank: `if (nb > M) nb = M`), so a pin below M
+ * would compute part of the message and no error; tAr's 2..24 were reachable from a tune and would
+ * have done exactly that. 0 keeps the one a row the row text promises. */
+static const int64_t kArIhcNblocks[] = { 0 };
+static const RadTunable tArIhc[] = {
+  { "nblocks",  kArIhcNblocks, NELEM(kArIhcNblocks), 0, "one a row: the kernel owns whole rows a block, so a smaller pin would drop rows. 0 = M" },
+  { "nthreads", kArNthreads, NELEM(kArNthreads), 1024, "unused: the norm's width sets the block for bit-exactness" },
+  { "drain",    kArDrain,    NELEM(kArDrain),    3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
+  { "acq",      kArAcq,      NELEM(kArAcq),      0, "acquire fence after the flag read" },
+};
 static const RadTunable tArLane[] = {
   { "nblocks",  kArNblocks,  NELEM(kArNblocks),  8, "blocks in the grid. 0 = scale with the message and clamp" },
   { "nthreads", kArNthreads, NELEM(kArNthreads), 256, "threads per block" },
   { "drain",    kArDrain,    NELEM(kArDrain),    3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
   { "acq",      kArAcq,      NELEM(kArAcq),      0, "acquire fence after the flag read" },
-  { "ts_min",   kArTsMin,    NELEM(kArTsMin),    32768, "unused here (tAr says why it is declared)" },
+  { "ts_min",   kArTsMin,    NELEM(kArTsMin),    16384, "unused here (tAr says why it is declared)" },
 };
 
 /* --------------------------------------------------------------------------------- row top-k
@@ -9084,6 +9119,21 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_oneshot_4rank_exact, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 
+/* The row above at `overlap` 1: the same entry point and the same arithmetic, a launch that leaves
+ * the CUs to the compute running beside it (tArLane). One-shot only, so it carries the same decode
+ * and verify heights: above them ar_twoshot_4rank_exact_lane serves the piece's all-reduce. */
+{ "ar_oneshot_4rank_exact_lane", "all_reduce", "ar",
+  "all-reduce (sum), one-shot push over P2P IPC scratch, per-block handshake; narrow launch beside "
+  "compute",
+  "exactly 4 ranks, all peer-accessible, overlap 1; one scratch slot per (parity, source rank); in "
+  "place; cudagraph-safe",
+  "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks "
+  "and to the wide row",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT + 1,
+  ROW(cArExact4Lane), ROW(tArLane), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_oneshot_4rank_exact, nullptr, nullptr, nullptr,
+  r4d_shape_all_reduce },
+
 { "ar_oneshot_8rank_exact", "all_reduce", "ar",
   "all-reduce (sum), one-shot push over P2P IPC scratch, per-block handshake",
   "exactly 8 ranks, all peer-accessible; one scratch slot per (parity, source rank); in "
@@ -10521,7 +10571,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "bf16 activations, f32 gains and tables; byte-identical to [add_bf16,] the exact all_reduce "
   "and rmsnorm_ihc_junction's chain",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
-  ROW(cArIhcJunction2), ROW(tAr), nullptr,
+  ROW(cArIhcJunction2), ROW(tArIhc), nullptr,
   r4d_rad_ar_ln_init, r4d_rad_ar_fini, r4d_rad_ar_rmsnorm_ihc_junction, nullptr, nullptr, nullptr,
   r4d_shape_rmsnorm_ihc_junction, nullptr, r4d_fuse_ar_rmsnorm_ihc_junction },
 
@@ -10534,7 +10584,26 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "four-rank exact all-reduce stores it; byte-identical to [add_bf16,] all_reduce and "
   "rmsnorm_ihc_junction's chain",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
-  ROW(cArIhcJunction4), ROW(tAr), nullptr,
+  ROW(cArIhcJunction4), ROW(tArIhc), nullptr,
+  r4d_rad_ar_hc_wide_init, r4d_rad_ar_fini, r4d_rad_ar_rmsnorm_ihc_junction_4rank, nullptr,
+  nullptr, nullptr, r4d_shape_rmsnorm_ihc_junction, nullptr, r4d_fuse_ar_rmsnorm_ihc_junction },
+
+/* The row above at `overlap` 1, for a collective issued on the second lane (`rad_lane`). The launch
+ * itself does not change: the kernel takes whole rows a block, so one a row is already the narrow
+ * form a wide launch has to be talked down to. What the row adds is the permission -- an op may
+ * only be issued beside compute when the row it resolves to declares `overlap` 1. Nothing requests
+ * it at four ranks yet: Hy4-flash's prefill is one lane (it has no checkpointed state to split a
+ * chunk at, core/sched/geometry.cpp), so this is the row a two-lane Hy4-flash prefill needs first. */
+{ "ar_rmsnorm_ihc_junction_4rank_lane", "ar_rmsnorm_ihc_junction", "norm",
+  "the four-rank exact one-shot all-reduce of a block's output and the iHC junction after it in "
+  "one kernel, on the wide family's transport, issued beside compute; a block owns whole rows",
+  "exactly 4 ranks, all peer-accessible, overlap 1; a unpitched; hc 2, 4 or 8; exact wire; one-shot "
+  "((ranks - 1) x the message a rank): for decode heights",
+  "bf16 activations, f32 gains and tables; the sum in fp32 in ascending rank order rounded as the "
+  "four-rank exact all-reduce stores it; byte-identical to [add_bf16,] all_reduce and "
+  "rmsnorm_ihc_junction's chain",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY + 1,
+  ROW(cArIhcJunction4Lane), ROW(tArIhc), nullptr,
   r4d_rad_ar_hc_wide_init, r4d_rad_ar_fini, r4d_rad_ar_rmsnorm_ihc_junction_4rank, nullptr,
   nullptr, nullptr, r4d_shape_rmsnorm_ihc_junction, nullptr, r4d_fuse_ar_rmsnorm_ihc_junction },
 
