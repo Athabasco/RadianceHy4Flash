@@ -11,7 +11,8 @@ server for AMD GPUs, with a plugin for **Tencent Hy4-flash** (`hy_v4_flash`, 220
   adaptive verify depth
 - tensor parallel at TP2 and TP4, calibration taps and the KL mode for quantising, and vision
 
-It is built and tested on two Radeon AI PRO R9700 cards (gfx1201, 32 GB each).
+It is built and tested on two Radeon AI PRO R9700 cards (gfx1201, 32 GB each), and on four of them
+at TP4.
 
 Quantised containers are made by a separate quantisation workflow. The one used below is
 [`keptn/hy4-flash-iqr-v4`](https://huggingface.co/keptn/hy4-flash-iqr-v4)
@@ -19,8 +20,9 @@ Quantised containers are made by a separate quantisation workflow. The one used 
 lists the other variants and their KL figures.
 
 For everything that is not Hy4-specific (other models, Docker, the full option list), see the
-upstream README and [`docs/GUIDE.md`](docs/GUIDE.md). The Hy4 details, measurements and the TP2
-recipe are in [`docs/ARCHITECTURES.md`](docs/ARCHITECTURES.md) (section "Hy4-flash").
+upstream README and [`docs/GUIDE.md`](docs/GUIDE.md). The Hy4 details and the TP2 recipe are in
+[`docs/ARCHITECTURES.md`](docs/ARCHITECTURES.md) (section "Hy4-flash"), the four-rank one with its
+measurements in [`docs/TP4.md`](docs/TP4.md).
 
 ## Example config: two R9700 at TP2
 
@@ -69,6 +71,56 @@ Measured with this config (u3 container, TP2, 210 W power cap, sampled at T 0.9)
 | decode without speculation | about 75 tok/s | about 305 tok/s |
 | decode with DFly2 | about 140–150 tok/s | about 380–430 tok/s |
 | prefill | 3000–4100 tok/s, depending on prompt length | |
+
+## Example config: four R9700 at TP4
+
+Four ranks cut the experts four ways: each card holds a quarter of them, and each expert's width is
+cut in 128-column blocks over the ranks, so a card's share is whole blocks and every block has one
+owner. The scheduler keys of the file above (the `draft-*` family, `busy-prefill-chunk`,
+`checkpoint-slots`, the Engram placement) are per request and carry over unchanged; the file below
+leaves them at their defaults and leaves placement to the planner, which at four ranks fits more of
+the experts on the cards than the TP2 recipe can.
+
+```yaml
+server:
+  host: 127.0.0.1
+  port: 8034
+  kernels: libr4d,libavx,spechub      # spechub carries the DFly2 coupling / traversal ops
+memory:
+  gpu-headroom-mib: 128
+models:
+  hy4-flash:
+    model: /srv/models/hy4-flash-iqr-v4/hy4-flash-iqr-v4.rad
+    tp: 4
+    max-model-len: 32768
+    max-num-seqs: 32
+    num-speculative-tokens: 5         # DFly2 drafts at most 5 tokens
+    prefill-span: 2                   # an 8192-token batch is two intervals, run as two steps
+    max-num-batched-tokens: 8192
+    checkpoint-interval: 4096         # one interval a step, and the step is what gets cut
+```
+
+Run it with the prefill pipelined:
+
+```sh
+RADIANCE_HY4_PIPE=1 radiance --config hy4-tp4.yaml
+```
+
+`RADIANCE_HY4_PIPE=1` runs a step as two row pieces and issues each piece's junction -- its `add`,
+its exact all-reduce and the norm the next layer reads -- on the step's second lane, beside the
+other piece's expert GEMMs. It needs a step of exactly one checkpoint interval, which is why the
+batch is two intervals wide and the span runs them as two steps; pieces under 1024 rows are not
+cut (`RADIANCE_HY4_PIPE_ROWS` moves that floor, `RADIANCE_HY4_PIPE_LANE` the lane).
+
+Measured at these settings on four R9700 (32 GB each, 210 W a card), a 10948-token prompt, three
+warm runs a config:
+
+| | |
+|---|---|
+| prefill, `checkpoint-interval: 4096` and the 8192-token batch, no pipeline | 5018.9 tok/s |
+| the same with `RADIANCE_HY4_PIPE=1` | **5568.6 tok/s** (+11.0 %, and +13.2 % over four ranks at the 2048-token intervals it ships with) |
+| decode, 1 / 8 clients | 147.7 / 540.9 tok/s, the same greedy tokens with and without the cut |
+| prefill with the cut, bit for bit | not the step run whole (`448a9473ec` against `e7001a8285`) |
 
 ## Build from source
 
