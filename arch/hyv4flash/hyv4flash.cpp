@@ -759,8 +759,7 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
         }
         RAD_ARCH_TRY(pv.j_end.declare(b, s, g, T, m.tr, pv.ffn.junction_a(), pv.ffn.junction_b(),
                                       pv.ffn.post_gain, &lay.hc_attn, lay.attn_gain, m.tr.xn,
-                                      pv.ffn.op_join, pv.ffn.op_ar, jp,
-                                      m.pipe_on ? 1 : 0));
+                                      pv.ffn.op_join, pv.ffn.op_ar, jp));
     }
 
     /* The layer's latent group, declared before its first store; a sparse layer's indexer
@@ -837,8 +836,7 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
         if (cs && f.i8 && f.rot && f.g8 == RAD_FP8_BLOCK) jq = cs->get(E, f.g8, "junc_ffn_in");
     }
     RAD_ARCH_TRY(lay.j_mid.declare(b, s, g, T, m.tr, lay.attn.w.o, 0, lay.attn.post_gain,
-                                   &lay.hc_ffn, lay.ffn_gain, m.tr.xn, 0, lay.attn.op_ar, jq,
-                                   m.pipe_on ? 1 : 0));
+                                   &lay.hc_ffn, lay.ffn_gain, m.tr.xn, 0, lay.attn.op_ar, jq));
     RAD_ARCH_TRY(lay.t_ffn_in.declare(b, nm, T, "ffn_in_norm", l, RAD_BF16, E, m.tr.xn));
     RAD_ARCH_TRY(lay.ffn.declare(b, nm, s, g, l, m.tr.xn, m.tr.y, m.mw, m.dense_gu, m.dense_ff,
                                  m.dense_out, msrc, lay.j_mid.codes_if()));
@@ -848,8 +846,7 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
         if (e == l + 1)
             RAD_ARCH_TRY(lay.j_end.declare(b, s, g, T, m.tr, lay.ffn.junction_a(),
                                            lay.ffn.junction_b(), lay.ffn.post_gain, nullptr, 0, 0,
-                                           lay.ffn.op_join, lay.ffn.op_ar, nullptr,
-                                           m.pipe_on ? 1 : 0));
+                                           lay.ffn.op_join, lay.ffn.op_ar, nullptr));
     RAD_ARCH_TRY(lay.t_resid.declare(b, nm, T, "resid", l, RAD_BF16, s.hc * E, m.tr.h));
     RAD_ARCH_TRY(m.calib.layer(b, g, s, l, m.tr.xn, lay.attn, !lay.sliding, lay.ffn,
                                lay.engram >= 0 ? &m.engrams[(size_t)lay.engram] : nullptr));
@@ -1059,10 +1056,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.engrams.resize(s.engram_layers.size());
     m.layers.resize((size_t)s.n_layer);
     /* The declare-time half of the pipeline: no taps, no calibration, more than one rank (a
-     * reduction to hide), and room for two pieces above the 1024-row band's floor. The step adds
-     * its own half, and a library that serves no narrow reduction clears this again below. */
-    m.pipe_on = pipe_env_on() && g.world > 1 && !taps_on() && calib_dir() == nullptr &&
-                T > kPipeMinRows;
+     * reduction to hide). No `T` here, and the row floor is the step's alone (kPipeMinRows): the
+     * graph a plugin declares must be the same at every `max_tok`, because the arena sizes its
+     * levels by declaring it again at smaller steps -- a floor in the declare dropped them. The
+     * step adds its own half, and a library that serves no narrow reduction clears this below. */
+    m.pipe_on = pipe_env_on() && g.world > 1 && !taps_on() && calib_dir() == nullptr;
     for (int l = 0; l < (int)s.n_layer; ++l) RAD_ARCH_TRY(trunk_layer(b, m, l, &msrc[(size_t)l]));
 
     /* The head: the streams' collapse, the final norm, the lm_head over the sampled rows. */
@@ -1075,8 +1073,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         Layer& lt = m.layers.back();
         RAD_ARCH_TRY(lt.j_end.declare(b, s, g, T, m.tr, lt.ffn.junction_a(), lt.ffn.junction_b(),
                                       lt.ffn.post_gain, &m.hc_head, m.final_gain, m.final_hidden,
-                                      lt.ffn.op_join, lt.ffn.op_ar, nullptr,
-                                      m.pipe_on ? 1 : 0));
+                                      lt.ffn.op_join, lt.ffn.op_ar, nullptr));
         /* A library without a narrow reduction leaves the junctions whole: no pipeline. */
         if (!lt.j_end.pipe_ok()) m.pipe_on = false;
     }

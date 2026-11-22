@@ -117,9 +117,10 @@ warm runs a config:
 
 | | |
 |---|---|
-| prefill, `checkpoint-interval: 4096` and the 8192-token batch, no pipeline | 5018.9 tok/s |
-| the same with `RADIANCE_HY4_PIPE=1` | **5568.6 tok/s** (+11.0 %, and +13.2 % over four ranks at the 2048-token intervals it ships with) |
-| decode, 1 / 8 clients | 147.7 / 540.9 tok/s, the same greedy tokens with and without the cut |
+| prefill, `checkpoint-interval: 4096` and the 8192-token batch, no pipeline | 4978.1 tok/s |
+| the same with `RADIANCE_HY4_PIPE=1` | **5577.5 tok/s** (+12.0 %, and +13.5 % over four ranks at the 2048-token intervals it ships with) |
+| decode, 1 / 8 clients | 147.2 / 551.8 tok/s, the same greedy tokens with and without the cut |
+| the cut's cost in memory | 0.05 GiB of activation arena and 0.32 GiB of the pools |
 | prefill with the cut, bit for bit | not the step run whole (`448a9473ec` against `e7001a8285`) |
 
 ## Build from source

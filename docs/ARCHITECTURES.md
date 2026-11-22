@@ -3483,12 +3483,14 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   *one* checkpoint interval is the shape it needs (`checkpoint-interval: 4096`,
   `max-num-batched-tokens: 8192`), because the span already overlaps intervals inside a wider step.
   Measured on 4x R9700 at 4096-row pieces: pieces on lane 0 -3.2%, on lane 1 +3.9% over the same
-  step run whole, and +13.2% against the shipped config with an 8192-token budget on the current
-  base (4919.1 against 5568.6 t/s, three runs each; +11.0% over the same budget without the
-  pieces); the cut itself is flat within 0.6% over six points, and decode is untouched (c1 147.7
-  t/s in all three arms). Not bit-identical -- the cut splits the routed pass, so each expert's
-  GEMM rounds its own sum
-  ([TP4.md](TP4.md#the-pipelined-prefill-at-four-ranks-built-132-with-decode-untouched-off-by-default)).
+  step run whole, and +13.5% against the shipped config with an 8192-token budget on the current
+  base (4913.5 against 5577.5 t/s, three runs each; +12.0% over the same budget without the
+  pieces); the cut itself is flat within 0.6% over six points, and decode is untouched (c1 146.3
+  to 148.0 t/s across the three arms). It costs 0.05 GiB of arena and 0.32 GiB of the pools, but
+  only if the declared graph does not depend on `max_tok` -- a row floor in the declare dropped
+  the arena's 256- and 1024-token levels and held 1.9 GiB. Not bit-identical -- the cut splits the
+  routed pass, so each expert's GEMM rounds its own sum
+  ([TP4.md](TP4.md#the-pipelined-prefill-at-four-ranks-built-135-with-decode-untouched-off-by-default)).
 - **The FP8 and INT8 indexers** (`RADIANCE_HY4_INDEXER=fp8` or `int8`; `exact`, the default, is HF's numerics). The
   key cache and the score take vLLM's IndexPool numerics on GLM's forms: `idx_pool_gated_fp8`
   keeps the pooled, normed, rotated group key in f32 and writes its 128-wide Hadamard into E4M3

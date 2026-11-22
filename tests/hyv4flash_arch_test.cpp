@@ -906,8 +906,15 @@ TEST(each_rank_declares_its_share_and_reduces_twice_a_layer) {
             CHECK_EQ(pint(find_op(b, "logits_gemm"), "n_vocab"), 320 / world);
             CHECK_EQ(find_b(b, "logits")->d.shape[1], 320 / world);
 
+            /* Six reductions at more than one rank, and each has its narrow twin beside it
+             * (`overlap` 1): the twin is declared whether or not the pipeline is on, because a
+             * graph whose op list depends on `max_tok` cannot be re-declared at a smaller step
+             * for the arena's levels (a_sizing_declare_...). */
             const int nar = count_op(b, "all_reduce");
-            CHECK_EQ(nar, world == 1 ? 0 : 6);
+            CHECK_EQ(nar, world == 1 ? 0 : 12);
+            int narrow = 0;
+            for (int i = 0; i < nar; ++i) narrow += pint(find_op(b, "all_reduce", i), "overlap") == 1;
+            CHECK_EQ(narrow, world == 1 ? 0 : 6);
             for (int i = 0; i < nar; ++i) {
                 const RecOp* ar = find_op(b, "all_reduce", i);
                 CHECK_EQ(pint(ar, "exact"), 1);
@@ -932,9 +939,9 @@ TEST(each_rank_declares_its_share_and_reduces_twice_a_layer) {
                     on_sum += x == sum;
                     on_dense += x == dense;
                 }
-                CHECK_EQ(on_o, 2);       /* the two sparse layers */
-                CHECK_EQ(on_sum, 2);     /* the two MoE layers */
-                CHECK_EQ(on_dense, 1);   /* layer 0 */
+                CHECK_EQ(on_o, 4);       /* the two sparse layers, wide and narrow */
+                CHECK_EQ(on_sum, 4);     /* the two MoE layers */
+                CHECK_EQ(on_dense, 2);   /* layer 0 */
             }
             steps_clean_at(b, rank, world);
         }
@@ -1212,6 +1219,38 @@ TEST(a_sizing_declare_matches_the_real_one_and_leaves_its_model_alone) {
     CHECK_EQ(p.shape_probe_ok, 1);
 }
 
+/* The same at more ranks, where the pipeline lives. With `RADIANCE_HY4_PIPE` on, a junction
+ * declares the narrow twin its second lane issues, and every sizing declare at a smaller step has
+ * to declare exactly the same ops -- that is how the arena sizes the levels it lends, and a level
+ * whose declare differs is dropped ("the sizing declare failed"), which is what happened while the
+ * twin was declared only above the pipeline's 1024-row floor: an 8192-token deployment lost its
+ * 256- and 1024-token levels, so small steps could not lend their arena back to the slab and boot
+ * held 1.9 GiB more than it needed. The row floor is the step's, not the graph's. */
+TEST(a_sizing_declare_at_four_ranks_matches_with_the_pipeline_on_and_off) {
+    for (int pipe = 0; pipe < 2; ++pipe) {
+        if (pipe) setenv("RADIANCE_HY4_PIPE", "1", 1);
+        else unsetenv("RADIANCE_HY4_PIPE");
+        for (int world : { 1, 2, 4 }) {
+            Declared d(bf16_encs, world, 0, true);
+            REQUIRE_EQ(d.rc, RAD_OK);
+            for (int64_t mt : { (int64_t)64, (int64_t)512, (int64_t)2048 }) {
+                RadBuilder pb;
+                bf16_encs(&pb);
+                RadBuildCtx pc = build_ctx(0, world);
+                pc.max_tok = mt;
+                pc.shape_probe = 1;
+                G3Env g3env;
+                REQUIRE_EQ(hyv4flash::declare(&pb, d.mk.meta(), &pc), RAD_OK);
+                REQUIRE_EQ(pb.ops.size(), d.b.ops.size());
+                for (size_t k = 0; k < pb.ops.size(); ++k) CHECK_EQ(pb.ops[k].op, d.b.ops[k].op);
+                for (size_t k = 0; k < pb.bufs.size(); ++k)
+                    CHECK_EQ(pb.bufs[k].name, d.b.bufs[k].name);
+            }
+        }
+        unsetenv("RADIANCE_HY4_PIPE");
+    }
+}
+
 /* The Engram table as E4M3 rows under a bf16 or an f32 scale a row (hy4-flash-bf16.recipe,
  * hy4-flash-bf16-f32.recipe): the scale view at the stored dtype, no runtime round trip. */
 TEST(the_engram_table_takes_a_bf16_or_an_f32_row_scale) {
@@ -1275,7 +1314,9 @@ TEST(quantised_experts_are_sliced_at_more_ranks) {
                 }
                 for (const auto& o : b.ops)
                     if (o.op == "moe_gemm_q") CHECK_EQ(pint(&o, "n_expert"), 8);
-                CHECK_EQ(count_op(b, "all_reduce"), 6);
+                /* Six reductions and the narrow twin of each (see
+             * each_rank_declares_its_share_and_reduces_twice_a_layer). */
+            CHECK_EQ(count_op(b, "all_reduce"), 12);
                 every_weight_read(d.b);
                 steps_clean_at(d.b, rank, world);
             }

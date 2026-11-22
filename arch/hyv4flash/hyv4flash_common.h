@@ -621,8 +621,7 @@ struct Junction {
      * pair the junction writes of `xn` (n % 128 == 0), read by the linears that accept it. */
     int declare(RadBuilder* bl, const Shape& s, const Geom& g, int64_t T, const Trunk& tr,
                 rad_buf a_, rad_buf b_, rad_weight w_post_, const Hyper* next, rad_weight w_next_,
-                rad_buf xn_, rad_op add_, rad_op reduce_, const Codes::Pair* pair = nullptr,
-                int overlap = 0) {
+                rad_buf xn_, rad_op add_, rad_op reduce_, const Codes::Pair* pair = nullptr) {
         *this = Junction{};
         if (!junction_on() || calib_dir() != nullptr) return RAD_OK;
         if (s.n_embd % 8) return RAD_OK;
@@ -688,12 +687,19 @@ struct Junction {
         }
         /* The narrow twin of the chain's reduction: the pipelined prefill issues it on the second
          * lane beside the GEMMs (a fused `ar_rmsnorm_ihc_junction` would hold its blocks on the
-         * card while it waits on the link). Declared only where the chain runs and only when the
-         * caller asks for the pipeline, so an unpipelined graph is the graph it was. */
-        if (world > 1 && op_reduce && overlap) {
+         * card while it waits on the link).
+         *
+         * Declared wherever the library serves it, whatever the pipeline is set to and whatever
+         * `T` is: the arena sizes a level by declaring this graph again at a smaller step, and the
+         * builder refuses a probe whose op list differs from the real one op by op (the same
+         * buffer, one more reduction per layer). Measured: declared only above the pipeline's row
+         * floor, every level below it was dropped ("the sizing declare failed") -- 256 and 1024
+         * tokens of an 8192-token deployment -- so small steps could not lend their arena and the
+         * boot held 1.9 GiB it did not need. An op that is declared and never issued costs
+         * nothing; a graph that changes with `max_tok` costs the loan. */
+        if (world > 1 && op_reduce) {
             int rc2 = RAD_OK;
             op_reduce_ov = decl_all_reduce(bl, g, n, a, &rc2, 1);
-            if (!op_reduce_ov) op = 0;   /* no narrow launch: the step below stays serial */
         }
         return RAD_OK;
     }

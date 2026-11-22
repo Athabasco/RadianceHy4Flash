@@ -150,10 +150,10 @@ Four things follow, and they close the question "can the kernel itself be made f
   `--perfar4` cannot pin it.
 - **What is left is the count**: ~4 us a launch plus ~8 us of handshake, 60-84 times a decode step
   (84 x 14 us is 1.2 ms of an 18 ms step). Removing launches is the pipelined prefill's job (the
-  `*_4rank_lane` rows), not a kernel's -- and at four ranks it bought 13.2% with decode flat,
+  `*_4rank_lane` rows), not a kernel's -- and at four ranks it bought 13.5% with decode flat,
   see below.
 
-## The pipelined prefill at four ranks: built, +13.2% with decode untouched, off by default
+## The pipelined prefill at four ranks: built, +13.5% with decode untouched, off by default
 
 A prefill step's two collectives per layer (the attention junction and the FFN junction) sit where
 nothing runs beside them, so their ~1 ms each is a hole in the step. `arch/hyv4flash` now splits a
@@ -187,17 +187,51 @@ warm runs each, one session, `RADIANCE_HY4_PIPE` the only difference between the
 
 | config | pp t/s | c1 t/s | c8 t/s | against shipped |
 |---|--:|--:|--:|--:|
-| shipped: `checkpoint-interval: 2048`, the span's overlap | 4919.1 | 148.2 | 541.3 | -- |
-| `checkpoint-interval: 4096`, `max-num-batched-tokens: 8192`, pieces off | 5018.9 | 147.7 | 552.1 | +2.0% |
-| the same, `RADIANCE_HY4_PIPE=1` | **5568.6** | 147.7 | 540.9 | **+13.2%** |
+| shipped: `checkpoint-interval: 2048`, the span's overlap | 4913.5 | 148.0 | 553.2 | -- |
+| `checkpoint-interval: 4096`, `max-num-batched-tokens: 8192`, pieces off | 4978.1 | 146.3 | 550.3 | +1.3% |
+| the same, `RADIANCE_HY4_PIPE=1` | **5577.5** | 147.2 | 551.8 | **+13.5%** |
 
-The pipeline is +11.0% over its own baseline (5568.6 against 5018.9) there, against +3.9% on the
-older base: the pieces are 2048 rows a piece at an 8192-token budget, and a 2048-row piece sits a
-whole shape band below the 4096-row step, so the step's second half gains from the split as well.
-Decode is untouched in the sense that matters -- c1 is 147.7 t/s in all three arms (the same
-`e56cb2263f` for 192 greedy tokens), c8 moves inside its +-1.5% noise (541.3 / 552.1 / 540.9).
-Prefill is still not bit-identical: 448a9473ec without the pieces (the same hash the shipped config
-gives) against e7001a8285 with them.
+A second session of the pipelined arm measured 5622.4 / 147.8 / 553.2, so the band is 5568 to 5622
+t/s. The pipeline is +12.0% over its own baseline there, against +3.9% on the older base: the
+pieces are 2048 rows a piece at an 8192-token budget, and a 2048-row piece sits a whole shape band
+below the 4096-row step, so the step's second half gains from the split as well. Decode is
+untouched in the sense that matters -- c1 is 146.3 to 148.0 t/s across the three arms (the same
+`e56cb2263f` for 192 greedy tokens) and c8 550.3 / 551.8 inside its +-1.5% noise. Prefill is still
+not bit-identical: 448a9473ec without the pieces (the same hash the shipped config gives) against
+e7001a8285 with them.
+
+**A row floor in the declare cost the arena its levels, not just the plugin a branch.** `pipe_on`
+was computed with `T > 1024` and the narrow twin of each junction was declared only when it was
+set, so the graph a pipelined deployment declared at 8192 rows carried six more reductions than the
+one it declared at 256 or 1024 -- and the arena sizes each level it lends by declaring the graph
+again at a smaller step. Measured before the fix, on this box:
+
+    W activation arena: no level for 256-token steps on rank 0 -- the sizing declare failed:
+      invalid argument
+    W activation arena: no level for 1024-token steps on rank 0 -- the sizing declare failed:
+      invalid argument
+    I activation arena: 4096 tokens use 2.03 GiB of 3.93 GiB ...
+
+So two of the three levels were dropped, steps below 4096 rows could not lend their arena back to
+the expert slab, and boot held ~1.9 GiB it did not need -- which on a box sized for the loan is an
+out-of-memory boot, and the KV pool loses the same. The row floor is the step's business
+(`n0 >= RADIANCE_HY4_PIPE_MIN`), not the graph's: the twin is declared wherever the library serves
+it, `pipe_on` keeps only the env, the rank count and the library check (it clears itself if the
+twin did not resolve), and the levels come back:
+
+| arm | 256 tokens | 1024 tokens | 4096 tokens | arena | the two pools |
+|---|--:|--:|--:|--:|--:|
+| shipped (2048-row steps) | 196.72 MiB | 556.32 MiB | 1.01 GiB of 1.95 | 1.95 GiB | -- |
+| pieces off | 260.80 MiB | 620.40 MiB | 2.01 GiB of 3.88 | 3.88 GiB | 107.47 GiB |
+| pieces on | 262.30 MiB | 626.40 MiB | 2.03 GiB of 3.93 | 3.93 GiB | 107.15 GiB |
+
+The cut costs 0.05 GiB of arena and 0.32 GiB of the pools, not 1.9 GiB. And it was worth more than
+the pipeline: with the levels dropped, the *decode* arm of a pipelined deployment was 540.9 against
+552.1 t/s (c8, -2%, at the edge of the noise), which the level below 4096 explains -- after the fix
+it is 551.8 against 550.3. `tests/hyv4flash_arch_test.cpp` keeps it that way:
+`a_sizing_declare_at_four_ranks_matches_with_the_pipeline_on_and_off` declares at 64, 512 and 2048
+rows with the pipeline off and on and compares the op and buffer lists (207 against 201 ops without
+the fix, the six twins being the difference).
 
 That the wider budget's arm fuses at all took a fix: its routed band tops out at 131072 slots, and
 `libr4d`'s two swiglu-quant rows carried a `C_LE("M", 65535)` from a 16-bit row count that neither
