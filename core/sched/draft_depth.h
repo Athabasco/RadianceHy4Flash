@@ -97,6 +97,15 @@ struct DraftDepthCfg {
     bool   load      = false;
     int    load_from = 5;        /* the fewest drafting rows of a load-aware step */
     int    load_min  = 2;        /* rounds a load-aware step always runs and drafts it never cuts */
+    /* Exploration (an exploring step verifies drafts 1 .. force whatever the tables say; 0 = none).
+     * A rule that never verifies a draft never learns its acceptance, and at one to four
+     * sequences the stop rule that ran there before kept the low-confidence bins of drafts 3 .. 5
+     * empty. The engine sets `force` for every `explore_every`-th load-aware step of fewer than
+     * kExploreBelow rows, by a counter of steps alone: no draw, token or law of the step enters, so
+     * the rule stays one with constants given the past (the exactness note above). */
+    int    force     = 0;
+    int    explore_every = 20;
+    enum { kExploreBelow = 5 };
     double load_lam[kLoadSeqs + 1]      = {};   /* by drafting rows n, [0] unused; n > kLoadSeqs takes the last */
     double load_row_ms[kLoadSeqs + 1]   = {};
     double load_round_ms[kLoadSeqs + 1] = {};
@@ -267,7 +276,7 @@ inline bool draft_depth_go_load(const DraftDepthCfg& c, DraftDepthRow* r, int n,
         /* A round the rule has read nothing for (round 2, decided one round behind) runs as under
          * the stop rule: with no law to weigh, the prices alone would turn all drafting on or off
          * for the whole step, and a calibration that is a little off must not be able to do that. */
-        else if (j <= lmin || draft_depth_need(c, j) <= 0) want[i] = true;
+        else if (j <= lmin || j <= c.force || draft_depth_need(c, j) <= 0) want[i] = true;
         else { p[i] = draft_depth_cal(c, j, r[i].conf, c.lag > 0 ? 0 : 1); cand[n_cand++] = i; }
         forced += want[i];
     }
@@ -327,7 +336,7 @@ inline void draft_depth_select(const DraftDepthCfg& c, DraftDepthRow* r, int n, 
             if (r[i].done || r[i].depth != j - 1) continue;
             /* the confidence read: conf(min(j, seen)), never a round past j */
             const int m = r[i].seen < j ? r[i].seen : j;
-            p[i] = j <= lmin ? 2.0 : draft_depth_cal(c, j, draft_depth_conf(r[i], m), m - (j - 2));
+            p[i] = j <= lmin || j <= c.force ? 2.0 : draft_depth_cal(c, j, draft_depth_conf(r[i], m), m - (j - 2));
             cand[n_cand++] = i;
         }
         for (int a = 1; a < n_cand; ++a) {

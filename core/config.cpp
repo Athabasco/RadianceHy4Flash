@@ -273,8 +273,12 @@ static const Flag g_flags[] = {
     "                                    throughput; fewer sequences than --draft-depth-load-from keep the\n"
     "                                    stop rule. Same output law" },
     { "--draft-depth-load-from", "N",   "--draft-depth-load: the fewest drafting sequences of a step the\n"
-                                        "load-aware rule decides (default 5)" },
+                                        "load-aware rule decides (default 5; 1 = from one\n"
+                                        "sequence, the rule priced at the margin instead of a stop threshold)" },
     { "--draft-depth-load-min", "N",    "--draft-depth-load: rounds a load-aware step always runs (default 2)" },
+    { "--draft-depth-explore", "N",     "--draft-depth-load: every Nth load-aware step of fewer than five drafting sequences\n"
+                                        "verifies the whole chain, so the acceptance bins the rule never reaches are learnt\n"
+                                        "(default 20; 0 = never). Counted by steps alone: same output law" },
     { "--draft-depth-load-late", "MODE", "on (default) | off -- --draft-depth-load: choose each row's verified\n"
                                         "drafts again when the next verify is issued, from the laws read by then" },
     { "--draft-depth-load-calib", "MODE", "--draft-depth-load: online (default; acceptance by confidence,\n"
@@ -1078,8 +1082,9 @@ int config_parse(int argc, char** argv, Config* c) {
             else { RAD_ERR("%s takes off or on, not '%s'", a.c_str(), v); return RAD_E_INVAL; }
             (S("--draft-depth-load") ? c->draft_depth_load : c->draft_depth_load_late) = b;
         }
-        else if (S("--draft-depth-load-from")) { if (!num(2, 64, &c->draft_depth_load_from)) return RAD_E_INVAL; }
+        else if (S("--draft-depth-load-from")) { if (!num(1, 64, &c->draft_depth_load_from)) return RAD_E_INVAL; }
         else if (S("--draft-depth-load-min"))  { if (!num(1, 16, &c->draft_depth_load_min)) return RAD_E_INVAL; }
+        else if (S("--draft-depth-explore"))   { if (!num(0, 10000, &c->draft_depth_explore)) return RAD_E_INVAL; }
         else if (S("--draft-depth-load-calib")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "online")) c->draft_depth_load_online = true;
@@ -1841,6 +1846,7 @@ const ShowRow kShow[] = {
     { "--draft-depth-load",   [](const Config& c) { return onoff(c.draft_depth_load); } },
     { "--draft-depth-load-from", [](const Config& c) { return num(c.draft_depth_load_from); } },
     { "--draft-depth-load-min", [](const Config& c) { return num(c.draft_depth_load_min); } },
+    { "--draft-depth-explore", [](const Config& c) { return num(c.draft_depth_explore); } },
     { "--draft-depth-load-late", [](const Config& c) { return onoff(c.draft_depth_load_late); } },
     { "--draft-depth-load-calib", [](const Config& c) {
           return std::string(c.draft_depth_load_online ? "online" : "static"); } },

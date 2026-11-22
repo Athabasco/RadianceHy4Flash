@@ -1119,6 +1119,8 @@ struct Config {
     bool        draft_depth_load = false;
     int         draft_depth_load_from = 5;
     int         draft_depth_load_min = 2;
+    /* every Nth load-aware step of fewer than 5 drafting rows verifies the whole chain (0 = never) */
+    int         draft_depth_explore = 20;
     bool        draft_depth_load_late = true;
     bool        draft_depth_load_online = true;
     std::string draft_depth_load_tok_ms;

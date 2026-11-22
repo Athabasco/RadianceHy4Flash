@@ -731,6 +731,8 @@ private:
     std::chrono::steady_clock::time_point depth_note_t_{};
     int           depth_note_step_ = -2, depth_note_rows_ = 0;
     uint64_t      depth_note_n_ = 0;
+    uint64_t      depth_explore_n_ = 0;                  /* load-aware steps counted for DraftDepthCfg::force */
+    int           depth_explore_force(bool load, int n);
     void          depth_step_note(const RadBatch* b, const StepOut& so);
     void          depth_load_log(const char* when) const;
     /* RADIANCE_DEBUG_CONC_LOG=<file>, diagnostics of the load-aware rule: one line a decode step (rows,

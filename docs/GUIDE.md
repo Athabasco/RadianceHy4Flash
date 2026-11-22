@@ -1801,7 +1801,13 @@ default) chooses each row's verified drafts again from those -- draft j by the l
 the one after it -- so a chain that turned unsure after its round was issued costs the round but no verify
 row, and the rows are cut back to a tile where the tile costs more than the drafts past it yield. A step
 with fewer sequences is decided by the stop rule exactly as without the key, so a single stream is served
-bit for bit as the stop rule serves it.
+bit for bit as the stop rule serves it. `draft-depth-load-from: 1` lets the rule decide a single stream
+too: a draft is verified when its acceptance (read off the online table) exceeds the tokens a millisecond
+times the row's price, with no threshold to tune. Below five drafting sequences every
+`draft-depth-explore`-th step (default 20) verifies the whole chain whatever the tables say, so the
+confidence bins the stop rule never reached (drafts 3 to 5 at low confidence) are learnt and not stuck at
+the built-in prior; the choice to explore counts steps and reads no draw, so the output law is
+unchanged.
 
 ```yaml
     max-num-seqs: 8
@@ -2730,7 +2736,8 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `draft-depth-lag: K` | 1 | `draft-depth: adaptive`: rounds the decision trails the chain (0 or 1); 1 hides the host's decision behind a running round |
 | `draft-depth-stat: S` | top | `draft-depth: adaptive`: `top` multiplies each round's largest probability, `path` the probability of the token it drew |
 | `draft-depth-load: MODE` | off | `on`: a step that drafts for `draft-depth-load-from` sequences or more runs draft round j only for the rows whose expected accepted drafts pay their verify rows, the kernel tile they open and the round, at the measured throughput (§4.6). Needs `draft-depth: adaptive` with `draft-depth-stat: top`. Same output law; fewer sequences keep the stop rule |
-| `draft-depth-load-from: N` | 5 | `draft-depth-load: on`: the fewest drafting sequences of a step the load-aware rule decides (2..64) |
+| `draft-depth-load-from: N` | 5 | `draft-depth-load: on`: the fewest drafting sequences of a step the load-aware rule decides (1..64; 1 = from one sequence, the rule priced at the margin in place of a stop threshold) |
+| `draft-depth-explore: N` | 20 | `draft-depth-load: on`: every Nth load-aware step of fewer than five drafting sequences verifies the whole chain, so the acceptance bins the stop rule never visited (drafts 3-5 at low confidence) are learnt; counted by steps alone, same output law; 0 = never |
 | `draft-depth-load-min: N` | 2 | `draft-depth-load: on`: rounds a load-aware step always runs, and drafts its late choice never cuts |
 | `draft-depth-load-late: MODE` | on | `draft-depth-load: on`: choose each row's verified drafts again when the next verify is issued, from the laws read by then |
 | `draft-depth-load-calib: MODE` | online | `draft-depth-load: on`: `online` keeps the rule's tables (acceptance by confidence, tokens a millisecond, row / round / tile prices) on the running server's own verifies and step times; `static` serves the built-in or given tables |

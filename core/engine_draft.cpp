@@ -165,8 +165,9 @@ int Engine::step_state_init() {
             draft_depth_load_defaults(&depth_cfg_);
             depth_cfg_.load      = true;
             depth_load_on_       = true;
-            depth_cfg_.load_from = std::max(2, cfg_.draft_depth_load_from);
+            depth_cfg_.load_from = std::max(1, cfg_.draft_depth_load_from);
             depth_cfg_.load_min  = std::min(std::max(cfg_.draft_depth_load_min, 1), depth_cfg_.max);
+            depth_cfg_.explore_every = std::max(0, cfg_.draft_depth_explore);
             depth_cfg_.late      = cfg_.draft_depth_load_late;
             depth_cfg_.late_lag  = 1;
             const int kN = DraftDepthCfg::kLoadSeqs, kJ = DraftDepthCfg::kJumps;
@@ -376,6 +377,14 @@ int Engine::tree_compact(int rows) {
  * The commit of the step in flight moves behind those decisions (the step loop collects after
  * issue_ahead), so its tokens are streamed up to the chain's rounds later than with a fixed chain;
  * the card is not held up by that. */
+/* The drafts an exploring step verifies whatever the tables say (DraftDepthCfg::force), 0 for the
+ * others: every explore_every-th load-aware step of fewer than kExploreBelow drafting rows, counted
+ * by steps alone. */
+int Engine::depth_explore_force(bool load, int n) {
+    if (!load || depth_cfg_.explore_every <= 0 || n >= DraftDepthCfg::kExploreBelow) return 0;
+    return (++depth_explore_n_ % (uint64_t)depth_cfg_.explore_every) == 0 ? depth_cfg_.max : 0;
+}
+
 int Engine::depth_row_nodes(int i) const {
     if (!depth_cfg_.on) return serial_done_;
     if (i < 0 || (size_t)i >= depth_of_.size()) return 0;
@@ -668,6 +677,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
         for (const StepEntry& pe : sched_.plan().e) depth_other_rows_ += pe.produces_token;
         depth_other_rows_ = std::max(0, depth_other_rows_ - n);
         depth_load_step_ = depth_cfg_.load && n >= depth_cfg_.load_from;
+        depth_cfg_.force = depth_explore_force(depth_load_step_, n);
     }
 
     /* Pass 0, then rounds 2..rounds: round 1 has no pass of its own. */
@@ -1211,6 +1221,7 @@ int Engine::block_depth_decide() {
         }
     }
     depth_load_step_ = load;
+    depth_cfg_.force = depth_explore_force(load, n);
     if (load) {
         draft_depth_block_load(depth_cfg_, depth_row_.data(), n, steps, depth_other_rows_);
         for (int i = 0; i < n; ++i) depth_of_[(size_t)i] = std::max(1, std::min(depth_row_[(size_t)i].depth, steps));
