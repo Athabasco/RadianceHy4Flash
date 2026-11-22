@@ -3699,6 +3699,26 @@ model the prefill stager overlaps from a 4097-token step, `auto` never holds a c
 (every routed layer then reads its pooled experts synchronously). An explicit N must be at least the stager's step
 (startup line `prefill staging: ...`, the warning names it; 4160 with a 64-token quantum).
 
+**TP2 recipe (u3 container, two R9700, 210 W; measured 2026-11-22, `work/tp2t1`).** (1) `draft-depth-stop: 0.3`
+with `draft-depth: adaptive` (default 0.85 verifies too little for one client; the general-levers
+measurement: +11 % code, +22 % thinking text at one client, neutral within 5 % at two to four clients,
+kernels/levers-general.md; u3 coupled, T 0.9: one stream 119 -> 135 tok/s, four 264 -> 273, eight 346 -> 343). (2) The activation arena is lent to the expert slab and the prefill stager
+runs (`shape_probe_ok`; `RADIANCE_HY4_SHAPE_PROBE=0` is the A/B switch): startup lines `activation arena: 256
+tokens use ... of 1.33 GiB ... the rest is lent` and `prefill staging: a 521 MiB ring`. Against the same
+build with the switch off, sampled T 0.9, code prompts: prefill (8K to 40K tokens) +15 to +25 % (2.85 -> 3.3-3.45
+k tok/s no-speculation; 2.7 -> 3.2-3.4 coupled; 2K prompts +7 to +20 %), decode at eight streams +5 % (no speculation) / +12 % (coupled),
+expert VRAM hit 0.984 -> 0.990. Placement only: greedy text and logprobs are byte-equal on the real
+container (sequential prompts, 9K and 19K prefills included; eight concurrent greedy streams are not
+reproducible even with the switch off, so they are not a test). (3) Not recommended on this container:
+`max-num-batched-tokens: 4096` with `prefill-span: 2` and `prefill-span-pass: step` gains +3 to +10 % prefill
+only from about 16K-token prompts (8K: +/-0; under 8 intervals no span), costs 2 to 5 % decode (the arena
+doubles to 2.69 GiB and the stager ring grows to 592 MiB) and changes prefill at tie level (a 19K prompt
+differs from token 0 of the logprobs); use it only for a deployment of mostly 16K+ prompts.
+(4) `host-pool-mib: 61000` changes nothing: the pinned pool holds the units the cards do not (7848 slots a
+rank either way), the mover keeps demote copies (24 GiB d2h in a no-speculation bench) and no "pool holds
+everything" mirror mode exists; the larger budget only feeds the KV cache. It needs `ttm.pages_limit` and
+the memlock limit above the extra pinned bytes.
+
 **Losslessness** is the gate, since a draft can never change the text: (1) `hyv4flash_arch_test`
 (the declared graph at one, two and four ranks, lint clean on every step kind, the query pass touching
 no trunk state, the refusals above, quantised linears at TP1 and TP2); (2) greedy ids and logprobs
