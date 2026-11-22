@@ -3702,7 +3702,35 @@ model the prefill stager overlaps from a 4097-token step, `auto` never holds a c
 **TP2 recipe (u3 container, two R9700, 210 W; measured 2026-11-22, `work/tp2t1`).** (1) `draft-depth-stop: 0.3`
 with `draft-depth: adaptive` (default 0.85 verifies too little for one client; the general-levers
 measurement: +11 % code, +22 % thinking text at one client, neutral within 5 % at two to four clients,
-kernels/levers-general.md; u3 coupled, T 0.9: one stream 119 -> 135 tok/s, four 264 -> 273, eight 346 -> 343). (2) The activation arena is lent to the expert slab and the prefill stager
+kernels/levers-general.md; u3 coupled, T 0.9: one stream 119 -> 135 tok/s, four 264 -> 273, eight 346 -> 343). (1b) The same rule priced at the margin
+instead of a threshold: add `draft-depth-load: on` and `draft-depth-load-from: 1` (the load-aware rule from
+one drafting sequence; `draft-depth-stop` is then not read). Six seed sets
+x two server runs, same prompts and seeds, T 0.9, 210 W, against (1), paired by seed set (`work/g1g5`):
+
+| clients | (1) stop 0.3, tok/s | (1b) from 1, tok/s | paired |
+|---|---|---|---|
+| 1, code A | 138.3 | 136.8 | -1.1 +- 1.4 % |
+| 1, code B | 140.5 | 139.6 | -0.5 +- 2.0 % |
+| 1, thinking text | 108.5 | 118.2 | +8.9 +- 1.7 % |
+| 2 | 203.7 | 209.0 | +2.6 +- 2.1 % |
+| 4 | 278.9 | 285.0 | +2.3 +- 2.4 % |
+| 8 | 377.0 | 379.4 | +0.7 +- 1.5 % |
+
+A tie on code at one client, a clear win on thinking text, and no loss at two to eight: it is the
+recommendation, and the threshold now follows the row's price (the online table reads 0.136 tok/ms and a
+1.2 ms row at one sequence, i.e. a draft is taken above about 0.16 acceptance) instead of a constant tuned
+on one container. `draft-depth-explore` (default 20) verifies the whole chain on every 20th such step so
+that the acceptance bins the stop rule never visited are learnt; measured with and without it the
+difference is inside the scatter (code -1.1 % with, -3.6 % without; thinking +8.9 / +10.2 %), so it stays
+on for the sake of the tables. Greedy text is byte-identical across every run (the rule reads laws only).
+(1c) `RADIANCE_HY4_DFLY_QTEMP` (default 1.0) divides DFly2's top-8 shortlist by q_temp before the proposal is
+drawn (`mtp_couple_propose`'s `q_temp`; the state plane records the Q that was drawn from, so the output
+law is the target's for any value: `tests/mtp_rrs_test.cpp` chi-square at 0.6 / 0.8 / 1.5, and
+`work/g1g5/chi_qt.py` on the mini dummy, host TP1 / TP2 and cards TP1 / TP2). Sweep {1.0, 0.9, 0.8, 0.6}
+at T 0.9, six seed sets, one and eight clients (paired against q_temp 1.0, stop 0.3 / from 1): no value
+wins clearly (one client code +0.5 to +4 %, thinking +2 to +8 %, all inside 1 to 2 standard errors; four to
+eight clients 0 to -4 %), so the default stays 1.0. A lower q_temp raises the drafts the stop rule
+verifies (the walk looks surer) and lowers the acceptance per draft (0.61 -> 0.55 at 0.6). (2) The activation arena is lent to the expert slab and the prefill stager
 runs (`shape_probe_ok`; `RADIANCE_HY4_SHAPE_PROBE=0` is the A/B switch): startup lines `activation arena: 256
 tokens use ... of 1.33 GiB ... the rest is lent` and `prefill staging: a 521 MiB ring`. Against the same
 build with the switch off, sampled T 0.9, code prompts: prefill (8K to 40K tokens) +15 to +25 % (2.85 -> 3.3-3.45

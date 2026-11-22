@@ -71,6 +71,10 @@ struct Dfly {
     bool want = false;              /* the drafter's weights are declared (manifest) */
     bool served = false;            /* ... and its passes are built */
     bool sabotage = false;
+    /* RADIANCE_HY4_DFLY_QTEMP: the proposal law's temperature, Q = softmax(top-8 / q_temp). 1 (the
+     * default) is the shortlist's own law. Exact for any value: the verify couples against the Q the
+     * state plane records; only the acceptance moves (WP13.8 open item, G-5a). */
+    double q_temp = 1.0;
     /* --draft-coupling on (kernels/dfly2.md §8.2): each chain step samples its proposal from the
      * law of its top-8 shortlist (mtp_couple_propose, round k + 1) and stores that law for the
      * coupled verify. */
@@ -129,6 +133,12 @@ struct Dfly {
                 why = buf;
             }
         };
+        if (const char* qt = std::getenv("RADIANCE_HY4_DFLY_QTEMP"); qt && *qt) {
+            char* end = nullptr;
+            const double v = std::strtod(qt, &end);
+            if (end != qt && *end == 0 && v >= 0.05 && v <= 20.0) q_temp = v;
+            else no("RADIANCE_HY4_DFLY_QTEMP='%s' is no number in [0.05, 20]", qt);
+        }
         if (e && !std::strcmp(e, "0")) no("RADIANCE_HY4_DFLY=0");
         coupled = ctx->draft_coupling != 0;
         if (coupled && b && !rad_op_declared(b, "mtp_couple_propose"))
@@ -801,7 +811,8 @@ struct Dfly {
                 }
                 st.op_couple = mk(b, "mtp_couple_propose",
                                   { RAD_RANGE("M", 1, S), RAD_INT("n_vocab", s.n_vocab),
-                                    RAD_INT("round", k + 1), RAD_INT("max_rounds", depth) },
+                                    RAD_INT("round", k + 1), RAD_INT("max_rounds", depth),
+                                    RAD_F64("q_temp", q_temp) },
                                   {}, { cidx, cval, couple_draws }, { cidx, couple_state });
                 HY4_NEED(st.op_couple, "mtp_couple_propose");
             }

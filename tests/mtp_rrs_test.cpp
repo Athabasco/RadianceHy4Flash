@@ -61,6 +61,7 @@ struct Law {
     int32_t qid[8];  float qval[8];                    /* the head's shortlist */
 };
 
+int g_load_from = 2;   /* the fewest drafting rows of a step the load-aware rule decides (the engine's --draft-depth-load-from) */
 double g_sharp = 1.0;   /* the laws' inverse temperature: a peaked target (T = 0.7 and a top-p) is the engine's regime */
 
 Law law_at(uint64_t prefix_hash, double head_noise) {
@@ -1435,12 +1436,12 @@ LoadRun run_depth_load(const DraftDepthCfg& cfg0, int n_seq, bool trav, int tria
                         draft_depth_observe(&row[i], row[i].seen + 1,
                                             draft_depth_stat(t[(size_t)i].st[row[i].seen], row[i].seen + 1, cfg.stat));
                 bool any = false;
-                if (cfg.load && n > 1) any = draft_depth_go_load(cfg, row, n, j, other_rows);
+                if (cfg.load && n >= g_load_from) any = draft_depth_go_load(cfg, row, n, j, other_rows);
                 else for (int i = 0; i < n; ++i) any = draft_depth_go(cfg, &row[i], j) || any;
                 if (!any) break;
                 ran = j;
             }
-            if (late && n > 1 && ran >= 2) {
+            if (late && n >= g_load_from && ran >= 2) {
                 /* the driver's wait: every row observed up to the rounds the choice may read */
                 const int upto = late == 2 ? ran : std::max(1, ran - cfg.late_lag);
                 for (int i = 0; i < n; ++i)
@@ -1580,10 +1581,11 @@ TEST(load_aware_chain_depth_keeps_the_target_law) {
     /* `tile`: a 16-row tile's price with seven other rows in the step, so the third round's rows
      * open a tile and the rule picks which of them by their p. */
     struct C { int n, lag; double trow, tround, tile; const char* name; };
-    const C cs[] = { { 2, 1, 0.30, 0.25, 0.0, "2 rows lag1" }, { 3, 1, 0.35, 0.40, 0.0, "3 rows lag1" },
+    const C cs[] = { { 1, 1, 0.30, 0.25, 0.0, "1 row  lag1" }, { 2, 1, 0.30, 0.25, 0.0, "2 rows lag1" }, { 3, 1, 0.35, 0.40, 0.0, "3 rows lag1" },
                      { 3, 0, 0.30, 0.30, 0.0, "3 rows lag0" }, { 3, 1, 0.20, 0.05, 0.45, "3 rows tile" } };
     for (const C& c : cs) {
         DraftDepthCfg cfg = depth_cfg_load(4, c.lag, 0.40, c.trow, c.tround);
+        g_load_from = c.n == 1 ? 1 : 2;
         for (auto& jm : cfg.load_jump_ms) jm[0] = c.tile;     /* past 16 rows */
         for (int trav = 1; trav >= 0; --trav) {
             const LoadRun r = run_depth_load(cfg, c.n, trav != 0, trials, 0.6, c.tile > 0 ? 7 : 0);
@@ -1600,6 +1602,38 @@ TEST(load_aware_chain_depth_keeps_the_target_law) {
         }
     }
     g_sharp = 1.0;
+    g_load_from = 2;
+}
+
+/* --draft-depth-load-from 1: the rule at one drafting row is draft_depth_select by hand (price of
+ * a row 1.0 ms at 0.2 tok/ms: a draft is taken above 0.2 acceptance), and an exploring step
+ * (DraftDepthCfg::force) verifies the chain to the forced depth whatever the tables say. */
+TEST(load_aware_depth_at_one_row_is_the_select_by_hand_and_an_exploring_step_forces_the_chain) {
+    DraftDepthCfg c = depth_cfg_load(5, 1, 0.85, 0.2, 0.0);
+    c.load_lam[1] = 0.2; c.load_row_ms[1] = 1.0; c.load_round_ms[1] = 0.4;
+    for (int j = 0; j <= DraftDepthCfg::kCalRounds; ++j)
+        for (int t = 0; t < 3; ++t) {
+            for (int k = 0; k < DraftDepthCfg::kCalKnots; ++k) c.cal_p[t][j][k] = j < 2 ? 1.0 : 0.0;
+            c.cal_p[t][j][0] = 0.5; c.cal_p[t][j][1] = 0.1;   /* conf 0: 0.5, conf >= .3: 0.1 */
+        }
+    DraftDepthRow r;
+    draft_depth_begin(c, &r, false);
+    for (int k = 1; k <= 4; ++k) draft_depth_observe(&r, k, 0.9);
+    draft_depth_select(c, &r, 1, 4, 0);
+    /* acceptance 0.1 at conf ~.6 < 0.2 x 1.0 ms: only the rounds that always run (min 2) */
+    CHECK_EQ(r.depth, std::max(c.min, c.load_min));
+    c.force = 4;
+    draft_depth_begin(c, &r, false);
+    for (int k = 1; k <= 4; ++k) draft_depth_observe(&r, k, 0.9);
+    draft_depth_select(c, &r, 1, 4, 0);
+    CHECK_EQ(r.depth, 4);
+    /* the round rule agrees: rounds up to force run although the tables refuse them */
+    DraftDepthRow g;
+    draft_depth_begin(c, &g, false);
+    for (int j = 2; j <= 4; ++j) {
+        while (g.seen < draft_depth_need(c, j)) draft_depth_observe(&g, g.seen + 1, 0.9);
+        CHECK(draft_depth_go_load(c, &g, 1, j, 0));
+    }
 }
 
 TEST(late_choice_of_the_verify_rows_reads_each_draft_by_the_laws_up_to_its_own) {
@@ -2080,6 +2114,7 @@ struct BlockBooks {
  * noisy target at the drafted prefix (a law at the node x_0..x_{k-1}, the property the exactness
  * argument uses). */
 bool g_dfly = false;
+float g_qtemp = 1.0f;   /* DFly2's proposal temperature (mtp_couple_propose q_temp) */
 
 float bf16_round(float x) {
     uint32_t u;
@@ -2115,6 +2150,7 @@ void draft_dfly(Tree* const* t, int n, const uint64_t* seed, const uint64_t* bas
         c.idx = idx.data(); c.val = val.data(); c.card = card.data();
         c.draw = reinterpret_cast<const uint32_t*>(draws.data());
         c.state = reinterpret_cast<uint32_t*>(st.data());
+        c.q_temp = g_qtemp;
         c.M = n; c.vocab = 1000;
         c.ld_idx = 8; c.ld_val = 8; c.ld_draw = RAD_MTP_COUPLE_DRAW_WORDS;
         c.st_round = (int64_t)n * RAD_MTP_COUPLE_STATE_WORDS; c.st_row = RAD_MTP_COUPLE_STATE_WORDS;
@@ -2532,6 +2568,27 @@ TEST(dfly_coupled_chain_emits_the_target_law_under_every_verify) {
         CHECK(r.z3 < 4.5); CHECK(r.z1 < 4.5);
         CHECK(r.mean_acc > 0.3);
     }
+    g_sharp = 1.0; g_dfly = false;
+}
+
+/* G-5a: RADIANCE_HY4_DFLY_QTEMP scales the shortlist before mtp_couple_propose; the state plane
+ * records the Q that was drawn from, the verify couples against it, so the target law holds for any
+ * q_temp (it only moves acceptance). A sharper Q accepts more, a flatter one less, at this toy. */
+TEST(dfly_coupled_chain_emits_the_target_law_for_any_proposal_temperature) {
+    g_sharp = 2.0; g_dfly = true;
+    const DraftDepthCfg off{};
+    double acc1 = 0;
+    for (float qt : { 1.0f, 0.6f, 0.8f, 1.5f }) {
+        g_qtemp = qt;
+        for (BlockVerify how : { BV_ROW, BV_TRAV }) {
+            const DepthRun r = run_block(off, how, 250000, 0.6, 5);
+            std::printf("  dfly chain of 5, q_temp %.1f %-9s: z3=%.2f z1=%.2f acc=%.3f\n", qt, bv_name(how), r.z3, r.z1, r.mean_acc);
+            CHECK(r.z3 < 4.5); CHECK(r.z1 < 4.5);
+            if (qt == 1.0f && how == BV_ROW) acc1 = r.mean_acc;
+            if (qt != 1.0f && how == BV_ROW) CHECK(std::fabs(r.mean_acc - acc1) > 0.004);
+        }
+    }
+    g_qtemp = 1.0f;
     g_sharp = 1.0; g_dfly = false;
 }
 

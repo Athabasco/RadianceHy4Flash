@@ -3037,7 +3037,7 @@ resolutions of one op. The one exception is `sample_chain` (below).
 | `sample_argmax` | `M`(range) `n_vocab` | `logits`, `params` → `token` |
 | `sample_merge_topk` | `M`(range) `n_cand` | `gathered`, `params` → `cand_idx`, `cand_val` |
 | `sample_logprobs` | `M`(range) `n_vocab` `k` `vocab_off`/opt | `logits`, `params`? → `stats` |
-| `mtp_couple_propose` | `M`(range) `n_vocab` `round` `max_rounds` | `idx`:inout, `val`, `seq_ids`, `draw` → `state`:inout |
+| `mtp_couple_propose` | `M`(range) `n_vocab` `round` `max_rounds` `q_temp`:f64/opt | `idx`:inout, `val`, `seq_ids`, `draw` → `state`:inout |
 | `mtp_couple_verify` | `M`(range) `n_cand` `n_vocab` | `cand_idx`, `cand_val`, `params`, `state` → `token`:inout |
 | `mtp_trav_verify` | `M`(range) `n_cand` `n_vocab` | `cand_idx`, `cand_val`, `params`, `state` → `token`:inout, `topo` |
 | `dflash_couple_propose` | `M`(range) `steps` `top_k` `rank` `n_vocab` `anchor_stride` `max_rounds` `q_temp`:f64/opt | `cand`, `unary`, `hp`?, `anchor`, `pred`w, `succ`w, `seq_ids`, `draw`, `tokens`:inout → `state`:inout |
@@ -3054,7 +3054,7 @@ if it is set, it must name `spechub` or the coupled ops are not loaded at all.
 
 `mtp_couple_propose` runs on a draft round's
 final reranked top-8 and samples the proposal `x ~ Q`, where `Q` is the FP64 softmax of those
-scores at temperature 1; it writes `x` into column 0 of `idx` and one state row per round. A row
+scores divided by `q_temp` (default 1; DFly2's `RADIANCE_HY4_DFLY_QTEMP`: like DFlash2's it moves acceptance only, the state records the Q that was drawn from); it writes `x` into column 0 of `idx` and one state row per round. A row
 whose `seq_ids` does not name the card its draw was staged for, or whose shortlist is malformed,
 leaves column 0 alone with `status = -1`. `mtp_couple_verify` runs after `sample_pick`, over the same
 final candidate plane, and applies the maximal coupling: the draft is accepted when it equals the
