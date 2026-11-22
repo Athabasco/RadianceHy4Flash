@@ -84,6 +84,13 @@ int chain_probe(void* stream, unsigned* x, unsigned* seen, unsigned pairs, unsig
  * (tests/device_test.cpp). RAD_E_UNSUPPORTED in a build without the backend. */
 int chain_marks(void* stream, unsigned* seen, unsigned n);
 
+/* Holds every host read of `stream`'s chain completion counter `lag` behind what it reads (0 ends
+ * it), as an L2 that has not written the counter back leaves it: the slot wait must end anyway
+ * (aql.cpp, reserve and chain_flush). chain_flushes() counts the flushes such waits have put in.
+ * Tests only (tests/device_test.cpp). */
+void chain_read_lag(void* stream, uint64_t lag);
+uint64_t chain_flushes();
+
 /* `n` chained launches onto `stream`, each a card-side copy of `bytes` (a multiple of 16) from
  * `src` to `dst` that also stores at seen[i] whether it found a chain record in its argument
  * slot: i + 1 if every block did, that with the top bit set if one did not. A block that found

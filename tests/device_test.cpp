@@ -239,6 +239,47 @@ TEST(a_chained_launch_reads_its_own_arguments_after_the_ring_has_lapped) {
     rad_dev_chain_infer(0);
 }
 
+/* The host reads a queue's chain completion counter through the BAR, and the blocks add to it in
+ * the card's L2: on an idle card the read can stay behind for good. A served Hy4-flash came up,
+ * sat idle, and its first step's barrier waited on a slot whose kernel had long finished, the
+ * read 6 blocks short, the queues all idle (wr 7142 = rd, slot 3046 needing 970263, the read
+ * 970259). The lag here stands in for the L2: with every read held at 0, a lap of event records
+ * (barriers, which use no argument slot) behind chained launches must not wait at all, and a lap
+ * of chained launches must not wait for good: the wait puts a flush in front and its completion
+ * frees the slots. */
+TEST(a_slot_wait_ends_when_the_hosts_read_of_the_chain_counter_lags_for_good) {
+    if (std::strcmp(rad::device_backend_name(), "aql") != 0) SKIP("launches chain on the AQL backend only");
+    const unsigned n = 4096 + 517;
+    Stream st;
+    Event ev;
+    DevBuf<unsigned> seen((int64_t)n * sizeof(unsigned), RAD_MEM_DEVICE);
+    REQUIRE(!!seen);
+    std::vector<unsigned> got(n);
+    rad_dev_chain_infer(2);
+    CHECK_OK(rad_memset_async(seen, 0, (int64_t)n * sizeof(unsigned), st.s));
+    CHECK_OK(rad_stream_sync(st.s));
+    CHECK_OK(rad::aql::chain_marks(st.s, seen, 64));
+    CHECK_OK(rad_stream_sync(st.s));
+    rad::aql::chain_read_lag(st.s, ~0ull);
+    const uint64_t f0 = rad::aql::chain_flushes();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < 4096 + 64; ++i) CHECK_OK(rad_event_record(ev.e, st.s));
+    CHECK_OK(rad_stream_sync(st.s));
+    CHECK_EQ(rad::aql::chain_flushes(), f0);   /* barriers waited for room only */
+    CHECK_OK(rad::aql::chain_marks(st.s, seen, n));
+    CHECK_OK(rad_stream_sync(st.s));
+    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(rad::aql::chain_flushes() > f0);
+    CHECK(s < 30.0);
+    rad::aql::chain_read_lag(st.s, 0);
+    CHECK_OK(rad_memcpy_async(got.data(), seen, (int64_t)n * sizeof(unsigned), st.s));
+    CHECK_OK(rad_stream_sync(st.s));
+    unsigned wrong = 0;
+    for (unsigned i = 0; i < n; ++i) wrong += got[i] != i + 1u;
+    CHECK_EQ(wrong, 0u);
+    rad_dev_chain_infer(0);
+}
+
 /* The host writes a launch's arguments and chain record into VRAM through the BAR, and the card's
  * host data path keeps such a write until it is flushed (aql.cpp, host_writes_out). A launch the
  * card starts within a microsecond or two of its doorbell otherwise reads the slot as it was. What

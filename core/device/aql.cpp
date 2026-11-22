@@ -643,6 +643,17 @@ struct Stream {
      * counter value read so far, so the BAR read happens only on a miss. */
     std::vector<uint64_t> slot_need;
     uint64_t        chain_seen = 0;
+    /* The counter as the host reads it can lag the card for good: the blocks add to it in the
+     * card's L2 at agent scope, and the BAR read sees the line only once the L2 has written it
+     * back, which an idle card may never do. So a slot wait that the counter does not end on its
+     * own puts a barrier-bit packet onto the queue (chain_flush): its completion proves every
+     * block issued before it has counted, whatever the read shows. flush_sig is its signal
+     * (made on first use), flush_target the blocks issued before it, flush_out whether one is
+     * outstanding. test_lag is what the read is held back by (aql::chain_read_lag, tests). */
+    hsa_signal_t    flush_sig{};
+    uint64_t        flush_target = 0;
+    bool            flush_out = false;
+    uint64_t        test_lag = 0;
     /* The blocks issued before the last packet that depends on what precedes it: what a chained
      * kernel played beside that packet (an overlap) waits for, since it reads nothing issued
      * from that packet on. */
@@ -1112,18 +1123,49 @@ inline void full_nap() {
 inline bool slot_free(Stream* s, uint64_t idx) {
     const uint64_t need = s->slot_need[idx & s->mask];
     if (need <= s->chain_seen) return true;
-    s->chain_seen = *reinterpret_cast<volatile uint64_t*>(s->chain_ctr);
+    const uint64_t c = *reinterpret_cast<volatile uint64_t*>(s->chain_ctr);
+    s->chain_seen = std::max(s->chain_seen, c > s->test_lag ? c - s->test_lag : 0);
     return need <= s->chain_seen;
 }
 
-inline int reserve(Stream* s, uint64_t* out) {
-    const uint64_t idx = s->wr;
+int chain_flush(Stream* s);
+std::atomic<uint64_t> g_chain_flushes{0};
+std::atomic<uint64_t> g_barrier_passes{0};
+
+/* Reserves the next packet index, the queue lock held. `kargs` false for a packet that uses no
+ * argument slot (a barrier), which waits for ring room only: a chained kernel still holding the
+ * slot's arguments does not care what the packet in its ring position becomes once it has been
+ * read. A wait the counter alone does not end puts a flush in front (chain_flush), so the index
+ * handed out may be past the one the call found. */
+inline int reserve(Stream* s, uint64_t* out, bool kargs = true) {
     const uint64_t size = s->mask + 1;
-    if (idx + kReserveMargin - s->rd > size || !slot_free(s, idx)) {
+    auto room = [&](uint64_t i) { return i + kReserveMargin - s->rd <= size; };
+    /* What the barrier no longer waits for, said once a process: the read named the slot busy. */
+    if (!kargs && !slot_free(s, s->wr) &&
+        g_barrier_passes.fetch_add(1, std::memory_order_relaxed) == 0)
+        RAD_INFO("device: card %d queue %u: a barrier goes into a ring slot whose chained kernel the "
+                 "counter's read names unfinished (read %" PRIu64 ", slot needs %" PRIu64 ", %" PRIu64
+                 " issued); a barrier uses no argument slot and does not wait (logged once)", s->ord,
+                 s->id, s->chain_seen, s->slot_need[s->wr & s->mask], s->chain_issued);
+    if (!room(s->wr) || (kargs && !slot_free(s, s->wr))) {
         Stall st("a full queue");
         for (;;) {
             s->rd = hsa_queue_load_read_index_scacquire(s->q);
-            if (idx + kReserveMargin - s->rd <= size && slot_free(s, idx)) break;
+            if (s->flush_out && hsa_signal_load_scacquire(s->flush_sig) <= 0) {
+                s->flush_out = false;
+                s->chain_seen = std::max(s->chain_seen, s->flush_target);
+            }
+            const uint64_t idx = s->wr;
+            if (room(idx)) {
+                if (!kargs || slot_free(s, idx)) break;
+                /* The ring has room and the counter still names the slot busy: either the kernel
+                 * really runs (a flush then only waits for it too) or the read is stale. */
+                if (!s->flush_out && room(idx + 1) && s->gates.load(std::memory_order_relaxed) == 0) {
+                    const int rc = chain_flush(s);
+                    if (rc < 0) return rc;
+                    continue;
+                }
+            }
             if (s->fault.load(std::memory_order_relaxed)) return RAD_E_DEVICE;
             /* Behind a closed gate the queue drains only once the host opens it, and the host is
              * the one waiting here. */
@@ -1136,7 +1178,7 @@ inline int reserve(Stream* s, uint64_t* out) {
             full_nap();
         }
     }
-    *out = idx;
+    *out = s->wr;
     return RAD_OK;
 }
 
@@ -1373,11 +1415,49 @@ inline uint64_t blocks_of(const hsa_kernel_dispatch_packet_t* p) {
 static_assert(RAD_CHAIN_KARG_OFF >= kKargMax && RAD_CHAIN_KARG_OFF + RAD_CHAIN_REC_BYTES <= kKargSlot,
               "the chain record sits in an argument slot's tail, past every kernel's arguments");
 
+/* reserve()'s proof that the chained kernels issued so far have all counted: a barrier-bit packet
+ * with nothing to wait for and a system-scope release, at the ring position reserve() found free,
+ * the queue lock held. The packet processor starts it only once every packet in front has
+ * completed, chained kernels without their bit included, so its signal reaching 0 says the
+ * counter has reached flush_target on the card. It orders like any barrier: what follows keeps
+ * its bit. */
+int chain_flush(Stream* s) {
+    if (!s->flush_sig.handle &&
+        hsa_signal_create(1, 0, nullptr, &s->flush_sig) != HSA_STATUS_SUCCESS) {
+        s->flush_sig.handle = 0;
+        device_set_error("a queue's chain flush: no signal could be made");
+        return RAD_E_DEVICE;
+    }
+    const uint64_t idx = s->wr;
+    hsa_signal_store_screlease(s->flush_sig, 1);
+    s->flush_target = s->chain_issued;
+    s->flush_out = true;
+    s->prev_chained = false;
+    s->plain_inflight = false;
+    s->peer_inflight = false;
+    s->chain_frontier = s->chain_issued;
+    s->frontier_open = false;
+    auto* p = reinterpret_cast<hsa_barrier_and_packet_t*>(
+        static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) + (idx & s->mask));
+    p->reserved0 = 0;
+    p->reserved1 = 0;
+    for (int i = 0; i < 5; ++i) p->dep_signal[i].handle = 0;
+    p->reserved2 = 0;
+    p->completion_signal = s->flush_sig;
+    publish(s, idx, header(HSA_PACKET_TYPE_BARRIER_AND, HSA_FENCE_SCOPE_NONE, HSA_FENCE_SCOPE_SYSTEM), 0);
+    if (g_chain_flushes.fetch_add(1, std::memory_order_relaxed) == 0)
+        RAD_INFO("device: card %d queue %u: a slot wait the chain counter's read did not end (read "
+                 "%" PRIu64 ", slot needs %" PRIu64 ", %" PRIu64 " issued); a flush barrier ends it "
+                 "(logged once)", s->ord, s->id, s->chain_seen, s->slot_need[idx & s->mask],
+                 s->chain_issued);
+    return RAD_OK;
+}
+
 int barrier(Stream* s, hsa_signal_t dep, hsa_signal_t done, int acq, int rel,
             uint64_t* out_idx = nullptr) {
     s->lock();
     uint64_t idx = 0;
-    const int rc = reserve(s, &idx);
+    const int rc = reserve(s, &idx, false);
     if (rc < 0) { s->unlock(); return rc; }
     s->prev_chained = false;
     s->plain_inflight = false;
@@ -1551,12 +1631,13 @@ struct PlayRun {
             s->lock();
             foreign = moved(s);
         }
-        const uint64_t idx = s->wr;
+        uint64_t idx = s->wr;
         if (idx + kReserveMargin - s->rd > s->mask + 1 || !slot_free(s, idx)) {
             ring();
-            uint64_t got = 0;
-            const int rc = reserve(s, &got);
+            const int rc = reserve(s, &idx);
             if (rc < 0) return rc;
+            /* A flush in front was published and rung by reserve itself. */
+            next = s->wr;
         }
         auto* p = static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) + (idx & s->mask);
         std::memcpy(reinterpret_cast<char*>(p) + 4, reinterpret_cast<const char*>(&r.pkt) + 4,
@@ -1879,6 +1960,7 @@ void stream_close(Stream* s) {
     }
     note_free(s->karg);
     note_free(s->bounce);
+    if (s->flush_sig.handle) hsa_signal_destroy(s->flush_sig);
     hsa_amd_memory_pool_free(s->karg);
     hsa_amd_memory_pool_free(s->bounce);
     s->magic = 0;
@@ -1907,6 +1989,9 @@ int a_stream_create(RadStream* out, int high_priority) {
             r->agent_only = false;
             r->chain_issued = 0;
             r->chain_seen = 0;
+            r->flush_out = false;      /* drained: a flush it put in has completed */
+            r->flush_target = 0;
+            r->test_lag = 0;
             /* The counter reset above went through the BAR; the card's L2 may still hold the old
              * value. Make the first dispatch take the system acquire (the half-lap rule does even
              * on an agent_only stream, which the epoch rule does not), as at creation. */
@@ -4833,6 +4918,17 @@ int chain_asks(void* stream, const void* src, void* dst, uint64_t bytes, unsigne
     return RAD_OK;
 }
 
+void chain_read_lag(void* stream, uint64_t lag) {
+    if (Stream* s = ours(stream)) {
+        s->lock();
+        s->test_lag = lag;
+        s->chain_seen = 0;   /* so the next slot check reads the counter again */
+        s->unlock();
+    }
+}
+
+uint64_t chain_flushes() { return g_chain_flushes.load(std::memory_order_relaxed); }
+
 int chain_marks(void* stream, unsigned* seen, unsigned n) {
     if (!ours(stream) || !seen) return RAD_E_INVAL;
     for (unsigned i = 0; i < n; ++i)
@@ -5154,6 +5250,8 @@ bool ride_reusable(void*) { return false; }
 int chain_probe(void*, unsigned*, unsigned*, unsigned, unsigned) { return RAD_E_UNSUPPORTED; }
 int chain_marks(void*, unsigned*, unsigned) { return RAD_E_UNSUPPORTED; }
 int chain_asks(void*, const void*, void*, uint64_t, unsigned*, unsigned) { return RAD_E_UNSUPPORTED; }
+void chain_read_lag(void*, uint64_t) {}
+uint64_t chain_flushes() { return 0; }
 }  // namespace aql
 }  // namespace rad
 
