@@ -1375,7 +1375,12 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         /* This rank's range within one plain expert, in model numbering; `phi` 0 is the even split,
          * which the loader divides itself. */
         int64_t plo = 0, phi = 0;
-        if (split) {
+        /* A plugin that slices every expert evenly (hyv4flash: `n_ff_exp` is the rank's share of
+         * `n_ff_all`, no `ff_hi`) has `split` false, yet the file stores each bf16 expert whole:
+         * the loader cuts the rank's share, so the weight is declared sharded at the share's
+         * extents like the quantised experts', not as an unsharded slice. */
+        const bool even_slice = !split && !ep && g.world > 1 && g.n_ff_all > c.n_ff_exp;
+        if (split || even_slice) {
             /* The expert's whole width: `n_ff_all` (the max of `ff_hi` is the whole width only at
              * two ranks). A plain expert has no scale blocks, so the unit is the GEMM's 64-wide
              * output tile. */

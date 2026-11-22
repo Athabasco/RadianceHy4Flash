@@ -1153,6 +1153,50 @@ TEST(quantised_experts_are_sliced_at_more_ranks) {
     CHECK_EQ(Declared(nl, 2, 0, true).rc, RAD_E_UNSUPPORTED);
 }
 
+/* A recipe that keeps a few experts bf16 beside quantised ones (the friend's hy4-flash-iqr-v4: 50
+ * whole bf16 experts, the rest u4 trellis / w4nl64). The container stores every bf16 expert whole,
+ * so at more ranks each is declared sharded at its share's extents like the quantised experts, for
+ * the loader to cut (it was declared as an unsharded slice, which the loader refused as "the file
+ * stores the whole expert"). */
+TEST(bf16_experts_beside_quantised_ones_are_sliced_with_them) {
+    auto mixed = [](RadBuilder* b) {
+        bf16_encs(b);
+        b->encs.clear();
+        for (const char* e : { "3", "6" })
+            for (const char* p : { "ffn_gate_up_exps", "ffn_down_exps" })
+                b->encs.push_back({ std::string("blk.2.") + p + "." + e + ".",
+                                    rad_enc_plain(RAD_BF16) });
+        b->encs.push_back({ "ffn_gate_up_exps", enc_nl64(4) });
+        b->encs.push_back({ "ffn_down_exps", enc_nl64(4) });
+        b->kv_block_by_consumer = true;
+    };
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            Declared d(+mixed, world, rank, true, 512);
+            REQUIRE_EQ(d.rc, RAD_OK);
+            const RadBuilder& b = d.b;
+            const int64_t F = 512 / world;
+            for (int e = 0; e < 8; ++e) {
+                char n[64];
+                std::snprintf(n, sizeof n, "blk.2.ffn_gate_up_exps.%d.weight", e);
+                const RecWeight* gu = find_w(b, n);
+                REQUIRE(gu != nullptr);
+                CHECK_EQ(gu->d.shape[0], 2 * F);
+                if (world > 1) {
+                    CHECK_EQ(gu->d.shard, (int)RAD_SHARD_ROW);
+                    CHECK_EQ(gu->d.n_row_parts, 2);
+                }
+                std::snprintf(n, sizeof n, "blk.2.ffn_down_exps.%d.weight", e);
+                const RecWeight* dn = find_w(b, n);
+                REQUIRE(dn != nullptr);
+                CHECK_EQ(dn->d.shape[1], F);
+                if (world > 1) CHECK_EQ(dn->d.shard, (int)RAD_SHARD_COL);
+            }
+            every_weight_read(d.b);
+            steps_clean_at(d.b, rank, world);
+        }
+}
+
 /* ================================================================== DFly2 (WP13.3) */
 namespace {
 /* mini with its drafter configured as ref/minicfg.py writes it: one draft layer over trunk layer
