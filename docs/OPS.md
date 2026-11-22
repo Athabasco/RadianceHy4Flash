@@ -3763,7 +3763,7 @@ refuses the graph rather than resolving a similar op.
 | `mla_project_kv` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `mode` `dtype` | `a`, `b`w → `y` |
 | `mla_expand_gate` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `dtype` | `x`, `w`w, `g` → `y` |
 | `mla_expand_gate_had_quant_i8g` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `group` `dtype` | `x`, `w`w, `g` → `q`, `scale`, `out_bf16`? |
-| `mla_attn_paged_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `block_size` `window` `scale`:f64 `dtype` `stable`/opt | `q`, `q_rope`, `kv`, `block_table`, `seqused`, `cu_seqlens`, `sinks`w → `out` |
+| `mla_attn_paged_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `block_size` `window` `scale`:f64 `dtype` `stable`/opt `row0`/opt | `q`, `q_rope`, `kv`, `block_table`, `seqused`, `cu_seqlens`, `sinks`w → `out` |
 | `mla_attn_sel_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `blocks` `block_size` `scale`:f64 `dtype` `stable`/opt | `q`, `q_rope`, `kv`, `bt`, `length`, `sinks`w → `out` |
 | `mla_row_norm_rope_store` | `M`(range) `latent` `rope_dim` `eps`:f64 `theta`:f64 `scale`:f64/opt `mode`/opt `sections`/opt `block_size` `dtype` | `row`:inout, `w`w, `positions`, `slot_mapping`, `kv_cache`:inout |
 | `mla_kv_split` | `M`(range) `heads` `k_dim` `v_dim` `rope_dim` `dtype` | `kvb`, `k_rope` → `k`, `v` |
@@ -3903,7 +3903,11 @@ maximum is taken (libref shifts by the maximum of the scores and the sink).
   gate acts after the expansion: `gate_mul`). Sequence `s` owns rows `[cu[s], cu[s+1])`; row `i`
   sits at `p = seqused[s] - qlen + i` and sees keys `[max(0, p - window + 1), p]`, **the window
   counting the row's own token** (512 means the own token and the 511 before it; `window 0` is all
-  of `0..p`). A page id < 0 or >= the pool contributes nothing.
+  of `0..p`). A page id < 0 or >= the pool contributes nothing. **`row0`** (optional, default 0)
+  adds to `p`: the pipelined prefill's piece at rows `[row0, row0 + M)` of a one-sequence step asks
+  this way for its queries' absolute positions, which the `seqused - qlen + i` form cannot give
+  (that is the last `qlen` rows' formula). `cu_seqlens` stays the step's own and `M` is the piece's,
+  so with `row0` 0 and `M` the step's rows nothing changes.
 - **`mla_attn_sel_sink`** is `mla_attn`'s form: row `r` reads tokens `[0, length[r])` through its
   own table row `bt[r]` (page `bt[r][t / block_size]`, slot `t % block_size`); `length` is clamped to
   `blocks * block_size`. With a table that lists a sequence's pages in order it equals

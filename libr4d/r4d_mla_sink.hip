@@ -82,12 +82,15 @@ struct SinkMeta {
     /* splits: the launch's slots (grid z, the partial pitch; 1 = unsplit), law: the law's slot
      * count, sc_shift: log2 of the super-chunk, fused: an unsplit launch that still runs the law
      * (one workgroup walks the row's slots in order and folds each into an accumulator in the
-     * scratch as merge_sink folds the partials). */
-    int rows, heads, seqs, blocks, bs, bs_shift, pages, splits, law, sc_shift, fused, window;
+     * scratch as merge_sink folds the partials). row0: the absolute row the launch's row 0 stands
+     * for -- 0 for a whole step, the piece's offset for the pipelined prefill's first piece (a
+     * piece at rows [row0, row0 + rows) of a one-sequence step is asked for its queries' absolute
+     * positions, which `used - qlen + i` cannot give: that is the last qlen rows' formula). */
+    int rows, heads, seqs, blocks, bs, bs_shift, pages, splits, law, sc_shift, fused, window, row0;
     float scale;
-    int pad = 0; /* no tail padding: a recorded pass's audit compares the argument's bytes */
+    int pad[2] = { 0, 0 }; /* no tail padding: a recorded pass's audit compares the argument's bytes */
 };
-static_assert(sizeof(SinkMeta) == 12 * 8 + 12 * 4 + 4 + 4, "SinkMeta is a kernel argument by value "
+static_assert(sizeof(SinkMeta) == 12 * 8 + 13 * 4 + 4 + 8, "SinkMeta is a kernel argument by value "
               "and carries no padding");
 
 /* r4d_mla_sink_pin_form: 0 the launcher's rule, 1 sixteen heads a workgroup, 2 thirty-two, 3 the
@@ -113,7 +116,7 @@ __device__ __forceinline__ void sink_range(const int* used, const int* cu, const
     } else {
         const int s = sink_seq(cu, m.seqs, r);
         const int qlen = cu[s + 1] - cu[s], i = r - cu[s];
-        const long p = (long)used[s] - qlen + i;
+        const long p = (long)used[s] - qlen + i + m.row0;
         const long top = p + 1 < 0 ? 0 : p + 1 < cap ? p + 1 : cap,
                    bottom = m.window > 0 && p + 1 - m.window > 0 ? p + 1 - m.window : 0;
         hi = (int)top;
@@ -641,6 +644,7 @@ int sink_body(const RadArgs* a, RadStream stream) {
                       sink_shift(SEL, window),
                       fused,
                       (int)window,
+                      SEL ? 0 : (int)r4d_geti_or(a, "row0", 0),
                       scale };
     const auto* qp = (const uint16_t*)q.data;
     const auto* rp = (const uint16_t*)qr.data;
