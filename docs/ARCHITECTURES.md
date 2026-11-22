@@ -3761,6 +3761,38 @@ rank either way), the mover keeps demote copies (24 GiB d2h in a no-speculation 
 everything" mirror mode exists; the larger budget only feeds the KV cache. It needs `ttm.pages_limit` and
 the memlock limit above the extra pinned bytes.
 
+**TP2 recipe, decode stalls while a prompt arrives (measured 2026-11-22, `work/sweep`, BetterBench `--workload`, 2 and 4
+background streams, 90 s a level, arrivals 2K to 32K every 15 s; u3 coupled, T 0.9, 210 W, `max-num-batched-tokens: 2048`).**
+Default (`busy-prefill-chunk: auto`, `prefill-interleave: auto:1`): worst stall 0.76 s (2 streams) / 0.81 s (4), stall p99 0.71 s,
+whatever the arrival depth; background decode per stream falls to 47 % (33 vs 70 tok/s at two, 24 vs 48 at four) inside arrival
+windows; arrival TTFT at 16K 9.5 / 10.3 s against 3.4 s cold. On this container `auto` floors a shared chunk at 1024 tokens (the
+stager's smallest pass, startup line `prefill staging`), not 4097. Cold prefill is the same in every row (3.96K tok/s at 2K,
+3.50K at 16K, 2.96K at 64K): the knobs act only while other sequences decode.
+
+| setting | worst stall 2 / 4 streams | stall p99 2 / 4 | bg tok/s per stream in window 2 / 4 | 16K arrival TTFT p50 2 / 4 |
+|---|---|---|---|---|
+| auto (default) | 762 / 812 ms | 713 / 715 ms | 33.4 / 24.4 | 9.5 / 10.3 s |
+| `busy-prefill-chunk: 1024` | 675 / 684 ms | 670 / 676 ms | 36.1 / 23.0 | 15.1 / 14.8 s |
+| **`busy-prefill-chunk: 512`** (2 runs) | 455, 445 / 503, 513 ms | 374, 369 / 418, 422 ms | 37.0, 44.0 / 26.7, 26.3 | 16.1, 15.4 / 16.9, 16.7 s |
+| `busy-prefill-chunk: 256` | 384 / 444 ms | 270 / 348 ms | 44.9 / 28.0 | 21.6 / 24.6 s |
+| `mixed-step-target-ms: 300` (2 runs) | 422, 385 / 374, 407 ms | 311, 303 / 317, 332 ms | 39.9, 37.8 / 27.5, 28.0 | 19.8, 20.5 / 25.4, 25.4 s |
+| `mixed-step-target-ms: 150` | 406 / 254 ms | 163 / 174 ms | 45.5 / 33.3 | 30.7 / 55.5 s |
+| `prefill-interleave: 0` | 712 / 710 ms | 712 / 710 ms | 7.7 / 7.4 | 5.0 / 5.5 s |
+| `prefill-interleave: 2` | 717 / 714 ms | 714 / 712 ms | 17.3 / 15.0 | 6.1 / 7.1 s |
+| `prefill-interleave: auto:2` | 795 / 716 ms | 706 / 712 ms | 47.4 / 30.7 | 14.3 / 15.7 s |
+| `busy-prefill-chunk: 1024` + `auto:2` | 766 / 781 ms | 667 / 681 ms | 41.0 / 28.0 | 21.3 / 23.1 s |
+
+Reading: the stall is the chunk step, and only a smaller chunk (or the learned cap) shortens it; `prefill-interleave` changes
+how often decoders get a step between chunks (decode rate in the window, TTFT) but not how long a chunk step blocks them (stall
+stays 0.71 s). Recommendation for interactive multi-user serving: `busy-prefill-chunk: 512`, which halves the stall (p99 0.71 to
+0.37-0.42 s) for +60 % arrival TTFT and no change in cold prefill; it is below the stager's 1024-token step, so startup warns
+and a chunk that is held back reads its routed experts synchronously (the arrival prefills slower, not the idle server).
+`mixed-step-target-ms: 300` gives the same stall (0.39-0.42 s) without the warning but 2.5x TTFT; 150 and 256 buy a further
+0.1-0.2 s for 2-5x TTFT and are not recommended. Keep `auto` for a server whose arrivals matter more than the decoders' cadence
+(batch or agent traffic): there is no setting below about 0.37 s of stall in this sweep, and nothing here changes a greedy
+token. Prefix cache and KV pool are unchanged (configuration only).
+
+
 **Losslessness** is the gate, since a draft can never change the text: (1) `hyv4flash_arch_test`
 (the declared graph at one, two and four ranks, lint clean on every step kind, the query pass touching
 no trunk state, the refusals above, quantised linears at TP1 and TP2); (2) greedy ids and logprobs
