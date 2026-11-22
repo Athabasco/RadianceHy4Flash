@@ -1195,36 +1195,6 @@ TEST(a_sizing_declare_matches_the_real_one_and_leaves_its_model_alone) {
     CHECK_EQ(p.shape_probe_ok, 1);
 }
 
-/* A sizing declare (RadBuildCtx::shape_probe) at a smaller step declares the same ops and buffers,
- * every buffer at most as tall and no other extent changed, and leaves the served model alone:
- * the real declare's steps still issue its own handles. The probe says so (shape_probe_ok). */
-TEST(a_sizing_declare_matches_the_real_one_and_leaves_its_model_alone) {
-    {
-        Declared d;
-        REQUIRE_EQ(d.rc, RAD_OK);
-        RadBuilder pb;
-        bf16_encs(&pb);
-        RadBuildCtx pc = build_ctx();
-        pc.max_tok = 64;
-        pc.shape_probe = 1;
-        REQUIRE_EQ(hyv4flash::declare(&pb, d.mk.meta(), &pc), RAD_OK);
-        REQUIRE_EQ(pb.ops.size(), d.b.ops.size());
-        for (size_t k = 0; k < pb.ops.size(); ++k) CHECK_EQ(pb.ops[k].op, d.b.ops[k].op);
-        REQUIRE_EQ(pb.bufs.size(), d.b.bufs.size());
-        for (size_t k = 0; k < pb.bufs.size(); ++k) {
-            const auto &q = pb.bufs[k].d, &f = d.b.bufs[k].d;
-            CHECK_EQ(pb.bufs[k].name, d.b.bufs[k].name);
-            CHECK_EQ(q.rank, f.rank);
-            CHECK(q.shape[0] <= f.shape[0]);
-            for (uint32_t x = 1; x < f.rank; ++x) CHECK_EQ(q.shape[x], f.shape[x]);
-        }
-        steps_clean_at(d.b, 0, 1);
-    }
-    RadArchProbe p{};
-    CHECK_OK(hyv4flash::probe(mini_meta().meta(), &p));
-    CHECK_EQ(p.shape_probe_ok, 1);
-}
-
 /* The Engram table as E4M3 rows under a bf16 or an f32 scale a row (hy4-flash-bf16.recipe,
  * hy4-flash-bf16-f32.recipe): the scale view at the stored dtype, no runtime round trip. */
 TEST(the_engram_table_takes_a_bf16_or_an_f32_row_scale) {
