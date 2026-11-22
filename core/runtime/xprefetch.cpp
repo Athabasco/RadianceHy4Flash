@@ -343,7 +343,7 @@ int Ctx::xp_predict(const RadPrefetchNext* nx, rad_buf h, int64_t r0, int64_t ro
 }
 
 int Ctx::xp_mark() {
-    if (!xp_) return RAD_OK;
+    if (!xp_ && !pace_hook_) return RAD_OK;
     if (!rec_) return xp_mark_run();
     TapeStep st;
     st.kind = kTapeXpMark;
@@ -432,6 +432,9 @@ int Ctx::xp_predict_run(const RadPrefetchNext& nx, rad_buf h, int64_t r0, int64_
 }
 
 int Ctx::xp_mark_run() {
+    /* The mover's paced copies first: they ride on the same next dispatch. */
+    if (pace_hook_) RAD_TRY(pace_hook_(cur_stream()));
+    if (!xp_) return RAD_OK;
     XpState& x = *xp_;
     if (!x.pend.valid) return RAD_OK;
     /* Refused only while another ride waits on the stream; the list then starts unmarked. */

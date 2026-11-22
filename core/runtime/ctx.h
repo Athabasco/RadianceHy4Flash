@@ -28,6 +28,7 @@
 #include <memory>
 #include <string>
 #include <deque>
+#include <functional>
 #include <vector>
 #include <unordered_map>
 
@@ -339,6 +340,11 @@ public:
     int  xp_predict(const RadPrefetchNext* next, rad_buf h, int64_t r0, int64_t rows, int64_t n_embd);
     int  xp_mark();
     int  xp_step(int layer);
+    /* The mover's pacing at the same mark (Mover::pace_mark, expert streaming X1 b): set at
+     * bringup, before any pass is recorded, so recorded passes carry the mark as a host step.
+     * Called with the compute stream at each routed layer's mark, also where the prefetch is off. */
+    void set_pace_hook(std::function<int(RadStream)> f) { pace_hook_ = std::move(f); }
+    bool xp_on() const { return xp_ != nullptr; }
     /* Drain, do not sample. `next_histogram` returns the oldest bank holding a landed histogram
      * for a step in (`after_step`, `before_step`), or -1. A caller loops on it with the step it
      * last credited, so it sees every histogram in order. The readers below take that bank; they
@@ -732,6 +738,7 @@ private:
 
     /* The expert prefetch's state (xp_state.h), null while it is off. */
     std::unique_ptr<XpState> xp_;
+    std::function<int(RadStream)> pace_hook_;
     void xp_free(XpState& x);
     void xp_serve(XpState& x);
     void xp_judge(XpState& x);
