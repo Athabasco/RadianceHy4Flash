@@ -54,6 +54,8 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
 
     n_layer_ = 0;
     for (const MoveUnit& mu : plan.units) n_layer_ = std::max(n_layer_, mu.layer + 1);
+    layer_routed_.assign((size_t)n_layer_, Relaxed<uint64_t>(0));
+    layer_missed_.assign((size_t)n_layer_, Relaxed<uint64_t>(0));
     res_count_.assign((size_t)n_layer_, 0);
 
     /* Each layer's units by expert id, and each slot's other movable units in plan order (slot
@@ -255,6 +257,8 @@ void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert,
     stats_.routed += (uint64_t)routed * passes;
     stats_.routed_resident += (uint64_t)resident * passes;
     stats_.stream_bytes += (uint64_t)miss * passes;
+    layer_routed_[l] += (uint64_t)routed * passes;
+    layer_missed_[l] += (uint64_t)(routed - resident) * passes;
     ++stats_.dispatches;
 }
 

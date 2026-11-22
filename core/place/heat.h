@@ -280,6 +280,18 @@ public:
     /* A snapshot by value: the counters are atomics read while the dispatch thread writes them.
      * Engine-internal decisions must use the individual counters (`warm`), not a snapshot. */
     HeatStats stats() const { return stats_.snapshot(); }
+    /* Per routed layer: experts routed and of them not resident (read in place across the link),
+     * counted on the same pass as `routed` / `routed_resident` and weighted alike. Readable from
+     * the HTTP thread (relaxed counters, sized at init). Empty before init. */
+    void layer_counts(std::vector<int64_t>* routed, std::vector<int64_t>* missed) const {
+        routed->assign(layer_routed_.size(), 0);
+        missed->assign(layer_missed_.size(), 0);
+        for (size_t l = 0; l < layer_routed_.size(); ++l) {
+            (*routed)[l] = (int64_t)layer_routed_[l].load();
+            (*missed)[l] = (int64_t)layer_missed_[l].load();
+        }
+    }
+    const HeatParams& params() const { return params_; }
 
     /* Exit banner, ending with the per-layer resident counts, which show whether every layer kept
      * its share of slots. */
@@ -290,6 +302,7 @@ private:
     bool       enabled_ = false;
     int32_t    n_layer_ = 0;
     HeatCounters stats_;
+    std::vector<Relaxed<uint64_t>> layer_routed_, layer_missed_;
 
     /* Heat by position, not by unit. Each layer owns a run of positions whose front is indexed by
      * expert: expert e of layer l is at slot_lo_[l] + e, whether or not the plan has a unit for it

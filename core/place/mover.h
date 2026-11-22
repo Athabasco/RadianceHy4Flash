@@ -330,6 +330,17 @@ struct MoverConfig {
     /* Pinned staging buffers for file-tier reads, one class stride each; the count the planner
      * charged to --host-pool-mib. */
     int stage_slots = RAD_PLACE_FILE_STAGE_SLOTS;
+
+    /* Pacing of a step's promotion copies (expert streaming X1 b). Off (0): a step's swaps go to
+     * the DMA engine as one list right behind the pass, and the card runs them under the in-place
+     * reads of the next pass's first routed layers, which share the upstream link with them. On,
+     * the promotions of the step (Engine::tiering_dispatch) are held on the host and sent from the
+     * next pass's routed layers' marks (pace_mark, behind each routed down GEMM), so they cross
+     * the link between the routed GEMMs: -1 spreads them evenly over the pass's marks, N > 0 sends
+     * at most N a mark. What a pass did not send goes out unpaced at the next dispatch. Demotions
+     * and every other move are never held. Bytes and their destinations do not change. The
+     * engine turns it on (-1) where no drafter runs (engine_bringup.cpp, RADIANCE_XS_PACE). */
+    int pace_units = 0;
 };
 
 /* ------------------------------------------------------------------ the loan */
@@ -358,6 +369,10 @@ struct MoverStats {
     /* Host copies given to budgeted victims (Mover::donor_slot); donors moved rather than
      * dropped by a recall or shrink; recalls that found no free slot for a donor. */
     uint64_t donated = 0, relocated = 0, stranded = 0;
+    /* Promotions publish_landed() published before the pass that followed their copy, rather than
+     * behind it. Pacing (MoverConfig::pace_units): promotion copies sent from a routed layer's
+     * mark, the marks that sent any, and copies still held when the pass ended (sent unpaced). */
+    uint64_t early_published = 0, paced_units = 0, paced_marks = 0, paced_late = 0;
     uint64_t ssd_reads = 0, ssd_bytes = 0;
     /* The staging leg of the same bytes: the file stager's copies from its pinned windows
      * into the VRAM staging buffer, which cross the link. Moves out of h2d_bytes so the
@@ -398,7 +413,8 @@ struct MoverCounters {
                       staged_units, staged_bytes, stage_overflow, stage_copies, ssd_staging_bytes,
                       ssd_promotions, ssd_promoted_bytes, ssd_deposits, ssd_deposit_bytes,
                       pool_evictions, ssd_layers, ssd_units, ssd_read_bytes, ssd_preads,
-                      ssd_read_ns, ssd_wait_ns, ssd_skipped_units, ssd_skipped_bytes;
+                      ssd_read_ns, ssd_wait_ns, ssd_skipped_units, ssd_skipped_bytes,
+                      early_published, paced_units, paced_marks, paced_late;
 
     MoverStats snapshot() const {
         MoverStats s;
@@ -438,6 +454,10 @@ struct MoverCounters {
         s.ssd_wait_ns        = ssd_wait_ns;
         s.ssd_skipped_units  = ssd_skipped_units;
         s.ssd_skipped_bytes  = ssd_skipped_bytes;
+        s.early_published    = early_published;
+        s.paced_units        = paced_units;
+        s.paced_marks        = paced_marks;
+        s.paced_late         = paced_late;
         return s;
     }
 };
@@ -503,6 +523,28 @@ public:
     int begin_dispatch(int dispatch, HeatEngine* heat);
     int prefetch_to_op(int32_t op_index);
     int issue(const Swap& s, HeatEngine* heat);
+
+    /* ---- expert streaming X1 --------------------------------------------------------------
+     *
+     * publish_landed: the retire half of begin_dispatch alone, called right before a pass is
+     * issued, so a promotion whose copy landed since the last dispatch is read from VRAM by that
+     * pass instead of the one after it. Held (paced) copies stay held. Counted in
+     * MoverStats::early_published.
+     *
+     * Pacing (MoverConfig::pace_units): pace_collect(true) around a step's issue/balance holds
+     * their promotion copies; pace_begin before the next pass sets the share a mark sends, from
+     * the marks the last pass made (`marks_hint` before any); pace_mark at each routed layer's
+     * mark sends the next share behind a ride on the compute stream `cs` (the stream waits for
+     * nothing). pace_flush sends what is left, unpaced; every other flush sends held copies too,
+     * so a drain or a recall never waits on a copy that was not sent. */
+    int  publish_landed(HeatEngine* heat);
+    bool pacing() const { return cfg_.pace_units != 0; }
+    int  pace_units() const { return cfg_.pace_units; }
+    void pace_collect(bool on) { pace_collect_ = on && pacing(); }
+    void pace_begin(int marks_hint);
+    int  pace_mark(RadStream cs);
+    int  pace_flush();
+    size_t pace_held() const { return held_.size() - held_next_; }
 
     /* ---- the loan: VRAM another pool is not using ------------------------------------------
      *
@@ -733,9 +775,13 @@ private:
         int64_t  pool_slot = -1;
         int64_t  to_slot = -1;
         RadEvent ev = nullptr;
+        /* A promotion whose copy pacing holds on the host: `ev` is not recorded for it yet, so
+         * retire must not query it. */
+        bool     held = false;
 
         void clear() {
             state = State::Free;
+            held = false;
             unit = -1;
             slab_slot = pool_slot = to_slot = -1;
         }
@@ -822,7 +868,19 @@ private:
     std::vector<RadCopySeg> move_segs_;
     std::vector<int32_t>    move_recs_;
     void queue_move_copy(void* dst, const void* src, int64_t bytes, int rec);
-    int  flush_moves();
+    /* `with_held` false keeps paced promotion copies held (publish_landed). */
+    int  flush_moves(bool with_held = true);
+    /* Pacing's held promotion copies, in the order the step issued them (hottest swaps first),
+     * `held_next_` the first not yet sent; each one's move record has `held` set. */
+    struct Held { RadCopySeg seg; int32_t rec; };
+    std::vector<Held>       held_;
+    size_t                  held_next_ = 0;
+    bool                    pace_collect_ = false;
+    int                     pace_quota_ = 0;      /* units a mark sends this pass */
+    int                     pace_marks_ = 0;      /* marks seen this pass */
+    int                     pace_marks_last_ = 0; /* marks the last pass made */
+    std::vector<RadCopySeg> pace_segs_;
+    int  send_held(size_t n);
     std::vector<ClassPools> pools_;
     std::vector<UnitState>  unit_;
     std::vector<Move>       moves_;
@@ -917,7 +975,7 @@ private:
      * taken, so starting there keeps the search short when lent slots put many in flight. */
     mutable size_t       rec_cursor_ = 0;
 
-    int  retire(HeatEngine* heat);
+    int  retire(HeatEngine* heat, bool with_held = true);
     int  record_gate();
     void republish(int32_t unit);
     void* reserve(const char* what, int64_t bytes, int kind);

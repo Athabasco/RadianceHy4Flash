@@ -493,6 +493,12 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             e["tiers"] = std::move(tiers);
             e["layer_units"]    = s.experts.layer_units;
             e["layer_resident"] = s.experts.layer_resident;
+            e["layer_routed"]   = s.experts.layer_routed;
+            e["layer_missed"]   = s.experts.layer_missed;
+            e["early_published"] = s.experts.early_published;
+            e["paced_units"]     = s.experts.paced_units;
+            e["paced_marks"]     = s.experts.paced_marks;
+            e["paced_late"]      = s.experts.paced_late;
             e["promotions"] = s.experts.promotions;
             e["demotions"]  = s.experts.demotions;
             e["distinct_promoted"] = s.experts.distinct_promoted;

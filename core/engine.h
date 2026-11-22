@@ -69,6 +69,8 @@ class XsTally;
 struct VramFacts;   /* mem/vram_budget.h */
 struct WeightFootprint;   /* place/planner.h */
 
+class RouteTrace;
+
 class Engine {
 public:
     explicit Engine(Config cfg);
@@ -267,6 +269,11 @@ private:
 
     /* --expert-stats FILE (place/xstats.h); null without the flag. */
     std::unique_ptr<ExpertStats> xstats_;
+    /* RADIANCE_ROUTE_TRACE=FILE (place/rtrace.h): rank 0's credited routing; null without it. */
+    std::shared_ptr<class RouteTrace> rtrace_;
+    /* Expert streaming X1 (a): publish the mover's landed promotions right before a pass is
+     * played (RADIANCE_XS_EARLY_PUBLISH, default on). */
+    bool xs_early_publish_ = true;
 
     RadModelMeta   meta_{};
     LoadedPlugins  plugins_;

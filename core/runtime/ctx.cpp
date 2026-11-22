@@ -1338,7 +1338,7 @@ int Ctx::play_pass(PassTape& t) {
         }
         case kTapeXpMark:
             lane_ = st.lane;
-            rc = xp_ ? xp_mark_run() : RAD_OK;
+            rc = xp_ || pace_hook_ ? xp_mark_run() : RAD_OK;
             lane_ = l0;
             break;
         case kTapeXpStep:

@@ -3889,6 +3889,14 @@ int Engine::load_weights() {
         /* The lent slots kept free for swaps follow the swaps asked for (mover.h): a rank that
          * holds nearly all its experts gets the idle ones back as residents. */
         mc.turnover_adaptive = true;
+        /* Expert streaming X1 (b), kernels/experts-streaming.md: RADIANCE_XS_PACE -1 spreads a
+         * step's promotion copies over the next pass's routed layers, N > 0 sends N a layer, 0
+         * sends them as one list behind the pass. Bytes do not change. Default: spread without a
+         * drafter (Hy4-flash TP2, eight distinct streams: +2-3 % decode, the in-place reads of
+         * the first routed layers no longer share the link with the copies); off with one, where
+         * verify passes measured 3-7 % slower with it (notes/xs-1.md). */
+        mc.pace_units = drafter_.kind == RAD_DRAFT_NONE ? -1 : 0;
+        if (const char* e = std::getenv("RADIANCE_XS_PACE"); e && *e) mc.pace_units = std::atoi(e);
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool
          * is as full as it will get; a load stopping with zero free is a placement failure, not
@@ -3900,7 +3908,28 @@ int Engine::load_weights() {
 
         /* The heat engine, bound to the same plan. On a static plan (all_vram, --deterministic) it
          * returns RAD_OK with `enabled() == false`. */
-        RAD_TRY(r->heat.init(r->plan, HeatParams{}));
+        /* Expert streaming X0.3: the heat engine's parameters from the environment, for replay
+         * and A/B runs (RADIANCE_HEAT_DECAY, _HYSTERESIS, _MIN_GAIN, _MOVES, _CREDIT_CAP); the
+         * startup line of HeatEngine::init says what is in force. */
+        HeatParams hp{};
+        {
+            auto envf = [](const char* k, float* v) {
+                if (const char* e = std::getenv(k); e && *e) {
+                    char* end = nullptr;
+                    const float x = std::strtof(e, &end);
+                    if (end != e && x >= 0.0f) *v = x;
+                    else RAD_WARN("%s='%s' is not a number >= 0; ignored", k, e);
+                }
+            };
+            envf("RADIANCE_HEAT_DECAY", &hp.decay);
+            envf("RADIANCE_HEAT_HYSTERESIS", &hp.hysteresis);
+            envf("RADIANCE_HEAT_MIN_GAIN", &hp.min_gain);
+            envf("RADIANCE_HEAT_CREDIT_CAP", &hp.credit_cap);
+            float mv = (float)hp.moves_per_step;
+            envf("RADIANCE_HEAT_MOVES", &mv);
+            hp.moves_per_step = (int)mv;
+        }
+        RAD_TRY(r->heat.init(r->plan, hp));
 
         /* Every destination must lie inside the weights pool. A copy past its end targets memory
          * the process does not own, which on this driver does not fault: the copy never completes
@@ -5149,6 +5178,21 @@ int Engine::start() {
             const int n = r->mover.pool_ranges(lo, hi, st, kXpMaxPools);
             if (n > 0) r->ctx.xp_open(lo, hi, st, n);
         }
+    /* Expert streaming X1 (b): the mover's paced copies go out from the routed layers' marks
+     * (Ctx::xp_mark), which recorded passes then carry. Not beside the TP1 prefetch, which rides
+     * on the same dispatch. */
+    for (auto& r : ranks_)
+        if (r->mover.pacing() && r->heat.enabled() && !r->ctx.xp_on()) {
+            Rank* rp = r.get();
+            r->ctx.set_pace_hook([rp](RadStream cs) { return rp->mover.pace_mark(cs); });
+            if (r->index == 0)
+                RAD_INFO("expert streaming: promotion copies paced over the routed layers (%s)",
+                         r->mover.pace_units() < 0 ? "spread over the pass"
+                                                   : fmt("%d a layer", r->mover.pace_units()).c_str());
+        }
+    if (const char* e = std::getenv("RADIANCE_XS_EARLY_PUBLISH"); e && *e)
+        xs_early_publish_ = std::atoi(e) != 0;
+    if (!xs_early_publish_) RAD_INFO("expert streaming: landed promotions publish behind the pass (RADIANCE_XS_EARLY_PUBLISH=0)");
     (void)rad_dev_set(ranks_[0]->device);
 
     /* The most the cache can hold: the whole carve, including lent blocks (a request reclaims them

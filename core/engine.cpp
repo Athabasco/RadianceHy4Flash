@@ -17,6 +17,7 @@
 #include "format/radfile.h"
 #include "gen_config.h"
 #include "kvstream/stage.h"
+#include "place/rtrace.h"
 #include "sample/accept.h"
 #include "sched/scheduler.h"
 #include "server/adapters.h"
@@ -1004,6 +1005,7 @@ void Engine::tiering_dispatch(Rank& r, int step) {
     }
 
     r.mover.begin_dispatch(step, &r.heat);
+    RouteTrace* const rt = r.index == 0 && rtrace_ && rtrace_->on() ? rtrace_.get() : nullptr;
 
     find_histograms(r, step);
     std::vector<Rank::HeatRow>& rows = r.heat_rows;
@@ -1018,6 +1020,8 @@ void Engine::tiering_dispatch(Rank& r, int step) {
         /* A bank can hold several passes (a draft head reports once per pass into one bank), so
          * weight it by the report count, or the layer's experts are underpriced and drained. */
         const int reps = r.ctx.last_histogram_reports(hr.layer, hr.bank);
+        if (rt) rt->row(step, r.ctx.last_histogram_step(hr.layer, hr.bank), hr.layer, reps, hr.h,
+                        n_ex, r.heat);
         r.heat.observe(hr.layer, hr.h, n_ex, reps > 1 ? (float)reps : 1.0f);
         /* The row is in cache now. */
         if (xs) xstats_credit(xs, r.ctx, hr.layer, hr.bank, hr.h);
@@ -1035,6 +1039,9 @@ void Engine::tiering_dispatch(Rank& r, int step) {
      * credited; the next unstaged step swaps on them. */
     std::vector<Swap> swaps;
     if (!r.stager.staged() && r.heat.step(&swaps) < 0) return;
+    /* X1 (b): this step's promotion copies are held and sent from the next pass's routed layers
+     * (Mover::pace_mark). Not behind a staged pass: the stager's copies share the stream. */
+    r.mover.pace_collect(!r.stager.staged());
     /* What the turnover slots follow (MoverConfig::turnover_adaptive). A staged step proposes
      * nothing and holds the turnover filled anyway (below), so it is not a quiet step. */
     if (!r.stager.staged()) r.mover.swap_demand((int64_t)swaps.size());
@@ -1061,6 +1068,8 @@ void Engine::tiering_dispatch(Rank& r, int step) {
     const bool hold = r.unstaged_steps < kTurnoverAfter;
     r.mover.hold_turnover(hold);
     (void)r.mover.balance(&r.heat, !hold);
+    r.mover.pace_collect(false);
+    if (rt) rt->dispatch_end(step, (int)swaps.size(), r.heat, r.mover.stats());
 }
 
 /* ------------------------------------------------------------------ --expert-stats
@@ -1178,6 +1187,13 @@ void Engine::rank_loop(int index) {
              * more later. An encoder pass is not a step of the token stream. */
             if (xstats_ && what != kIssueSampler && b->enc == 0)
                 if (XsTally* xs = xstats_->tally(index)) xs->issued(*b);
+            /* Expert streaming X1: a promotion whose copy has landed is published before the pass
+             * is played, so this pass reads it from VRAM (not the next one); the paced copies the
+             * last dispatch held are spread over this pass's routed layers. */
+            if (what != kIssueSampler && b->draft_pass == 0 && r.heat.enabled()) {
+                if (xs_early_publish_) (void)r.mover.publish_landed(&r.heat);
+                if (r.mover.pacing()) r.mover.pace_begin(r.ctx.n_route_layers());
+            }
             int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
             if (s < 0) {
                 RAD_ERR("rank %d step %d: %s", index, b->step, r.ctx.step_error());
@@ -2954,6 +2970,15 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
 
     if (const int xs = xstats_open(); xs < 0) return xs;
+    if (const char* tp = std::getenv("RADIANCE_ROUTE_TRACE"); tp && *tp && !ranks_.empty() &&
+        ranks_[0]->heat.enabled()) {
+        auto t = std::make_shared<RouteTrace>();
+        if (t->open(tp, ranks_[0]->plan) < 0) RAD_WARN("RADIANCE_ROUTE_TRACE: cannot write %s", tp);
+        else {
+            RAD_INFO("route trace: rank 0's credited routing to %s", tp);
+            rtrace_ = std::move(t);
+        }
+    }
 
     barrier_ = std::make_unique<RankBarrier>(cfg_.tp + 1);
     stopping_.store(false, std::memory_order_release);
@@ -3001,6 +3026,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
     xstats_close();
+    if (rtrace_) rtrace_->close();
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);
     return ls < 0 ? ls : s;
@@ -3403,6 +3429,11 @@ int Engine::run_server() {
                 /* The routed hit rate: residency describes the plan, this describes the traffic. */
                 s.experts.routed            = (int64_t)hs.routed;
                 s.experts.routed_resident   = (int64_t)hs.routed_resident;
+                heat.layer_counts(&s.experts.layer_routed, &s.experts.layer_missed);
+                s.experts.early_published = (int64_t)ms.early_published;
+                s.experts.paced_units     = (int64_t)ms.paced_units;
+                s.experts.paced_marks     = (int64_t)ms.paced_marks;
+                s.experts.paced_late      = (int64_t)ms.paced_late;
 
             }
 
