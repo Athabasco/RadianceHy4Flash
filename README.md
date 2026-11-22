@@ -92,8 +92,6 @@ models:
   hy4-flash:
     model: /srv/models/hy4-flash-iqr-v4/hy4-flash-iqr-v4.rad
     tp: 4
-    max-model-len: 32768
-    max-num-seqs: 32
     num-speculative-tokens: 5         # DFly2 drafts at most 5 tokens
     prefill-span: 2                   # an 8192-token batch is two intervals, run as two steps
     max-num-batched-tokens: 8192
