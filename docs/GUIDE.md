@@ -4550,6 +4550,24 @@ is as open as `/stats`; the fleet's is behind the API key like `/admin/fleet`. I
 each model's state is the figure `s:<id>`, a code: 0 cold, 1 parked, 2 loading or closing,
 3 resident, 4 failed, 5 waiting for room.
 
+**Expert residency on `/stats`** (`experts`, present where experts move between tiers): `routed` is
+the experts the router picked, `routed_res` how many of them were resident in VRAM when picked, so
+`routed_res / routed` is the hit rate of the traffic (residency alone describes the plan, not the
+traffic); the rest were read in place across the link. `layer_routed` and `layer_missed` give the same
+counts per routed layer (rank 0). `promotions` and `demotions` count the moves; `distinct_promoted` the
+units ever promoted. `readmits` counts promotions of a unit that was demoted at *any* earlier time
+(cumulative over the server's life), so it grows slowly even without thrash. `readmit_16`,
+`readmit_128` and `readmit_1024` count the re-promotions proper: a unit promoted again within 16, 128
+or 1024 heat steps of its own demotion (nested: every `readmit_16` is also in the other two).
+`heat_steps` is that step count, the unit of the windows. A high `readmit_128 / promotions` means the
+heat guards ping-pong units. `early_published`, `paced_units`, `paced_marks` and `paced_late` describe
+expert streaming (a promotion published before the next pass; promotion copies spread over a pass's
+routed layers, `RADIANCE_XS_PACE`: -1 spread, N per layer, 0 off; default spread without a drafter,
+off with one; `RADIANCE_XS_EARLY_PUBLISH=0` restores the old order). The heat engine's parameters can be
+set for A/B runs with `RADIANCE_HEAT_DECAY`, `_HYSTERESIS`, `_MIN_GAIN`, `_CREDIT_CAP` and `_MOVES`;
+the startup log says what is in force. `RADIANCE_ROUTE_TRACE=<file>` records rank 0's routing for
+`rad-heat-replay`.
+
 `/server_info` reports what a running process serves: the model, the cards, the KV cache, the draft
 depth and the wire, as the startup log does.
 
