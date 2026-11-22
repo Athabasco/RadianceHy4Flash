@@ -268,7 +268,7 @@ static const RadParamSpec pEngramIds[] = { P_INT("M"), P_INT("heads"), P_INT("ng
     P_INT("pad"), P_INT("map_size"), P_INTO("image"), P_INTO("video") };
 static const RadOperandSpec oEngramIds[] = { OPD("tok"), INOUT("state"), OPD("cu"), OPD("pos"),
     WGT("token_map"), WGT("mult"), WGT("vocab_sizes"), WGT("offsets"), OPD_O("num_accepted"),
-    OPD_O("cache_idx"), OUT("ids"), OUT("mask") };
+    OPD_O("cache_idx"), OUT("ids"), OUT("mask"), OUT_O("ahead_ids") };
 static const RadParamSpec pEngramNorm[] = { P_INT("M"), P_INT("heads"), P_INT("n"), P_F64("eps"),
     P_STR("dtype") };
 static const RadOperandSpec oEngramNorm[] = { OPD("e"), WGT("gain"), OUT("y") };
@@ -358,6 +358,10 @@ static const RadParamSpec pCast[] = { P_INT("M"), P_INT("n"), P_STR("from"), P_S
 
 /* ---- quantisation and rotation ------------------------------------------------------------ */
 static const RadParamSpec pQuant[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype") };
+/* had_quant_act_i8g's and had_quant_act_fp8's: `chained` 1 asks for the chained form where a device
+ * library has one (libr4d's *_chained rows); the result is the same, so the host kernels ignore it. */
+static const RadParamSpec pHadQuantI8g[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"),
+                                            P_INTO("chained") };
 /* gram_accum's: `upper` 1 accumulates only k2 >= k1, the half a reader of a symmetric H needs. */
 static const RadParamSpec pGram[]  = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"), P_INTO("upper") };
 /* `asum`, quant_act_i8's optional third output: group-major per-row code sums an asymmetric
@@ -1510,7 +1514,10 @@ static const RadOpSchema kSchemas[] = {
   "Engram's hash ids: c_k = map[tok_k] (pad before the document start and for an id at or past "
   "map_size), m_k = c_k * mult[k] in wrapping int64, mix_g = m_0 ^ .. ^ m_{g-1}, head i of order g: "
   "floor_mod(mix_g, vocab_sizes[i]) + offsets[i]; mask = tok not in {pad, image, video}. `state` is "
-  "ngram_ids' window of committed ids." },
+  "ngram_ids' window of committed ids. With `ahead_ids` present, `tok` holds the following "
+  "prompt of the last sequence past the step's rows (numel(ahead_ids) / heads tokens, positions "
+  "continuing its last), and their ids land in `ahead_ids` (a read-ahead hint); the window written "
+  "back is the step's own." },
 { "engram_norm", ARR(pEngramNorm), ARR(oEngramNorm),
   "One rms norm a head over the gathered rows: y[i] = round(gain[i] * x[i] * rsqrt(mean_head(x^2) + "
   "eps)). eps is a parameter: 0.0078125 (HF in bf16) or 1.19e-7." },
@@ -1667,14 +1674,14 @@ static const RadOpSchema kSchemas[] = {
 /* The rotated fp8 twin. Unlike had_quant_act_i8, the group is both rotation width and scale
  * granularity, and the factor of `group` is left entirely to the paired w4a8h weight plane, where
  * the division is an exact exponent shift on a bf16 (libref/ref_quant.cpp). */
-{ "had_quant_act_fp8", ARR(pQuant), ARR(oQuantFp8),
+{ "had_quant_act_fp8", ARR(pHadQuantI8g), ARR(oQuantFp8),
   "quant_act_fp8 with a Walsh-Hadamard rotation of width `group` (128) along n first: scale = "
   "amax(rotated) / 448 per group, [M, n/group] in f32, n a multiple of `group`. Pairs with a "
   "four-, five- or six-bit expert weight rotated the same way, its scale carrying the factor of "
   "`group` (dtypes w4a8h, w4nla8h, w4nl64a8h, w5nl64a8h, w6nl64a8h)." },
 /* Its int8 twin, the activation of the i8a8h GEMMs; the factor of `group` is the weight's here
  * too. */
-{ "had_quant_act_i8g", ARR(pQuant), ARR(oQuantFp8),
+{ "had_quant_act_i8g", ARR(pHadQuantI8g), ARR(oQuantFp8),
   "quant_act_i8g with a Walsh-Hadamard rotation of width `group` along n first: scale = "
   "amax(rotated) / 127 per group, [M, n/group] in f32, n a multiple of `group`. Pairs with an i8 "
   "weight rotated the same way, its scale carrying the factor of `group` (dtype i8a8h). A `group` "

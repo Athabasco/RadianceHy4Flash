@@ -1286,6 +1286,7 @@ int ref_engram_ids_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     o.skip();                                                        /* cache_idx */
     o.t((uint32_t)RAD_I32, { M, heads });                            /* ids */
     o.t((uint32_t)RAD_I32, { M });                                   /* mask */
+    o.skip();                                                        /* ahead_ids */
     return o.finish("engram_ids", operand, out);
 }
 

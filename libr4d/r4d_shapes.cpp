@@ -594,7 +594,7 @@ extern "C" int r4d_shape_engram_ids(const RadParam* p, int n_p, int operand, Rad
         opd_idx(2, 0, M, -1, RAD_OPD_F_IDX_CU), opd_idx(M, 0, 0, 1 << 20),
         opd_idx(msize, 0, 1000), idx64(ngram, 0, 1000003), idx64(heads, 0, 997),
         idx64(heads, 0, -1), opd_idx(1, 0, 0, M), opd_none(), opd((uint32_t)RAD_I32, M, heads),
-        opd((uint32_t)RAD_I32, M) };
+        opd((uint32_t)RAD_I32, M), opd_none() };
     R4D_PICK(l);
 }
 extern "C" int r4d_shape_engram_norm(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

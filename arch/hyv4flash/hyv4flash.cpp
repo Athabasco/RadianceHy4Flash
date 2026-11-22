@@ -832,6 +832,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* The producers write bf16 planes only: a bf16 trunk linear reads them, an int8 one quantises
      * its input itself into the rank's code pair (Lin), declared at the first one. */
     g.w_bf16 = true;
+    /* Every GEMM of the int8 decode pass chains, so the 128-group rotated quantisers between them
+     * run chained too (Geom::chain_q8; gpu-mini int8 decode 0.86 -> 0.75 ms a token at TP1).
+     * RADIANCE_HY4_CHAIN_Q8=0 keeps them plain. */
+    g.chain_q8 = chain_q8_on();
     m.codes.b = b;
     m.codes.nm = &nm;
     m.codes.rows = g.max_tok;

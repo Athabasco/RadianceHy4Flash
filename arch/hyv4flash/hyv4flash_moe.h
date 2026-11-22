@@ -28,21 +28,55 @@ struct GatedMlp {
     GateQuantFP8 act{};
     rad_buf gu = 0;
     ActFP8 ff{};
+    /* The product's rotated int8 codes written by the gate itself (gated_had_quant_i8g,
+     * fused_quant_on), where down is rotated int8 and libr4d serves it: `ff` carries the codes and
+     * down declares no quantiser. Byte-identical to silu_mul followed by had_quant_act_i8g. */
+    bool gfuse = false;
+    /* `feed`: gate_up reads the codes that linear wrote of the same input (Lin::feed). */
     int declare(RadBuilder* b, Names& nm, const Geom& g, const Shape& s, int l, const char* gu_name,
                 const char* dn_name, const char* mp, int64_t ff_w, rad_buf x, rad_buf y,
-                rad_buf gu_buf, rad_buf ff_buf) {
+                rad_buf gu_buf, rad_buf ff_buf, const Lin* feed = nullptr) {
         gu = gu_buf;
+        ff = ActFP8{};
         ff.x = ff_buf;
         ActFP8 in{};
         in.x = x;
         const auto grp = grp_layer(l);
+        gate_up.feed = feed;
         RAD_ARCH_TRY(gate_up.declare(b, nm, g, gu_name, 2 * ff_w, s.n_embd, RAD_SHARD_ROW, grp,
                                      { nm.ckpt("%s.gate_proj.weight", mp),
                                        nm.ckpt("%s.up_proj.weight", mp) },
                                      in, gu, 0, { ff_w, ff_w }));
-        RAD_ARCH_TRY(act.declare(b, g, gu, ff, ff_w, "silu"));
+        const char* dw = nm.f("%s.weight", dn_name);
+        RAD_ARCH_TRY(map_linear(b, dw, { nm.ckpt("%s.down_proj.weight", mp) }));
+        down.mapped = true;
+        const CodeForm fd = code_form(b, dw);
+        gfuse = fused_quant_on() && fd.rot && ff_w % fd.g8 == 0 && calib_dir() == nullptr &&
+                rad_op_declared(b, "gated_had_quant_i8g");
+        if (gfuse) {
+            Codes* cs = codes_of(b);
+            const Codes::Pair* pr = cs ? cs->get(ff_w, fd.g8, "gated") : nullptr;
+            if (!pr) return RAD_E_INVAL;
+            ff.q8 = pr->q8;
+            ff.s8 = pr->s8;
+            ff.g8 = fd.g8;
+            ff.q8_fed = ff.q8_rot = true;
+            Geom gq = g;
+            gq.w_bf16 = false;
+            act = GateQuantFP8{};
+            /* Only the codes: nothing reads the bf16 product. */
+            if (act.declare(b, gq, gu, ff, ff_w, "silu", 0, false) != RAD_OK || !act.op) {
+                gfuse = false;
+                ff = ActFP8{};
+                ff.x = ff_buf;
+                act = GateQuantFP8{};
+            }
+        }
+        if (!gfuse) RAD_ARCH_TRY(act.declare(b, g, gu, ff, ff_w, "silu"));
+        down.fed_codes = gfuse ? &ff : nullptr;
         RAD_ARCH_TRY(down.declare(b, nm, g, dn_name, s.n_embd, ff_w, RAD_SHARD_COL, grp,
                                   { nm.ckpt("%s.down_proj.weight", mp) }, ff, y));
+        down.fed_codes = nullptr;
         return RAD_OK;
     }
     void step(RadCtx* c, rad_buf x, rad_buf y, int64_t T) const {
@@ -140,6 +174,11 @@ struct Ffn {
         c.n_ff_exp = s.n_ff_exp;
         c.n_ff_shared = 0;            /* the shared expert reads x: this file's */
         c.sigmoid_router = 1;
+        /* The selection and the expert sort in one launch (router_sigmoid_topk_scatter) wherever a
+         * pass fits the sort's one workgroup (decode and verify heights); the separate pair
+         * otherwise and on the host. Byte-identical (rad_block_moe_fp8.h), a launch fewer a layer.
+         * RADIANCE_HY4_ROUTER_FUSE=0 keeps the pair. */
+        c.router_fuse = router_fuse_on() ? 1 : 0;
         c.norm_topk = s.norm_topk;
         c.route_scale = s.route_scale;
         c.n_group = 1;
@@ -243,6 +282,8 @@ struct Ffn {
             /* The checkpoint names the latent pair by direction in width: routed_expert_down_proj
              * narrows x into the latent in front of the experts, routed_expert_up_proj widens their
              * sum back. */
+            /* The latent's and the shared expert's gate_up read x: one quantiser (Lin::feed). */
+            lat_in.lead = "ffn_in";
             RAD_ARCH_TRY(lat_in.declare(b, nm, g, nm.f("blk.%d.ffn_latent_in", l), s.latent,
                                         s.n_embd, RAD_SHARD_NONE, grp,
                                         { nm.ckpt("%s.routed_expert_down_proj.weight", mp) },
@@ -264,7 +305,7 @@ struct Ffn {
             RAD_ARCH_TRY(shared.declare(b, nm, g, s, l, nm.f("blk.%d.ffn_gate_up_shexp", l),
                                         nm.f("blk.%d.ffn_down_shexp", l),
                                         nm.ckpt("%s.shared_experts", mp), s.n_ff_shared_r, xf,
-                                        w.sout, w.sgu, w.sff));
+                                        w.sout, w.sgu, w.sff, &lat_in));
             op_join = mk(b, "add",
                          { RAD_RANGE("M", 1, T), RAD_INT("n", s.n_embd), RAD_STR("dtype", "bf16") },
                          {}, { w.routed, w.sout }, { w.routed });

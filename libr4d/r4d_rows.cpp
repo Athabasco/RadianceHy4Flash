@@ -712,7 +712,7 @@ static const RadOperandSpec oEngramIds[] = {
     {"pos", RAD_OPD_IN, 0}, {"token_map", RAD_OPD_WEIGHT, 0}, {"mult", RAD_OPD_WEIGHT, 0},
     {"vocab_sizes", RAD_OPD_WEIGHT, 0}, {"offsets", RAD_OPD_WEIGHT, 0},
     {"num_accepted", RAD_OPD_IN, 1}, {"cache_idx", RAD_OPD_IN, 1}, {"ids", RAD_OPD_OUT, 0},
-    {"mask", RAD_OPD_OUT, 0},
+    {"mask", RAD_OPD_OUT, 0}, {"ahead_ids", RAD_OPD_OUT, 1},
 };
 static const RadParamSpec pEngramNorm[] = {
     P_INT("M"), P_INT("heads"), P_INT("n"), P_F64("eps"), P_STR("dtype"),
@@ -1365,6 +1365,17 @@ static const RadParamSpec pQuantActFp8[] = {
     { "group", RAD_P_INT, RAD_REQUIRED },
     { "dtype", RAD_P_STR, RAD_REQUIRED },
 };
+/* had_quant_act_i8g's and had_quant_act_fp8's: `chained` 1 selects the *_chained row, the same kernel run in its
+ * chained form at decode heights. An architecture asks for it where it measured the chain paying
+ * (Hy4-flash); without it the row stays plain (a chained quantiser between two plain GEMMs
+ * measured slower on Flash-Next, see rad_kernel_chain). */
+static const RadParamSpec pHadQuantActI8g[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    { "group", RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+    P_INTO("chained"),
+};
 static const RadOperandSpec oQuantActFp8[] = {
     { "x",     RAD_OPD_IN,  0 },
     { "q",     RAD_OPD_OUT, 0 },
@@ -1676,6 +1687,16 @@ static const RadParamSpec pRmsNormQuantFp8[] = {
     { "group", RAD_P_INT, RAD_REQUIRED },
     { "dtype", RAD_P_STR, RAD_REQUIRED },
     P_F64O("wadd"),
+};
+/* rmsnorm_had_quant_i8g's: `chained` as had_quant_act_i8g's. */
+static const RadParamSpec pRmsNormHadQuantI8g[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    P_F64("eps"),
+    { "group", RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+    P_F64O("wadd"),
+    P_INTO("chained"),
 };
 static const RadOperandSpec oRmsNormQuantFp8[] = {
     { "x",        RAD_OPD_IN,     0 },
@@ -3858,7 +3879,10 @@ static const RadOpSchema kSchemas[] = {
            "Engram's hash ids: c_k = map[tok_k] (pad before the document start and for an id at or past "
            "map_size), m_k = c_k * mult[k] in wrapping int64, mix_g = m_0 ^ .. ^ m_{g-1}, head i of order g: "
            "floor_mod(mix_g, vocab_sizes[i]) + offsets[i]; mask = tok not in {pad, image, video}. `state` is "
-           "ngram_ids' window of committed ids."),
+           "ngram_ids' window of committed ids. With `ahead_ids` present, `tok` holds the following "
+           "prompt of the last sequence past the step's rows (numel(ahead_ids) / heads tokens, positions "
+           "continuing its last), and their ids land in `ahead_ids` (a read-ahead hint); the window written "
+           "back is the step's own."),
     SCHEMA("engram_norm", pEngramNorm, oEngramNorm,
            "One rms norm a head over the gathered rows: y[i] = round(gain[i] * x[i] * rsqrt(mean_head(x^2) + "
            "eps)). eps is a parameter: 0.0078125 (HF in bf16) or 1.19e-7."),
@@ -4037,7 +4061,7 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("rmsnorm_quant_fp8", pRmsNormQuantFp8, oRmsNormQuantFp8,
            "RMS norm and the fp8 activation quantiser in one pass over the row. The bf16 norm "
            "output the unfused pair wrote is still written, and the codes are taken over it."),
-    SCHEMA("rmsnorm_had_quant_i8g", pRmsNormQuantFp8, oRmsNormQuantFp8,
+    SCHEMA("rmsnorm_had_quant_i8g", pRmsNormHadQuantI8g, oRmsNormQuantFp8,
            "rmsnorm_quant_fp8 with had_quant_act_i8g's quantiser on its pass: a `group`-wide "
            "Hadamard of the bf16 norm output, then int8 codes per (row, `group`). `out_bf16` "
            "receives the UNROTATED norm output. Pairs only with an i8 weight stored rotated "
@@ -4111,10 +4135,10 @@ static const RadOpSchema kSchemas[] = {
            "quant_act_fp8 at INT8 codes: per-(row, `group`-column) symmetric int8, PLAIN ROW-MAJOR, "
            "the scale amax/127 and a code the value over it rounded to nearest-even. What the int8 "
            "trunk GEMMs (dtype i8a8) read."),
-    SCHEMA("had_quant_act_fp8", pQuantActFp8, oQuantActFp8,
+    SCHEMA("had_quant_act_fp8", pHadQuantActI8g, oQuantActFp8,
            "quant_act_fp8 with a `group`-wide Hadamard along K first; pairs with a four-, five- "
            "or six-bit expert weight stored rotated, its scale carrying the factor of `group`."),
-    SCHEMA("had_quant_act_i8g", pQuantActFp8, oQuantActFp8,
+    SCHEMA("had_quant_act_i8g", pHadQuantActI8g, oQuantActFp8,
            "quant_act_i8g with a `group`-wide Hadamard along K first; pairs with an i8 weight stored "
            "rotated, its scale carrying the residual factor of `group`."),
     SCHEMA("qsa_work", pQsaWork, oQsaWork,
@@ -5727,6 +5751,10 @@ static const RadConstraint cDequantFp8[] = {
 static const RadConstraint cHadQuantActFp8[] = {
     C_DIV("n", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
 };
+/* The same where the caller asks for the chained form (`chained` 1). */
+static const RadConstraint cHadQuantActI8gCh[] = {
+    C_DIV("n", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"), C_EQ("chained", 1),
+};
 /* IQ8R's activation: one scale per 256 columns, each 128-wide half rotated on its own. */
 static const RadConstraint cHadQuantActIq8r[] = {
     C_DIV("n", R4D_I8_GROUP_WIDE), C_EQ("group", R4D_I8_GROUP_WIDE), C_IN("dtype", "bf16"),
@@ -5807,6 +5835,9 @@ static const RadConstraint cArRmsNormQuantFp8[] = {
  * (which also gives the all-reduce's 16B words). */
 static const RadConstraint cRmsNormHadQuantI8g[] = {
     C_DIV("n", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cRmsNormHadQuantI8gCh[] = {
+    C_DIV("n", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"), C_EQ("chained", 1),
 };
 static const RadConstraint cArRmsNormHadQuantI8g[] = {
     C_DIV("n", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
@@ -9798,6 +9829,16 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cHadQuantActFp8), NOTUNE,
   nullptr, nullptr, r4d_rad_had_quant_act_fp8 },
 
+/* The same kernel in its chained form where the caller asks (`chained` 1): a rotated codebook
+ * expert's activation (the latent and the clamped product) in a pass whose GEMMs chain. */
+{ "had_quant_act_fp8_chained", "had_quant_act_fp8", "quant",
+  "had_quant_act_fp8, launched in its chained form at decode heights",
+  "had_quant_act_fp8's, and `chained` 1",
+  "had_quant_act_fp8's bytes",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY + 1,
+  ROW(cHadQuantActI8gCh), NOTUNE,
+  nullptr, nullptr, r4d_rad_had_quant_act_fp8 },
+
 { "quant_act_i8g", "quant_act_i8g", "quant",
   "per-(row, 128-column) symmetric int8 quantisation of a bf16 activation",
   "quant_act_fp8's: n a multiple of 4, group 128, a ragged last group written zero-padded",
@@ -9814,6 +9855,17 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "scale (dtype i8a8h)",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cHadQuantActFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_had_quant_act_i8g },
+
+/* The same kernel where the caller asks for its chained form (`chained` 1, in rad_kernel_chain's
+ * list): one row a geometry still, since only a query naming `chained` reaches it and it outranks
+ * the plain row there. */
+{ "had_quant_act_i8g_chained", "had_quant_act_i8g", "quant",
+  "had_quant_act_i8g, launched in its chained form at decode heights",
+  "had_quant_act_i8g's, and `chained` 1",
+  "had_quant_act_i8g's bytes",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY + 1,
+  ROW(cHadQuantActI8gCh), NOTUNE,
   nullptr, nullptr, r4d_rad_had_quant_act_i8g },
 
 { "had_quant_act_iq8r", "had_quant_act_i8g", "quant",
@@ -10010,6 +10062,15 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "output, byte-identical to rmsnorm + had_quant_act_i8g",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cRmsNormHadQuantI8g), NOTUNE,
+  nullptr, nullptr, r4d_rad_rmsnorm_had_quant_i8g, nullptr, nullptr, nullptr,
+  r4d_shape_rmsnorm_had_quant_i8g },
+
+{ "rmsnorm_had_quant_i8g_chained", "rmsnorm_had_quant_i8g", "quant",
+  "rmsnorm_had_quant_i8g, launched in its chained form at decode heights",
+  "rmsnorm_had_quant_i8g's, and `chained` 1",
+  "rmsnorm_had_quant_i8g's bytes",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY + 1,
+  ROW(cRmsNormHadQuantI8gCh), NOTUNE,
   nullptr, nullptr, r4d_rad_rmsnorm_had_quant_i8g, nullptr, nullptr, nullptr,
   r4d_shape_rmsnorm_had_quant_i8g },
 
@@ -11885,6 +11946,10 @@ extern "C" int rad_kernel_chain(int i) {
          * and fill rows, the f32 narrowing, the layer scale and the draft cache's row scatter */
         "ar_gather_2rank", "iota", "fill_bf16", "fill_f32", "fill_i32", "cast_f32_bf16", "mul_weight_bf16",
         "scatter_rows_u8", "scatter_rows_bf16",
+        /* the 128-group rotated int8 and E4M3 quantisers where the architecture asks for their chained
+         * forms (`chained` 1): Hy4-flash's int8 trunk, every GEMM around them chained (gpu-mini
+         * int8 decode 0.86 -> 0.75 ms a token at TP1) */
+        "had_quant_act_i8g_chained", "rmsnorm_had_quant_i8g_chained", "had_quant_act_fp8_chained",
     };
     for (const char* p : kChained)
         if (std::strcmp(k->name, p) == 0) return 2;

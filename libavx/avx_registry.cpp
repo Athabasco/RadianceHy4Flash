@@ -234,7 +234,7 @@ static const RadParamSpec pEngramIds[] = { P_INT("M"), P_INT("heads"), P_INT("ng
     P_INT("pad"), P_INT("map_size"), P_INTO("image"), P_INTO("video") };
 static const RadOperandSpec oEngramIds[] = { OPD("tok"), INOUT("state"), OPD("cu"), OPD("pos"),
     WGT("token_map"), WGT("mult"), WGT("vocab_sizes"), WGT("offsets"), OPD_O("num_accepted"),
-    OPD_O("cache_idx"), OUT("ids"), OUT("mask") };
+    OPD_O("cache_idx"), OUT("ids"), OUT("mask"), OUT_O("ahead_ids") };
 static const RadParamSpec pEngramNorm[] = { P_INT("M"), P_INT("heads"), P_INT("n"), P_F64("eps"),
     P_STR("dtype") };
 static const RadOperandSpec oEngramNorm[] = { OPD("e"), WGT("gain"), OUT("y") };
@@ -315,6 +315,9 @@ static const RadParamSpec pCast[] = { P_INT("M"), P_INT("n"), P_STR("from"), P_S
 /* ---- quantisation and rotation ------------------------------------------------------------ */
 static const RadParamSpec pQuant[]      = { P_INT("M"), P_INT("n"), P_INT("group"),
                                             P_STR("dtype") };
+/* had_quant_act_i8g's and had_quant_act_fp8's (libref's spelling): `chained` is a device library's row choice, ignored here. */
+static const RadParamSpec pHadQuantI8g[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"),
+                                            P_INTO("chained") };
 /* gram_accum's: `upper` 1 accumulates only k2 >= k1, the half a reader of a symmetric H needs. */
 static const RadParamSpec pGram[]       = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"),
                                             P_INTO("upper") };
@@ -1230,7 +1233,10 @@ static const RadOpSchema kSchemas[] = {
   "Engram's hash ids: c_k = map[tok_k] (pad before the document start and for an id at or past "
   "map_size), m_k = c_k * mult[k] in wrapping int64, mix_g = m_0 ^ .. ^ m_{g-1}, head i of order g: "
   "floor_mod(mix_g, vocab_sizes[i]) + offsets[i]; mask = tok not in {pad, image, video}. `state` is "
-  "ngram_ids' window of committed ids." },
+  "ngram_ids' window of committed ids. With `ahead_ids` present, `tok` holds the following "
+  "prompt of the last sequence past the step's rows (numel(ahead_ids) / heads tokens, positions "
+  "continuing its last), and their ids land in `ahead_ids` (a read-ahead hint); the window written "
+  "back is the step's own." },
 { "engram_norm", ARR(pEngramNorm), ARR(oEngramNorm),
   "One rms norm a head over the gathered rows: y[i] = round(gain[i] * x[i] * rsqrt(mean_head(x^2) + "
   "eps)). eps is a parameter: 0.0078125 (HF in bf16) or 1.19e-7." },
@@ -1290,10 +1296,10 @@ static const RadOpSchema kSchemas[] = {
   "symmetric int8, one f32 scale per `group` contiguous elements, row-major." },
 { "quant_act_fp8", ARR(pQuant), ARR(oQuantFp8), "symmetric block-scaled E4M3 quantiser." },
 { "quant_cols_fp8", ARR(pQuantCols), ARR(oQuantCols), "E4M3 with one scale per column." },
-{ "had_quant_act_fp8", ARR(pQuant), ARR(oQuantFp8),
+{ "had_quant_act_fp8", ARR(pHadQuantI8g), ARR(oQuantFp8),
   "width-128 Hadamard, then quant_act_fp8's symmetric E4M3 per group. No normalisation: the "
   "1/128 is the rotated expert weight's stored scale (docs/OPS.md)." },
-{ "had_quant_act_i8g", ARR(pQuant), ARR(oQuantFp8),
+{ "had_quant_act_i8g", ARR(pHadQuantI8g), ARR(oQuantFp8),
   "width-`group` Hadamard, then quant_act_i8g's symmetric int8 per group. No normalisation: the "
   "1/group is the i8a8h weight's stored scale (docs/OPS.md)." },
 { "gram_accum", ARR(pGram), ARR(oGram),

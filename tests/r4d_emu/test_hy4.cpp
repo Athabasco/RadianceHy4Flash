@@ -306,15 +306,18 @@ static void mla_kv() {
 
 static void engram_ids() {
     const int64_t heads = 4, ngram = 3, pad = 90, msize = 100, image = 95, video = 96;
-    for (int form = 0; form < 4; ++form) {
-        const bool decode = form & 1, wide = form & 2;
+    /* Form 4: a prefill whose last sequence hashes three tokens of its following prompt into
+     * `ahead_ids` (the read-ahead), `tok` running on past the step's rows. */
+    for (int form = 0; form < 5; ++form) {
+        const bool decode = form & 1, wide = form & 2, ahd = form == 4;
+        const int64_t A = ahd ? 3 : 0;
         const int64_t S = 3, W = decode ? 4 : 2;
         const std::vector<int64_t> Ts = decode ? std::vector<int64_t>{ 3, 1, 2 } : std::vector<int64_t>{ 4, 1, 3 };
         int64_t M = 0;
         for (int64_t t : Ts) M += t;
         Rng rng((uint32_t)(form + 3));
         std::vector<Opd> ops;
-        ops.push_back(opd(RAD_I32, { M }));
+        ops.push_back(opd(RAD_I32, { M + A }));
         fill(ops[0], [&](int64_t) {
             const uint32_t r = rng.r(12);
             return r == 0 ? (double)pad : r == 1 ? (double)image : r == 2 ? (double)video : r == 3 ? 150.0 : (double)rng.r(90);
@@ -354,10 +357,15 @@ static void engram_ids() {
         ops.push_back(opd(wide ? RAD_I64 : RAD_I32, { M, heads }));
         ops.push_back(opd(RAD_I32, { M }));
         ops[10].out = ops[11].out = true;
+        if (ahd) {
+            ops.push_back(opd(RAD_I32, { A, heads }));
+            ops[12].out = true;
+        }
         std::vector<RadParam> p = { pi("M", M), pi("heads", heads), pi("ngram", ngram), pi("pad", pad),
                                     pi("map_size", msize), pi("image", image), pi("video", video) };
         char w[100];
-        std::snprintf(w, sizeof w, "engram_ids %s, ids i%d, bit for bit", decode ? "decode" : "prefill", wide ? 64 : 32);
+        std::snprintf(w, sizeof w, "engram_ids %s%s, ids i%d, bit for bit", decode ? "decode" : "prefill",
+                      ahd ? " with ahead_ids" : "", wide ? 64 : 32);
         check("engram_ids", r4d_rad_engram_ids, w, p, ops);
     }
 }

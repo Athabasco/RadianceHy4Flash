@@ -876,6 +876,9 @@ int ref_engram_ids(const RadArgs* a, RadStream) {
     const RadTensor* nacc = t_in(a, 8);
     const RadTensor* sidx = t_in(a, 9);
     const RadTensor &ids = a->t[10], &mask = a->t[11];
+    /* The following prompt's ids (a read-ahead hint): `tok` holds A tokens of the last sequence
+     * past the step's rows. */
+    const RadTensor* ahead = a->n_t > 12 ? t_in(a, 12) : nullptr;
     const int64_t heads = p_int(a, "heads", 0), ngram = p_int(a, "ngram", 0),
                   pad = p_int(a, "pad", -1), msize = p_int(a, "map_size", 0),
                   image = p_int(a, "image", -1), video = p_int(a, "video", -1);
@@ -885,9 +888,11 @@ int ref_engram_ids(const RadArgs* a, RadStream) {
     if (tok.rank < 1 || numel(&tok) < 1 || numel(&map) < msize || numel(&mult) < ngram ||
         numel(&vsz) < heads || numel(&off) < heads || cu.rank != 1 || cu.shape[0] < 2)
         return RAD_E_SHAPE;
-    const int64_t M = numel(&tok), n_seq = cu.shape[0] - 1;
-    if (numel(&pos) < M || ids.rank != 2 || ids.shape[0] < M || ids.shape[1] != heads ||
-        numel(&mask) < M || st.rank < 2 || st.shape[st.rank - 1] < ctx)
+    const int64_t A = ahead ? numel(ahead) / heads : 0;
+    const int64_t M = numel(&tok) - A, n_seq = cu.shape[0] - 1;
+    if (M < 1 || numel(&pos) < M || ids.rank != 2 || ids.shape[0] < M || ids.shape[1] != heads ||
+        numel(&mask) < M || st.rank < 2 || st.shape[st.rank - 1] < ctx ||
+        (ahead && (ahead->rank != 2 || ahead->shape[1] != heads || cu_at(&cu, n_seq) != M)))
         return RAD_E_SHAPE;
     for (int64_t h = 0; h < heads; ++h)
         if (ld_idx(&vsz, h) <= 0 || ld_idx(&off, h) < 0) return RAD_E_SHAPE;
@@ -917,9 +922,15 @@ int ref_engram_ids(const RadArgs* a, RadStream) {
             const int64_t p = ctx + t - k;
             return p < ctx ? prev[p] : ld_idx(&tok, bos + p - ctx);
         };
-        REF_PAR_FOR(T * heads * 4)
-        for (int64_t t = 0; t < T; ++t) {
-            const int64_t m = bos + t, pm = ld_idx(&pos, m);
+        /* The last sequence runs on into the following prompt: rows T .. T + A - 1 of it, at the
+         * positions after its last, written to `ahead`. */
+        const int64_t TA = T + (s + 1 == n_seq ? A : 0);
+        REF_PAR_FOR(TA * heads * 4)
+        for (int64_t t = 0; t < TA; ++t) {
+            const int64_t m = bos + t;
+            const int64_t pm = t < T ? ld_idx(&pos, m) : ld_idx(&pos, bos + T - 1) + 1 + (t - T);
+            const RadTensor& out = t < T ? ids : *ahead;
+            const int64_t mo = t < T ? m : t - T;
             int64_t mixed[8];
             for (int64_t k = 0; k < ngram; ++k) {
                 int64_t c = map_pad;
@@ -934,10 +945,11 @@ int ref_engram_ids(const RadArgs* a, RadStream) {
                 mix ^= mixed[g];
                 for (int64_t j = 0; j < per; ++j) {
                     const int64_t h = (g - 1) * per + j;
-                    st_int(ids.dtype, ids.data, m * ids.stride[0] + h * ids.stride[1],
+                    st_int(out.dtype, out.data, mo * out.stride[0] + h * out.stride[1],
                            floor_mod(mix, ld_idx(&vsz, h)) + ld_idx(&off, h));
                 }
             }
+            if (t >= T) continue;
             const int64_t t0 = ld_idx(&tok, m);
             st_int(mask.dtype, mask.data, offlin(&mask, m),
                    t0 != pad && t0 != image && t0 != video ? 1 : 0);

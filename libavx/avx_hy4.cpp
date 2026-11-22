@@ -932,6 +932,9 @@ AVX_KERNEL(engram_ids) {
     const RadTensor* nacc = rad_arg_in(a, 8);
     const RadTensor* sidx = rad_arg_in(a, 9);
     const RadTensor &ids = a->t[10], &mask = a->t[11];
+    /* The following prompt's ids (a read-ahead hint): `tok` holds A tokens of the last sequence
+     * past the step's rows. */
+    const RadTensor* ahead = a->n_t > 12 ? rad_arg_in(a, 12) : nullptr;
     const int64_t heads = p_int(a, "heads", 0), ngram = p_int(a, "ngram", 0),
                   pad = p_int(a, "pad", -1), msize = p_int(a, "map_size", 0),
                   image = p_int(a, "image", -1), video = p_int(a, "video", -1);
@@ -941,9 +944,11 @@ AVX_KERNEL(engram_ids) {
     if (tok.rank < 1 || numel(&tok) < 1 || numel(&map) < msize || numel(&mult) < ngram ||
         numel(&vsz) < heads || numel(&off) < heads || cu.rank != 1 || cu.shape[0] < 2)
         return RAD_E_SHAPE;
-    const int64_t M = numel(&tok), n_seq = cu.shape[0] - 1;
-    if (numel(&pos) < M || ids.rank != 2 || ids.shape[0] < M || ids.shape[1] != heads ||
-        numel(&mask) < M || st.rank < 2 || st.shape[st.rank - 1] < ctx)
+    const int64_t A = ahead ? numel(ahead) / heads : 0;
+    const int64_t M = numel(&tok) - A, n_seq = cu.shape[0] - 1;
+    if (M < 1 || numel(&pos) < M || ids.rank != 2 || ids.shape[0] < M || ids.shape[1] != heads ||
+        numel(&mask) < M || st.rank < 2 || st.shape[st.rank - 1] < ctx ||
+        (ahead && (ahead->rank != 2 || ahead->shape[1] != heads || cuv(&cu, n_seq) != M)))
         return RAD_E_SHAPE;
     std::vector<int64_t> vtab((size_t)heads), otab((size_t)heads), mtab((size_t)ngram);
     for (int64_t h = 0; h < heads; ++h) {
@@ -977,9 +982,16 @@ AVX_KERNEL(engram_ids) {
             const int64_t p = ctx + t - k;
             return p < ctx ? prev[p] : ldi(&tok, offlin(&tok, bos + p - ctx));
         };
-        AVX_PARALLEL_FOR_IF(T * heads >= 4096)
-        for (int64_t t = 0; t < T; ++t) {
-            const int64_t m = bos + t, pm = ldi(&pos, offlin(&pos, m));
+        /* The last sequence runs on into the following prompt: rows T .. T + A - 1 of it, at the
+         * positions after its last, written to `ahead`. */
+        const int64_t TA = T + (s + 1 == n_seq ? A : 0);
+        AVX_PARALLEL_FOR_IF(TA * heads >= 4096)
+        for (int64_t t = 0; t < TA; ++t) {
+            const int64_t m = bos + t;
+            const int64_t pm = t < T ? ldi(&pos, offlin(&pos, m))
+                                     : ldi(&pos, offlin(&pos, bos + T - 1)) + 1 + (t - T);
+            const RadTensor& out = t < T ? ids : *ahead;
+            const int64_t mo = t < T ? m : t - T;
             int64_t mixed[8];
             for (int64_t k = 0; k < ngram; ++k) {
                 int64_t c = map_pad;
@@ -994,10 +1006,11 @@ AVX_KERNEL(engram_ids) {
                 mix ^= mixed[g];
                 for (int64_t j = 0; j < per; ++j) {
                     const int64_t h = (g - 1) * per + j;
-                    st_int_dt(ids.dtype, ids.data, m * ids.stride[0] + h * ids.stride[1],
+                    st_int_dt(out.dtype, out.data, mo * out.stride[0] + h * out.stride[1],
                               floor_mod(mix, vtab[(size_t)h]) + otab[(size_t)h]);
                 }
             }
+            if (t >= T) continue;
             const int64_t t0 = ldi(&tok, offlin(&tok, m));
             st_int_dt(mask.dtype, mask.data, offlin(&mask, m),
                       t0 != pad && t0 != image && t0 != video ? 1 : 0);

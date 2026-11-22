@@ -223,20 +223,26 @@ struct Codes {
     RadBuilder* b = nullptr;
     Names* nm = nullptr;
     int64_t rows = 0;
-    struct Pair { int64_t k = 0, g8 = 0; rad_buf q8 = 0, s8 = 0; };
+    struct Pair { int64_t k = 0, g8 = 0; std::string tag; rad_buf q8 = 0, s8 = 0; };
     std::vector<Pair> pairs;
     int n_linear = 0;              /* int8 linears reading a pair */
-    /* The pair at width `k` and scale group `g8` (128, IQ8R 256), declared on first use. */
-    const Pair* get(int64_t k, int64_t g8) {
+    int n_fed = 0;                 /* of them, those reading codes another op wrote (Lin::feed) */
+    /* The pair at width `k` and scale group `g8` (128, IQ8R 256), declared on first use. A `tag`
+     * names a pair of its own, which only the linears and producers of that role write: the codes
+     * of a shared input must survive until its last reader (Lin::feed), whatever other linear of
+     * the same width runs between. */
+    const Pair* get(int64_t k, int64_t g8, const char* tag = "") {
         for (const Pair& p : pairs)
-            if (p.k == k && p.g8 == g8) return &p;
+            if (p.k == k && p.g8 == g8 && p.tag == tag) return &p;
         Pair p;
         p.k = k;
         p.g8 = g8;
-        p.q8 = decl_b(b, nm->f("trunk_codes.%lld.%lld.q8", (long long)k, (long long)g8), RAD_I8,
-                      { rows, k });
-        p.s8 = decl_b(b, nm->f("trunk_codes.%lld.%lld.s8", (long long)k, (long long)g8), RAD_F32,
-                      { rows, (k + g8 - 1) / g8 });
+        p.tag = tag;
+        const char* sep = *tag ? "." : "";
+        p.q8 = decl_b(b, nm->f("trunk_codes%s%s.%lld.%lld.q8", sep, tag, (long long)k, (long long)g8),
+                      RAD_I8, { rows, k });
+        p.s8 = decl_b(b, nm->f("trunk_codes%s%s.%lld.%lld.s8", sep, tag, (long long)k, (long long)g8),
+                      RAD_F32, { rows, (k + g8 - 1) / g8 });
         if (!p.q8 || !p.s8) return nullptr;
         pairs.push_back(p);
         return &pairs.back();
@@ -271,17 +277,87 @@ inline Codes* codes_of(RadBuilder* b) {
     return nullptr;
 }
 
+/* Shared int8 inputs (the friend's q8_fed sharing): several int8 linears read one bf16 input,
+ * and the codes the first one's quantiser writes are the codes each of the others would write
+ * itself (the same quantiser over the same bytes), so the others read them and declare no
+ * quantiser. Byte-identical. A group shares only where the weights read the same codes: the same
+ * K, scale group and rotation (Lin::code_form); a member of another form quantises its own. The
+ * leader writes a pair of its own (Codes::get's tag), so no linear of the same width between it
+ * and the last member overwrites the codes, and the members are issued after it with nothing
+ * writing the input between (the caller's order). Off: RADIANCE_HY4_SHARE_CODES=0. */
+inline bool share_codes_on() {
+    const char* e = std::getenv("RADIANCE_HY4_SHARE_CODES");
+    return !(e && *e && std::strcmp(e, "0") == 0);
+}
+/* The int8 producers that write a linear's codes in their own pass (rmsnorm_had_quant_i8g for the
+ * normed q residual, gated_had_quant_i8g for the dense and shared MLPs' down projection), where
+ * libr4d serves them. Byte-identical to the producer followed by had_quant_act_i8g (docs/OPS.md).
+ * Off: RADIANCE_HY4_FUSED_QUANT=0. */
+inline bool fused_quant_on() {
+    const char* e = std::getenv("RADIANCE_HY4_FUSED_QUANT");
+    return !(e && *e && std::strcmp(e, "0") == 0);
+}
+
+/* The chained 128-group rotated int8 quantisers (Geom::chain_q8). Off: RADIANCE_HY4_CHAIN_Q8=0. */
+inline bool chain_q8_on() {
+    const char* e = std::getenv("RADIANCE_HY4_CHAIN_Q8");
+    return !(e && *e && std::strcmp(e, "0") == 0);
+}
+
+/* MoeFP8's fused selection and sort (Config::router_fuse). Off: RADIANCE_HY4_ROUTER_FUSE=0. */
+inline bool router_fuse_on() {
+    const char* e = std::getenv("RADIANCE_HY4_ROUTER_FUSE");
+    return !(e && *e && std::strcmp(e, "0") == 0);
+}
+
+/* The int8 codes a stored linear reads: none for a plain bf16 (or unknown) weight, else its K-wise
+ * scale group and whether they are in the rotated (Hadamard) domain. */
+struct CodeForm {
+    bool i8 = false, rot = false;
+    int64_t g8 = 0;
+    bool same(const CodeForm& o) const { return i8 && o.i8 && rot == o.rot && g8 == o.g8; }
+};
+inline CodeForm code_form(RadBuilder* b, const char* wn) {
+    CodeForm f;
+    RadEncoding e{};
+    if (!weight_enc(b, wn, &e)) return f;
+    if (rad_enc_is(&e, "plain") && e.n_planes == 1 && e.plane[0].dtype == RAD_BF16) return f;
+    const bool rot = linear_is_w8h(e) || linear_is_wnh(e);
+    if (!rot && !linear_is_w8(e)) return f;
+    f.i8 = true;
+    f.rot = rot;
+    f.g8 = linear_w8h_group(e);
+    return f;
+}
+
 /* A trunk linear: LinearFP8 at the encoding its weight is stored in (a plain bf16 GEMM, or the
  * int8 forms above over the rank's scratch pair), with LinearFP8's declare and step. */
 struct Lin : LinearFP8 {
     rad_buf q8 = 0, s8 = 0;
     int64_t g8 = RAD_FP8_BLOCK;
+    CodeForm form{};
+    /* Set before declare. `lead`: this linear opens a shared input (a tag naming the role, e.g.
+     * "attn_in"), quantising into that role's own pair. `feed`: it reads the codes `feed` wrote
+     * (declared and issued before it, over the same input), when their forms match. `fed_codes`:
+     * it reads the codes a producer writes in its own pass (`q8`, `s8`, `g8`, `q8_rot`), which the
+     * caller declared after checking the form (Lin::code_form). */
+    const char* lead = nullptr;
+    const Lin* feed = nullptr;
+    const ActFP8* fed_codes = nullptr;
+    bool fed = false;   /* declared without a quantiser: its codes come from `feed` or `fed_codes` */
     ActFP8 with_codes(const ActFP8& a) const {
         ActFP8 r = a;
         if (q8 && !r.q8) {
             r.q8 = q8;
             r.s8 = s8;
             r.g8 = g8;
+        }
+        if (fed) {
+            r.q8 = q8;
+            r.s8 = s8;
+            r.g8 = g8;
+            r.q8_fed = true;
+            r.q8_rot = form.rot;
         }
         return r;
     }
@@ -299,6 +375,7 @@ struct Lin : LinearFP8 {
                                       e.plane[0].dtype == RAD_BF16);
         Geom gl = g;
         gl.w_bf16 = plain;
+        fed = false;
         if (!plain) {
             if (!linear_is_w8(e) && !linear_is_w8h(e) && !linear_is_wnh(e)) {
                 char en[256];
@@ -309,13 +386,32 @@ struct Lin : LinearFP8 {
                                 "with a zero point)\n", wn, en);
                 return RAD_E_DTYPE;
             }
+            form = code_form(b, wn);
             Codes* c = codes_of(b);
-            const Codes::Pair* pr = c ? c->get(n_in, linear_w8h_group(e)) : nullptr;
-            if (!pr) return RAD_E_INVAL;
-            q8 = pr->q8;
-            s8 = pr->s8;
-            g8 = pr->g8;
+            if (!c) return RAD_E_INVAL;
+            if (fed_codes && fed_codes->q8 && fed_codes->s8 && fed_codes->g8 == form.g8 &&
+                fed_codes->q8_rot == form.rot) {
+                q8 = fed_codes->q8;
+                s8 = fed_codes->s8;
+                g8 = fed_codes->g8;
+                fed = true;
+            } else if (feed && feed->lead && feed->q8 && !feed->fed && feed->form.same(form) &&
+                       feed->K == n_in &&
+                       share_codes_on()) {
+                q8 = feed->q8;
+                s8 = feed->s8;
+                g8 = feed->g8;
+                fed = true;
+            } else {
+                const Codes::Pair* pr =
+                    c->get(n_in, form.g8, lead && share_codes_on() ? lead : "");
+                if (!pr) return RAD_E_INVAL;
+                q8 = pr->q8;
+                s8 = pr->s8;
+                g8 = pr->g8;
+            }
             ++c->n_linear;
+            if (fed) ++c->n_fed;
         }
         return LinearFP8::declare(b, nm, gl, base, n_out, n_in, shard, grp, src, with_codes(a), y,
                                   max_rows, row_parts, span_lo, span_hi);

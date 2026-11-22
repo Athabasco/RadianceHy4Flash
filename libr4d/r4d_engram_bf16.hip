@@ -3,7 +3,11 @@
 //   engram_ids   c_k = map[t_k] (the pad id before the document start, and for an id outside the
 //                map), m_k = c_k * mult[k] in wrapping int64, mix_g = m_0 ^ .. ^ m_{g-1}, head i of
 //                order g: floor_mod(mix_g, vocab_sizes[i]) + offsets[i]; mask = tok not in
-//                {pad, image, video}. `state` is ngram_ids' window of committed ids.
+//                {pad, image, video}. `state` is ngram_ids' window of committed ids. With
+//                `ahead_ids`, `tok` runs on past the step's rows into the last sequence's following
+//                prompt, whose ids (no mask) go there: the read-ahead hint of a host gather. The
+//                caller's cu ends at the step's last row, the last sequence's (the host libraries
+//                check it; here it is the contract).
 //   engram_norm  y[i] = bf16(gain[i] * x[i] * rsqrt(mean_head(x^2) + eps)), one rms a head
 //   engram_gate  main = w_val * val * rsqrt(mean(val^2) + eps); per stream c:
 //                kn = w_key*key*rsqrt(..), qn = w_query*h_c*rsqrt(..), d = (sum kn*qn) n^-0.5,
@@ -65,17 +69,20 @@ struct EngramIds {
     const int64_t* off;
     const int32_t* nacc;   // may be null
     const int32_t* sidx;   // may be null
-    int32_t M, heads, ngram, pad, msize, image, video, n_seq, W;
-    uint64_t sp, ip;       // the window's row pitch, ids' row pitch
+    int32_t* ahead;        // may be null: the following prompt's ids, A rows past the step's M
+    int32_t M, A, heads, ngram, pad, msize, image, video, n_seq, W;
+    uint64_t sp, ip, ap;   // the window's row pitch, ids' and ahead's row pitch
 };
 
 template <bool I64>
 __device__ __forceinline__ void engram_ids_body(EngramIds p, void* __restrict__ ids_,
                                                 int32_t* __restrict__ mask) {
     const uint64_t g = (uint64_t)blockIdx.x * 256u + threadIdx.x;
-    if (g >= (uint64_t)p.M * (uint64_t)p.heads) return;
+    if (g >= (uint64_t)(p.M + p.A) * (uint64_t)p.heads) return;
     const int32_t m = (int32_t)(g / (uint32_t)p.heads), head = (int32_t)(g % (uint32_t)p.heads);
-    const int32_t s = eg_seq_of(p.cu, p.n_seq, m);
+    // A row past the step's is the last sequence's following prompt (`ahead`).
+    const bool ah = m >= p.M;
+    const int32_t s = ah ? p.n_seq - 1 : eg_seq_of(p.cu, p.n_seq, m);
     if (s < 0) return;
     const int32_t slot = p.sidx ? p.sidx[s] : s;
     if (slot < 0) return;
@@ -85,7 +92,7 @@ __device__ __forceinline__ void engram_ids_body(EngramIds p, void* __restrict__ 
     const int32_t bos = p.cu[s], t = m - bos;
     const int32_t* __restrict__ st = p.state + (uint64_t)slot * p.sp + o;
     const int32_t order = head / per + 1;   // the head's mix XORs shifts 0 .. order
-    const int32_t pm = p.pos[m];
+    const int32_t pm = ah ? p.pos[p.M - 1] + 1 + (m - p.M) : p.pos[m];
     const int64_t map_pad = p.map[p.pad];
     int64_t mix = 0;
     for (int32_t k = 0; k <= order; ++k) {
@@ -100,6 +107,10 @@ __device__ __forceinline__ void engram_ids_body(EngramIds p, void* __restrict__ 
     }
     const int64_t vs = p.vsz[head];
     const int64_t id = (vs > 0 ? eg_floor_mod(mix, vs) : 0) + p.off[head];
+    if (ah) {
+        p.ahead[(uint64_t)(m - p.M) * p.ap + head] = (int32_t)id;
+        return;
+    }
     if (I64) ((int64_t*)ids_)[(uint64_t)m * p.ip + head] = id;
     else     ((int32_t*)ids_)[(uint64_t)m * p.ip + head] = (int32_t)id;
     if (head == 0) {
@@ -311,11 +322,12 @@ bool eg_i64(const RadTensor* t) { return t && t->dtype == RAD_I64; }
 }  // namespace
 
 extern "C" int r4d_rad_engram_ids(const RadArgs* a, RadStream s) {
-    enum { TOK = 0, STATE, CU, POS, MAP, MULT, VSZ, OFF, NACC, SIDX, IDS, MASK };
+    enum { TOK = 0, STATE, CU, POS, MAP, MULT, VSZ, OFF, NACC, SIDX, IDS, MASK, AHEAD };
     const RadTensor *tok = r4d_opt(a, TOK), *st = r4d_opt(a, STATE), *cu = r4d_opt(a, CU),
                     *pos = r4d_opt(a, POS), *map = r4d_opt(a, MAP), *mult = r4d_opt(a, MULT),
                     *vsz = r4d_opt(a, VSZ), *off = r4d_opt(a, OFF), *nacc = r4d_opt(a, NACC),
-                    *sidx = r4d_opt(a, SIDX), *ids = r4d_opt(a, IDS), *mask = r4d_opt(a, MASK);
+                    *sidx = r4d_opt(a, SIDX), *ids = r4d_opt(a, IDS), *mask = r4d_opt(a, MASK),
+                    *ahead = a->n_t > AHEAD ? r4d_opt(a, AHEAD) : nullptr;
     if (!tok || !st || !cu || !pos || !map || !mult || !vsz || !off || !ids || !mask)
         return R4D_NO(RAD_E_INVAL);
     if (!eg_i32(tok) || !eg_i32(st) || !eg_i32(cu) || !eg_i32(pos) || !eg_i32(map) ||
@@ -330,7 +342,12 @@ extern "C" int r4d_rad_engram_ids(const RadArgs* a, RadStream s) {
         return R4D_NO(RAD_E_SHAPE);
     if (pad < 0 || pad >= msize) return R4D_NO(RAD_E_INVAL);
     const long long ctx = ngram - 1;
-    const long long M = r4d_numel(tok);
+    /* `tok` holds the step's rows, then the A tokens whose ids go to `ahead` (i32 [A, heads]). */
+    const long long A = ahead ? r4d_numel(ahead) / heads : 0;
+    if (ahead && (!eg_i32(ahead) || ahead->rank != 2 || ahead->shape[1] != heads ||
+                  ahead->stride[1] != 1))
+        return R4D_NO(RAD_E_SHAPE);
+    const long long M = r4d_numel(tok) - A;
     if (tok->rank < 1 || M < 1 || M > INT32_MAX / 64 || !r4d_contig(tok) || !r4d_contig(cu) ||
         cu->rank != 1 || cu->shape[0] < 2 || r4d_numel(pos) < M || r4d_numel(map) < msize ||
         r4d_numel(mult) < ngram || r4d_numel(vsz) < heads || r4d_numel(off) < heads ||
@@ -353,6 +370,9 @@ extern "C" int r4d_rad_engram_ids(const RadArgs* a, RadStream s) {
     p.off = (const int64_t*)off->data;
     p.nacc = nacc ? (const int32_t*)nacc->data : nullptr;
     p.sidx = sidx ? (const int32_t*)sidx->data : nullptr;
+    p.ahead = A > 0 ? (int32_t*)ahead->data : nullptr;
+    p.A = A > 0 ? (int32_t)A : 0;
+    p.ap = A > 0 ? (uint64_t)ahead->stride[0] : 0;
     p.M = (int32_t)M;
     p.heads = (int32_t)heads;
     p.ngram = (int32_t)ngram;
@@ -365,7 +385,8 @@ extern "C" int r4d_rad_engram_ids(const RadArgs* a, RadStream s) {
     p.W = (int32_t)st->shape[st->rank - 1];
     p.sp = (uint64_t)st->stride[0];
     p.ip = (uint64_t)ids->stride[0];
-    const uint32_t blocks = (uint32_t)((M * heads + 255) / 256);
+    if (A > 0 && M + A > INT32_MAX / 64) return R4D_NO(RAD_E_SHAPE);
+    const uint32_t blocks = (uint32_t)(((M + A) * heads + 255) / 256);
     const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;   /* decode heights */
 #define R4D_EGI_K(I_, C_) R4D_EMIT(s, (engram_ids_kernel<I_, C_>), dim3(blocks), dim3(256), 0, p, \
                                    ids->data, (int32_t*)mask->data)

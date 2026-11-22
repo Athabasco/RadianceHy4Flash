@@ -5045,6 +5045,29 @@ static void hy4_cases(std::vector<Hand>& hs) {
         hs.push_back(std::move(h));
     }
 
+    {
+        /* The read-ahead (`ahead_ids`): two prefill sequences, the last with three tokens of its
+         * following prompt in `tok` past the step's six rows. */
+        const int64_t M = 6, A = 3, heads = 6, ngram = 4, W = 5, map = 40;
+        static const int64_t mult[4] = { 1000003, 998244353, 1000000007, 4294967311LL };
+        static const int64_t vsz[6] = { 31, 37, 41, 43, 47, 53 }, off[6] = { 0, 40, 80, 120, 160, 200 };
+        Hand h("a prefill whose last sequence hashes its following prompt ahead", "engram_ids", 0.0);
+        h.idx({ 1, 2, 3, 4, 5, 6, 7, 39, 8 })
+         .dense(RAD_I32, { 2, W }, [](int64_t i) { return (float)(10 + i); }, true)
+         .idx({ 0, 2, 6 })
+         .idx({ 4, 5, 0, 1, 2, 3 })
+         .dense(RAD_I32, { map }, [](int64_t i) { return (float)(i % 13); })
+         .raw(RAD_I64, { 4 }, mult)
+         .raw(RAD_I64, { 6 }, vsz)
+         .raw(RAD_I64, { 6 }, off)
+         .none().none()
+         .dense(RAD_I32, { M, heads }, [](int64_t) { return -5.0f; }, true)
+         .dense(RAD_I32, { M }, sent, true)
+         .dense(RAD_I32, { A, heads }, [](int64_t) { return -5.0f; }, true)
+         .pi("M", M).pi("heads", heads).pi("ngram", ngram).pi("pad", 0).pi("map_size", map);
+        hs.push_back(std::move(h));
+    }
+
     /* ---- iHC ---------------------------------------------------------------------------- */
     for (const bool post : { true, false }) {
         /* h is a column slice of a wider plane; base far below zero saturates a gate at hc_eps. */

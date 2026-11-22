@@ -658,12 +658,20 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
             const char* qn = hi8 ? "had_quant_act_i8g" : a.q8_fed ? "quant_act_i8g"
                            : rot ? "had_quant_act_fp8" : "quant_act_fp8";
             op_quant =
-                rw(b,
-                   RAD_OP(b, qn,
-                          RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
-                                     RAD_INT("group", a.cg()), RAD_STR("dtype", g.dtype)),
-                          RAD_NOWEIGHTS),
-                   { a.x }, { a.cq(), a.cs() });
+                (hi8 || (rot && !a.q8_fed)) && g.chain_q8   /* the chained row (Geom::chain_q8) */
+                    ? rw(b,
+                         RAD_OP(b, qn,
+                                RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
+                                           RAD_INT("group", a.cg()), RAD_STR("dtype", g.dtype),
+                                           RAD_INT("chained", 1)),
+                                RAD_NOWEIGHTS),
+                         { a.x }, { a.cq(), a.cs() })
+                    : rw(b,
+                         RAD_OP(b, qn,
+                                RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
+                                           RAD_INT("group", a.cg()), RAD_STR("dtype", g.dtype)),
+                                RAD_NOWEIGHTS),
+                         { a.x }, { a.cq(), a.cs() });
             if (!op_quant) return RAD_E_INVAL;
         }
         return op?RAD_OK:RAD_E_INVAL;
@@ -1553,7 +1561,14 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
                                                col ? span_hi / wg : span_hi));
         }
         const int64_t hi = max_rows > 0 ? max_rows : g.max_tok;
-        if (!a.q8_fed)
+        if (!a.q8_fed && rot8 && g.chain_q8)   /* the chained row (Geom::chain_q8) */
+            op_q = rw(b, RAD_OP(b, "had_quant_act_i8g",
+                     RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("n", K),
+                                RAD_INT("group", wg), RAD_STR("dtype", "bf16"),
+                                RAD_INT("chained", 1)),
+                     RAD_NOWEIGHTS),
+                  { a.x }, { a.q8, a.s8 });
+        else if (!a.q8_fed)
             op_q = rw(b, RAD_OP(b, rot8 ? "had_quant_act_i8g" : "quant_act_i8g",
                      RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("n", K),
                                 RAD_INT("group", wg), RAD_STR("dtype", "bf16")),

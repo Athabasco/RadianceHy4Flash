@@ -703,7 +703,7 @@ and is optional.
 | op | params | operands |
 |---|---|---|
 | `quant_act_fp8` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
-| `had_quant_act_fp8` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
+| `had_quant_act_fp8` | `M` `n` `group` `dtype` `chained`/opt | `x` → `q`, `scale` |
 | `quant_cols_fp8` | `M` `n` `dtype` | `x` → `y`, `scale` |
 | `rmsnorm_quant_fp8` | `M` `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gated_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
@@ -731,9 +731,9 @@ for it. `residual` present is the `fused_add_rms_norm` form.
 
 | op | params | operands |
 |---|---|---|
-| `had_quant_act_i8g` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
+| `had_quant_act_i8g` | `M` `n` `group` `dtype` `chained`/opt | `x` → `q`, `scale` |
 | `gated_had_quant_i8g` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
-| `rmsnorm_had_quant_i8g` | `M` `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
+| `rmsnorm_had_quant_i8g` | `M` `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt `chained`/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gate_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate`, `x` → `q`, `scale`, `out_bf16`? |
 | `gate_had_quant_i8g` | `M` `n` `group` `dtype` `act`:str/opt | `gate`, `x` → `q`, `scale`, `out_bf16`? |
 | `rmsnorm_quant_i8` | `M` `n` `eps`:f64 `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
@@ -752,6 +752,12 @@ one launch for a norm read by three projections (q, k and v), and none between t
 the down projection. `out_bf16` receives the unrotated value, for a bf16 consumer. `n` is a
 multiple of `group`. A rotated code read as a plain one, or the reverse, gives a model that runs
 and is wrong, so these are separate ops.
+
+`chained` 1 on `had_quant_act_i8g`, `had_quant_act_fp8` and `rmsnorm_had_quant_i8g` asks for the
+chained form of the 128-group kernel (libr4d's `*_chained` rows, the same bytes): an architecture
+whose GEMMs around these quantisers all chain sets it (Hy4-flash); without it the rows stay plain,
+since one chained quantiser between two plain GEMMs measured slower (Flash-Next). The host
+libraries ignore it.
 
 `gate_had_quant_i8g` is `gate_quant_fp8`'s product (the gate in its own operand: a gated
 attention's gate is a column slice of the `[q|gate]` projection) with `had_quant_act_i8g`'s
@@ -3764,7 +3770,7 @@ refuses the graph rather than resolving a similar op.
 | `idx_pool_gated` | `M`(range) `n` `ratio` `rotary_dim` `eps`:f64 `theta`:f64 `mode` `sections`/opt `block_size`/opt `dtype` | `k`, `wv`w, `wg`w, `ape`w, `gain`w, `pos`, `page`?, `cache`:inout? → `out`? |
 | `idx_pool_gated_fp8` | `M`(range) `n` `ratio` `rotary_dim` `eps`:f64 `theta`:f64 `mode` `sections`/opt `block_size`/opt `dtype` | `k`, `wv`w, `wg`w, `ape`w, `gain`w, `pos`, `page`?, `cache`:inout? → `q`?, `scale`? |
 | `idx_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` | `q`, `gate`, `k`, `bt`, `cu`, `nc` → `score` |
-| `engram_ids` | `M`(range) `heads` `ngram` `pad` `map_size` `image`/opt `video`/opt | `tok`, `state`:inout, `cu`, `pos`, `token_map`w, `mult`w, `vocab_sizes`w, `offsets`w, `num_accepted`?, `cache_idx`? → `ids`, `mask` |
+| `engram_ids` | `M`(range) `heads` `ngram` `pad` `map_size` `image`/opt `video`/opt | `tok`, `state`:inout, `cu`, `pos`, `token_map`w, `mult`w, `vocab_sizes`w, `offsets`w, `num_accepted`?, `cache_idx`? → `ids`, `mask`, `ahead_ids`? |
 | `engram_norm` | `M`(range) `heads` `n` `eps`:f64 `dtype` | `e`, `gain`w → `y` |
 | `engram_gate` | `M`(range) `n` `hc` `eps`:f64 `dtype` | `key`, `val`, `mask`, `w_key`w, `w_query`w, `w_val`w, `w_branch`w, `h`:inout |
 | `dfly_sel` | `M`(range) `blocks_in` `blocks` `ratio` `seqs` | `sel`, `nsel`, `src`, `bt`, `pos`, `cu` → `out`, `len`, `count`? |
@@ -4007,12 +4013,17 @@ step when `num_accepted` is present, the prefill layout otherwise); `cache_idx` 
 each sequence (the sequence index when absent). It is optional and sits after `num_accepted`, so
 the operands the design note lists keep their positions. One issue serves one Engram layer (the
 multipliers, sizes and offsets differ a layer); the history is shared, so only the first issue of a
-step may advance it. `ids` is i32 or i64, `mask` i32.
+step may advance it. `ids` is i32 or i64, `mask` i32. `ahead_ids` (i32 `[A, heads]`) is
+`ngram_ids`' read-ahead (above): `tok` then holds A more tokens, the last sequence's following prompt
+(`cu` ends at the step's last row, that sequence's), hashed at the positions after its last into
+`ahead_ids`; ids, mask and the window written back are the step's alone. Hy4-flash passes them to
+the gather's `ahead`.
 
 **`engram_norm`**: `y[m][i] = round( gain[i] * x[m][i] * rsqrt(mean_head(x^2) + eps) )`, one rms a
-head of `n` (96) channels, the sum in f64. **`eps` is a parameter and an open decision**: HF's port
-builds these norms as `nn.RMSNorm(dim)` with no eps, which resolves to `finfo(dtype).eps`:
-0.0078125 in bf16, 1.19e-7 in f32 (vLLM uses the latter). Tests state which they use.
+head of `n` (96) channels, the sum in f64. **`eps` is a parameter**: HF's port builds these norms as
+`nn.RMSNorm(dim)` with no eps, which resolves to `finfo(dtype).eps`: 0.0078125 in bf16, 1.19e-7 in
+f32 (vLLM and llama.cpp use the latter, and so does the Hy4-flash plugin by default). Tests state
+which they use.
 
 **`engram_gate`**: `key [M, hc*n]` and `val [M, n]` are the two projections of the normed rows,
 `mask [M]` i32, `w_key`, `w_query`, `w_branch` `[hc*n]` (the `hc` per-stream gains joined),
