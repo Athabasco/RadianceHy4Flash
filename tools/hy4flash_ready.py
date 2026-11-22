@@ -934,13 +934,13 @@ ITEMS = [("A1", a1), ("A2", a2), ("A3", a3), ("A4", a4), ("A5", a5), ("A6", a6),
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--build", required=True)
-    ap.add_argument("--ref", default=os.path.join(SRC, "..", "..", "ref"))
+    ap.add_argument("--ref", default=os.path.join(SRC, "..", "ref"))
     ap.add_argument("--release", help="directory for the release structure (default <work>/release)")
     ap.add_argument("--work")
     ap.add_argument("--only", help="comma list, e.g. A1,A9")
     ap.add_argument("--gpu", action="store_true", help="also run the card items (A5), under flock gpu.lock")
     ap.add_argument("--full-suite", nargs="*", metavar="BUILD", help="run the whole ctest of these build directories (A11)")
-    ap.add_argument("--iqr-container", default=os.path.join(SRC, "..", "..", "work/close/iqr-fresh.rad"),
+    ap.add_argument("--iqr-container", default=os.path.join(SRC, "..", "work/close/iqr-fresh.rad"),
                     help="a gpu-mini container converted with the current hy4-flash-iqr-gptq.recipe (tcq_rows=128 for gate_up), for A8 on the cards. "
                          "Its GPTQ takes ~95 min on the host, so it is made once: CALIB=<grams of a gpu-mini calibration> rad-convert <gpu-mini ckpt> --add tables.safetensors "
                          "--recipe data/recipes/hy4-flash-iqr-gptq.recipe -o iqr-fresh.rad --max-ctx 3008 --max-tok 3000")
