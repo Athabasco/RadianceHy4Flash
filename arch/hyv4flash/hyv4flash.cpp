@@ -67,6 +67,73 @@
 
 namespace hyv4flash {
 
+/* ------------------------------------------------------------------ the pipelined prefill
+ * A prefill chunk wider than two shape bands runs as two row pieces: one piece's junction (join,
+ * exact all-reduce, sandwich norm) is issued on the second lane and the other piece's arms run
+ * beside it, so half of the two reductions a layer pays rides under GEMMs (docs/TP4.md). It is the
+ * same trade qwen35_fp8's step_pipelined makes at two ranks; here the layer's whole collective is
+ * already one Junction, so nothing but that junction and Ffn::body has to know about pieces.
+ *
+ * Off unless RADIANCE_HY4_PIPE=1 says otherwise, off with taps (they are declared at the step's
+ * height, not per piece), off for a calibration run (its hooks read between the ops) and off for a
+ * media step (the encoder's own reduction would have to ride the other lane). */
+/* A piece must stay inside the shape band the whole step's kernels were picked from, so the floor
+ * is the band's lower edge: a 4096-row chunk halves into two 2048-row pieces, a 2048-row chunk does
+ * not (two 1024-row pieces would pick other kernels and other numbers). */
+constexpr int64_t kPipeMinRows = 1024;
+
+inline bool pipe_env_on() {
+    const char* e = std::getenv("RADIANCE_HY4_PIPE");
+    return e && *e && std::strcmp(e, "0") != 0;
+}
+/* The floor, overridable to sweep a smaller piece than the band allows (RADIANCE_HY4_PIPE_MIN). */
+inline int64_t pipe_min_rows() {
+    const char* e = std::getenv("RADIANCE_HY4_PIPE_MIN");
+    const int64_t v = (e && *e) ? std::atoll(e) : 0;
+    return v > 0 ? v : kPipeMinRows;
+}
+/* Half the chunk, a multiple of 64 (the GEMMs' row grain); RADIANCE_HY4_PIPE_ROWS cuts elsewhere. */
+inline int64_t pipe_rows(int64_t T) {
+    const char* e = std::getenv("RADIANCE_HY4_PIPE_ROWS");
+    if (e && *e) {
+        const int64_t v = std::atoll(e);
+        if (v > 0 && v < T) return ((v + 63) / 64) * 64;
+    }
+    return ((T + 1) / 2 + 63) / 64 * 64;
+}
+
+/* The second lane (abi/rad_runtime.h): issue on lane 1 while lane 0 runs on, then join. */
+inline void pipe_on1(RadCtx* c, const std::function<void()>& fn) {
+    rad_lane(c, 1);
+    rad_lane_join(c, 0, 1);
+    fn();
+    rad_lane(c, 0);
+}
+inline void pipe_wait1(RadCtx* c) { rad_lane_join(c, 1, 0); }
+/* RADIANCE_HY4_PIPE_LANE=0 issues the same pieces on lane 0 only: it separates what the pieces cost
+ * from what riding the second lane gains. */
+inline bool pipe_lane() {
+    static const bool on = [] {
+        const char* e = std::getenv("RADIANCE_HY4_PIPE_LANE");
+        return !(e && *e && e[0] == '0');
+    }();
+    return on;
+}
+inline void pipe_issue(RadCtx* c, const std::function<void()>& fn) {
+    if (pipe_lane())
+        pipe_on1(c, fn);
+    else
+        fn();
+}
+inline void pipe_join(RadCtx* c) {
+    if (pipe_lane()) pipe_wait1(c);
+}
+/* One line per process when the pipeline first runs, so a log says which prefill shape took it. */
+inline bool& pipe_said() {
+    static bool said = false;
+    return said;
+}
+
 struct Layer {
     bool sliding = false;
     int engram = -1;      /* index into Model::engrams, -1 for none */
@@ -113,6 +180,12 @@ struct Model {
     rad_op op_mm_scatter = 0, op_mm_copy = 0, op_mm_reduce = 0;
     Dfly df{};       /* DFly2, the block drafter (hyv4flash_dfly.h) */
     int arm = kArmBf16;   /* the routed arms' activation codes (Ffn::arm) */
+    /* The pipelined prefill (docs/TP4.md, "the pipelined prefill"): a chunk wider than two shape
+     * bands runs as two row pieces, so the layer's junction (join, reduction, sandwich norm) of one
+     * piece rides the second lane beside the other piece's GEMMs. `pipe_on` is the declare-time
+     * half (the junction's narrow reduction exists, the buffers are concurrent); the step adds the
+     * per-batch half. */
+    bool pipe_on = false;
 };
 static std::unique_ptr<Model> models[MAX_SLOTS];
 /* Where a sizing declare goes (RadBuildCtx::shape_probe): the engine declares again at smaller step
@@ -686,7 +759,8 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
         }
         RAD_ARCH_TRY(pv.j_end.declare(b, s, g, T, m.tr, pv.ffn.junction_a(), pv.ffn.junction_b(),
                                       pv.ffn.post_gain, &lay.hc_attn, lay.attn_gain, m.tr.xn,
-                                      pv.ffn.op_join, pv.ffn.op_ar, jp));
+                                      pv.ffn.op_join, pv.ffn.op_ar, jp,
+                                      m.pipe_on ? 1 : 0));
     }
 
     /* The layer's latent group, declared before its first store; a sparse layer's indexer
@@ -763,7 +837,8 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
         if (cs && f.i8 && f.rot && f.g8 == RAD_FP8_BLOCK) jq = cs->get(E, f.g8, "junc_ffn_in");
     }
     RAD_ARCH_TRY(lay.j_mid.declare(b, s, g, T, m.tr, lay.attn.w.o, 0, lay.attn.post_gain,
-                                   &lay.hc_ffn, lay.ffn_gain, m.tr.xn, 0, lay.attn.op_ar, jq));
+                                   &lay.hc_ffn, lay.ffn_gain, m.tr.xn, 0, lay.attn.op_ar, jq,
+                                   m.pipe_on ? 1 : 0));
     RAD_ARCH_TRY(lay.t_ffn_in.declare(b, nm, T, "ffn_in_norm", l, RAD_BF16, E, m.tr.xn));
     RAD_ARCH_TRY(lay.ffn.declare(b, nm, s, g, l, m.tr.xn, m.tr.y, m.mw, m.dense_gu, m.dense_ff,
                                  m.dense_out, msrc, lay.j_mid.codes_if()));
@@ -773,7 +848,8 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
         if (e == l + 1)
             RAD_ARCH_TRY(lay.j_end.declare(b, s, g, T, m.tr, lay.ffn.junction_a(),
                                            lay.ffn.junction_b(), lay.ffn.post_gain, nullptr, 0, 0,
-                                           lay.ffn.op_join, lay.ffn.op_ar));
+                                           lay.ffn.op_join, lay.ffn.op_ar, nullptr,
+                                           m.pipe_on ? 1 : 0));
     RAD_ARCH_TRY(lay.t_resid.declare(b, nm, T, "resid", l, RAD_BF16, s.hc * E, m.tr.h));
     RAD_ARCH_TRY(m.calib.layer(b, g, s, l, m.tr.xn, lay.attn, !lay.sliding, lay.ffn,
                                lay.engram >= 0 ? &m.engrams[(size_t)lay.engram] : nullptr));
@@ -982,6 +1058,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(m.calib.begin(b, nm, g, ctx, s, m.mw.lat.x));
     m.engrams.resize(s.engram_layers.size());
     m.layers.resize((size_t)s.n_layer);
+    /* The declare-time half of the pipeline: no taps, no calibration, more than one rank (a
+     * reduction to hide), and room for two pieces above the 1024-row band's floor. The step adds
+     * its own half, and a library that serves no narrow reduction clears this again below. */
+    m.pipe_on = pipe_env_on() && g.world > 1 && !taps_on() && calib_dir() == nullptr &&
+                T > kPipeMinRows;
     for (int l = 0; l < (int)s.n_layer; ++l) RAD_ARCH_TRY(trunk_layer(b, m, l, &msrc[(size_t)l]));
 
     /* The head: the streams' collapse, the final norm, the lm_head over the sampled rows. */
@@ -994,7 +1075,24 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         Layer& lt = m.layers.back();
         RAD_ARCH_TRY(lt.j_end.declare(b, s, g, T, m.tr, lt.ffn.junction_a(), lt.ffn.junction_b(),
                                       lt.ffn.post_gain, &m.hc_head, m.final_gain, m.final_hidden,
-                                      lt.ffn.op_join, lt.ffn.op_ar));
+                                      lt.ffn.op_join, lt.ffn.op_ar, nullptr,
+                                      m.pipe_on ? 1 : 0));
+        /* A library without a narrow reduction leaves the junctions whole: no pipeline. */
+        if (!lt.j_end.pipe_ok()) m.pipe_on = false;
+    }
+    /* Every junction needs its narrow reduction for the pipeline to have one form to issue on the
+     * second lane; then name what that lane touches to the planner (Ctx::lane1_ rule 3: a transient
+     * there could otherwise share arena bytes with a run of lane 0's that overlaps it in time). The
+     * connection buffers are PERSIST already, so this costs the routed/shared sums and the
+     * attention's output, the only transients lane 1 reads. */
+    for (const Layer& l : m.layers)
+        if (!l.j_mid.pipe_ok() || !l.j_end.pipe_ok()) m.pipe_on = false;
+    if (m.pipe_on) {
+        for (rad_buf v : { m.tr.h, m.tr.post, m.tr.xn })
+            if (v) rad_buf_concurrent(b, v);
+        for (const Layer& l : m.layers)
+            for (rad_buf v : { l.attn.w.o, l.ffn.junction_a(), l.ffn.junction_b() })
+                if (v) rad_buf_concurrent(b, v);
     }
     RAD_ARCH_TRY(m.t_final.declare(b, nm, T, "final_hidden", -1, RAD_BF16, E, m.final_hidden));
     m.op_gather = mk(b, "gather_rows",
@@ -1134,6 +1232,11 @@ static void step(RadCtx* c, const RadBatch* batch) {
         return;
     }
     const StepPlan p = plan(m, batch);
+    /* The step half of the pipeline gate: one sequence (the pieces are one chunk's rows), no media
+     * rows (their reduction would have to pick a lane too), and both pieces above the band floor so
+     * each one's kernels are the ones the whole step's shape would have picked. */
+    const int64_t n0 = pipe_rows(T), n1 = T - n0;
+    const bool pipe = m.pipe_on && nmm == 0 && batch->n_seq == 1 && n0 >= pipe_min_rows() && n1 > 0;
     RAD_ISSUE_N(c, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.x0, T));
     if (nmm > 0) {
         /* Rank 0 holds the rows, the others zeros: the exact sum gives every rank the rows. */
@@ -1171,9 +1274,12 @@ static void step(RadCtx* c, const RadBatch* batch) {
         if (!l.sliding && !l.ix.step(c, batch, lp)) return;
         if (!l.sliding) m.df.snap_step(c, (int)i, m.iw, T, lp.select);
         const bool jm = (bool)l.j_mid;
+        const bool je = (bool)l.j_end;
         l.attn.core(c, batch, lp, m.iw.sel, m.iw.len, m.iw.nsel, jm);
         if (jm) {
-            l.j_mid.step(c, T);
+            /* With both junctions split, the pieces below are this junction: running it whole here
+             * as well would add the connection twice (and reduce twice). */
+            if (!(pipe && je)) l.j_mid.step(c, T);
             l.attn.tail_taps(c, T);
         }
         m.calib.after_attn(c, (int)i, T);
@@ -1187,7 +1293,32 @@ static void step(RadCtx* c, const RadBatch* batch) {
             RAD_ISSUE_N(c, l.op_ffn_norm, T, brows(m.tr.x, T), RAD_W(l.ffn_gain), brows(m.tr.xn, T));
         l.t_ffn_in.step(c, brows(m.tr.xn, T), T);
         m.calib.after_ffn_norm(c, (int)i, T);
-        const bool je = (bool)l.j_end;
+        if (pipe && jm && je) {
+            /* The pipelined prefill: piece 0's junction exposed, then piece 1's junction beside
+             * piece 0's arms, then piece 0's junction beside piece 1's arms. Every piece's chain
+             * steps inside its rows (the reduction sums the same rank order element by element),
+             * so the result is the serial step's. Every collective rides lane 1, the exposed pieces
+             * too: the ranks must agree on one lane (abi/rad_runtime.h), so a piece on lane 0 would
+             * end the lane-1 run. */
+            if (!pipe_said()) {
+                pipe_said() = true;
+                fprintf(stderr, "hyv4flash: pipelined prefill, %lld + %lld rows\n", (long long)n0,
+                        (long long)n1);
+            }
+            pipe_issue(c, [&] { l.j_mid.step(c, 0, n0, pipe_lane()); });
+            pipe_join(c);
+            pipe_issue(c, [&] { l.j_mid.step(c, n0, n1, pipe_lane()); });
+            l.ffn.body(c, T, 0, n0);
+            pipe_join(c);
+            pipe_issue(c, [&] { l.j_end.step(c, 0, n0, pipe_lane()); });
+            l.ffn.body(c, T, n0, n1);
+            l.ffn.route_report(c);
+            pipe_join(c);
+            pipe_issue(c, [&] { l.j_end.step(c, n0, n1, pipe_lane()); });
+            pipe_join(c);
+            entered = je && l.j_end.tail;
+            continue;
+        }
         if (!l.ffn.step(c, batch, je)) return;
         if (je) {
             l.j_end.step(c, T);

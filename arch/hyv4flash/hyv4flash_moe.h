@@ -89,6 +89,14 @@ struct GatedMlp {
         act.step(c, gu, T);
         down.step(c, ff, y, T);
     }
+    /* Rows [r0, r0 + n): the pipelined prefill runs the arm a piece at a time. */
+    void step(RadCtx* c, rad_buf x, rad_buf y, int64_t T, int64_t r0, int64_t n) const {
+        ActFP8 in{};
+        in.x = x;
+        gate_up.step(c, in, gu, T, r0, n);
+        act.step(c, gu, T, r0, n);
+        down.step(c, ff, y, T, r0, n);
+    }
 };
 
 /* The routed arm's activation codes (MoeWire::declare). */
@@ -375,6 +383,31 @@ struct Ffn {
     /* `fused_tail`: stop in front of the join; the layer's Junction runs it, the reduction and
      * the sandwich norm (and tail_taps() the tap behind them). */
     void tail_taps(RadCtx* c, int64_t T) const { t_out.step(c, brows(yf, T), T); }
+    /* Rows [r0, r0 + n) of the arm, up to (not including) the join: what the pipelined prefill
+     * runs on the compute lane beside the other piece's Junction. The debug taps are declared at
+     * the step's height and not per piece, so the pipeline runs only with taps off; the reduction
+     * and the sandwich norm stay the layer's Junction, exactly as in `step(c, batch, true)`. */
+    void body(RadCtx* c, int64_t T, int64_t r0, int64_t n) const {
+        auto act = [](rad_buf v) {
+            ActFP8 a{};
+            a.x = v;
+            return a;
+        };
+        if (!moe_layer) {
+            mlp.step(c, xf, mo, T, r0, n);
+            return;
+        }
+        lat_in.step(c, act(xf), w.lat.x, T, r0, n);
+        moe.pass(c, T, r0, n, false);
+        lat_out.step(c, w.lat, w.routed, T, r0, n);
+        shared.step(c, xf, w.sout, T, r0, n);
+    }
+    /* The step's routing histogram for the heat engine, once after the last piece: `step` ends its
+     * passes with it, and without it the expert tiers have nothing to promote on (measured: 12% of
+     * a 4K prefill step). */
+    void route_report(RadCtx* c) const {
+        if (moe_layer) moe.route_report(c);
+    }
     bool step(RadCtx* c, const RadBatch* batch, bool fused_tail = false) const {
         const int64_t T = batch->n_tok;
         auto act = [](rad_buf v) {

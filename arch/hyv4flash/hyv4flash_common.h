@@ -133,14 +133,24 @@ inline rad_weight decl_f32(RadBuilder* b, const char* name, const char* src,
  * exact bf16 (summed in f32 in rank order, rounded once), whatever wire the deployment allows,
  * because the norm behind it and the calibration read the sum. 0 at one rank. At more ranks a
  * library that serves no exact reduction is a refusal (PLAN §1.5), returned in `*rc`. */
-inline rad_op decl_all_reduce(RadBuilder* b, const Geom& g, int64_t n, rad_buf x, int* rc) {
+inline rad_op decl_all_reduce(RadBuilder* b, const Geom& g, int64_t n, rad_buf x, int* rc,
+                              int overlap = 0) {
     *rc = RAD_OK;
     if (g.world <= 1) return 0;
-    const rad_op h = mk(b, "all_reduce",
-                        { RAD_INT("world_size", g.world), RAD_RANGE("numel", n, g.max_tok * n),
-                          RAD_STR("dtype", "bf16"), RAD_INT("exact", 1),
-                          RAD_INT("min_bytes", g.wire_min_bytes) },
-                        {}, { x }, { x });
+    /* `overlap` 1 declares the twin the second lane may issue: the library picks a launch narrow
+     * enough that the GEMM beside it loses nothing (docs/TP4.md, the pipelined prefill). It is a
+     * separate op because the row a step resolves to is the whole launch's shape. */
+    const rad_op h = overlap
+        ? mk(b, "all_reduce",
+             { RAD_INT("world_size", g.world), RAD_RANGE("numel", n, g.max_tok * n),
+               RAD_STR("dtype", "bf16"), RAD_INT("exact", 1),
+               RAD_INT("min_bytes", g.wire_min_bytes), RAD_INT("overlap", overlap) },
+             {}, { x }, { x })
+        : mk(b, "all_reduce",
+             { RAD_INT("world_size", g.world), RAD_RANGE("numel", n, g.max_tok * n),
+               RAD_STR("dtype", "bf16"), RAD_INT("exact", 1),
+               RAD_INT("min_bytes", g.wire_min_bytes) },
+             {}, { x }, { x });
     if (!h) {
         fprintf(stderr, "radiance: hyv4flash: no loaded library serves an exact bf16 all_reduce "
                         "over %d ranks; the tensor-parallel graph needs one before each sandwich "
@@ -475,6 +485,8 @@ struct Hyper {
     rad_weight fn = 0, base = 0, scale = 0;
     rad_op op_pre = 0, op_post = 0;
     bool head = false;
+    /* Row strides of the three buffers ihc_post reads, for the row-range form. */
+    int64_t hc = 0, n_embd = 0;
     int declare(RadBuilder* b, Names& nm, const Shape& s, int64_t max_tok, const char* scope,
                 const char* fn_src, const char* base_src, const char* scale_src,
                 RadWeightGroup grp, bool is_head, rad_buf h, rad_buf x, rad_buf post) {
@@ -503,6 +515,8 @@ struct Hyper {
     /* The write, declared where it is issued (declaration order is liveness): behind the block. */
     int declare_post(RadBuilder* b, const Shape& s, int64_t max_tok, rad_buf h, rad_buf post,
                      rad_buf y) {
+        hc = s.hc;
+        n_embd = s.n_embd;
         op_post = mk(b, "ihc_post",
                      { RAD_RANGE("M", 1, max_tok), RAD_INT("n", s.n_embd), RAD_INT("hc", s.hc),
                        RAD_STR("dtype", "bf16") },
@@ -520,6 +534,11 @@ struct Hyper {
     }
     void post_add(RadCtx* c, rad_buf y, rad_buf post, rad_buf h, int64_t T) const {
         RAD_ISSUE_N(c, op_post, T, brows(y, T), brows(post, T), brows(h, T));
+    }
+    /* Rows [r0, r0 + n): the pipelined prefill writes the connection a piece at a time. */
+    void post_add(RadCtx* c, rad_buf y, rad_buf post, rad_buf h, int64_t r0, int64_t n) const {
+        RAD_ISSUE_N(c, op_post, n, brow_slice(y, r0, n, n_embd), brow_slice(post, r0, n, hc),
+                    brow_slice(h, r0, n, hc * n_embd));
     }
 };
 
@@ -558,18 +577,29 @@ inline bool cache_row_on() {
     return !(e && *e && std::strcmp(e, "0") == 0);
 }
 
-/* The four-rank twin (ar_rmsnorm_ihc_junction _4rank) has not run on four cards yet (the dev box
- * has two). At world 4 the plugin therefore issues the tested chain (add, standalone exact
- * all_reduce, plain junction) unless RADIANCE_HY4_JUNCTION_TP4=1. World 2 is unaffected. */
-inline bool junction_tp4() {
+/* The four-rank twin (ar_rmsnorm_ihc_junction _4rank) fuses the reduction into the norm's own
+ * kernel, so it holds the CUs while it waits on the link: that pays only where the step is
+ * launch-bound. Measured on 4x R9700 behind Gen4 switches at 210 W (Hy4-flash, DFly2 at depth 5,
+ * greedy): a six-row verify, one sequence, decodes 132.8 tok/s fused against 131.0 chained, +1.4%;
+ * twelve rows (two sequences) 213.1 against 221.6, -3.8%; twenty-four rows -6.2%; forty-eight -9%.
+ * kjRows4 is the height up to which it pays: 8 keeps a depth-5 verify fused and stops below two
+ * sequences'. World 2 fuses at every height (its twin was tested there).
+ * RADIANCE_HY4_JUNCTION_TP4 overrides the four-rank rule: 1 fuses every verify height (the whole
+ * ar_wide_write_rows band), 0 never fuses at four ranks, and the chain (add, standalone exact
+ * all_reduce, plain junction) carries every height above the band either way. */
+enum { kjRows4 = 8 };
+inline int64_t junction_rows(const Geom& g) {
+    if (g.world == 2) return g.max_tok;      /* tested, and two ranks is one link */
     const char* e = std::getenv("RADIANCE_HY4_JUNCTION_TP4");
-    return e && *e && std::strcmp(e, "0") != 0;
+    if (e && *e) return std::strcmp(e, "0") == 0 ? 0 : ar_wide_write_rows(g);
+    return kjRows4;
 }
 
 struct Junction {
     rad_op op = 0, op_ar = 0;           /* the plain row, the all-reduce twin */
     rad_op op_add = 0, op_reduce = 0;   /* the chain's add and all_reduce, for the fallback */
-    int64_t ar_rows = 0, n = 0;
+    rad_op op_reduce_ov = 0;            /* the same reduction at `overlap` 1, for the second lane */
+    int64_t ar_rows = 0, n = 0, hc = 0, hc_n = 0;
     int world = 1;
     bool tail = true;
     rad_buf a = 0, b = 0, post = 0, h = 0, xn = 0, y = 0, x = 0;
@@ -581,6 +611,8 @@ struct Junction {
     explicit operator bool() const { return op != 0; }
     /* The codes the readers of xn find, or null. */
     const ActFP8* codes_if() const { return op && codes.q8 ? &codes : nullptr; }
+    /* Whether the second lane may take this junction's reduction (the narrow twin exists). */
+    bool pipe_ok() const { return op_reduce_ov != 0; }
 
     /* `a` the block's output (`b` the addend in front, 0 for none), `w_post` its sandwich norm's
      * gain; `next` the next connection (0 for tail 0) and `w_next` the next block's input norm,
@@ -589,11 +621,14 @@ struct Junction {
      * pair the junction writes of `xn` (n % 128 == 0), read by the linears that accept it. */
     int declare(RadBuilder* bl, const Shape& s, const Geom& g, int64_t T, const Trunk& tr,
                 rad_buf a_, rad_buf b_, rad_weight w_post_, const Hyper* next, rad_weight w_next_,
-                rad_buf xn_, rad_op add_, rad_op reduce_, const Codes::Pair* pair = nullptr) {
+                rad_buf xn_, rad_op add_, rad_op reduce_, const Codes::Pair* pair = nullptr,
+                int overlap = 0) {
         *this = Junction{};
         if (!junction_on() || calib_dir() != nullptr) return RAD_OK;
         if (s.n_embd % 8) return RAD_OK;
         n = s.n_embd;
+        hc = s.hc;
+        hc_n = s.hc * s.n_embd;
         world = g.world;
         tail = next != nullptr;
         a = a_; b = b_; post = tr.post; h = tr.h;
@@ -632,9 +667,11 @@ struct Junction {
             return o;
         };
         /* The twin first: at more ranks the plain row is the fallback behind the standalone
-         * reduction. Two ranks at every height, four at decode and verify heights. */
-        if (world == 2 || (world == 4 && junction_tp4())) {
-            ar_rows = world == 2 ? g.max_tok : ar_wide_write_rows(g);
+         * reduction. Two ranks at every height, four up to the height measured to pay (or the
+         * whole verify band under RADIANCE_HY4_JUNCTION_TP4). */
+        const int64_t jrows = (world == 2 || world == 4) ? junction_rows(g) : 0;
+        if (jrows > 0) {
+            ar_rows = jrows;
             std::vector<RadParam> pa = ps;
             pa[0] = RAD_RANGE("M", 1, ar_rows);
             pa.push_back(RAD_INT("world_size", world));
@@ -648,6 +685,15 @@ struct Junction {
             codes.s8 = pair->s8;
             codes.g8 = 128;
             codes.q8_fed = codes.q8_rot = true;
+        }
+        /* The narrow twin of the chain's reduction: the pipelined prefill issues it on the second
+         * lane beside the GEMMs (a fused `ar_rmsnorm_ihc_junction` would hold its blocks on the
+         * card while it waits on the link). Declared only where the chain runs and only when the
+         * caller asks for the pipeline, so an unpipelined graph is the graph it was. */
+        if (world > 1 && op_reduce && overlap) {
+            int rc2 = RAD_OK;
+            op_reduce_ov = decl_all_reduce(bl, g, n, a, &rc2, 1);
+            if (!op_reduce_ov) op = 0;   /* no narrow launch: the step below stays serial */
         }
         return RAD_OK;
     }
@@ -665,6 +711,32 @@ struct Junction {
         if (world > 1) {
             if (b) RAD_ISSUE_N(c, op_add, T, brows(a, T), brows(b, T), brows(a, T));
             issue_all_reduce(c, op_reduce, a, T, n);
+            issue(op, RAD_NONE);
+            return;
+        }
+        issue(op, B);
+    }
+    /* Rows [r0, r0 + n) only: what the pipelined prefill hands the second lane, a piece at a time.
+     * `beside` picks the narrow reduction (op_reduce_ov), which is the only form allowed on that
+     * lane; the fused `op_ar` never runs here (it takes the whole band, so it is only for a small
+     * T). Nothing in the chain steps outside a row, so a piece's rows are the same numbers as the
+     * whole step's. */
+    void step(RadCtx* c, int64_t r0, int64_t rows, bool beside) const {
+        if (rows <= 0) return;
+        auto row = [&](rad_buf v, int64_t pitch) { return brow_slice(v, r0, rows, pitch); };
+        const RadOperand B = b ? row(b, n) : RAD_NONE;
+        auto issue = [&](rad_op o, RadOperand bb) {
+            RAD_ISSUE_N(c, o, rows, row(a, n), bb, RAD_W(w_post), row(post, hc), row(h, hc_n),
+                        tail ? RAD_W(fn) : RAD_NONE, tail ? RAD_W(scale) : RAD_NONE,
+                        tail ? RAD_W(base) : RAD_NONE, tail ? RAD_W(w_next) : RAD_NONE,
+                        xn ? row(xn, n) : RAD_NONE, y ? row(y, n) : RAD_NONE,
+                        x ? row(x, n) : RAD_NONE);
+        };
+        if (op_ar && rows <= ar_rows && !beside) { issue(op_ar, B); return; }
+        if (world > 1) {
+            const rad_op red = beside && op_reduce_ov ? op_reduce_ov : op_reduce;
+            if (b) RAD_ISSUE_N(c, op_add, rows, row(a, n), row(b, n), row(a, n));
+            if (red) RAD_ISSUE_N(c, red, rows * n, row(a, n), RAD_NONE);
             issue(op, RAD_NONE);
             return;
         }

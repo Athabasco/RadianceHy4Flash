@@ -731,6 +731,14 @@ TEST(unserved_forms_are_refused_at_declare) {
         b->encs[0].second = i8;
         b->encs[1].second = i8;
     };
+    /* The case this test used to refuse: quantised routed experts declare and are served (the
+     * refused forms above are the ones no producer of this graph writes). */
+    {
+        Declared q(experts);
+        REQUIRE_EQ(q.rc, RAD_OK);
+        CHECK(find_w(q.b, "blk.2.ffn_gate_up_exps.3.weight") != nullptr);
+        CHECK(find_w(q.b, "blk.2.glm_router.weight") != nullptr);
+    }
     auto hc = [](RadBuilder* b) {
         bf16_encs(b);
         b->encs.insert(b->encs.begin(), { "hc_attn.fn", rad_enc_affine(RAD_I8, RAD_BF16, 1, 128) });
@@ -974,12 +982,6 @@ TEST(tensor_parallel_refusals) {
 
 /* ------------------------------------------------------------------ quantised formats (PLAN §4.3) */
 namespace {
-
-const RecOp* op_writing(const RadBuilder& b, rad_buf x, const char* name) {
-    for (const auto& o : b.ops)
-        if (o.op == name && in(o.writes, x)) return &o;
-    return nullptr;
-}
 
 /* Every declared weight of the served graph (all but the drafter and the tower, declared and not
  * served) is a weight operand of some op: no plane is declared and left unread. */
@@ -1943,16 +1945,20 @@ TEST(the_dfly2_taps_are_the_references_keys) {
     CHECK_LINT(d.b, ps[0].get(), ps[1].get(), ps[2].get());
 }
 
-/* The four-rank twin ar_rmsnorm_ihc_junction is untested on four cards: at world 4 the plugin
- * declares the chain (standalone all_reduce + plain rmsnorm_ihc_junction) unless
- * RADIANCE_HY4_JUNCTION_TP4=1; world 2 declares the twin by default. */
-TEST(the_four_rank_junction_twin_is_opt_in) {
+/* The four-rank twin ar_rmsnorm_ihc_junction fuses the reduction into the norm kernel, so it holds
+ * the CUs while it waits on the link: the plugin declares it up to kjRows4 (8) rows, the height
+ * measured to pay, and leaves the taller verify heights to the chain (standalone all_reduce +
+ * plain rmsnorm_ihc_junction), which stays declared either way. RADIANCE_HY4_JUNCTION_TP4=1
+ * widens the twin to the whole verify band, =0 turns it off at four ranks; world 2 declares it at
+ * every height. */
+TEST(the_four_rank_junction_twin_takes_the_launch_bound_heights) {
     unsetenv("RADIANCE_HY4_JUNCTION_TP4");
     for (int world : { 1, 2, 4 }) {
         Declared d(bf16_encs, world, 0, true);
         REQUIRE_EQ(d.rc, RAD_OK);
         CHECK(count_op(d.b, "rmsnorm_ihc_junction") > 0);
-        CHECK_EQ(count_op(d.b, "ar_rmsnorm_ihc_junction") > 0, world == 2);
+        CHECK_EQ(count_op(d.b, "ar_rmsnorm_ihc_junction") > 0, world == 2 || world == 4);
+        /* Four ranks keep the chain declared for the heights above the fused band. */
         if (world == 4) CHECK(count_op(d.b, "all_reduce") > 0);
     }
     setenv("RADIANCE_HY4_JUNCTION_TP4", "1", 1);
@@ -1960,6 +1966,14 @@ TEST(the_four_rank_junction_twin_is_opt_in) {
     unsetenv("RADIANCE_HY4_JUNCTION_TP4");
     REQUIRE_EQ(d.rc, RAD_OK);
     CHECK(count_op(d.b, "ar_rmsnorm_ihc_junction") > 0);
+
+    /* =0 is the chain at every height: no twin, the standalone reduction only. */
+    setenv("RADIANCE_HY4_JUNCTION_TP4", "0", 1);
+    Declared off(bf16_encs, 4, 0, true);
+    unsetenv("RADIANCE_HY4_JUNCTION_TP4");
+    REQUIRE_EQ(off.rc, RAD_OK);
+    CHECK_EQ(count_op(off.b, "ar_rmsnorm_ihc_junction"), 0);
+    CHECK(count_op(off.b, "all_reduce") > 0);
 }
 
 RAD_TEST_MAIN()

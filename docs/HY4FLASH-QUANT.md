@@ -144,11 +144,16 @@ listed as OPEN with the command that decides them.
 ## TP4 safety (junction twin, kernel arguments)
 
 - The fused `ar_rmsnorm_ihc_junction` (the all-reduce, sandwich norm, iHC post/pre and the next
-  input norm in one launch) has run on two cards only. At world 2 the plugin uses it by default; at
-  world 4 it issues the tested chain (add, standalone exact `all_reduce`, plain
-  `rmsnorm_ihc_junction`) unless `RADIANCE_HY4_JUNCTION_TP4=1`. `RADIANCE_HY4_JUNCTION=0` keeps the
-  whole unfused chain at every world. Try the flag on your four cards and compare greedy output
-  with and without it before relying on it.
+  input norm in one launch) fuses the reduction into the norm's own kernel, so it holds the CUs
+  while it waits on the link: it pays only where the step is launch-bound, which is one sequence.
+  At world 2 the plugin uses it at every height; at world 4 up to eight rows (a depth-5 verify of
+  one sequence), and the chain (add, standalone exact `all_reduce`, plain `rmsnorm_ihc_junction`)
+  carries everything above. Measured on 4x R9700 behind Gen4 switches at 210 W (Hy4-flash, DFly2
+  depth 5, greedy, bit-identical output): six rows 132.8 tok/s fused against 131.0 chained (+1.4%),
+  twelve rows -3.8%, twenty-four -6.2%, forty-eight -9%. `RADIANCE_HY4_JUNCTION_TP4=1` widens the
+  fuse to the whole verify band (the pre-split behaviour, and it loses at two sequences and up),
+  `=0` keeps the chain at four ranks at every height. `RADIANCE_HY4_JUNCTION=0` keeps the whole
+  unfused chain at every world.
 - Kernel arguments passed by value (peers, row and gather structs of the all-reduce family) carry
   no padding (`static_assert`s in libr4d), since a recorded pass's audit compares argument bytes.
 
