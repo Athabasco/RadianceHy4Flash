@@ -904,6 +904,39 @@ extern "C" int r4d_rad_unrelayout_iqr_vocab(const RadParam* p, int n_p, int oper
     return r4d_rad_unrelayout_iqr(q, 4, il, enc, sel, src, src_bytes, pl, n);
 }
 
+/* ==================================================================== a dual launch's two weights
+ *
+ * gemm_nt_q_dual's operands are a, a_scale, b, b_scale, y, b2, b2_scale, y2 (r4d_rows.cpp): the
+ * second weight's codes and scales at 5 and 6 where the first's are at 2 and 3. Both are the row's
+ * N, K and group and both `i8a8h` of the one form a dual launch reads -- its second part's blocks
+ * read that weight exactly as a launch of their own would -- so the dense hooks answer for either
+ * once the operand is renumbered. */
+namespace {
+inline int dual_operand(int operand) {
+    return operand == 5 ? IL_B : operand == 6 ? IL_BSCALE : operand;
+}
+}  /* namespace */
+
+extern "C" int r4d_rad_layout_iqr_dual(const RadParam* p, int n_p, int operand,
+                                       const RadEncoding* enc, const int* sel,
+                                       const RadTensor* pl, int n, RadLayout* out) {
+    return r4d_rad_layout_iqr(p, n_p, dual_operand(operand), enc, sel, pl, n, out);
+}
+
+extern "C" int r4d_rad_relayout_iqr_dual(const RadParam* p, int n_p, int operand,
+                                         const RadEncoding* enc, const int* sel,
+                                         const RadTensor* pl, int n, void* dst,
+                                         int64_t dst_bytes) {
+    return r4d_rad_relayout_iqr(p, n_p, dual_operand(operand), enc, sel, pl, n, dst, dst_bytes);
+}
+
+extern "C" int r4d_rad_unrelayout_iqr_dual(const RadParam* p, int n_p, int operand,
+                                           const RadEncoding* enc, const int* sel,
+                                           const void* src, int64_t src_bytes,
+                                           const RadTensor* pl, int n) {
+    return r4d_rad_unrelayout_iqr(p, n_p, dual_operand(operand), enc, sel, src, src_bytes, pl, n);
+}
+
 /* ==================================================================== the routed experts
  *
  * moe_gemm_iqr's tables: every entry is one expert's IQR weight, relayouted by the dense hooks at
