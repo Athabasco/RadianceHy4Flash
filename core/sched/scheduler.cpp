@@ -1686,6 +1686,14 @@ void Scheduler::fill_group_step(StepPlan& p, bool ahead) {
     ce.hidden_row = -1;
     ce.hidden_n = 0;
     ce.ckpt_restore = -1;
+    /* The checkpoint is the state after the chunk's last token read through every layer. Before
+     * the last sub-step the layers above layer_hi have not written this chunk's keys and values,
+     * so a snapshot now would be partial and must neither be taken nor published (S-02 D4). The
+     * carried entry keeps its slot and token until then. */
+    if (!p.slice_last) {
+        ce.ckpt_slot = -1;
+        ce.ckpt_tok = -1;
+    }
     ce.dev = false;
     ce.dev_tok = 0;
     ce.dev_aux = 0;
@@ -3733,19 +3741,20 @@ int Scheduler::commit(StepResult& res) {
          * the request with the reason; that token and everything after it is not sent. */
         bool lp_failed = false;
 
-        /* The snapshot the engine just took is now readable. Marked here, not at reservation
-         * (which happens at planning), so a lookup in between cannot adopt a slot still holding
-         * the previous tenant's state. A later restore is enqueued on the same stream behind this
-         * save, so issuing the copy is enough. */
-        if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && pc_)
-            pc_->commit_checkpoint(r, (int64_t)e.ctx_len + e.ckpt_tok + 1);
-
         if (e.is_prefill) {
             /* S-02: the chunk's rows and everything that follows from them (KV trim, sink
              * progress, the prompt's stats, the prefix publish, the suffix index, the token)
              * commit once, on the group's last sub-step. Before it the sub-step has only run this
              * chunk's rows through its layers. */
             if (!slice_more) {
+                /* The snapshot the engine just took is now readable. Marked here, not at
+                 * reservation (which happens at planning), so a lookup in between cannot adopt a
+                 * slot still holding the previous tenant's state. A later restore is enqueued on
+                 * the same stream behind this save, so issuing the copy is enough. A sliced chunk
+                 * stages its checkpoint on the last sub-step only, so nothing is published
+                 * before the chunk's state is whole. */
+                if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && pc_)
+                    pc_->commit_checkpoint(r, (int64_t)e.ctx_len + e.ckpt_tok + 1);
                 r.n_computed += e.n_tokens;
                 /* The chunk is committed: a window group returns its blocks below the window now,
                  * not at this sequence's next ensure(), which may be steps away. */

@@ -10495,3 +10495,53 @@ TEST(a_group_s_decoders_are_planned_at_the_token_they_committed) {
     REQUIRE_EQ(f.sch.find(d)->output.size(), (size_t)3);
     (void)p;
 }
+
+/* The checkpoint at the end of a chunk is the chunk read through every layer. Before the last
+ * sub-step the layers above layer_hi have not written this chunk's keys and values, so the
+ * snapshot is neither taken nor published then: a lookup in between must not adopt a partial
+ * slot. */
+TEST(a_group_s_checkpoint_is_taken_and_committed_on_its_last_slice) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/1024, /*max_ctx=*/4096);
+    f.prog.meta.n_layers = 8;
+    f.cfg.checkpoint_interval = 512;         /* the 512-row prompt ends on it */
+    f.cfg.chunk_slices = 4;
+    f.cfg.slice_layers_ok = true;
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 512);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(512, 64);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+
+    const StepPlan& pl = f.sch.plan();
+    CHECK_EQ(pl.slice_m, 4);
+    REQUIRE_EQ((int)pl.e.size(), 2);
+    CHECK_EQ(pl.e[1].n_tokens, 512);         /* ends on the 256 interval: the chunk's last row */
+    CHECK_EQ(pl.e[1].ckpt_tok, 511);
+    CHECK(pl.e[1].ckpt_slot >= 0);
+    CHECK_EQ(f.pc.reserved, 1);              /* the slot is the group's from planning */
+    CHECK_EQ(f.pc.committed.size(), (size_t)0);
+    CHECK_EQ(b->n_checkpoints, 0);
+
+    for (int32_t j = 0; j < 4; ++j) {
+        const RadBatch* nb = f.sch.step_next();
+        if (j + 1 < 4) {
+            REQUIRE(nb != nullptr);
+            /* only the group's last sub-step stages the snapshot */
+            CHECK_EQ(nb->n_checkpoints, j + 1 == 3 ? 1 : 0);
+            CHECK_EQ(f.sch.next_plan().e[1].ckpt_slot >= 0, j + 1 == 3);
+        } else {
+            CHECK(nb == nullptr);            /* the last sub-step: nothing left to slice */
+        }
+        f.commit_plain(20 + j);
+        /* nothing is published before the last sub-step's commit */
+        CHECK_EQ(f.pc.committed.size(), (size_t)(j + 1 == 4 ? 1 : 0));
+        if (j + 1 < 4) f.sch.promote_next();
+    }
+    REQUIRE_EQ(f.pc.committed.size(), (size_t)1);
+    CHECK_EQ(f.pc.committed[0], 512);
+    CHECK_EQ(f.sch.find(p)->output.size(), (size_t)1);
+    CHECK_EQ(f.sch.find(d)->output.size(), (size_t)5);
+}
