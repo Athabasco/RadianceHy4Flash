@@ -49,6 +49,14 @@ scripts/backlog/lane.sh --env iks-A               # what a lane exports: port, m
   `gpu2` on iks. Nothing else takes a card: `run.sh` and `lane-pair.sh` start their servers this way. `gpu.lock`
   (default `<lane lock dir>` = `/tmp/radiance-lanes`, `RAD_LANE_LOCK_DIR` overrides) is what a local lane run holds
   for its whole run.
+- **The local lane serves `<tree>/build/bin/radiance`**, so that tree is built once. Here the build needs ROCm's
+  clang++ as the host compiler: the host's GCC 13 rejects the compound literals in `abi/rad_runtime.h`, and a
+  whole-tree build stops on the narrowing errors in `tests/museglimmer_test.cpp`, which the lane does not use.
+  ```sh
+  cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
+        -DRAD_WITH_HIP=ON -DRAD_GPU_TARGETS=gfx1201
+  cmake --build build --target radiance -j 32
+  ```
 - **`run.sh <tag> <cfg.yaml> <phases> [ENV=VAL ...] [-- radiance args]`** one server in the lane, `probe.py`
   against it, then it is stopped. Everything lands in `runs/<lane>/<tag>/`: the lane's rendered config
   (`<cfg>.yaml` with the lane's port, model, host pool and `ngram-placement`), `server.log`, `run.out`, `<tag>.json`.
