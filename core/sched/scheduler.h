@@ -874,8 +874,9 @@ private:
     void (Scheduler::*record_step_)(int64_t, int64_t) = &Scheduler::record_no_step;
     diag::StepRing step_ring_;
     /* --prefill-interleave: decode-only steps still owed before the next chunk, and how many
-     * prefilling requests the last step() held back. step_next_locked stops issuing ahead once
-     * the hold is spent, or the chunk would wait as long as the decoders keep stepping ahead. */
+     * prefilling requests the last step() held back. step_next_locked issues the hold's decode-only
+     * steps ahead while it runs, and the step that carries the chunk once it is spent, so the
+     * chunk is planned while the card runs rather than in the waiters' time to first token. */
     int64_t interleave_left_ = 0;
     int64_t held_prefill_ = 0;
     /* --prefill-interleave auto: the decode-only steps after a chunk (interleave_steps), sized by
