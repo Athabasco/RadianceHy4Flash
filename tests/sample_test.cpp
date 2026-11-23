@@ -2065,6 +2065,33 @@ TEST(a_penalty_window_of_zero_leaves_the_logits_alone) {
     CHECK_EQ(ch.s.staged_params(&n)[0].flags & RAD_SP_PENALTY, 0);
 }
 
+/* C-06: the history plane rides at the width of the step's widest staged row, and every row
+ * reads it at that pitch. Two greedy penalty rows of unequal history: the shorter one's
+ * penalty flips its winner, the longer one's leaves its own winner alone. A row read at the
+ * wrong pitch reads another row's ids and one of the two tokens changes; the host reference
+ * draws the same pair from the same histories. */
+TEST(penalty_rows_of_unequal_history_widths_read_the_compact_plane) {
+    HostChain ch(4, 2, 0);
+    NEED_CHAIN(ch)
+    SamplingParams sp = greedy_params();
+    sp.rep_penalty = 2.0f;
+    sp.penalty_last_n = -1;                     /* the whole staged history */
+    Request a = make_req(1, { 0 }, sp);              /* the shorter row */
+    Request b = make_req(2, { 1, 1, 2, 3, 2, 3 }, sp);   /* the widest row */
+    std::vector<int32_t> tok;
+    CHECK_OK(ch.step({ &a, &b }, { 1.2f, 1.0f, 0.5f, 0.0f,
+                                   1.2f, 1.0f, 0.5f, 0.0f }, &tok));
+    CHECK_EQ(tok[0], 1);   /* token 0's 1.2 halves to 0.6, under token 1's 1.0 */
+    CHECK_EQ(tok[1], 0);   /* token 0 is not in the longer history */
+    const std::vector<float> row = { 1.2f, 1.0f, 0.5f, 0.0f };
+    const std::vector<int32_t> ha = { 0 }, hb = { 1, 1, 2, 3, 2, 3 };
+    HostRefInput in{};
+    in.history = ha.data(); in.n_history = (int64_t)ha.size();
+    CHECK_EQ(host_sample(row.data(), 4, sp, in), 1);
+    in.history = hb.data(); in.n_history = (int64_t)hb.size();
+    CHECK_EQ(host_sample(row.data(), 4, sp, in), 0);
+}
+
 /* DRY runs with no breakers, as llama.cpp's does. History "a b c a b": c would extend the repeat
  * "a b" and is penalised by 1 * 2^0, which takes it from the top logit to below the rest. */
 TEST(dry_runs_without_sequence_breakers) {

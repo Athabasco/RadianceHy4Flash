@@ -354,6 +354,14 @@ private:
     const DeviceSampleParams* cur_stage_ = nullptr;   /* what the last build staged */
     int32_t*            hist_stage_   = nullptr;
     uint8_t*            brk_stage_    = nullptr;
+    /* C-06: the history planes ride to the card at the width the step's rows use, not at
+     * max_hist: the kernels and the references read the row pitch as numel/M, so the upload
+     * width is the pitch they see. When a step's longest staged history is shorter than the
+     * full width, run() compacts the staged rows into these uploads; at full width it uploads
+     * the staging directly. The widest row the last build staged: */
+    int32_t*            hist_pack_    = nullptr;
+    uint8_t*            brk_pack_     = nullptr;
+    int64_t             hist_w_       = 0;
     int32_t*            ngram_stage_  = nullptr;   /* [rows][2]: n-gram length, window */
     uint32_t*           ngram_wl_stage_ = nullptr; /* [rows][mask_words] exemption bitmask */
     uint32_t*           mask_stage_   = nullptr;
