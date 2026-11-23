@@ -128,8 +128,11 @@ static int d_prefill_tail(const DeriveInput& in, int32_t* out, int64_t cap, int6
         if (r < 0 || r >= in.n_tok) return RAD_E_INVAL;
         keep[r] = 1;
     }
+    /* Every decode row, sampled or not: the compact pass reads its rows [0, DT) as the batch's
+     * decode rows (block table, seqused, the stable instance), so they stay whole and in place
+     * in both variants (the plugin checks it: hyv4flash.cpp, tail_keeps_decode). */
+    std::fill_n(keep.begin(), p.n_tok_decode, 1);
     if (anchors) {
-        std::fill_n(keep.begin(), p.n_tok_decode, 1);
         for (int64_t s = p.n_seq_decode; s < in.n_seq; ++s)
             if (in.cu_seqlens[s + 1] > in.cu_seqlens[s])
                 keep[in.cu_seqlens[s + 1] - 1] = 1;

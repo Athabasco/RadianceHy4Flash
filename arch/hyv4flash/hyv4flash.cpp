@@ -918,6 +918,18 @@ static int split_ranks(Shape& s, int world, int rank) {
     return RAD_OK;
 }
 
+/* The prefill_tail derivation's layout (abi/rad_runtime.h, RadBatch::prefill_tail_h; written by
+ * core/sched/derive.cpp, d_prefill_tail): [rows, decode_rows, cu[S+1], prefill_cu[P+1],
+ * original_row[m], position[m], three rotary planes of m when the step carries rope_pos (an
+ * encoder is declared), ckpt_cu[3] when it carries ckpt_cut]. The reader in step() and the
+ * capacity declare() gives the buffer both take their offsets from here. */
+struct TailLayout {
+    int64_t cu, pf_cu, ids, pos, rope, ckpt, end;
+    TailLayout(int64_t S, int64_t P, int64_t m, bool rope_planes)
+        : cu(2), pf_cu(cu + S + 1), ids(pf_cu + P + 1), pos(ids + m), rope(pos + m),
+          ckpt(rope + (rope_planes ? 3 * m : 0)), end(ckpt + 3) {}
+};
+
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS ||
         rad_build_slot(ctx) >= MAX_SLOTS)
@@ -1164,7 +1176,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RadBufDecl d{};
         d.dtype = RAD_I32;
         d.rank = 1;
-        d.shape[0] = 7 + 2 * g.max_seqs + (s.mrope ? 5 : 2) * g.max_logit_rows;
+        /* The largest tail: no decode sequence (P = max_seqs), every logit row kept, a
+         * checkpoint cut. The derivation writes rotary planes when the step carries rope_pos,
+         * which the core hands only a program that declares an encoder (batch.cpp, mm_on_); the
+         * tower declares one only when served (hyv4flash_vision.h: `if (!serve) return`), so
+         * s.mrope (served) covers every step whose tail has the planes. */
+        d.shape[0] = TailLayout(g.max_seqs, g.max_seqs, g.max_logit_rows, s.mrope).end;
         d.kind = RAD_BUF_DERIVED;
         d.domain = RAD_DOMAIN_DEVICE;
         d.derive = m.df.served ? "prefill_tail_anchors" : "prefill_tail";
@@ -1235,6 +1252,15 @@ static StepPlan plan(const Model& m, const RadBatch* batch) {
             if (live > ib->block_table_pitch) live = ib->block_table_pitch;
     p.live = live < 1 ? 1 : live;
     return p;
+}
+
+/* The compact pass reads its rows [0, DT) as the batch's decode rows: paged() hands them the
+ * batch's block table, seqused and decode bounds, and the stable instance. The derivation keeps
+ * every decode row (d_prefill_tail); a tail whose kept rows do not start with exactly those runs
+ * the full pass instead. The kept rows ascend, so the last decode row in place means all are. */
+static bool tail_keeps_decode(const int32_t* meta, const TailLayout& tl, int64_t DT) {
+    if (DT == 0) return true;
+    return meta[0] >= DT && meta[1] == DT && meta[tl.ids + DT - 1] == DT - 1;
 }
 
 /* In-place row moves issue disjoint slices: kernels copy in parallel within a launch.
@@ -1329,30 +1355,30 @@ static void step(RadCtx* c, const RadBatch* batch) {
             RAD_ISSUE_N(c, l.op_attn_norm, T, brows(m.tr.x, T), RAD_W(l.attn_gain), brows(m.tr.xn, T));
         StepPlan lp = p;
         const int32_t* meta = batch->prefill_tail_h;
-        if (i + 1 == m.layers.size() && m.tail_meta && meta && p.P && meta[0] < T) {
+        const TailLayout tl(p.S, p.P, meta ? meta[0] : 0, batch->rope_pos != nullptr);
+        if (i + 1 == m.layers.size() && m.tail_meta && meta && p.P && meta[0] < T &&
+            tail_keeps_decode(meta, tl, p.DT)) {
             lp.T = meta[0];
             rows.n = lp.T;
             if (rows.n) {
                 lp.DT = meta[1];
                 const auto* device = static_cast<const int32_t*>(rad_buf_ptr(c, m.tail_meta));
-                const int64_t first_id = 4 + p.S + p.P;
-                rows.ids = meta + first_id;
+                rows.ids = meta + tl.ids;
+                rows.pf_cu = device + tl.pf_cu;
                 compact = *batch;
                 compact.n_tok = lp.T;
                 compact.n_tok_decode = lp.DT;
-                compact.cu_seqlens = device + 2;
-                rows.pf_cu = device + 2 + p.S + 1;
-                compact.positions = device + first_id + lp.T;
-                compact.positions_h = meta + first_id + lp.T;
+                compact.cu_seqlens = device + tl.cu;
+                compact.positions = device + tl.pos;
+                compact.positions_h = meta + tl.pos;
                 /* An interior checkpoint is a single sequence. The retained queries are a
                  * suffix. Only a cut inside that suffix can split its MoE pass. */
                 if (batch->ckpt_cut) {
-                    const int64_t ck = first_id + (batch->rope_pos ? 5 : 2) * lp.T;
-                    const int cut = meta[ck + 1];
+                    const int cut = meta[tl.ckpt + 1];
                     compact.ckpt_cut = cut > 0 && cut < lp.T ? cut : 0;
-                    compact.ckpt_cu = compact.ckpt_cut ? device + ck : nullptr;
+                    compact.ckpt_cu = compact.ckpt_cut ? device + tl.ckpt : nullptr;
                 }
-                compact.rope_pos = batch->rope_pos ? compact.positions + lp.T : nullptr;
+                compact.rope_pos = batch->rope_pos ? device + tl.rope : nullptr;
                 queries = &compact;
             }
         }

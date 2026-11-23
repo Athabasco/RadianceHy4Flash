@@ -2747,6 +2747,70 @@ TEST(prefill_tail_maps_mixed_outputs_and_anchors_to_original_rows) {
     CHECK_EQ(empty, 0);
 }
 
+/* #74 review, point 2: both variants keep every decode row, sampled or not, so the compact
+ * rows [0, DT) are the batch's decode rows in place. Decode sequence 1 (row 2) is not sampled. */
+TEST(prefill_tail_keeps_every_decode_row_in_both_variants) {
+    StepPlan plan;
+    plan.phase = RAD_PHASE_MIXED;
+    plan.n_seq_decode = 2;
+    plan.n_tok_decode = 3;
+    int32_t cu[] = {0, 2, 3, 8};
+    int32_t pos[] = {40, 41, 50, 0, 1, 2, 3, 4};
+    int32_t ids[] = {0, 1, 7};
+    DeriveInput in;
+    in.plan = &plan;
+    in.cu_seqlens = cu;
+    in.positions = pos;
+    in.out_ids = ids;
+    in.n_out = 3;
+    in.n_tok = 8;
+    in.n_seq = 3;
+    for (bool anchors : {false, true}) {
+        int32_t out[32] = {};
+        int64_t used = 0;
+        CHECK_OK(derive_row(derive_index(anchors ? "prefill_tail_anchors" : "prefill_tail"))
+                     ->fn(in, out, 32, &used));
+        CHECK_EQ(out[0], 4);
+        CHECK_EQ(out[1], 3);
+        const int32_t* kept = out + 4 + 3 + 1;   /* [m, DT, cu[4], pf_cu[2]] */
+        for (int i = 0; i < 3; ++i) CHECK_EQ(kept[i], i);
+        CHECK_EQ(kept[3], 7);
+    }
+}
+
+/* #74 review, point 1: the largest tail -- no decode sequence, rotary planes, a checkpoint cut --
+ * is 7 + 2 * n_seq + 5 * rows ints, the bound hyv4flash declares (TailLayout); without rotary
+ * planes it is 7 + 2 * n_seq + 2 * rows. One int less is refused. */
+TEST(prefill_tail_largest_tail_is_the_declared_bound) {
+    StepPlan plan;
+    plan.phase = RAD_PHASE_PREFILL;
+    int32_t cu[] = {0, 3, 6, 9, 12};
+    std::vector<int32_t> pos(12), rope(36);
+    for (int i = 0; i < 12; ++i) pos[(size_t)i] = i;
+    for (int i = 0; i < 36; ++i) rope[(size_t)i] = 100 + i;
+    int32_t ids[] = {1, 2, 4, 5, 7, 8, 10, 11};
+    DeriveInput in;
+    in.plan = &plan;
+    in.cu_seqlens = cu;
+    in.positions = pos.data();
+    in.out_ids = ids;
+    in.n_out = 8;
+    in.n_tok = 12;
+    in.n_seq = 4;
+    in.ckpt_cut = 2;
+    for (bool rotary : {true, false}) {
+        in.rope_pos = rotary ? rope.data() : nullptr;
+        const int64_t bound = 7 + 2 * 4 + (rotary ? 5 : 2) * 8;
+        std::vector<int32_t> out((size_t)bound, 0);
+        int64_t used = 0;
+        CHECK_OK(derive_row(derive_index("prefill_tail"))->fn(in, out.data(), bound, &used));
+        CHECK_EQ(out[0], 8);
+        CHECK_EQ(used, bound);
+        CHECK_EQ(derive_row(derive_index("prefill_tail"))->fn(in, out.data(), bound - 1, &used),
+                 RAD_E_FULL);
+    }
+}
+
 TEST(prefill_tail_translates_an_interior_checkpoint_into_the_suffix) {
     StepPlan plan;
     plan.phase = RAD_PHASE_PREFILL;
