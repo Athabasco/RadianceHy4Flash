@@ -198,15 +198,16 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     mixed_target_prefill_continues_ = false;
     draft_refill_ = 0;
     /* S-02: the chunk a step carries may be planned as m layer-sliced sub-steps only when the
-     * plugin declares the persistent set that makes a slice resumable and the trunk has more than
+     * plugin reports it can run the trunk over a layer range and resume from a slice
+     * (RadArchProbe::slice_layers_ok, which Engine::declare put in cfg) and the trunk has more than
      * one layer to split. --chunk-slices off (the default) never slices. */
     n_layers_  = prog.meta.n_layers;
-    slice_ok_  = prog.ctx.layer_slices > 0;
+    slice_ok_  = cfg.slice_layers_ok;
     group_ = ChunkGroup{};
     if (cfg.chunk_slices != 0 && n_layers_ > 1) {
         if (!slice_ok_)
-            RAD_INFO("scheduler: --chunk-slices: this model's plugin declares no resumable layer "
-                     "slice set (RadBuildCtx::layer_slices), so a chunk is never sliced");
+            RAD_INFO("scheduler: --chunk-slices: this model's plugin reports no resumable layer "
+                     "range (RadArchProbe::slice_layers_ok), so a chunk is never sliced");
         else if (cfg.chunk_slices < 0)
             RAD_INFO("scheduler: --chunk-slices auto: m from --chunk-slice-target-ms %lld and "
                      "--chunk-slice-cost-pct %lld once a chunk step and a decode step are "

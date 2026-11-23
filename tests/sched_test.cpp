@@ -10187,16 +10187,17 @@ TEST(a_block_drafters_rows_are_issued_ahead_with_their_own_prefix_unless_a_seque
 
 /* ================================================================== a chunk planned in layer slices (S-02) */
 
-/* A trunk of `L` layers whose plugin declares the whole trunk as its resumable slice set
- * (RadBuildCtx::layer_slices), a decoder, and a chunk of up to 512 rows: the mixed step a chunk
- * group starts on. No state checkpoints, so a prompt's chunk is a whole 512 rows and its last one
- * emits the token (a tail snapshot would cut the last quantum off it). */
+/* A trunk of `L` layers whose plugin reports it can run the trunk over a layer range
+ * (RadArchProbe::slice_layers_ok, which the engine reads into cfg.slice_layers_ok), a decoder, and a
+ * chunk of up to 512 rows: the mixed step a chunk group starts on. No state checkpoints, so a
+ * prompt's chunk is a whole 512 rows and its last one emits the token (a tail snapshot would cut
+ * the last quantum off it). */
 static void slice_fixture(Fixture& f, int64_t slices, int32_t L = 8) {
     f.build(16384, 64, 512, 16384, /*windowed=*/false, /*linear=*/false);
     f.prog.meta.n_layers = L;
     f.cfg.checkpoint_interval = 0;
     f.cfg.chunk_slices = slices;
-    f.prog.ctx.layer_slices = L;
+    f.cfg.slice_layers_ok = true;
 }
 
 /* A decoder (its prompt already committed, so it decodes) beside a `prompt`-row chunk, stepped
@@ -10308,32 +10309,32 @@ TEST(the_slice_count_follows_the_m_law) {
         const char* name;
         int64_t slices;          /* cfg.chunk_slices: N, auto (-1), off (0) */
         int32_t layers;          /* the trunk */
-        int32_t slice_layers;    /* what the plugin declares */
+        int32_t slice_ok;        /* the plugin's report (cfg.slice_layers_ok) */
         double  chunk_s, decode_s;
         int64_t target_ms, cost_pct;
         int     prompt;
         int32_t want;            /* m, or 0 for "not sliced" */
     };
     const Case cases[] = {
-        { "fixed 4",               4, 8, 8, 0.0,   0.0,    150, 10, 496, 4 },
-        { "fixed 8 capped by L",   8, 3, 3, 0.0,   0.0,    150, 10, 496, 3 },
-        { "auto: C 565 ms",       -1, 8, 8, 0.565, 0.0135, 150, 10, 496, 4 },
-        { "auto: C 1.2 s",        -1, 8, 8, 1.2,   0.0135, 150, 10, 496, 8 },
-        { "auto: D 50 ms",        -1, 8, 8, 0.565, 0.05,   150, 10, 496, 2 },
-        { "auto: cost_pct 0",     -1, 8, 8, 0.565, 0.0135, 150,  0, 496, 0 },
-        { "auto: target 600 ms",  -1, 8, 8, 0.565, 0.0135, 600, 10, 496, 0 },
-        { "auto: unmeasured",     -1, 8, 8, 0.0,   0.0,    150, 10, 496, 0 },
+        { "fixed 4",               4, 8, 1, 0.0,   0.0,    150, 10, 496, 4 },
+        { "fixed 8 capped by L",   8, 3, 1, 0.0,   0.0,    150, 10, 496, 3 },
+        { "auto: C 565 ms",       -1, 8, 1, 0.565, 0.0135, 150, 10, 496, 4 },
+        { "auto: C 1.2 s",        -1, 8, 1, 1.2,   0.0135, 150, 10, 496, 8 },
+        { "auto: D 50 ms",        -1, 8, 1, 0.565, 0.05,   150, 10, 496, 2 },
+        { "auto: cost_pct 0",     -1, 8, 1, 0.565, 0.0135, 150,  0, 496, 0 },
+        { "auto: target 600 ms",  -1, 8, 1, 0.565, 0.0135, 600, 10, 496, 0 },
+        { "auto: unmeasured",     -1, 8, 1, 0.0,   0.0,    150, 10, 496, 0 },
         { "one layer",             4, 1, 1, 0.0,   0.0,    150, 10, 496, 0 },
         { "no slice set",          4, 8, 0, 0.0,   0.0,    150, 10, 496, 0 },
-        { "off",                   0, 8, 8, 0.0,   0.0,    150, 10, 496, 0 },
-        { "64-row chunk",          4, 8, 8, 0.0,   0.0,    150, 10,  64, 0 },
+        { "off",                   0, 8, 1, 0.0,   0.0,    150, 10, 496, 0 },
+        { "64-row chunk",          4, 8, 1, 0.0,   0.0,    150, 10,  64, 0 },
     };
     for (const Case& c : cases) {
         Fixture f;
         slice_fixture(f, c.slices, c.layers);
         f.cfg.chunk_slice_target_ms = c.target_ms;
         f.cfg.chunk_slice_cost_pct = c.cost_pct;
-        f.prog.ctx.layer_slices = c.slice_layers;
+        f.cfg.slice_layers_ok = c.slice_ok != 0;
         CHECK_OK(f.start());
         uint64_t d = 0, p = 0;
         const RadBatch* b = slice_start(f, &d, &p, c.prompt, c.chunk_s, c.decode_s);
@@ -10348,6 +10349,35 @@ TEST(the_slice_count_follows_the_m_law) {
             CHECK_EQ(f.sch.find(p)->output.size(), (size_t)1);
         }
     }
+}
+
+/* --chunk-slices asks, but the scheduler plans by the plugin's report (RadArchProbe::slice_layers_ok,
+ * which Engine::declare reads into cfg.slice_layers_ok): a model whose trunk cannot be stopped
+ * between two layers keeps m = 1, runs the chunk whole, and the scheduler says why at init. */
+TEST(a_model_that_reports_no_layer_range_is_never_sliced) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/4);
+    f.cfg.slice_layers_ok = false;              /* the plugin's RadArchProbe::slice_layers_ok = 0 */
+    const std::string logged = info_of([&] { CHECK_OK(f.start()); });
+    CHECK(has(logged, "no resumable layer range"));
+
+    uint64_t d = 0, p = 0;
+    const RadBatch* b = slice_start(f, &d, &p);
+    REQUIRE(b != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    CHECK_EQ(f.sch.plan().slice_m, 0);
+    CHECK_EQ(f.sch.metrics().steps_sliced, (int64_t)0);
+    /* nothing is planned ahead of it: the one step runs the whole chunk */
+    CHECK(f.sch.step_next() == nullptr);
+    CHECK_EQ(f.sch.next_prefill_first_layer(), 0);
+    int32_t rows = 0;
+    for (const auto& e : f.sch.plan().e)
+        if (e.is_prefill) rows += (int32_t)e.n_tokens;
+    REQUIRE(rows > 0);
+    f.commit_plain(12);
+    CHECK_EQ(f.sch.find(p)->n_computed, (int64_t)rows);
+    CHECK_EQ(f.sch.find(p)->output.size(), (size_t)1);
+    CHECK_EQ(f.sch.metrics().substeps, (int64_t)0);
 }
 
 /* A prefill-only step is never sliced (there is no decoder to hand it to), and nor is one carrying

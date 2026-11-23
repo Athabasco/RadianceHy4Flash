@@ -296,9 +296,11 @@ typedef struct RadBuildCtx {
     /* The number of trunk layers, from the first, whose persistent state a pass can carry across
      * a step boundary and pick up again at layer L: every state the layers [0, L) write is either
      * declared as replicated persistent (the KV cache, an attention sink, a tap, a calibration
-     * table) or fully rewritten by the trunk of each pass. 0, the zero-initialised default, says
-     * the plugin declares no such set, and the scheduler never slices a chunk for it; the plugin
-     * reports the same fact in RadArchProbe::slice_layers_ok. */
+     * table) or fully rewritten by the trunk of each pass. The core sets it to the whole trunk only
+     * when --chunk-slices asks for slicing and the plugin reports it can serve a layer range
+     * (RadArchProbe::slice_layers_ok), which is the same report the scheduler plans a chunk by. 0,
+     * the zero-initialised default, says the plugin declares no such set, so no chunk is sliced
+     * for it. */
     int32_t  layer_slices;
 } RadBuildCtx;
 

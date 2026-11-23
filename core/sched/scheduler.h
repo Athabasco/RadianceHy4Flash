@@ -951,7 +951,8 @@ private:
     };
     ChunkGroup group_;
     int32_t    n_layers_ = 0;     /* Program::meta.n_layers, the trunk's depth */
-    bool       slice_ok_ = false; /* the plugin declares a resumable slice set */
+    bool       slice_ok_ = false; /* the plugin reports it can run the trunk over a layer range
+                                   * (RadArchProbe::slice_layers_ok, read into cfg by the engine) */
 
     SchedMetrics m_{};
     std::chrono::steady_clock::time_point step_start_{};
