@@ -9,6 +9,7 @@ container `hy4-flash-iqr-v4-u3.rad` (keptn/hy4-flash-iqr-v4).
 | `audit/{A..E}-*.md`, `audit/COMMON.md` | the five read-only code audits the items cite: op lists, kernel fact sheets, thread and wake maps, longer derivations |
 | `refs/kernels/*.md`, `refs/notes/*.md` | the earlier notes the backlog cites |
 | `CARDS.md` | how cards built from the backlog work: lanes, merge bar, lossy items, working from outside |
+| `closed/<ID>.md` | items closed without code: the number, the reason, and what an operator or a later card needs from them |
 | `../../scripts/backlog/` | the measuring tools and configs of §2, copied unedited (still with their local paths; the SETUP-LANES card makes them lane-aware) |
 
 How paths in the backlog map onto this directory:
@@ -27,3 +28,7 @@ Since the backlog was written, these decisions were made:
 - **Format changes:** none. F-01..F-11, F-13 (as a format change), F-18, F-20 and F-21 are dropped.
 - **"The friend's decisions":** §4 calls the lossy rows the friend's. They are the repository owner's decisions now.
 - **Lossy runtime rows:** X-07 (with F-12 / F-13 as its groups), F-14, F-15, F-16, F-17 and P-13 / F-19 are built opt-in, each with a KL report.
+- **M-13 (CWSR off on a dedicated box):** closed without code. The operator setting is worth ~68 MiB = 48 units, but
+the engine refuses to serve under it (Incompatible) and its failure mode is a full card reset, so it buys the smallest
+of the three lossless memory levers at the highest price. Number, sources and the verify steps a lane would run:
+`closed/M-13.md`.
