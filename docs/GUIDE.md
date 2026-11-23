@@ -1318,6 +1318,27 @@ decoders keep their cadence. A lone prefill is not held, nor is the step after a
 chunk. `0` schedules as before. `/stats` counts the decode-only steps the hold inserted as
 `steps_held`, `/metrics` as `radiance:engine_steps_held_total`.
 
+The step that carries a chunk, and the step that admits a waiting request, are planned before the
+step they follow has read back: the engine builds the next step from what the host can already know
+(the chunk's extent from the budget and the shares, the admission from the queue) while the card
+runs the last one, so their planning is off the waiters' time to first token. An ahead step carries
+one continuing chunk or the one a spent hold left over, and one admission; where two prompts want a
+chunk in the same step -- they share the step's budget -- the step is built after the commit as
+before. Everything a step must have written on the card before its pass is issued with it: the
+slots a fresh admission took are zeroed, and a prefix hit's recurrent half is copied into them, when
+the step is issued, not at the loop's own point in the next iteration, which comes after that pass.
+On the `local` lane (TP2, 2x R9700, one server a run,
+`scripts/backlog/run.sh <tag> scripts/backlog/nospec.yaml c1,c8,stall1,stall4`) arrival TTFT was
+2.353, 2.560 and 2.389 -> 2.136, 2.150, 2.111 and 2.066 s beside one decoder and 2.477, 2.608 and
+2.447 -> 2.345, 2.412, 2.365 and 2.342 s beside four; the mixed steps were ahead
+(`engine_steps_ahead_total` 411 -> 414, 415 of 420 and 411 -> 413, 414 of 421, the same 4 and 5
+mixed steps) and the hold shortened with the cheaper chunk step (`engine_steps_held_total` 53, 59 ->
+36, 39 beside one decoder, 42, 44 -> 35, 39 beside four). `c1` and `c8` were unchanged (71.2 vs
+71.4 tok/s, 302.6 vs 302.9) and greedy text was identical, so the gain is the overlap alone. With
+the clear and the restore moved to issue time, one more run of the same lane was inside all four
+ranges (`c1` 71.6 tok/s, `c8` 305.5, arrival TTFT 2.076 s beside one decoder and 2.367 s beside
+four), so the two duties cost nothing where they are now done.
+
 Served default: `prefill-interleave: auto:1` (below), so decoding sessions keep about half their
 rate while prompts prefill; `deterministic: true`, KL mode and generators keep 0, and an explicit `N`
 or `auto[:SHARE]` is kept as given. Measured on Qwen3.8-Flash-Next (fp8, TP2, MTP 3, 8 sessions

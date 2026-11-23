@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <new>
 #include <string>
 #include <unistd.h>
@@ -4133,7 +4134,7 @@ TEST(interleave_does_not_hold_after_a_prompts_last_chunk) {
 }
 
 /* A decode-only step of the hold may be issued ahead; it counts toward N and as a held step, and
- * once the hold is spent the next step is a full one that carries the chunk. */
+ * once the hold is spent the step that carries the chunk is issued ahead as well. */
 TEST(interleave_counts_steps_issued_ahead_and_then_serves_the_chunk) {
     Fixture f;
     f.build();
@@ -4154,13 +4155,100 @@ TEST(interleave_counts_steps_issued_ahead_and_then_serves_the_chunk) {
     f.commit_plain(12);
     f.sch.promote_next();
     CHECK_EQ(f.sch.metrics().steps_held, 2);
-    CHECK(f.sch.step_next() == nullptr);                /* the hold is spent */
+    CHECK(f.sch.step_next() != nullptr);                /* the hold is spent: the chunk's step, ahead */
     f.commit_plain(12);
+    f.sch.promote_next();
 
-    CHECK(f.sch.step() != nullptr);
     bool chunk = false;
     for (const StepEntry& e : f.sch.plan().e) if (e.seq == p && e.is_prefill) chunk = true;
     CHECK(chunk);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+}
+
+/* The stager's arming for the step after one issued ahead (S-03). Engine::arena_step releases the
+ * step issued ahead against its own plan, so it asks prefill_continues(next_plan), and the answer
+ * must be the one the same plan gets when the scheduler's own release reads it: nothing staged for
+ * a step the hold follows, the next chunk's experts staged for a step that carries one. Returns
+ * the answer for the step issued ahead; the caller says which it is. */
+static bool ahead_arming(int64_t interleave) {
+    Fixture f;
+    f.build();
+    f.cfg.prefill_interleave = interleave;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(64);
+    const uint64_t d = f.submit(100, 512);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    f.sch.find(d)->speculation_fixed = true;
+    const uint64_t p = f.submit(2000, 4);
+    CHECK(f.sch.step() != nullptr);                     /* the first chunk, released normally */
+    /* Commit the hold's decode-only steps until the step that carries a chunk is issued ahead. */
+    bool issued = f.sch.step_next() != nullptr;
+    for (int k = 0; !issued && k < 8; ++k) {
+        f.commit_plain(12);
+        CHECK(f.sch.step() != nullptr);
+        issued = f.sch.step_next() != nullptr;
+    }
+    CHECK(issued);                                      /* the chunk's step is the one issued ahead */
+    const bool ahead = f.sch.prefill_continues(/*next_plan=*/true);
+    f.commit_plain(12);
+    f.sch.promote_next();
+    bool chunk = false;
+    for (const StepEntry& e : f.sch.plan().e) if (e.seq == p && e.is_prefill) chunk = true;
+    CHECK(chunk);                                       /* the step issued ahead is the next chunk */
+    CHECK_EQ(f.sch.prefill_continues(), ahead);         /* released normally: the same answer */
+    return ahead;
+}
+
+/* No hold follows that chunk's step, so the step after it carries the next chunk: the stager is
+ * armed. */
+TEST(prefill_continues_ahead_arms_for_the_chunk_of_the_next_step) {
+    CHECK(ahead_arming(/*interleave=*/0));
+}
+
+/* The chunk's step arms the hold, whose decode-only step drops a chunk's experts: nothing is
+ * staged, as nothing is when the same step is released by step(). */
+TEST(prefill_continues_ahead_is_not_armed_for_a_step_the_hold_follows) {
+    CHECK(!ahead_arming(/*interleave=*/1));
+}
+
+/* The plan the stager asks about is the one the step issued ahead runs, not the open step's: the
+ * open step's last chunk finishes its prompt (nothing left to stage), while the admission the step
+ * issued ahead takes carries rows and must arm it. */
+TEST(prefill_continues_ahead_reads_the_step_issued_ahead_not_the_open_one) {
+    Fixture f;
+    f.build();
+    f.cfg.prefill_interleave = 0;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(64);
+    const uint64_t d = f.submit(100, 512);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    f.sch.find(d)->speculation_fixed = true;
+    const uint64_t p = f.submit(600, 4);                /* 256 + 256 + 88 */
+    f.sch.find(p)->speculation_fixed = true;
+    CHECK(f.sch.step() != nullptr);                     /* p's first chunk */
+    bool asked = false, open_leaves = true, ahead_leaves = false;
+    for (int k = 0; k < 8 && !asked; ++k) {
+        bool last = false;
+        for (const StepEntry& e : f.sch.plan().e)
+            if (e.seq == p && e.is_prefill && e.produces_token) last = true;
+        if (last) f.submit(2000, 4);                    /* arrives as p's last chunk runs */
+        const bool issued = f.sch.step_next() != nullptr;
+        if (last) {                                     /* p's rows all go in this step */
+            CHECK(issued);                              /* its chunk, issued ahead */
+            open_leaves  = f.sch.prefill_continues();
+            ahead_leaves = f.sch.prefill_continues(/*next_plan=*/true);
+            asked = true;
+            break;
+        }
+        f.commit_plain(12);
+        if (issued) f.sch.promote_next();
+        else CHECK(f.sch.step() != nullptr);
+    }
+    CHECK(asked);                                       /* p's last chunk went by */
+    CHECK(!open_leaves);                                /* nothing left of the open step's prompt */
+    CHECK(ahead_leaves);                                /* the step issued ahead carries a chunk */
 }
 
 /* The arithmetic at a real deployment's shape: a 2048-token step and interval, the stager arming
@@ -6690,6 +6778,44 @@ TEST(a_step_is_issued_ahead_only_once_the_requests_speculation_is_fixed) {
     CHECK(f.sch.step_next() != nullptr);
 }
 
+/* The room gate refuses to admit a fresh prompt beside a running sequence, and a step issued
+ * ahead takes that refusal the way step() does: the waiter stays queued, hit and all, for the step
+ * after the commit to decide. Taking the wait (kAdmitWait) as an admission moved the waiter into
+ * running_ with no card of its own (s.card stays -1) and a stale sched_tokens, staged a row the
+ * builder refuses, and then handed the hit back -- so the wait cost the prefix hit step() keeps
+ * across a bounce. */
+TEST(the_room_gate_refuses_an_admission_issued_ahead) {
+    Fixture f;
+    f.build(/*blocks=*/32, /*states=*/64, /*max_tok=*/512);
+    f.cfg.prefill_room_gate = true;
+    CHECK_OK(f.start());
+
+    const uint64_t d = f.submit(100, 64);
+    CHECK(f.sch.step() != nullptr);                 /* the decoder's prompt */
+    f.commit_plain();
+    Request* dr = f.sch.find(d);
+    REQUIRE(dr != nullptr);
+    dr->speculation_fixed = true;
+
+    /* An earlier request filled the cache: a prefix 304 tokens deep, resumed at the 256
+     * checkpoint, which leaves 6 blocks of the pool free beside the running decoder. */
+    f.pc.seed(304);
+    f.pc.lin = 256;
+    f.pc.src = 3;
+    CHECK(f.sch.step() != nullptr);                 /* the decoder's step, in flight */
+
+    /* 32 blocks of prompt: far past the six the pool has free beside the runner. */
+    const uint64_t w = f.submit(500, 8);
+    CHECK(f.sch.step_next() == nullptr);            /* the gate's wait is no admission, ahead too */
+    Request* wr = f.sch.find(w);
+    REQUIRE(wr != nullptr);
+    CHECK_EQ((int)wr->state, (int)ReqState::Waiting);
+    /* The hit is kept for the next attempt, where step()'s wait leaves it. */
+    CHECK_EQ(wr->n_computed, (int64_t)256);
+    CHECK_EQ((int)f.kv.block_table(w, 0).size(), 16);
+    CHECK_EQ((int64_t)f.sch.metrics().queue_depth, (int64_t)1);
+}
+
 /* No step is issued ahead behind one that ends every request it carries: its rows would
  * belong to finished requests, and a request arriving after the last token would wait out its
  * forward pass. The verify ends a request most likely when its drafts hold an end-of-generation
@@ -7152,17 +7278,41 @@ struct AheadRun {
     std::vector<BatchRows> steps;
     std::vector<std::vector<int32_t>> out;
     std::vector<int64_t> held;      /* paged blocks each sequence holds at the end */
+    std::vector<int32_t> phases;    /* plan phase of each step, in order */
     int ahead = 0;                  /* steps that ran issued ahead */
+    int mixed_ahead = 0;            /* of those, the mixed ones (a chunk beside decode rows) */
+    int64_t steps_ahead_counter = 0;/* the scheduler's own count of them */
     int card_host_disagree = 0;
 };
 
-void ahead_setup(Fixture& f, int n_spec, std::vector<uint64_t>& ids) {
+/* The requests a run is made of: the ones submitted before its first step, and requests that
+ * arrive while it runs. An arrival at step t is queued once step t is planned and before its
+ * commit, which is where a request arriving on the card's flight lands. */
+struct AheadScript {
+    std::vector<int> prompts{ 40, 56, 72 };
+    std::vector<std::pair<int, int>> arrivals;   /* {step, prompt length} */
+    std::function<void(Fixture&)> tweak;         /* config the run differs by */
+};
+
+void ahead_setup(Fixture& f, int n_spec, std::vector<uint64_t>& ids,
+                 const AheadScript& sc = AheadScript{}) {
     f.build();
     f.cfg.n_spec = n_spec;
+    if (sc.tweak) sc.tweak(f);
     CHECK_OK(f.start());
-    for (int n : { 40, 56, 72 }) {
+    for (int n : sc.prompts) {
         auto r = f.request(n, 0);
         r->speculation_fixed = true;     /* no grammar: the commit cannot change speculation */
+        ids.push_back(f.add(std::move(r)));
+    }
+}
+
+/* Queue the script's requests that arrive at this step, once its plan exists. */
+void ahead_arrivals(Fixture& f, const AheadScript& sc, std::vector<uint64_t>& ids, int t) {
+    for (const auto& a : sc.arrivals) {
+        if (a.first != t) continue;
+        auto r = f.request(a.second, 0);
+        r->speculation_fixed = true;
         ids.push_back(f.add(std::move(r)));
     }
 }
@@ -7196,23 +7346,27 @@ void ahead_finish(Fixture& f, const std::vector<uint64_t>& ids, AheadRun& run) {
         run.out.push_back(f.sch.find(id)->output);
         run.held.push_back((int64_t)f.kv.block_table(id, 0).size());
     }
+    run.steps_ahead_counter = f.sch.metrics().steps_ahead;
 }
 
 /* Every step built by step() after the commit. */
-AheadRun ahead_reference(int n_spec, int steps) {
+AheadRun ahead_reference(int n_spec, int steps, const AheadScript& sc = AheadScript{}) {
     Fixture f;
     std::vector<uint64_t> ids;
-    ahead_setup(f, n_spec, ids);
+    ahead_setup(f, n_spec, ids, sc);
     AheadRun run;
     const RadBatch* b = f.sch.step();
     if (!b) return run;
     run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+    run.phases.push_back((int32_t)f.sch.plan().phase);
     for (int t = 0; t < steps; ++t) {
+        ahead_arrivals(f, sc, ids, t);
         CHECK_OK(ahead_commit(f, t));
         ahead_publish(f, ids, n_spec, t + 1);
         b = f.sch.step();
         if (!b) break;
         run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+        run.phases.push_back((int32_t)f.sch.plan().phase);
     }
     ahead_finish(f, ids, run);
     return run;
@@ -7222,16 +7376,18 @@ AheadRun ahead_reference(int n_spec, int steps) {
  * acceptance into the StepSlots, the draft head's proposals into them, expect_draft and
  * step_next, the trunk advance on the new build, then the commit, the drafter's set_draft and
  * promote_next. */
-AheadRun ahead_pipelined(int n_spec, int steps) {
+AheadRun ahead_pipelined(int n_spec, int steps, const AheadScript& sc = AheadScript{}) {
     Fixture f;
     std::vector<uint64_t> ids;
-    ahead_setup(f, n_spec, ids);
+    ahead_setup(f, n_spec, ids, sc);
     AheadRun run;
     std::vector<StepSlot> slots((size_t)f.cfg.max_seqs);
     const RadBatch* b = f.sch.step();
     if (!b) return run;
     run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+    run.phases.push_back((int32_t)f.sch.plan().phase);
     for (int t = 0; t < steps; ++t) {
+        ahead_arrivals(f, sc, ids, t);
         /* The sampler's rows for step t: the drafts it agrees with, then its own token. */
         const StepPlan& p = f.sch.plan();
         std::vector<int32_t> y((size_t)b->n_out + 1, -1);
@@ -7248,7 +7404,9 @@ AheadRun ahead_pipelined(int n_spec, int steps) {
         for (int i = 0; i < acc.n_seq; ++i) adv_row(acc, i);
         for (const StepEntry& e : p.e) {
             const StepSlot& S = slots[(size_t)e.card];
-            if (S.acc != ahead_acc(e.seq, t, e.n_spec) || S.tok[0] != ahead_tok(e.seq, t))
+            /* A chunk that does not reach the prompt's end samples nothing to check. */
+            if (e.dev_out >= 0 &&
+                (S.acc != ahead_acc(e.seq, t, e.n_spec) || S.tok[0] != ahead_tok(e.seq, t)))
                 ++run.card_host_disagree;
             /* The draft head's proposals for step t + 1 (ADV_ROUND / ADV_TAKE on a card). */
             for (int j = 0; j < n_spec; ++j)
@@ -7268,11 +7426,13 @@ AheadRun ahead_pipelined(int n_spec, int steps) {
             f.sch.promote_next();
             b = nb;
             ++run.ahead;
+            if (nb->phase == RAD_PHASE_MIXED) ++run.mixed_ahead;
         } else {
             b = f.sch.step();
             if (!b) break;
         }
         run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+        run.phases.push_back((int32_t)f.sch.plan().phase);
     }
     ahead_finish(f, ids, run);
     return run;
@@ -7311,6 +7471,137 @@ TEST(a_step_issued_ahead_equals_the_step_built_after_the_commit) {
             CHECK(b.held[i] <= a.held[i] + 1);
         }
     }
+}
+
+/* A prefill chunk carried ahead: a long prompt whose chunks are split by the checkpoint interval
+ * runs beside a decoding sequence, so the step after each commit is mixed (a decode row plus the
+ * prompt's next chunk). That chunk starts where the in-flight one ends -- the host knows, since a
+ * prefill advances n_computed by exactly its rows -- and takes the budget the rows behind it
+ * leave. Issued ahead it must be the same chunk, in the same batch, with the same phase. */
+TEST(a_mid_prompt_chunk_is_issued_ahead) {
+    const int T = 16;
+    AheadScript sc;
+    sc.prompts = { 40, 900 };
+    const AheadRun a = ahead_reference(0, T, sc);
+    const AheadRun b = ahead_pipelined(0, T, sc);
+    CHECK_EQ(b.ahead, T);
+    CHECK_EQ(b.steps_ahead_counter, (int64_t)b.ahead);
+    CHECK_EQ(b.card_host_disagree, 0);
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    REQUIRE_EQ(a.steps.size(), (size_t)T + 1);
+    for (size_t t = 0; t < a.steps.size(); ++t) {
+        const bool same = a.steps[t] == b.steps[t];
+        CHECK(same);
+        if (!same) std::fprintf(stderr, "    step %zu differs\n", t);
+        CHECK_EQ(a.steps[t].bad_slots, 0);
+        CHECK_EQ(b.steps[t].bad_slots, 0);
+    }
+    CHECK(a.out == b.out);
+    CHECK(a.phases == b.phases);
+    int mixed = 0;
+    for (int32_t ph : b.phases) if (ph == RAD_PHASE_MIXED) ++mixed;
+    CHECK(mixed >= 2);                       /* the chunk's steps ran beside decode rows */
+}
+
+/* A newcomer carried ahead: a request arriving while the step before it flies is admitted into the
+ * step issued ahead (media ready, the context fits), so its first chunk is planned, staged and
+ * launched without waiting for the commit. The run then carries that prompt's next chunks beside
+ * the decoding sequences, as above. */
+TEST(an_admission_is_issued_ahead) {
+    const int T = 16;
+    AheadScript sc;
+    sc.arrivals.push_back({ 2, 300 });
+    const AheadRun a = ahead_reference(0, T, sc);
+    const AheadRun b = ahead_pipelined(0, T, sc);
+    CHECK_EQ(b.ahead, T);                    /* every step after the first ran ahead */
+    CHECK_EQ(b.steps_ahead_counter, (int64_t)b.ahead);
+    CHECK_EQ(b.card_host_disagree, 0);
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    REQUIRE_EQ(a.steps.size(), (size_t)T + 1);
+    for (size_t t = 0; t < a.steps.size(); ++t) {
+        const bool same = a.steps[t] == b.steps[t];
+        CHECK(same);
+        if (!same) std::fprintf(stderr, "    step %zu differs\n", t);
+        CHECK_EQ(a.steps[t].bad_slots, 0);
+        CHECK_EQ(b.steps[t].bad_slots, 0);
+    }
+    CHECK(a.out == b.out);
+    CHECK(a.phases == b.phases);
+    /* The arrival is in step 3 in both runs: admitted ahead, it is the step after the step it
+     * arrived in, not the one after that. */
+    REQUIRE_EQ(a.steps.size(), (size_t)T + 1);
+    CHECK_EQ(a.steps[3].seq.size(), (size_t)4);
+    CHECK_EQ(a.steps[2].seq.size(), (size_t)3);
+}
+
+/* A chunk the step's shares hold back is left to the step after the commit: the budget the rows it
+ * made room for did not use goes back to the chunk there (step()'s reclaim), so the chunk issued
+ * ahead would be a shorter one than the full step plans. */
+TEST(a_chunk_held_back_by_the_shares_is_left_to_the_step_after_the_commit) {
+    const int T = 12;
+    AheadScript sc;
+    sc.prompts = { 40, 900 };
+    sc.tweak = [](Fixture& f) {
+        f.cfg.busy_prefill_chunk = 128;   /* under the 256-token checkpoint chunk */
+    };
+    const AheadRun a = ahead_reference(0, T, sc);
+    const AheadRun b = ahead_pipelined(0, T, sc);
+    CHECK(b.ahead > 0);
+    CHECK(b.ahead < T);                   /* the capped chunk's step was not issued ahead */
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    for (size_t t = 0; t < a.steps.size(); ++t) CHECK(a.steps[t] == b.steps[t]);
+    CHECK(a.out == b.out);
+    CHECK(a.phases == b.phases);
+}
+
+/* Two requests arriving in the same step: step() would admit as many as fit, so the step issued
+ * ahead (which admits the head only) is left to the step after the commit. */
+TEST(a_queue_of_two_arrivals_is_admitted_after_the_commit) {
+    const int T = 12;
+    AheadScript sc;
+    sc.arrivals.push_back({ 2, 300 });
+    sc.arrivals.push_back({ 2, 340 });
+    const AheadRun a = ahead_reference(0, T, sc);
+    const AheadRun b = ahead_pipelined(0, T, sc);
+    CHECK(b.ahead > 0);
+    CHECK(b.ahead < T);
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    for (size_t t = 0; t < a.steps.size(); ++t) CHECK(a.steps[t] == b.steps[t]);
+    CHECK(a.out == b.out);
+    CHECK(a.phases == b.phases);
+}
+
+/* A chunk the hold left over: the step that takes it after the hold's last held step carries a
+ * prefill row, so it is a mixed step and can be issued ahead like any other. */
+TEST(a_chunk_the_hold_left_over_is_issued_ahead) {
+    const int T = 20;
+    AheadScript sc;
+    sc.prompts = { 40, 900 };
+    sc.tweak = [](Fixture& f) {
+        f.cfg.prefill_interleave = 2;   /* two decode-only steps behind each chunk step */
+    };
+    const AheadRun a = ahead_reference(0, T, sc);
+    const AheadRun b = ahead_pipelined(0, T, sc);
+    CHECK(b.mixed_ahead > 0);       /* the chunk after the hold ran issued ahead */
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    for (size_t t = 0; t < a.steps.size(); ++t) CHECK(a.steps[t] == b.steps[t]);
+    CHECK(a.out == b.out);
+    CHECK(a.phases == b.phases);
+}
+
+/* The rows keep step()'s order: the decode rows first, then the prompt chunk, so a chunk whose
+ * sequence was admitted before a decoder's still follows that decoder's row. */
+TEST(a_chunk_issued_ahead_keeps_the_order_of_the_sequences) {
+    const int T = 12;
+    AheadScript sc;
+    sc.prompts = { 900, 40 };   /* the prompt that continues has the lower slot */
+    const AheadRun a = ahead_reference(0, T, sc);
+    const AheadRun b = ahead_pipelined(0, T, sc);
+    CHECK(b.ahead > 0);
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    for (size_t t = 0; t < a.steps.size(); ++t) CHECK(a.steps[t] == b.steps[t]);
+    CHECK(a.out == b.out);
+    CHECK(a.phases == b.phases);
 }
 
 /* ================================================================== a block drafter on the card */

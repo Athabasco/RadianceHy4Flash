@@ -1228,10 +1228,10 @@ void Engine::rank_loop(int index) {
 }
 
 /* ------------------------------------------------------------------ the scheduler thread */
-int Engine::prepare_release(const RadBatch* b) {
+int Engine::prepare_release(const RadBatch* b, bool ahead) {
     /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
      * parked, so the level can change and a recall can drain both streams. */
-    if (const int as = arena_step(b); as < 0) return as;
+    if (const int as = arena_step(b, ahead); as < 0) return as;
     /* Grow the followers' pools to match rank 0's before the step's block table is used:
      * admission grew rank 0's cache and the new ids are already in the table. Done here, not on
      * the 100 ms arbiter tick, because the step is about to run; safe because every rank thread is
@@ -1271,10 +1271,16 @@ int Engine::issue_ahead(const RadBatch** out) {
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
     kv_test_prepare(sched_.plan(), nb->step, ranks_);
 #endif
+    /* The two host duties of a step, both writing what its first read wants on the card: the
+     * state slots a fresh admission took are zeroed, and a prefix hit's recurrent half is copied
+     * in, before the pass below. The loop does the same for a step it releases itself; here they
+     * must be done now, because the loop reaches them only after this step has run. */
+    clear_fresh_states();
+    RAD_TRY(restore_hits(sched_.next_plan()));
     /* Its rows' tokens, positions and slots, advanced on the card behind this step's acceptance
      * and drafts. */
     RAD_TRY(advance_all(ADV_TRUNK, 0, false));
-    RAD_TRY(prepare_release(nb));
+    RAD_TRY(prepare_release(nb, /*ahead=*/true));
     issue_what_.store(kIssueModel, std::memory_order_release);
     step_batch_.store(nb, std::memory_order_release);
     barrier_->arrive_and_wait();
@@ -1356,8 +1362,9 @@ int Engine::step_loop() {
         step_watch.progress();
         lora_epoch_.fetch_add(1, std::memory_order_acq_rel);
         phase_t_ = std::chrono::steady_clock::now();
-        /* Encode media for waiting requests while nothing is in flight. The scheduler issues no
-         * step ahead while a request waits, and a request with unencoded media waits. */
+        /* Encode media for waiting requests while nothing is in flight. A request with unencoded
+         * media keeps the scheduler from issuing a step ahead (step_next), so the encode runs
+         * before the step that admits it. */
         if (!ahead && sched_.encodes_pending()) {
             if (const int es = run_encodes(); es < 0) return fail_loop(es);
         }
@@ -1411,7 +1418,9 @@ int Engine::step_loop() {
         idle = 0;
         if (t_on) phase_mark(PH_PLAN);
 
-        clear_fresh_states();
+        /* A step issued ahead cleared its fresh slots when it was issued: the loop reaches this
+         * point after that step's pass has run, and the clear would wipe the state it computed. */
+        if (!issued) clear_fresh_states();
 
         /* Entries that want logits rows, in BatchBuilder's out_ids order: those with
          * produces_token, 1 + n_spec rows each. Row and sequence indices differ (a mid-prompt
@@ -1488,59 +1497,31 @@ int Engine::step_loop() {
          * whose pinned rows could not be allocated rides the same deferred path. */
         int bst = RAD_OK;
 
-        /* RADIANCE_LOG_STEPS: one line per step with its phase and each sequence's slot, query
-         * length and context. Off by default (one line per decode step). */
+        /* RADIANCE_LOG_STEPS: one line per step with its phase, whether it was issued ahead (its
+         * plan made by step_next and its pass released before the loop reached it), and each
+         * sequence's slot, query length, context and the checkpoint it restores from. Off by
+         * default (one line per decode step). */
         static const bool log_steps = std::getenv("RADIANCE_LOG_STEPS") != nullptr;
         if (log_steps) {
             std::string s = fmt("step %d %s n_seq=%lld n_tok=%lld", b->step,
                                 b->phase == RAD_PHASE_PREFILL ? "prefill" :
                                 b->phase == RAD_PHASE_DECODE  ? "decode"  : "MIXED",
                                 (long long)b->n_seq, (long long)b->n_tok);
-            for (int i = 0; i < b->n_seq && i < 8; ++i)
+            if (issued) s += " ahead";
+            for (int i = 0; i < b->n_seq && i < 8; ++i) {
                 s += fmt("  [%d] slot=%d q=%d ctx=%d", i, plan.e[(size_t)i].slot,
                          plan.e[(size_t)i].n_tokens, plan.e[(size_t)i].ctx_len);
+                if (plan.e[(size_t)i].ckpt_restore >= 0)
+                    s += fmt(" ck=%d", (int)plan.e[(size_t)i].ckpt_restore);
+            }
             RAD_INFO("%s", s.c_str());
         }
 
-        /* Restore the recurrent half of a prefix hit before the step that reads it (the adopted
-         * blocks carry the attention layers), copying from the snapshot's host slot. Enqueued on
-         * each rank's stream before the release, so no synchronisation is needed.
-         *
-         * Under the scheduler's lock, because an HTTP thread's cancel mutates the sequence table.
-         * Taken only when the step has a restore. */
-        bool any_restore = false;
-        for (const StepEntry& e : plan.e) if (e.ckpt_restore >= 0) { any_restore = true; break; }
-        if (any_restore) {
-            const int rs = sched_.locked([&]() -> int {
-                for (const StepEntry& e : plan.e) {
-                    if (e.ckpt_restore < 0) continue;
-                    if (!state_slots_of(e.seq, &ckpt_slots_)) continue;
-                    /* The window behind the hit, in the blocks admit_one seeded. */
-                    if (ranks_[0]->kv.has_window_snapshot() &&
-                        !ranks_[0]->kv.window_rows(e.seq, e.ctx_len, &ckpt_win_)) {
-                        RAD_ERR("sequence %llu: no window rows at %d to restore into",
-                                (unsigned long long)e.seq, (int)e.ctx_len);
-                        return RAD_E_STATE;
-                    }
-                    for (size_t ri = 0; ri < ranks_.size(); ++ri) {
-                        auto& rk = ranks_[ri];
-                        if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
-                        const int s = rk->kv.checkpoint_restore(ckpt_slots_.data(),
-                                                                (int)ckpt_slots_.size(),
-                                                                e.ckpt_restore, rk->ctx.stream(),
-                                                                &ckpt_win_);
-                        if (s < 0) {
-                            RAD_ERR("could not restore sequence %llu from checkpoint slot %d on "
-                                    "rank %d: %s", (unsigned long long)e.seq,
-                                    (int)e.ckpt_restore, (int)ri, rad_strerror(s));
-                            if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
-                            return s;
-                        }
-                    }
-                    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
-                }
-                return RAD_OK;
-            });
+        /* Restore the recurrent half of a prefix hit before the step that reads it. A step planned
+         * here restores here, before its release; a step issued ahead restored when it was issued
+         * (issue_ahead), since this point comes after the pass it released. */
+        if (!issued) {
+            const int rs = restore_hits(plan);
             if (rs < 0) return fail_loop(rs);
         }
 
@@ -2467,7 +2448,7 @@ void Engine::loan_tick(bool idle) {
  * in those slots revert to their host copies (an address change, not a copy) and both streams
  * that can read a slot are drained. A prefill pays this on its first chunk only, since the loan
  * does not regrow until steps have been small for a while (arena_tick). */
-int Engine::arena_step(const RadBatch* b) {
+int Engine::arena_step(const RadBatch* b, bool ahead) {
     if (arena_rows_.size() <= 1 || !b) return RAD_OK;
     /* An encoder pass needs the full plan: its activations are sized by the pass, and a plugin
      * declares them small under shape_probe. */
@@ -2477,10 +2458,12 @@ int Engine::arena_step(const RadBatch* b) {
     const uint64_t now = rad_mono_ns();
     arena_last_ = arena_rows_[(size_t)level];
     if (arena_last_ >= arena_floor_) { arena_floor_ = arena_last_; arena_floor_ns_ = now; }
-    /* Whether the next step continues a prompt, so the stager stages its first layers at this
-     * step's end. Never for a step issued ahead (a decode step whose plan the scheduler does not
-     * hold). */
-    const bool more = b->phase != RAD_PHASE_DECODE && sched_.prefill_continues();
+    /* Whether the step after this one continues a prompt, so the stager stages its first layers at
+     * this step's end. Released normally, `b` is the step about to run and the scheduler holds its
+     * plan; issued ahead, `b` is the step issued ahead and its plan is the one the scheduler plans
+     * for it (`plan_next_`). Either way the question is whether that plan leaves a chunk, which is
+     * nothing to stage when the hold follows it. */
+    const bool more = b->phase != RAD_PHASE_DECODE && sched_.prefill_continues(ahead);
     for (auto& r : ranks_) {
         const int64_t allow = r->arena_lent[(size_t)level];
         if (r->mover.loan(Mover::kLendArena) > allow ||
@@ -2701,6 +2684,48 @@ void Engine::clear_fresh_states() {
         }
     }
     ranks_[0]->kv.clear_state_clears();
+}
+
+/* The recurrent half of a prefix hit: its attention layers are in the blocks the hit adopted,
+ * its state is in the snapshot's host slot, and the step that first reads it copies that in.
+ * Enqueued on each rank's stream before the release that runs the step, so no synchronisation is
+ * needed.
+ *
+ * Under the scheduler's lock, because an HTTP thread's cancel mutates the sequence table. */
+int Engine::restore_hits(const StepPlan& plan) {
+    bool any_restore = false;
+    for (const StepEntry& e : plan.e) if (e.ckpt_restore >= 0) { any_restore = true; break; }
+    if (!any_restore) return RAD_OK;
+    return sched_.locked([&]() -> int {
+        for (const StepEntry& e : plan.e) {
+            if (e.ckpt_restore < 0) continue;
+            if (!state_slots_of(e.seq, &ckpt_slots_)) continue;
+            /* The window behind the hit, in the blocks admit_one seeded. */
+            if (ranks_[0]->kv.has_window_snapshot() &&
+                !ranks_[0]->kv.window_rows(e.seq, e.ctx_len, &ckpt_win_)) {
+                RAD_ERR("sequence %llu: no window rows at %d to restore into",
+                        (unsigned long long)e.seq, (int)e.ctx_len);
+                return RAD_E_STATE;
+            }
+            for (size_t ri = 0; ri < ranks_.size(); ++ri) {
+                auto& rk = ranks_[ri];
+                if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
+                const int s = rk->kv.checkpoint_restore(ckpt_slots_.data(),
+                                                        (int)ckpt_slots_.size(),
+                                                        e.ckpt_restore, rk->ctx.stream(),
+                                                        &ckpt_win_);
+                if (s < 0) {
+                    RAD_ERR("could not restore sequence %llu from checkpoint slot %d on "
+                            "rank %d: %s", (unsigned long long)e.seq,
+                            (int)e.ckpt_restore, (int)ri, rad_strerror(s));
+                    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                    return s;
+                }
+            }
+            if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+        }
+        return RAD_OK;
+    });
 }
 
 int Engine::serve(std::unique_ptr<StallWatch> watch) {

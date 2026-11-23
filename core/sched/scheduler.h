@@ -378,18 +378,23 @@ public:
 
     /* ---------------------------------------------------- the next step, before this one commits
      *
-     * A decode step's successor needs nothing the host learns from it: every row continues where
-     * the card's acceptance leaves it (sched/advance.h), with drafts proposed on the card, and the
-     * host can bound how far that is. So the next forward pass is issued while this one runs.
+     * A decode step's successor needs almost nothing the host learns from it: every row continues
+     * where the card's acceptance leaves it (sched/advance.h), with drafts proposed on the card,
+     * and the host can bound how far that is. A request admitted, or a prompt chunk continued, is
+     * likewise known at issue time -- the prompt is in the request and a chunk advances n_computed
+     * by its rows. So the next forward pass, mixed or not, is issued while this one runs.
      *
      *   expect_draft   after the drafter is issued: how many drafts the next step verifies for a
      *               sequence, capped at its window (under the adaptive policy possibly fewer
      *               than the rounds that ran).
-     *   step_next      plans and builds that step: every row of this one, as a device row, at
-     *               the furthest context it can reach. Null (step() runs after the commit
-     *               instead) when only committed state can decide: a request awaiting admission,
-     *               a prefill chunk to continue, a grammar, the context's end, or a pool that
-     *               cannot grow.
+     *   step_next      plans and builds that step: every row of this one that produces a token, as
+     *               a device row, at the furthest context it can reach, plus the head waiter's
+     *               admission and at most one prompt chunk -- the one this step continues, or the
+     *               one a spent hold left over. Null (step() runs after the commit instead) when
+     *               only committed state can decide: media still encoding, a grammar, the
+     *               context's end, a pool that cannot grow, an admission the pool's room or a
+     *               recompute's extent makes wait, a chunk the step's own shares hold
+     *               back, or more than one prompt chunk to place.
      *   promote_next   once this step has committed: the next step becomes the open one.
      *
      * While the next step is open, commit() leaves continuing requests' blocks in place, and a
@@ -498,6 +503,9 @@ public:
     void block_end();
 
     const StepPlan&      plan() const { return plan_; }
+    /* The step step_next() planned, from its return until promote_next() makes it plan(): the step
+     * released ahead of its commit, whose entries the engine must set up before that release. */
+    const StepPlan&      next_plan() const { return plan_next_; }
     const ChunkGeometry& geometry() const { return geo_; }
     DraftController&     draft() { return draft_; }
     LookupGate&          lookup_gate() { return lookup_; }
@@ -551,8 +559,11 @@ public:
      * by the engine after init; false keeps every checkpoint at a chunk's end. */
     void    set_ckpt_inside(bool on) { ckpt_inside_ = on; builder_.set_ckpt_cut(on); }
     /* Whether the step just planned leaves a prompt with at least the stager's smallest pass still
-     * to prefill, so the next step most likely carries a chunk the stager arms for. */
-    bool    prefill_continues() const;
+     * to prefill, so the next step most likely carries a chunk the stager arms for -- and that next
+     * step is not a held one (--prefill-interleave), which would drop what was staged. With
+     * `next_plan`, the step issued ahead (`plan_next_`) is the one being released; its hold is
+     * counted from its own shape, since promote_next() arms it after the release. */
+    bool    prefill_continues(bool next_plan = false) const;
     /* Visible for tests: the most a prefill chunk at `n_computed` of a `n_target`-token sequence
      * may take of `budget` when `reserve` tokens of other work are still to be planned in the step
      * and `shared` says rows are already planned ahead of it. Returns `budget` when
@@ -869,8 +880,9 @@ private:
     void (Scheduler::*record_step_)(int64_t, int64_t) = &Scheduler::record_no_step;
     diag::StepRing step_ring_;
     /* --prefill-interleave: decode-only steps still owed before the next chunk, and how many
-     * prefilling requests the last step() held back. step_next_locked stops issuing ahead once
-     * the hold is spent, or the chunk would wait as long as the decoders keep stepping ahead. */
+     * prefilling requests the last step() held back. step_next_locked issues the hold's decode-only
+     * steps ahead while it runs, and the step that carries the chunk once it is spent, so the
+     * chunk is planned while the card runs rather than in the waiters' time to first token. */
     int64_t interleave_left_ = 0;
     int64_t held_prefill_ = 0;
     /* --prefill-interleave auto: the decode-only steps after a chunk (interleave_steps), sized by
