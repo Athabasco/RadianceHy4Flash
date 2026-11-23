@@ -376,6 +376,11 @@ typedef struct RadBatch {
      * ckpt_cut is 0. */
     int32_t        ckpt_cut;
     const int32_t* ckpt_cu;
+    /* ABI 44. Host mirror of the optional prefill_tail[_anchors] derivation.
+     * [rows, decode_rows, cu[n_seq+1], prefill_cu[n_prefill+1], original_row[rows], position[rows],
+     * optional three rotary planes of rows, optional compact ckpt_cu[3]].
+     * A full or empty tail needs only rows. */
+    const int32_t* prefill_tail_h;
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:
