@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """layer.py stamps.csv probe.json phase records [layer_index]: median exclusive us per record of one layer of the pass kind."""
 import csv, json, sys, collections, subprocess, re, statistics
+import demangle
+FILT = demangle.path()  # c++filt locally, the ROCm SDK's llvm-cxxfilt on iks
+if not FILT: sys.exit("layer.py: no c++filt or llvm-cxxfilt, neither on PATH nor next to the tree's compiler")
 rows = list(csv.DictReader(open(sys.argv[1]))); R = json.load(open(sys.argv[2])); PH = sys.argv[3]; REC = int(sys.argv[4]); LI = int(sys.argv[5]) if len(sys.argv) > 5 else 6
 for r in rows:
     for k in ("pass", "seq", "start_ns", "end_ns", "records", "queue"): r[k] = int(r[k] or 0)
 p = [p for p in R["phases"] if p["name"] == PH][0]; a, b = p["mono_ns"]
 rows = [r for r in rows if r["records"] == REC and a <= r["start_ns"] <= b and r["end_ns"]]
 names = sorted({r["kernel"] for r in rows})
-dem = dict(zip(names, subprocess.run(["c++filt"] + names, capture_output=True, text=True).stdout.split("\n")))
+dem = dict(zip(names, subprocess.run([FILT] + names, capture_output=True, text=True).stdout.split("\n")))
 def short(n):
     d = re.sub(r"\(anonymous namespace\)::", "", dem[n]); d = re.sub(r"^void ", "", d)
     return d.split("(")[0][:70]
