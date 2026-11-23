@@ -483,11 +483,10 @@ public:
      * offset at every step size; above is what a smaller step packs smaller
      * (core/build/rad_bufplan.cpp, plan_level). */
     int64_t arena_fixed_bytes = 0;
-    /* The prefill staging region, above every planned buffer: where a step the stager arms for
-     * (a prefill step of 128 rows or more) copies a routed layer's non-resident experts ahead of
-     * the layer (core/place/stager.h). Sized by the VRAM budget and appended by the engine; part of
-     * the arena top that a step the stager does not arm for lends to the expert slab. -1 / 0 when
-     * absent. */
+    /* The prefill staging region, above every planned buffer: where a full-size step copies a
+     * routed layer's non-resident experts ahead of the layer (core/place/stager.h). Sized by the
+     * VRAM budget and appended by the engine; part of the arena top that smaller levels lend to
+     * the expert slab. -1 / 0 when absent. */
     int64_t arena_stage_off = -1;
     int64_t arena_stage_bytes = 0;
     int64_t host_arena_bytes = 0;    /* RAD_DOMAIN_HOST */
@@ -846,10 +845,9 @@ struct Config {
     int64_t max_tok = 2048;            /* --max-num-batched-tokens */
     /* --busy-prefill-chunk: how much of a step a prefill chunk may take when other work is
      * pending in it (decode rows, another prefill, a request waiting for admission). -1 = auto:
-     * leave those their rows plus a share for admission, but keep at least a level's pass (one
-     * past the largest arena level below the span's, Scheduler::set_stage_rows). 0 = off: the
-     * chunk takes every token the step has left. N > 0: cap the chunk at N tokens on such a step.
-     * See Scheduler::step, docs/GUIDE.md. */
+     * leave those their rows plus a share for admission, but keep at least the smallest pass the
+     * prefill stager arms for. 0 = off: the chunk takes every token the step has left. N > 0: cap
+     * the chunk at N tokens on such a step. See Scheduler::step, docs/GUIDE.md. */
     int64_t busy_prefill_chunk = -1;
     double  prefill_interleave_share = 0.25;   /* --prefill-interleave auto[:SHARE] */
     /* Whether --prefill-interleave was given. Not given, engine bring-up serves auto:1 (decode-only

@@ -903,13 +903,9 @@ declined promotion returns as a miss over the same link, so a higher threshold l
 without saving bytes.
 
 **Prefill stager** (`core/place/stager.h`). A prefill chunk routes to nearly every expert, so
-pinned-pool experts would cross the link inside each layer's GEMMs. It arms from a 128-row step:
-from there a chunk routes 16 of 512 experts per row, so nearly every pooled expert is read either
-way. For such a step the stager copies them, for the layers ahead, into a VRAM ring while earlier
-layers run, and points each layer's ops at the copies. The ring is at the top of the activation
-arena for a full-plan step and just above the smaller levels' buffers for any other: a staged step
-keeps that place out of the expert slab's loan whatever level it runs at, and the steps that keep
-nothing (decode steps, which route a small share) lend it. Output is bit-identical.
+pinned-pool experts would cross the link inside each layer's GEMMs. For large steps the stager
+copies them, for the layers ahead, into a VRAM ring at the top of the activation arena while
+earlier layers run, and points each layer's ops at the copies. Output is bit-identical.
 
 **Decode prefetch** (`core/runtime/xprefetch.h`). Under expert-tiered placement, each routed layer
 applies the next layer's router to its own router input, copies the likeliest pinned-pool experts

@@ -908,9 +908,7 @@ larger prefill chunk costs resident experts (§4.5). While steps are small most 
 architecture plugin declares its activations again at smaller step sizes (the decode rows rounded up
 to a power of two, at least 256, then each level 4x the one below, up to the step budget), each packed
 into the bottom of the arena. While recent steps fit a smaller size, the top of the arena holds expert
-weights (less the prefill stager's ring, which sits above every level's own buffers and which a
-prefill step of 128 rows or more keeps out of the loan, whatever level it runs at, so such a step is
-staged too); the first larger step takes it back before it runs (an address change, not a copy). Startup
+weights; the first larger step takes it back before it runs (an address change, not a copy). Startup
 prints what each size lends (`activation arena: lends ...`). A plugin opts in with
 `RadArchProbe::shape_probe_ok`; one that does not keeps its whole arena.
 
@@ -1615,20 +1613,14 @@ Measured on two R9700s (PCIe Gen5 x8, 265 W) over MXFP4 containers:
 chunk leaves room for one row plus the draft window per decode row behind it, and a share of the
 budget (an eighth, at least one quantum) for each prefill behind it and for the next request waiting
 to start, so a long prompt (a minute or more at 256K) does not starve decode rows or admission. The
-chunk never drops under a level's pass (one past the largest level below the span's, in whole
-quanta: 1024 with a 64-token quantum, where the levels are 256 and 1024 tokens): a chunk under it
-runs that level's step for fewer rows, and the step's fixed cost -- the routed GEMMs, the ring's
-copies -- is paid either way, which a shared prefill loses more on than sharing saves. That is not
-the stager's own floor: the stager arms from a 128-row step (from there a chunk routes 16 of 512
-experts a row, so nearly every pooled expert is read anyway), and a step that lands on the smallest
-level keeps the ring for its own step too, so a lone short prompt or a resume turn is staged there:
-taking the ring back from the expert slab once costs an address change and a refill of what the slab
-gives up, which pays for a lone prompt and not once per chunk of a shared prefill. Where holding a
+chunk never drops under the smallest step the prefill stager overlaps (one more than the largest
+arena level, named on the startup line `prefill staging: ...`); below that every routed layer reads
+its pooled experts synchronously and the prefill slows far more than sharing saves. Where holding a
 chunk back would leave a short remainder before the checkpoint boundary, the interval is split into
 two staged halves instead. Decode rows alone take only their few tokens: the chunk ends a quantum
 short of the boundary and the next step finishes it. A prompt with nothing beside it is unaffected.
 `off` lets a chunk take the whole step; `N` holds a shared chunk to N tokens (startup warns when N is
-under that floor). `radiance:engine_prefill_chunks_capped_total` counts the chunks held back.
+under the stager's step). `radiance:engine_prefill_chunks_capped_total` counts the chunks held back.
 
 **Adaptive mixed-step latency** (`mixed-step-target-ms: N`, default off). A mixed step contains
 both prefill rows and at least one decoding sequence. When this flag is set, completed mixed steps

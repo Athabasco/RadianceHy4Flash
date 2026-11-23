@@ -4251,9 +4251,8 @@ TEST(prefill_continues_ahead_reads_the_step_issued_ahead_not_the_open_one) {
     CHECK(ahead_leaves);                                /* the step issued ahead carries a chunk */
 }
 
-/* The arithmetic at a real deployment's shape: a 2048-token step and interval, the held-back
- * chunk's floor a level's pass at 1025 tokens (so a held-back chunk keeps 1024 and its step-mates
- * take the rest). */
+/* The arithmetic at a real deployment's shape: a 2048-token step and interval, the stager arming
+ * at 1025 tokens (so a held-back chunk keeps 1024 and its step-mates take the rest). */
 TEST(busy_cap_keeps_the_stager_floor_and_never_leaves_a_runt) {
     Fixture f;
     f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/2048, /*max_ctx=*/8192);
@@ -9294,15 +9293,15 @@ TEST(a_recycled_slot_does_not_carry_the_previous_request_s_admission) {
  * checkpoint interval prefilled.
  *
  * SIM_N prompts of SIM_LEN tokens arrive at once, each then decodes SIM_OUT tokens with three
- * drafts a step (a uniform 0..3 accepted), a held-back chunk's floor a level's pass at 1025
- * rows, under --prefix-resume exact. SIM_BUSY and SIM_IL are --busy-prefill-chunk and
- * --prefill-interleave (-1 for auto, at SIM_SHARE of a chunk step's time: SIM_IL=-1 SIM_SHARE=1 is
- * auto:1). Each step's time is a cost model in seconds: SIM_DEC0 + SIM_DECR per decode row when it
- * has one, plus SIM_PF0 + SIM_PFB per row when it carries a chunk. The defaults are fitted to
- * Qwen3.8-Flash-Next at TP2 (a lone prefill at ~5.4K tokens/s on 2048-token chunks; one sequence
- * decoding ~145 tokens/s, sixteen ~650 with MTP), not measured per step shape: the schedule is the
- * scheduler's own, the times are an estimate. Prints the aggregate prefill rate, the
- * time-to-first-token spread and the decode rate of sequences decoding while some prompt still
+ * drafts a step (a uniform 0..3 accepted), the stager arming at 1025 rows, under
+ * --prefix-resume exact. SIM_BUSY and SIM_IL are --busy-prefill-chunk and --prefill-interleave
+ * (-1 for auto, at SIM_SHARE of a chunk step's time: SIM_IL=-1 SIM_SHARE=1 is auto:1). Each step's
+ * time is a cost model in seconds: SIM_DEC0 + SIM_DECR per decode row when it has one, plus
+ * SIM_PF0 + SIM_PFB per row when it carries a chunk. The defaults are fitted to Qwen3.8-Flash-Next
+ * at TP2 (a lone prefill at ~5.4K tokens/s on 2048-token chunks; one sequence decoding ~145
+ * tokens/s, sixteen ~650 with MTP), not measured per step shape: the schedule is the scheduler's
+ * own, the times are an estimate. Prints the aggregate prefill rate,
+ * the time-to-first-token spread and the decode rate of sequences decoding while some prompt still
  * waits for its first token. */
 static double sim_env(const char* k, double d) {
     const char* v = std::getenv(k);

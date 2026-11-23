@@ -1448,27 +1448,18 @@ void Scheduler::set_stage_rows(int64_t rows) {
         RAD_INFO("scheduler: --busy-prefill-chunk %lld: a prefill chunk sharing a step with other "
                  "work takes at most %lld tokens of it", (long long)n, (long long)(n / Q * Q));
         if (stage_rows_ > 0 && n < stage_rows_)
-            RAD_WARN("scheduler: --busy-prefill-chunk %lld is under the %lld-token pass a held-back "
-                     "chunk is held at: a chunk under it runs the largest smaller arena level's "
-                     "step for fewer rows, and that step's fixed cost -- the slab's routed GEMMs, "
-                     "the ring's copies -- is paid either way, which costs a long prefill more "
-                     "than sharing saves (leave it at auto, which keeps the floor, or set "
+            RAD_WARN("scheduler: --busy-prefill-chunk %lld is under the %lld-token step the prefill "
+                     "stager overlaps at: a held-back chunk alone reads every routed layer's "
+                     "pooled experts synchronously, which slows a long prefill far more than the "
+                     "smaller step saves (leave it at auto, which keeps the floor, or set "
                      "at least %lld)", (long long)n, (long long)stage_rows_,
-                     (long long)stage_floor(Q));
+                     (long long)stage_rows_);
         return;
     }
     RAD_INFO("scheduler: --busy-prefill-chunk auto: a prefill chunk sharing a step leaves decode "
              "rows and waiting requests their room and keeps at least %lld tokens%s",
-             (long long)stage_floor(Q),
-             stage_rows_ > 0 ? " (a level's pass, one past the largest smaller arena level)" : "");
-}
-
-int64_t Scheduler::stage_floor(int64_t quantum) const {
-    const int64_t Q = std::max<int64_t>(quantum, 1);
-    /* Rounded down, as before this card: the floor holds a chunk at a level's pass and a quantum
-     * more would thin a shared prefill past it, which the measurement the floor rests on did not
-     * ask for (closed/M-03a.md). */
-    return std::max(Q, stage_rows_ / Q * Q);
+             (long long)std::max(Q, stage_rows_ / Q * Q),
+             stage_rows_ > 0 ? " (the prefill stager's smallest pass)" : "");
 }
 
 /* How much of the step a prefill chunk may take when other work wants in.
@@ -1476,10 +1467,9 @@ int64_t Scheduler::stage_floor(int64_t quantum) const {
  * Uncapped, a prefill row takes every token the step has left, and on a prompt of a few hundred
  * thousand tokens that lasts a minute or more, during which decode rows behind it get nothing and
  * admission never runs. The cap leaves `reserve` (computed by step()) and never goes under the
- * floor: a level's pass, one past the largest smaller arena level, rounded down to the quantum,
- * or one quantum with no stager. A chunk under it runs that level's step for fewer rows, and the
- * step's fixed cost -- the routed GEMMs, the ring's copies -- is paid either way, which costs a
- * long prefill more than sharing saves.
+ * floor: the smallest step the prefill stager overlaps, rounded down to the quantum, or one
+ * quantum with no stager. A smaller step reads every routed layer's pooled experts
+ * synchronously, which costs a long prefill far more than sharing saves.
  *
  * Chunks end on the checkpoint interval (plan_chunk), so a chunk held short leaves a remainder,
  * about the size of the reserve, as the next step's whole chunk. When that would be under the
@@ -1500,10 +1490,10 @@ int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget
     int64_t cap = mode == 0 ? budget : budget - reserve;
     if (mode > 0) {
         /* The operator's number, with no floor; set_stage_rows warns when it is under the
-         * level's pass. */
+         * stager's step. */
         cap = std::min(cap, mode);
     } else if (mode < 0) {
-        const int64_t floor = stage_floor(Q);
+        const int64_t floor = std::max(Q, stage_rows_ / Q * Q);
         cap = std::max(cap, floor);
         const int64_t remaining = n_target - n_computed;
         int64_t span = remaining;                       /* where this run of chunks must end */

@@ -2447,10 +2447,7 @@ void Engine::loan_tick(bool idle) {
  * If the level needs memory the slab holds, it is reclaimed synchronously before the step: units
  * in those slots revert to their host copies (an address change, not a copy) and both streams
  * that can read a slot are drained. A prefill pays this on its first chunk only, since the loan
- * does not regrow until steps have been small for a while (arena_tick). A step the prefill stager
- * arms for takes back more than its level's step: the ring's place too, whatever level it runs at
- * (arena_step_lent), so a lone prompt or a resume turn of a few hundred rows is staged and the
- * slab refills after it once the step's level is what the floor holds. */
+ * does not regrow until steps have been small for a while (arena_tick). */
 int Engine::arena_step(const RadBatch* b, bool ahead) {
     if (arena_rows_.size() <= 1 || !b) return RAD_OK;
     /* An encoder pass needs the full plan: its activations are sized by the pass, and a plugin
@@ -2468,13 +2465,7 @@ int Engine::arena_step(const RadBatch* b, bool ahead) {
      * nothing to stage when the hold follows it. */
     const bool more = b->phase != RAD_PHASE_DECODE && sched_.prefill_continues(ahead);
     for (auto& r : ranks_) {
-        /* A step the stager will copy through the ring keeps the ring's place out of the slab's
-         * loan, whatever arena level it runs at: a prefill step of kStageArmRows rows or more
-         * routes nearly every pooled expert whether it lands on the smallest level or above it
-         * (arena_step_lent, stager.h). Every other step lends what its level does. */
-        const bool staged = r->arena_low_off >= 0 && r->stager.arms_for(b);
-        const int64_t allow =
-            arena_step_lent(r->arena_lent[(size_t)level], r->arena_ring_lent, staged);
+        const int64_t allow = r->arena_lent[(size_t)level];
         if (r->mover.loan(Mover::kLendArena) > allow ||
             r->mover.loan_held(Mover::kLendArena) > allow) {
             RAD_TRY(rad_dev_set(r->device));
@@ -2486,13 +2477,12 @@ int Engine::arena_step(const RadBatch* b, bool ahead) {
             }
         }
         RAD_TRY(r->ctx.set_level(level));
-        /* The full plan lends nothing, so its top (the staging region) is the step's ring. A step
-         * the stager arms for finds the place below it, right above the highest level's buffers,
-         * unlent too, whether it lands on the smallest level or above it (arena_step_lent). A
-         * decode step at a level above the smallest lends what its level does, so it is handed no
-         * ring: it has few rows per layer to copy and none of it pays. */
+        /* The full plan lends nothing, so its top (the staging region) is the step's ring; the
+         * span's shared level keeps a place of its own for it (stager.h); every other level
+         * lends both. */
         char* const ring = level == 0 ? r->stager.ring_full()
-                         : staged ? r->stager.ring_low() : nullptr;
+                         : arena_last_ == arena_span_rows_ && r->arena_low_off >= 0
+                               ? r->stager.ring_low() : nullptr;
         r->stager.set_ring(ring);
         /* The next step's first layers go ahead only from the full plan, into the region at the
          * top that no level's buffers use. At the shared level the ring is memory the full plan
@@ -2979,16 +2969,14 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         RAD_TRY(rad_dev_set(ranks_[0]->device));
     } else
     RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_));
-    /* The smallest step a held-back prefill chunk takes. A chunk held back for other work
-     * (--busy-prefill-chunk) stays at or above it. It is a level's pass, one past the largest
-     * arena level below the span's, and not the stager's arm floor (kStageArmRows, 128 rows): a
-     * chunk under it runs that level's step for fewer rows, and the step's fixed cost -- the
-     * routed GEMMs, the ring's copies -- is paid either way. The maximum over ranks, since the
-     * step waits for the slowest. */
+    /* The smallest step the prefill stager overlaps. A chunk held back for other work
+     * (--busy-prefill-chunk) stays at or above it; below it every routed layer reads its pooled
+     * experts synchronously, which costs far more than sharing the step saves. The maximum over
+     * ranks, since the step waits for the slowest. */
     {
         int64_t stage_rows = 0;
         for (auto& rk : ranks_)
-            if (rk->stager.enabled()) stage_rows = std::max(stage_rows, rk->arena_top_rows + 1);
+            if (rk->stager.enabled()) stage_rows = std::max(stage_rows, rk->stager.min_rows());
         sched_.set_stage_rows(stage_rows);
         /* The shortest prompt a span pays for where routed experts are read from host memory: a
          * spanned step runs at the full plan, which lends the expert slab nothing, while every

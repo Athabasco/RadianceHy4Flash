@@ -3710,13 +3710,10 @@ step (MoeFP8's `rows` is `max-num-batched-tokens`), so a routed pass is `tokens 
 = 131072 under `max-num-batched-tokens: 8192` (`prefill-span: 4`, `prefill-span-pass: step`, `prefill-span-first: on`).
 libr4d's `swiglu_clamped_bf16` and the fused `swiglu_clamped_quant` once refused past 65535 rows and stopped the engine
 at a 19.5K-token prompt; they serve up to 2^31 - 1 rows now. Leave `busy-prefill-chunk` at its default (`auto`): on this
-model the arena's smaller levels run up to 4096 tokens, the prefill stager arms from a 128-token step and a step at any of those levels
-keeps the ring above its buffers (M-03b), and `auto` never holds a shared chunk under a level's pass (one past the largest level below
-the span's: 1025 rows, 1024 with a 64-token quantum, where the levels are 256 and 1024 tokens); an explicit `busy-prefill-chunk` under
-that floor (Flash-Next's 1088 was, against the 4097-token step the stager used to need) is what the startup warns about: a held-back
-chunk under a level's pass runs that level's step for fewer rows, and the step's fixed cost -- the routed GEMMs, the ring's copies --
-is paid either way (before M-03b it also read every routed layer's pooled experts synchronously, which cost -26 % prefill). An explicit
-N must be at least that floor (startup line `prefill staging: ...` names the arm floor, the warning names the chunk floor).
+model the prefill stager overlaps from a 4097-token step, `auto` never holds a chunk under it, and an explicit
+`busy-prefill-chunk: 1088` (Flash-Next's value) is under it, which the startup warns about and which cost -26 % prefill
+(every routed layer then reads its pooled experts synchronously). An explicit N must be at least the stager's step
+(startup line `prefill staging: ...`, the warning names it; 4160 with a 64-token quantum).
 
 **TP2 recipe (u3 container, two R9700, 210 W; measured 2026-11-22, `work/tp2t1`).** (1) `draft-depth-stop: 0.3`
 with `draft-depth: adaptive` (default 0.85 verifies too little for one client; the general-levers
@@ -3770,10 +3767,8 @@ the memlock limit above the extra pinned bytes.
 background streams, 90 s a level, arrivals 2K to 32K every 15 s; u3 coupled, T 0.9, 210 W, `max-num-batched-tokens: 2048`).**
 Default (`busy-prefill-chunk: auto`, `prefill-interleave: auto:1`): worst stall 0.76 s (2 streams) / 0.81 s (4), stall p99 0.71 s,
 whatever the arrival depth; background decode per stream falls to 47 % (33 vs 70 tok/s at two, 24 vs 48 at four) inside arrival
-windows; arrival TTFT at 16K 9.5 / 10.3 s against 3.4 s cold. On this container `auto` floors a shared chunk at 1024 tokens with a
-64-token quantum (a level's pass, one past the largest level below the span's; M-03b left the floor there and moved the stager's own
-arm floor to 128 rows), so the `auto` row below is this floor. Cold prefill is
-the same in every row (3.96K tok/s at 2K,
+windows; arrival TTFT at 16K 9.5 / 10.3 s against 3.4 s cold. On this container `auto` floors a shared chunk at 1024 tokens (the
+stager's smallest pass, startup line `prefill staging`), not 4097. Cold prefill is the same in every row (3.96K tok/s at 2K,
 3.50K at 16K, 2.96K at 64K): the knobs act only while other sequences decode.
 
 | setting | worst stall 2 / 4 streams | stall p99 2 / 4 | bg tok/s per stream in window 2 / 4 | 16K arrival TTFT p50 2 / 4 |

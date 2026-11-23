@@ -115,13 +115,12 @@ int PrefillStager::init(const Program& prog, const Plan& plan, Mover* mover, cha
     return rad_memcpy_list_async(nullptr, 0, 0, mover_->transfer_stream());
 }
 
-/* Arms only for a trunk pass carrying a prompt chunk of at least min_rows rows, whose level has a
- * ring (see stager.h, runtime/stager.h stage_arms; the engine kept the ring's place out of the
- * slab's loan for exactly these). Layers the previous pass staged early are kept if it arms with
- * the ring where they are, and withdrawn if not. */
+/* Arms only for a trunk pass whose level has a ring and with at least min_rows tokens (see
+ * stager.h). Layers the previous pass staged early are kept if it arms with the ring where they
+ * are, and withdrawn if not. */
 bool PrefillStager::begin_pass(const RadBatch* b) {
     if (!b || b->draft_pass != 0) return false;
-    armed_ = want_ != nullptr && arms_for(b);
+    armed_ = want_ != nullptr && enabled() && b->n_tok >= min_rows_;
     staged_ = armed_;
     if (!armed_) {
         withdraw_early();
