@@ -1157,6 +1157,61 @@ TEST(quantised_trunk_linears_share_one_quantiser_an_input) {
     }
 }
 
+/* K-01: latent_in and the shared arm's gate_up are one width over one input's codes, so where both
+ * are one IQR form the plugin gives them one gemm_nt_q_dual a MoE layer -- the two launches' blocks
+ * in one grid, both products byte-identical (the row's oracle). Off with RADIANCE_HY4_FUSE_DUAL=0,
+ * and never for a pair of two forms. (The mini model's shared arm reads the 128-wide hidden into a
+ * 256-wide gate_up, the latent 256 wide off the same hidden, so the pair is N 256 over K 128.) */
+TEST(the_latent_and_the_shared_gate_up_go_out_as_one_launch) {
+    struct Run { const char* what; bool same, off; };
+    const Run runs[] = { { "one form", true, false }, { "one form, fused off", true, true },
+                         { "two forms", false, false } };
+    for (const Run& r : runs) {
+        fprintf(stderr, "run %s\n", r.what);
+        if (r.off) setenv("RADIANCE_HY4_FUSE_DUAL", "0", 1);
+        RadBuilder b;
+        bf16_encs(&b);
+        b.encs.insert(b.encs.begin(), { { "ffn_gate_up_shexp", r.same ? enc_trellis(RAD_U5, true)
+                                                                       : enc_i8(true) },
+                                        { "ffn_down_shexp", enc_i8(true) },
+                                        { "ffn_latent_in", enc_trellis(RAD_U5, true) } });
+        MetaKV mk = mini_meta();
+        mk.set("n_embd", "256").set("routed_expert_hidden_size", "256");
+        RadBuildCtx ctx = build_ctx();
+        G3Env g3env;
+        int rc = 0;
+        const std::string err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
+        unsetenv("RADIANCE_HY4_FUSE_DUAL");
+        if (rc != RAD_OK) fputs(err.c_str(), stderr);
+        REQUIRE_EQ(rc, RAD_OK);
+        /* One dual a MoE layer where the pair is one form, and none otherwise. */
+        CHECK_EQ(count_op(b, "gemm_nt_q_dual"), r.same && !r.off ? 2 : 0);
+        /* The pair's own two GEMMs stay declared: the row serves the 16-row band a decode step is
+         * and the Lins keep theirs for every wider pass, so neither launch is lost. */
+        int own = 0;
+        for (const auto& o : b.ops)
+            if (o.op == "gemm_nt_q" && pstr(&o, "dtype") == "i8a8h" && pint(&o, "N") == 256 &&
+                pint(&o, "K") == 128) {
+                ++own;
+                const RecParam* m = param(&o, "M");
+                REQUIRE(m != nullptr);
+                CHECK(m->ihi > 16);
+            }
+        CHECK_EQ(own, 4);
+        /* The dual is declared at the pair's width and K, inside the band its kernels serve. */
+        for (const auto& o : b.ops)
+            if (o.op == "gemm_nt_q_dual") {
+                CHECK_EQ(pint(&o, "N"), 256);
+                CHECK_EQ(pint(&o, "K"), 128);
+                const RecParam* m = param(&o, "M");
+                REQUIRE(m != nullptr);
+                CHECK_EQ(m->ihi, 16);
+            }
+        every_weight_read(b);
+        steps_clean_at(b, 0, 1);
+    }
+}
+
 /* q_nope and q_rope rotated int8 of one form at a q_lora of whole 128 groups: the q residual's norm
  * writes their codes in its pass (rmsnorm_had_quant_i8g) from q_a's raw output, so neither has a
  * quantiser; on a CPU engine q_nope quantises the normed residual once and q_rope reads its codes. */
