@@ -3066,6 +3066,63 @@ TEST(a_staged_layer_is_published_at_its_copies_and_unstaged_at_its_pool_slots) {
     rad_stream_destroy(compute);
 }
 
+/* The exit report's stager line: what the prefill stager copied into a pass's buffers, in units,
+ * bytes and copies, and the units that found no buffer room. The promotion line used to print
+ * `prefetched` -- heat's copies into a slab slot -- as "staged", so a long-context prefill that
+ * staged terabytes said "0 staged" beside /stats's staged bytes (M-16). */
+TEST(the_exit_report_prints_the_stagers_units_bytes_copies_and_overflow) {
+    HeatFixture hf;
+    Mover m;
+    MoverConfig mc;
+    CHECK_OK(m.init(hf.f.prog, hf.plan, mc));
+    RadStream compute = nullptr;
+    CHECK_OK(rad_stream_create(&compute, 0));
+    CHECK_OK(m.bind_compute_stream(compute));
+
+    std::vector<int32_t> units, pooled;
+    for (int32_t u = 0; u < (int32_t)hf.plan.units.size(); ++u) {
+        if (hf.plan.units[(size_t)u].expert < 0) continue;
+        units.push_back(u);
+        if (hf.plan.units[(size_t)u].tier == Tier::HostPinned) pooled.push_back(u);
+    }
+    REQUIRE(pooled.size() >= 2);
+
+    /* Room for all but one pooled unit: the rest stage, one is counted as overflow. */
+    const int64_t each = align_up(hf.plan.units[(size_t)pooled[0]].bytes, RAD_ALIGN_UNIT);
+    const int64_t cap = each * (int64_t)(pooled.size() - 1);
+    std::vector<char> buf((size_t)cap);
+    RadEvent done = nullptr;
+    CHECK_OK(rad_event_create_local(&done));
+    std::vector<int32_t> staged;
+    CHECK_OK(m.stage_units(units, buf.data(), cap, nullptr, done, &staged));
+
+    const MoverStats st = m.stats();
+    REQUIRE(st.staged_units == (uint64_t)staged.size());
+    REQUIRE(st.staged_units > 0);
+    REQUIRE(st.stage_overflow == (uint64_t)1);
+    /* No slab prefetch here: the figure that used to stand in for "staged" is 0. */
+    CHECK(st.prefetched == (uint64_t)0);
+
+    const std::string r = m.report();
+    CHECK(r.find(fmt("stager: %llu routed layers, %llu units staged (%.2f GiB) in %llu copies, "
+                     "%llu units no buffer had room for",
+                     (unsigned long long)st.stage_layers, (unsigned long long)st.staged_units,
+                     (double)st.staged_bytes / 1073741824.0,
+                     (unsigned long long)st.stage_copies,
+                     (unsigned long long)st.stage_overflow)) != std::string::npos);
+    /* And the promotion line is prefetches, not "staged". */
+    const size_t nl = r.find('\n');
+    REQUIRE(nl != std::string::npos);
+    CHECK(r.substr(0, nl).find("staged") == std::string::npos);
+    CHECK(r.substr(0, nl).find("prefetches") != std::string::npos);
+
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    m.unstage_units(staged);
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    rad_event_destroy(done);
+    rad_stream_destroy(compute);
+}
+
 /* The prefill stager's order over a pass of two routed layers: at the pass's first op the first
  * layer goes out, and the second too if the ring has room; each layer returns to its pool slots
  * when the next layer starts; nothing is staged in a pass that was not armed.

@@ -4194,6 +4194,38 @@ TEST(busy_cap_keeps_the_stager_floor_and_never_leaves_a_runt) {
     CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 8 + 256, false, false), 1024);
 }
 
+/* S-01: an interval a quantum under the step (1984 under a 2048-token batch) is one step per
+ * interval, not two. The newcomer's chunk sharing its step with decode rows still lands on the
+ * interval boundary, and the last quantum of the batch stays free for the decode rows behind it.
+ * At an interval equal to the batch the same chunk stops a quantum short of the boundary (1984)
+ * and every interval runs a second, 64-row step that carries the checkpoint -- short in wall time
+ * (40-65 ms) but it arms its own run of decode-only interleave steps, which is the arrival TTFT
+ * the note measures (-27 % / -14 % in its own runs; three runs a side on the iks-A lane give
+ * 2.63 -> 2.20 s and 2.75 -> 2.41 s). */
+TEST(an_interval_a_quantum_under_the_batch_leaves_no_remainder_step) {
+    for (const int64_t interval : { (int64_t)2048, (int64_t)1984 }) {
+        Fixture f;
+        f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/2048, /*max_ctx=*/8192);
+        f.cfg.checkpoint_interval = interval;
+        CHECK_OK(f.start());
+        f.sch.set_stage_rows(1025);
+        /* decode rows alone behind it (2 rows x (1 + 3 drafts)): no split, the chunk is what is
+         * left of the cap at the quantum, 1984, whichever the interval */
+        CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 8, false, /*rows_only=*/true), 2040);
+        CHECK_EQ(f.sch.plan_chunk(0, 100000, 2040, nullptr), 1984);
+        /* the step after it: the remainder up to the interval (64 rows at 2048), or a whole
+         * interval when the interval is the chunk (1984) */
+        const int64_t cap = f.sch.busy_cap(1984, 100000, 2048, 8, false, true);
+        CHECK_EQ(cap, 2040);
+        CHECK_EQ(f.sch.plan_chunk(1984, 100000, cap, nullptr), interval == 2048 ? 64 : 1984);
+        /* four decoders (4 rows x (1 + 3 drafts)) take 32 rows of the batch, still inside the
+         * quantum of headroom, so the chunk is the interval and the next step is not a runt */
+        const int64_t cap4 = f.sch.busy_cap(1984, 100000, 2048, 32, false, true);
+        CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 32, false, true), 2016);
+        CHECK_EQ(f.sch.plan_chunk(1984, 100000, cap4, nullptr), interval == 2048 ? 64 : 1984);
+    }
+}
+
 /* The share left for a request that then does not start (its media is not encoded yet) goes back
  * to the chunk that made room for it: the step is planned as if nothing had waited. */
 TEST(auto_a_share_nobody_takes_goes_back_to_the_prefill) {

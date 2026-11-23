@@ -3794,6 +3794,23 @@ and a chunk that is held back reads its routed experts synchronously (the arriva
 (batch or agent traffic): there is no setting below about 0.37 s of stall in this sweep, and nothing here changes a greedy
 token. Prefix cache and KV pool are unchanged (configuration only).
 
+`checkpoint-interval` sits under every row of this sweep and costs nothing: the rows above were taken at the default 2048
+interval under a 2048-token batch, where an arrival's chunk stops a quantum short of the interval boundary and every
+interval runs a second, 16-64-row step that carries the checkpoint and arms an interleave run of its own. Set the interval
+a quantum under the batch (`checkpoint-interval: 1984` under `max-num-batched-tokens: 2048`) and the chunk fills the interval:
+on the `iks-A` lane (TP2, u3, 210 W, `scripts/backlog/nospec.yaml` and the same file with the line removed, a 5.7K arrival
+three times on each side) arrival TTFT fell from 2.63 to 2.20 s at one decoder (-16 %) and from 2.75 to 2.41 s at four
+(-12 %); the decoders' typical gap (13.3 / 18.3 ms), the worst stall (573 / 594 to 563 / 583 ms), the cold prefill (0.65 to
+0.67 s at 2.4K, 7.17 to 7.14 s at 24.9K) and decode (72.4 tok/s, 13.58 ms a step) are unchanged, and
+`RADIANCE_LOG_STEPS=1` shows `MIXED 1985 | MIXED 1985 | MIXED 1729` an interval where it showed `MIXED 2033 | MIXED 17 |
+MIXED 2033 | MIXED 17 | MIXED 1601`. It composes with the rows here rather than replacing them:
+`busy-prefill-chunk: 512` halves the chunk step (worst gap 563 to 246 ms) at a much slower arrival (2.96 to 5.55 s in that
+sweep), and its 512-token chunks already land on the 2048 boundary, so the interval makes no difference there
+(5.55 to 5.28 s at one, 5.01 to 5.06 s at four, one run each). A smaller chunk removes a share of the stall; the interval
+removes the second step. The chunks are then a quantum shorter than 2048 rows, so a long prompt's answer can differ the
+way it does between any two chunk sizes -- measured against the 2048-chunk baseline as far as `max-num-batched-tokens: 1984`
+moves it, with a prompt that is one chunk either way bit-identical; no dtype, kernel or accumulation changes.
+
 
 **Losslessness** is the gate, since a draft can never change the text: (1) `hyv4flash_arch_test`
 (the declared graph at one, two and four ranks, lint clean on every step kind, the query pass touching

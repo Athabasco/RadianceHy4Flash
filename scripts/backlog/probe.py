@@ -3,9 +3,13 @@
 phases: c1, c8, think (c1, reasoning high), c4, pf6 (prefill ~6.7K tokens: 22,000 characters of tree source),
 pf20 (prefill ~24.9K: 72,000), pf2 (~2.4K: 7,400), stall1 / stall4 (a ~5.7K arrival while 1 / 4 decoders run),
 tailN (a prompt of ~N characters), c1s (64 tok), c8s (48 tok), idle (a finished conversation's KV
-leaves VRAM for the experts and its prefix still resumes; RAD_IDLE_CHARS, RAD_IDLE_WAIT_S). The
-token counts are the ones the backlog's own runs measured on these phases, so a lane's ttft compares
-with the numbers in notes/backlog/."""
+leaves VRAM for the experts and its prefix still resumes; RAD_IDLE_CHARS, RAD_IDLE_WAIT_S), long8
+(the item's eight long conversations at once, then idle, demand and return; RAD_LONG8_CHARS), and
+longctx (eight ~46K-token sessions: a prefill wave of one token each, then the same eight prompts
+decoded 128 tokens, so all eight are at long context together: the shape notes/backlog/refs/notes/
+longctx.md measured as N8 48K, where the stager overflows its ring -- longctx-pre / longctx-decode in
+the JSON). The token counts are the ones the backlog's own runs measured on these phases, so a lane's
+ttft compares with the numbers in notes/backlog/."""
 import json, sys, threading, time, urllib.request, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from prompts import CODE_PROMPTS as P, SRC, long_prompt
@@ -223,6 +227,14 @@ def phase(name, prompts, n=256, effort="none"):
     print(json.dumps({k: (round(v, 3) if isinstance(v, float) else v) for k, v in o.items() if k not in ("stats", "metrics")}), flush=True)
     time.sleep(2)
     return o
+def longctx(chars=140000, n=8, ntok=128):
+    # Eight sessions arrive and fill. One prompt each, built once, so both waves carry the same
+    # strings -- what a prefix-cache hit needs (at 46K they can still be evicted: check the log's
+    # `cache` figure, which a re-prefill sets to 0).
+    ps = [long_prompt(chars, 40 + i, stamp=True) for i in range(n)]
+    pre = phase("longctx-pre", ps, 1)
+    dec = phase("longctx-decode", ps, ntok)
+    return {"prefill": pre, "decode": dec}
 R = {"phases": []}
 if "nowarm" not in PH: request(P[11], 48); request(P[10], 48)
 for ph in PH:
@@ -241,9 +253,10 @@ for ph in PH:
     elif ph == "stall4": R["phases"].append(stall("stall4", 4, 22000))
     elif ph.startswith("tail"):  # tailN: prompt of ~N chars lone, to size small prefill steps
         R["phases"].append(phase(ph, [long_prompt(int(ph[4:]), 3)], 2))
+    elif ph == "longctx": R["phases"].append(longctx())
     elif ph == "pf6c": R["phases"].append(phase("pf6c", [long_prompt(22000, 7, stamp=True)], 2))
     elif ph == "idle": R["phases"].append(idle(int(os.environ.get("RAD_IDLE_CHARS", 72000))))
     elif ph == "long8": R["phases"].append(long8(int(os.environ.get("RAD_LONG8_CHARS", 140000))))
     else: sys.exit(f"probe.py: no phase '{ph}'; phases: c1 c1b c1s c2 c4 c8 c8s think pf2 pf6 pf6c pf20 "
-                  "stall1 stall4 tailN idle long8 nowarm")
+                  "longctx stall1 stall4 tailN idle long8 nowarm")
 json.dump(R, open(OUT, "w"), indent=1)

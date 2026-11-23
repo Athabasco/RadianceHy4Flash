@@ -3,8 +3,8 @@
  * (kernels/experts-streaming.md §7.2).
  *
  *   rad-heat-replay TRACE [--lat N] [--decay X] [--hysteresis X] [--min-gain X] [--moves N]
- *                         [--credit-cap X] [--presence] [--resident N] [--from D] [--to D]
- *                         [--oracle]
+ *                         [--credit-cap X] [--presence] [--resident N] [--layer-min N]
+ *                         [--from D] [--to D] [--oracle]
  *
  * The model: one slab class, the trace's first tier snapshot as the starting resident set and its
  * size as the slab (the live run's lent-slot fills and drops are not modelled, so its resident count
@@ -18,12 +18,19 @@
  *
  * Prints, per run: dispatches, routed and missed units a dispatch (the replay's, against the live
  * engine's own count at credit time), promotions a dispatch, readmits, link MB a dispatch (streamed
- * misses and promotion copies). With --resident the slab is cut or grown to N units first
- * (coldest = highest expert index), a capacity sweep. */
+ * misses and promotion copies), and the residents a layer at the start and at the end (min..max,
+ * median, sd over the layers that hold a movable unit). With --resident the slab is cut or grown to
+ * N units first (coldest = highest expert index), a capacity sweep. With --layer-min N no layer is
+ * left under N resident units: the starting set is raised to the highest floor this slab can hold
+ * on every layer, never above N (the units come from the layers above it, the fullest first,
+ * highest expert index first, so the total does not move, and a floor the slab cannot hold is
+ * clamped rather than overshot), and a swap whose demotion would take a layer under that floor is
+ * abandoned (heat.abandon), the model of a mover that keeps a per-layer floor (M-16, E-M6). */
 #include "place/heat.h"
 #include "place/planner.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -104,16 +111,41 @@ struct Opt {
     int lat = 2;
     HeatParams hp{};
     bool presence = false, oracle = false;
-    int64_t resident = -1;
+    int64_t resident = -1, layer_min = 0;
     int32_t from = INT32_MIN, to = INT32_MAX;
 };
+
+/* The residents a layer over the layers that hold a movable unit: min..max (median, sd), the
+ * exit report's per-layer table as one line (M-16). */
+std::string layer_line(const Trace& t, const std::vector<int64_t>& res) {
+    std::vector<int64_t> r;
+    for (int32_t l = 0; l < t.nl; ++l) {
+        bool has = false;
+        for (int32_t e = 0; e < t.ne && !has; ++e) {
+            const size_t k = (size_t)l * (size_t)t.ne + e;
+            has = t.bytes[k] > 0 && t.movable[k];
+        }
+        if (has) r.push_back(res[(size_t)l]);
+    }
+    if (r.empty()) return "no movable layer";
+    std::sort(r.begin(), r.end());
+    double mean = 0;
+    for (int64_t x : r) mean += (double)x;
+    mean /= (double)r.size();
+    double var = 0;
+    for (int64_t x : r) var += ((double)x - mean) * ((double)x - mean);
+    var /= (double)r.size();
+    return fmt("%lld..%lld (median %lld, sd %.0f)", (long long)r.front(), (long long)r.back(),
+               (long long)r[r.size() / 2], std::sqrt(var));
+}
 
 }  /* namespace */
 
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: %s TRACE [--lat N] [--decay X] [--hysteresis X] [--min-gain X] "
-                     "[--moves N] [--credit-cap X] [--presence] [--resident N] [--from D] [--to D] [--oracle]\n",
+                     "[--moves N] [--credit-cap X] [--presence] [--resident N] [--layer-min N] "
+                     "[--from D] [--to D] [--oracle]\n",
                      argv[0]);
         return 2;
     }
@@ -133,6 +165,7 @@ int main(int argc, char** argv) {
         else if (a == "--presence") o.presence = true;
         else if (a == "--oracle") o.oracle = true;
         else if (a == "--resident") o.resident = std::atoll(val());
+        else if (a == "--layer-min") o.layer_min = std::atoll(val());
         else if (a == "--from") o.from = std::atoi(val());
         else if (a == "--to") o.to = std::atoi(val());
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
@@ -164,6 +197,75 @@ int main(int argc, char** argv) {
         res0 = have;
     }
 
+    /* --layer-min: no layer under N resident units at any dispatch, at the same total. Every layer
+     * is raised to the highest floor this slab can hold, never above N (units come off the layers
+     * above it, the fullest first, the highest expert index first), so what the floor costs is the
+     * hit rate of the residents it moves, not a bigger slab. `floor_achieved` is that floor: a trace
+     * whose slab cannot hold N everywhere is clamped to what it reaches, not overshot. */
+    std::vector<int64_t> layer_res((size_t)t.nl, 0);
+    for (int32_t l = 0; l < t.nl; ++l)
+        for (int32_t e = 0; e < t.ne; ++e) {
+            const size_t k = (size_t)l * (size_t)t.ne + e;
+            layer_res[(size_t)l] += t.bytes[k] > 0 && t.movable[k] && tier[k] == (uint8_t)Tier::VRAM;
+        }
+    int64_t floor_achieved = 0;
+    if (o.layer_min > 0) {
+        /* The highest floor this slab can hold on every layer: raising the thin layers to F is paid
+         * for by the layers above F, so F is feasible while sum of max(0, res - F) >= sum of
+         * max(0, F - res), which is monotone in F. Bisect for it, never above the request: a floor
+         * the slab cannot hold is clamped to the one it can, not overshot and not left frozen. */
+        auto feasible = [&](int64_t f) {
+            int64_t supply = 0, demand = 0;
+            for (int32_t l = 0; l < t.nl; ++l) {
+                bool has = false;
+                for (int32_t e = 0; e < t.ne && !has; ++e) {
+                    const size_t k = (size_t)l * (size_t)t.ne + e;
+                    has = t.bytes[k] > 0 && t.movable[k];
+                }
+                if (!has) continue;
+                const int64_t v = layer_res[(size_t)l];
+                if (v > f) supply += v - f;
+                else demand += f - v;
+            }
+            return supply >= demand;
+        };
+        for (int64_t lo = 0, hi = o.layer_min; lo < hi;) {
+            const int64_t mid = lo + (hi - lo + 1) / 2;
+            if (feasible(mid)) lo = mid;
+            else hi = mid - 1;
+            floor_achieved = lo;
+        }
+        for (int32_t l = 0; l < t.nl; ++l) {
+            while (layer_res[(size_t)l] < floor_achieved) {
+                int32_t e_in = -1;
+                for (int32_t e = 0; e < t.ne && e_in < 0; ++e) {
+                    const size_t k = (size_t)l * (size_t)t.ne + e;
+                    if (t.bytes[k] > 0 && t.movable[k] && tier[k] != (uint8_t)Tier::VRAM) e_in = e;
+                }
+                if (e_in < 0) break;
+                int32_t l_out = -1;
+                for (int32_t l2 = 0; l2 < t.nl; ++l2)
+                    if (layer_res[(size_t)l2] > floor_achieved &&
+                        (l_out < 0 || layer_res[(size_t)l2] > layer_res[(size_t)l_out]))
+                        l_out = l2;
+                if (l_out < 0) break;
+                int32_t e_out = -1;
+                for (int32_t e = t.ne - 1; e >= 0 && e_out < 0; --e) {
+                    const size_t k = (size_t)l_out * (size_t)t.ne + e;
+                    if (t.bytes[k] > 0 && t.movable[k] && tier[k] == (uint8_t)Tier::VRAM) e_out = e;
+                }
+                if (e_out < 0) break;
+                tier[(size_t)l * (size_t)t.ne + e_in] = (uint8_t)Tier::VRAM;
+                tier[(size_t)l_out * (size_t)t.ne + e_out] = (uint8_t)Tier::HostPinned;
+                ++layer_res[(size_t)l];
+                --layer_res[(size_t)l_out];
+            }
+        }
+    }
+    const std::string layer_start = layer_line(t, layer_res);
+    /* What the floor binds: the requested one, or the one this slab can hold on every layer. */
+    const int64_t floor_ = floor_achieved;
+
     /* A plan of one unit per (layer, expert), one slab class. */
     Plan plan;
     plan.dynamic = true;
@@ -185,6 +287,10 @@ int main(int argc, char** argv) {
 
     struct Pub { int32_t pass; Swap s; };
     std::deque<Pub> pend;
+    /* The floor's bookkeeping: the committed residents a layer and the delta of the swaps accepted
+     * but not yet published, so a batch of swaps cannot walk a layer under N between two passes. */
+    std::vector<int64_t> layer_pend((size_t)t.nl, 0);
+    uint64_t floor_refused = 0;
     std::vector<int32_t> dense((size_t)t.ne);
     uint64_t routed = 0, missed = 0, live_missed = 0, rows_n = 0, promos = 0, miss_bytes = 0, promo_bytes = 0;
     uint64_t oracle_adm = 0;
@@ -207,12 +313,22 @@ int main(int argc, char** argv) {
                 heat.set_busy(s.promote, false);
                 vram[(size_t)s.promote] = 1;
                 if (ever_demoted[(size_t)s.promote]) ++readmits;
+                if (plan.units[(size_t)s.promote].movable) {
+                    const size_t l = (size_t)plan.units[(size_t)s.promote].layer;
+                    ++layer_res[l];
+                    --layer_pend[l];
+                }
             }
             if (s.demote >= 0) {
                 heat.set_tier(s.demote, Tier::HostPinned);
                 heat.set_busy(s.demote, false);
                 vram[(size_t)s.demote] = 0;
                 ever_demoted[(size_t)s.demote] = 1;
+                if (plan.units[(size_t)s.demote].movable) {
+                    const size_t l = (size_t)plan.units[(size_t)s.demote].layer;
+                    --layer_res[l];
+                    ++layer_pend[l];
+                }
             }
         }
     };
@@ -247,10 +363,26 @@ int main(int argc, char** argv) {
         swaps.clear();
         heat.step(&swaps);
         for (const Swap& s : swaps) {
+            if (s.demote >= 0 && floor_ > 0) {
+                const size_t l = (size_t)plan.units[(size_t)s.demote].layer;
+                if (layer_res[l] + layer_pend[l] <= floor_) {
+                    heat.abandon(s);
+                    ++floor_refused;
+                    continue;
+                }
+            }
             pend.push_back(Pub{ d + o.lat, s });
-            if (s.promote >= 0) { ++promos; promo_bytes += (uint64_t)plan.units[(size_t)s.promote].bytes; }
+            if (s.promote >= 0) {
+                ++promos;
+                promo_bytes += (uint64_t)plan.units[(size_t)s.promote].bytes;
+                if (plan.units[(size_t)s.promote].movable)
+                    ++layer_pend[(size_t)plan.units[(size_t)s.promote].layer];
+            }
+            if (s.demote >= 0 && plan.units[(size_t)s.demote].movable)
+                --layer_pend[(size_t)plan.units[(size_t)s.demote].layer];
         }
     }
+    publish_to(INT32_MAX);
     const HeatStats hs = heat.stats();
     /* The live run's own counters over the same dispatches. */
     const Disp* d0 = nullptr;
@@ -267,6 +399,12 @@ int main(int argc, char** argv) {
     std::printf("params: lat %d decay %.3f hysteresis %.2f min-gain %.2f moves %d credit-cap %.0f%s%s\n", o.lat,
                 (double)o.hp.decay, (double)o.hp.hysteresis, (double)o.hp.min_gain, o.hp.moves_per_step,
                 (double)o.hp.credit_cap, o.presence ? " presence" : "", o.oracle ? " ORACLE" : "");
+    std::printf("residents a layer: start %s, end %s\n", layer_start.c_str(),
+                layer_line(t, layer_res).c_str());
+    if (o.layer_min > 0)
+        std::printf("floor: %lld units a layer (achieved %lld at the start, enforced), %llu swaps "
+                    "abandoned on it\n",
+                    (long long)o.layer_min, (long long)floor_, (unsigned long long)floor_refused);
     std::printf("replay: routed %.1f missed %.1f (hit %.4f; heat's own count %.4f) promotions %.2f "
                 "readmits %.1f%% link MB a dispatch: stream %.1f promote %.1f\n",
                 routed / nd, missed / nd, routed ? 1.0 - (double)missed / routed : 0.0,
