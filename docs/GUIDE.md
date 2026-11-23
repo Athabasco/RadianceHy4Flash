@@ -1571,11 +1571,16 @@ chunk leaves room for one row plus the draft window per decode row behind it, an
 budget (an eighth, at least one quantum) for each prefill behind it and for the next request waiting
 to start, so a long prompt (a minute or more at 256K) does not starve decode rows or admission. The
 chunk never drops under the smallest step the prefill stager overlaps (one more than the largest
-arena level, named on the startup line `prefill staging: ...`); below that every routed layer reads
-its pooled experts synchronously and the prefill slows far more than sharing saves. Where holding a
-chunk back would leave a short remainder before the checkpoint boundary, the interval is split into
-two staged halves instead. Decode rows alone take only their few tokens: the chunk ends a quantum
-short of the boundary and the next step finishes it. A prompt with nothing beside it is unaffected.
+arena level, named on the startup line `prefill staging: ...`) rounded up to the chunk quantum: a
+pass of 1025 tokens at a 64-token quantum keeps 1088 rows, because rounding it down would hold the
+chunk at the 1024 rows of a level whose step lends the ring, which the stager does not arm for at
+all. Below that every routed layer reads its pooled experts synchronously and the prefill slows far
+more than sharing saves. Where holding a chunk back would leave a short remainder before the
+checkpoint boundary, the interval is split into two halves at or above that floor instead; where
+the interval cannot hold two such halves (2048 cannot hold two of 1088), the chunk takes the
+interval less the reserve and the remainder is the next step's chunk. Decode rows alone take only
+their few tokens: the chunk ends a quantum short of the boundary and the next step finishes it. A
+prompt with nothing beside it is unaffected.
 `off` lets a chunk take the whole step; `N` holds a shared chunk to N tokens (startup warns when N is
 under the stager's step). `radiance:engine_prefill_chunks_capped_total` counts the chunks held back.
 

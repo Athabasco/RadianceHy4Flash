@@ -1446,8 +1446,27 @@ void Scheduler::set_stage_rows(int64_t rows) {
     }
     RAD_INFO("scheduler: --busy-prefill-chunk auto: a prefill chunk sharing a step leaves decode "
              "rows and waiting requests their room and keeps at least %lld tokens%s",
-             (long long)std::max(Q, stage_rows_ / Q * Q),
-             stage_rows_ > 0 ? " (the prefill stager's smallest pass)" : "");
+             (long long)stage_floor(Q),
+             stage_rows_ > 0 ? " (the prefill stager's smallest pass, rounded up to the quantum)"
+                             : "");
+}
+
+/* The shortest chunk the prefill stager arms for, as a chunk length.
+ *
+ * The engine's step (stage_rows_) is one more than the largest arena level that lends the ring
+ * (1025 rows with a 1024-row level), so a step of that many rows takes the level above and is
+ * staged. It is not a multiple of the chunk quantum, and rounding it *down* to one (1025 -> 1024
+ * at a quantum of 64) is exactly the level that lends the ring: that step takes the lending level,
+ * the stager does not arm for it (Place::Stager::begin_pass wants a ring), and every routed layer
+ * of the chunk reads its pooled experts synchronously -- the pass the floor is there to avoid
+ * (backlog M-03a). Rounded up, the floor is the shortest chunk whose step is staged after all. */
+int64_t Scheduler::stage_floor(int64_t quantum) const {
+    const int64_t Q = std::max<int64_t>(quantum, 1);
+    if (stage_rows_ <= 0) return Q;
+    /* No deployment has a step near the int64 ceiling; saturate instead of wrapping, and the min
+     * with the budget in busy_cap then keeps the chunk legal. */
+    if (stage_rows_ > INT64_MAX - (Q - 1)) return INT64_MAX;
+    return std::max(Q, (stage_rows_ + Q - 1) / Q * Q);
 }
 
 /* How much of the step a prefill chunk may take when other work wants in.
@@ -1455,13 +1474,15 @@ void Scheduler::set_stage_rows(int64_t rows) {
  * Uncapped, a prefill row takes every token the step has left, and on a prompt of a few hundred
  * thousand tokens that lasts a minute or more, during which decode rows behind it get nothing and
  * admission never runs. The cap leaves `reserve` (computed by step()) and never goes under the
- * floor: the smallest step the prefill stager overlaps, rounded down to the quantum, or one
- * quantum with no stager. A smaller step reads every routed layer's pooled experts
+ * floor: the smallest step the prefill stager overlaps, rounded up to the quantum (stage_floor),
+ * or one quantum with no stager. A smaller step reads every routed layer's pooled experts
  * synchronously, which costs a long prefill far more than sharing saves.
  *
  * Chunks end on the checkpoint interval (plan_chunk), so a chunk held short leaves a remainder,
  * about the size of the reserve, as the next step's whole chunk. When that would be under the
- * floor, the interval is split into two chunks at or above the floor instead. */
+ * floor, the interval is split into two chunks at or above the floor instead (where the interval
+ * cannot hold two, as 2048 cannot hold two 1088-row chunks at a quantum of 64, no split keeps both
+ * halves staged, and the whole interval less the reserve goes out). */
 int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget,
                             int64_t reserve, bool shared, bool rows_only,
                             int64_t mixed_target_shares, int64_t mixed_target_decode_reserve) const {
@@ -1481,7 +1502,7 @@ int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget
          * stager's step. */
         cap = std::min(cap, mode);
     } else if (mode < 0) {
-        const int64_t floor = std::max(Q, stage_rows_ / Q * Q);
+        const int64_t floor = stage_floor(Q);
         cap = std::max(cap, floor);
         const int64_t remaining = n_target - n_computed;
         int64_t span = remaining;                       /* where this run of chunks must end */
