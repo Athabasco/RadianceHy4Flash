@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # lanes.sh: the backlog's lanes and their settings, sourced by lane.sh and run.sh.
 #
 # A lane is a TP2 pair of R9700 at 210 W with the u3 container (notes/backlog/CARDS.md §1):
@@ -124,14 +125,4 @@ lane_health() {  # lane_health <port>: 0 if the server answers /health (python3:
 import sys, urllib.request
 urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/health", timeout=3).read()
 EOF
-}
-
-lane_wait() {  # lane_wait <port> <pid> [secs]: wait for /health, or for the server to die
-  local port=$1 pid=$2 secs=${3:-900} i
-  for i in $(seq 1 "$secs"); do
-    lane_health "$port" && return 0
-    kill -0 "$pid" 2>/dev/null || return 1
-    sleep 1
-  done
-  return 1
 }

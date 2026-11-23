@@ -18,7 +18,7 @@ RAD_REPO=$(rad_here); export RAD_REPO
 cfg=${1:?usage: lane-pair.sh <cfg.yaml> <phases> [ENV=VAL ...]}
 ph=${2:?usage: lane-pair.sh <cfg.yaml> <phases> [ENV=VAL ...]}
 shift 2
-while [ $# -gt 0 ]; do export "$1"; shift; done
+while [ $# -gt 0 ]; do export "${1?}"; shift; done
 tag=${TAG:-pair-$(date -u +%m%d-%H%M)}
 lanes="iks-A iks-B"
 

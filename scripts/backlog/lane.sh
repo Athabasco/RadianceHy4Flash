@@ -30,7 +30,7 @@ usage() {
 
 mode=run
 case $1 in
-  ''|-h|--help|help) usage; exit $([ -z "$1" ] && echo 2 || echo 0) ;;
+  ''|-h|--help|help) usage; [ -n "$1" ] && exit 0; exit 2 ;;
   lanes) echo "$RAD_LANES" | tr ' ' '\n'; exit 0 ;;
   --env) lane_env "${2:-${RAD_LANE:-local}}" || exit 2
          # a remote lane's paths are under the home on that host, not this one's: show it as `~`
