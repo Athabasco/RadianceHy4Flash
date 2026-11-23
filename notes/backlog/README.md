@@ -10,6 +10,7 @@ container `hy4-flash-iqr-v4-u3.rad` (keptn/hy4-flash-iqr-v4).
 | `refs/kernels/*.md`, `refs/notes/*.md` | the earlier notes the backlog cites |
 | `CARDS.md` | how cards built from the backlog work: lanes, merge bar, lossy items, working from outside |
 | `closed/<ID>.md` | items closed without code: the number, the reason, and what an operator or a later card needs from them |
+| `M-03a.md` | a card whose code is done but which needs a lane (`CARDS.md` §6): what changed, what passed without a card, and the lane checks that are still open |
 | `../../scripts/backlog/` | the measuring tools and configs of §2: `run.sh`, `probe.py`, `bench.py`, `agg.py`, `layer.py`, `profdiff.py`, `profagg.py`, `attr.py`, `prompts.py`, `demangle.py` and the configs, with `lane.sh`, `lanes.sh`, `lane-cfg.py` and `lane-pair.sh` that make them lane-aware (§1.1) |
 
 How paths in the backlog map onto this directory:
