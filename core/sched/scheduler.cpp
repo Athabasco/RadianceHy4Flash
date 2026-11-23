@@ -197,6 +197,28 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     mixed_target_prefill_planned_ = 0;
     mixed_target_prefill_continues_ = false;
     draft_refill_ = 0;
+    /* S-02: the chunk a step carries may be planned as m layer-sliced sub-steps only when the
+     * plugin declares the persistent set that makes a slice resumable and the trunk has more than
+     * one layer to split. --chunk-slices off (the default) never slices. */
+    n_layers_  = prog.meta.n_layers;
+    slice_ok_  = prog.ctx.layer_slices > 0;
+    group_ = ChunkGroup{};
+    if (cfg.chunk_slices != 0 && n_layers_ > 1) {
+        if (!slice_ok_)
+            RAD_INFO("scheduler: --chunk-slices: this model's plugin declares no resumable layer "
+                     "slice set (RadBuildCtx::layer_slices), so a chunk is never sliced");
+        else if (cfg.chunk_slices < 0)
+            RAD_INFO("scheduler: --chunk-slices auto: m from --chunk-slice-target-ms %lld and "
+                     "--chunk-slice-cost-pct %lld once a chunk step and a decode step are "
+                     "measured", (long long)cfg.chunk_slice_target_ms,
+                     (long long)cfg.chunk_slice_cost_pct);
+        else
+            RAD_INFO("scheduler: --chunk-slices %lld: a prefill chunk sharing a step with decode "
+                     "rows is planned as %lld layer-sliced sub-steps",
+                     (long long)cfg.chunk_slices,
+                     (long long)std::min<int64_t>(std::min<int64_t>(cfg.chunk_slices, 8),
+                                                  n_layers_));
+    }
     if (cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_BLOCK && prog.drafter.window > 0 &&
         hit_holes_draft_) {
         draft_refill_ = prog.drafter.window;
@@ -1568,6 +1590,176 @@ int64_t Scheduler::interleave_steps() const {
     return n >= (double)kInterleaveAutoMax ? kInterleaveAutoMax : (int64_t)n;
 }
 
+/* ------------------------------------------------------------------ the layer-sliced chunk */
+
+/* S-02's m law (§2.2 of notes/backlog/design/S-02.md). `--chunk-slices N` fixes m = N; `auto` derives it
+ * from the learned step costs: m = clamp(ceil(C / target), 1, min(8, 1 + floor(cost_pct * C / D))) -- enough
+ * slices to bring a sub-step to the target, no more of them than the decode wait they add may buy (the
+ * cap is what keeps a chunk from growing by more than `cost_pct` percent). The chunk itself must be at
+ * least 128 rows (rule 2 of §2.3) and the trunk at least two layers, or a slice has nothing to run.
+ * 1 means "do not slice". */
+int32_t Scheduler::chunk_slice_count(int64_t tokens) const {
+    if (!slice_ok_ || cfg_.chunk_slices == 0 || n_layers_ < 2) return 1;
+    if (tokens < 128) return 1;
+    int32_t m = 0;
+    if (cfg_.chunk_slices > 0) {
+        m = (int32_t)cfg_.chunk_slices;
+    } else {
+        const double C = ema_chunk_s_, D = ema_decode_s_;
+        if (C <= 0.0 || D <= 0.0) return 1;   /* nothing measured yet: leave the chunk whole */
+        const double target = (double)cfg_.chunk_slice_target_ms / 1000.0;
+        if (target <= 0.0) return 1;
+        int32_t top = 1 + (int32_t)std::floor((double)cfg_.chunk_slice_cost_pct / 100.0 * C / D);
+        if (top > 8) top = 8;
+        m = (int32_t)std::ceil(C / target);
+        if (m > top) m = top;
+    }
+    if (m > 8) m = 8;
+    if (m > n_layers_) m = n_layers_;   /* at least one layer a slice */
+    return m < 2 ? 1 : m;
+}
+
+int32_t Scheduler::next_prefill_first_layer(bool next_plan) const {
+    const StepPlan& p = next_plan ? plan_next_ : plan_;
+    if (p.slice_m > 0 && !p.slice_last) return p.layer_hi;
+    return 0;
+}
+
+/* The next sub-step's rows: the frozen decode rows, one token each, then the carried chunk. The
+ * chunk's row base is therefore the same on every sub-step, which is what lets a plugin keep its
+ * transient row state and resume at layer_lo. */
+void Scheduler::fill_group_step(StepPlan& p, bool ahead) {
+    p.slice_m = group_.n_slices;
+    p.slice_j = group_.next;
+    p.layer_lo = group_.lo;
+    p.slice_last = group_.next + 1 >= group_.n_slices;
+    p.layer_hi = p.slice_last ? n_layers_
+                              : (int32_t)(((int64_t)(group_.next + 1) * n_layers_) / group_.n_slices);
+    p.n_spec = 0;
+    p.spec_is_tree = tree_;
+    p.phase = RAD_PHASE_MIXED;
+
+    int32_t row = 0;
+    for (int32_t slot : group_.dec) {
+        SchedReq& s = *reqs_[(size_t)slot];
+        Request& r = *s.req;
+        StepEntry e;
+        e.req = &r;
+        e.seq = r.id;
+        e.slot = slot;
+        e.card = s.card;
+        e.n_tokens = 1;
+        e.ctx_len = (int32_t)(r.n_computed + 1);
+        e.n_spec = 0;
+        e.n_accepted = r.n_accepted + 1;
+        e.conv_cursor = s.conv_cursor;
+        e.draft = s.draft;
+        e.n_draft = 0;
+        e.is_prefill = false;
+        e.produces_token = true;
+        e.dev_tok = e.ctx_len;
+        e.dev_out = row;
+        e.dev_aux = 0;
+        if (ahead) s.entry_next = (int32_t)p.e.size(); else s.entry = (int32_t)p.e.size();
+        p.e.push_back(e);
+        p.n_tok += 1;
+        ++row;
+    }
+    p.n_seq_decode = (int64_t)group_.dec.size();
+    p.n_tok_decode = (int64_t)group_.dec.size();
+
+    StepEntry ce = group_.entry;
+    ce.n_tokens = group_.n_tokens;
+    ce.n_spec = 0;
+    ce.n_draft = 0;
+    ce.draft = nullptr;
+    ce.draft_parent = nullptr;
+    ce.hidden_row = -1;
+    ce.hidden_n = 0;
+    ce.ckpt_restore = -1;
+    ce.dev = false;
+    ce.dev_tok = 0;
+    ce.dev_aux = 0;
+    ce.produces_token = p.slice_last && group_.produces_token;
+    ce.dev_out = ce.produces_token ? row : -1;
+    SchedReq& cs = *reqs_[(size_t)group_.slot];
+    if (ahead) cs.entry_next = (int32_t)p.e.size(); else cs.entry = (int32_t)p.e.size();
+    cs.sched_tokens = group_.n_tokens;
+    cs.n_draft = 0;
+    p.e.push_back(ce);
+    p.n_tok += group_.n_tokens;
+
+    group_.lo = p.layer_hi;
+    ++group_.next;
+    ++m_.substeps;
+}
+
+bool Scheduler::plan_group_slice() {
+    if (!group_.active) return false;
+    fill_group_step(plan_, false);
+    return true;
+}
+
+bool Scheduler::plan_group_ahead() {
+    if (!group_.active || group_.next >= group_.n_slices) return false;
+    fill_group_step(plan_next_, true);
+    return true;
+}
+
+/* Decide whether the mixed step just planned opens a group (§2.3 of the design). Every refusal
+ * here leaves the step exactly as it was: one whole chunk with its decode rows. */
+bool Scheduler::start_group() {
+    if (!slice_ok_ || cfg_.chunk_slices == 0 || n_layers_ < 2) return false;
+    if (plan_.phase != RAD_PHASE_MIXED || plan_.n_tok_decode <= 0) return false;
+    if (plan_.n_spec != 0) return false;   /* drafting inside a group would move the base */
+    int32_t pf = -1;
+    for (int32_t i = 0; i < (int32_t)plan_.e.size(); ++i) {
+        const StepEntry& e = plan_.e[(size_t)i];
+        if (e.is_prefill) {
+            if (pf >= 0) return false;      /* one chunk a step, or the base is not one row */
+            pf = i;
+            continue;
+        }
+        if (e.n_spec != 0 || e.n_tokens != 1) return false;
+    }
+    if (pf < 0) return false;
+    const StepEntry ce = plan_.e[(size_t)pf];
+    /* A checkpoint inside the chunk, or a restore from a prefix hit, is one whole pass. */
+    if (ce.ckpt_restore >= 0) return false;
+    if (ce.ckpt_tok >= 0 && ce.ckpt_slot >= 0 && ce.ckpt_tok + 1 < ce.n_tokens) return false;
+    const int32_t m = chunk_slice_count(ce.n_tokens);
+    if (m < 2) return false;
+    /* Reserve the frozen decode rows' KV for the whole group now: no sub-step may fail an
+     * ensure, and a shortfall is one more reason to leave the chunk whole. */
+    for (int32_t i = 0; i < pf; ++i) {
+        const StepEntry& e = plan_.e[(size_t)i];
+        if (kv_->ensure_from(e.seq, e.ctx_len + m, e.ctx_len) < 0) return false;
+    }
+    group_.active = true;
+    group_.slot = ce.slot;
+    group_.n_tokens = ce.n_tokens;
+    group_.n_slices = m;
+    group_.next = 1;                 /* sub-step 0 is the step just planned */
+    group_.lo = (int32_t)((int64_t)n_layers_ / m);
+    group_.produces_token = ce.produces_token;
+    group_.entry = ce;
+    group_.dec.clear();
+    for (int32_t i = 0; i < pf; ++i) group_.dec.push_back(plan_.e[(size_t)i].slot);
+
+    plan_.slice_m = m;
+    plan_.slice_j = 0;
+    plan_.layer_lo = 0;
+    plan_.layer_hi = group_.lo;
+    plan_.slice_last = false;
+    ++m_.steps_sliced;
+    ++m_.substeps;
+    /* The chunk plans its token once, on the last sub-step; unmasked it would emit m of them. */
+    StepEntry& e = plan_.e[(size_t)pf];
+    e.produces_token = false;
+    e.dev_out = -1;
+    return true;
+}
+
 /* ------------------------------------------------------------------ preemption */
 bool Scheduler::preempt_back() {
     int32_t slot = running_.back();
@@ -2108,6 +2300,29 @@ const RadBatch* Scheduler::step() {
     step_decode_tok_ = 0;
     mixed_target_prefill_planned_ = 0;
     mixed_target_prefill_continues_ = false;
+
+    /* S-02: an open chunk group's next sub-step is planned from its frozen set, ahead of every
+     * gate below: the group's rows and their base may not move, so nothing is admitted, preempted
+     * or held in this step. The build failure path is the ordinary one, with the group dropped. */
+    if (group_.active) {
+        plan_group_slice();
+        span_now_ = false;
+        mixed_target_active_ = false;
+        held_prefill_ = 0;
+        step_start_ = std::chrono::steady_clock::now();
+        const RadBatch* gb = builder_.build(plan_, *kv_, step_);
+        if (!gb) {
+            for (StepEntry& e : plan_.e)
+                if (e.slot >= 0 && (size_t)e.slot < reqs_.size()) reqs_[(size_t)e.slot]->entry = -1;
+            plan_.reset();
+            group_ = ChunkGroup{};
+            step_open_ = false;
+            return nullptr;
+        }
+        ++step_;
+        step_open_ = true;
+        return gb;
+    }
 
     /* A preempted prefill waits for the whole-recompute gate so it cannot loop. That wait is
      * bounded here, for every overdue preempted request, not only the queue head: a head that
@@ -2814,6 +3029,10 @@ const RadBatch* Scheduler::step() {
             k += e.n_tokens;
         }
     }
+    /* S-02: a mixed step carrying one whole chunk beside decode rows may open a chunk group.
+     * Every refusal leaves the plan as it is, so a step is only ever sliced when the design's
+     * conditions all hold. */
+    start_group();
     /* Every snapshot this step restores from must still be in the store. The prefix cache keeps a
      * handed-out snapshot's slot until the next step begins (PrefixCache::begin_step), so this
      * should always hold; it is checked because restoring from a released slot reads another
@@ -3012,6 +3231,29 @@ const RadBatch* Scheduler::refuse_ahead(AheadRefused why) {
 
 const RadBatch* Scheduler::step_next_locked() {
     if (!step_open_ || next_open_ || plan_.e.empty()) return nullptr;
+    /* S-02: a group's next sub-step is planned from its frozen set, with no admission against it;
+     * the step after the last sub-step is planned normally by step() after the commit. */
+    if (group_.active) {
+        if (group_.next >= group_.n_slices) return refuse_ahead(AheadRefused::MidPrompt);
+        const int32_t lo = group_.lo;
+        plan_next_.reset();
+        plan_next_.spec_is_tree = tree_;
+        plan_group_ahead();
+        const RadBatch* gb = builder_.build(plan_next_, *kv_, step_);
+        if (!gb) {
+            for (const StepEntry& e : plan_next_.e)
+                if (e.slot >= 0 && (size_t)e.slot < reqs_.size())
+                    reqs_[(size_t)e.slot]->entry_next = -1;
+            plan_next_.reset();
+            --group_.next;
+            group_.lo = lo;
+            return refuse_ahead(AheadRefused::Kv);
+        }
+        for (size_t i = 0; i < plan_next_.e.size(); ++i)
+            reqs_[(size_t)plan_next_.e[i].slot]->entry_next = (int32_t)i;
+        next_open_ = true;
+        return gb;
+    }
     /* Before the loop below, which reserves the next step's KV. */
     if (ends_every_request()) return refuse_ahead(AheadRefused::EndsEvery);
 
@@ -3420,6 +3662,10 @@ int Scheduler::commit(StepResult& res) {
     committed_.clear();
 
     const int32_t W = conv_window();
+    /* S-02: a sub-step of a chunk group commits only its decode rows; the chunk's own commit
+     * waits for the last sub-step (`slice_more`), and the group ends with it. */
+    const bool slice_step = plan_.slice_m > 0;
+    const bool slice_more = slice_step && !plan_.slice_last;
 
     /* A mixed step leaves decode rows the same replay factors as a decode step (recurrent path
      * over [0, n_seq_decode), chunked over the rest), so their scratch is not invalidated; the
@@ -3436,7 +3682,8 @@ int Scheduler::commit(StepResult& res) {
             s.entry = -1;
             /* Unless the drafter's snapshot still names it, or the next step carries it: the
              * sweep below, or that step's commit, releases it once nothing does. */
-            if (s.pending_free && !block_holds(r.id) && !(next_open_ && s.entry_next >= 0)) {
+            if (s.pending_free && !block_holds(r.id) && !(next_open_ && s.entry_next >= 0) &&
+                !(slice_more && group_.holds(s.slot))) {
                 free_kv(s);
                 s.pending_free = false;
                 --n_deferred_;
@@ -3462,40 +3709,46 @@ int Scheduler::commit(StepResult& res) {
             pc_->commit_checkpoint(r, (int64_t)e.ctx_len + e.ckpt_tok + 1);
 
         if (e.is_prefill) {
-            r.n_computed += e.n_tokens;
-            /* The chunk is committed: a window group returns its blocks below the window now,
-             * not at this sequence's next ensure(), which may be steps away. */
-            kv_->trim_window(r.id, r.n_computed);
-            step_prefill_tok_ += e.n_tokens;
-            server::sink_prompt_progress(r.sink, r.n_computed, (int32_t)r.prompt.size(),
-                                         r.n_cached);
-            /* Once, when the prompt is fully placed: the usage block's admission accounting.
-             * `n_cached` is what the prefix cache supplied. */
-            if (r.n_computed >= (int64_t)r.prompt.size()) {
-                server::sink_prompt_stats(r.sink, (int32_t)r.prompt.size(), r.n_cached);
-                /* From here a decode step reads the ring, and the engine checks the resolve's
-                 * overflow. */
-                last_prefill_ids_.push_back(r.id);
+            /* S-02: the chunk's rows and everything that follows from them (KV trim, sink
+             * progress, the prompt's stats, the prefix publish, the suffix index, the token)
+             * commit once, on the group's last sub-step. Before it the sub-step has only run this
+             * chunk's rows through its layers. */
+            if (!slice_more) {
+                r.n_computed += e.n_tokens;
+                /* The chunk is committed: a window group returns its blocks below the window now,
+                 * not at this sequence's next ensure(), which may be steps away. */
+                kv_->trim_window(r.id, r.n_computed);
+                step_prefill_tok_ += e.n_tokens;
+                server::sink_prompt_progress(r.sink, r.n_computed, (int32_t)r.prompt.size(),
+                                             r.n_cached);
+                /* Once, when the prompt is fully placed: the usage block's admission accounting.
+                 * `n_cached` is what the prefix cache supplied. */
+                if (r.n_computed >= (int64_t)r.prompt.size()) {
+                    server::sink_prompt_stats(r.sink, (int32_t)r.prompt.size(), r.n_cached);
+                    /* From here a decode step reads the ring, and the engine checks the resolve's
+                     * overflow. */
+                    last_prefill_ids_.push_back(r.id);
+                }
+                if (e.produces_token && res.token && r.embed) {
+                    /* The answer is the pooled vector the engine already put in the sink; there is
+                     * no token to emit, and `eos` ends the request below. */
+                    if (!s.first_tok_us) s.first_tok_us = mono_us();
+                } else if (e.produces_token && res.token) {
+                    if (!s.first_tok_us) s.first_tok_us = mono_us();
+                    r.output.push_back(res.token[i]);
+                    const TokenLogprobs* lp =
+                        res.lp && res.first_row[i] >= 0 && r.sp.n_probs >= 0
+                            ? &res.lp[res.first_row[i]] : nullptr;
+                    if (lp && lp->token < 0) lp_failed = true;
+                    else overflowed = !server::sink_push(r.sink, res.token[i], lp, pushed_ns);
+                    /* The conv window absorbed this chunk; the cursor advances one committed
+                     * position, as in decode. */
+                    s.conv_cursor = (int32_t)((s.conv_cursor + 1) % (W ? W : 1));
+                }
+                /* --draft-suffix: index this chunk now, behind the token it just pushed, so the first
+                 * decode does not index the whole prompt at once (suffix.h, S-06). */
+                if (cfg_.draft_suffix && r.may_speculate) suffix_index(s, r);
             }
-            if (e.produces_token && res.token && r.embed) {
-                /* The answer is the pooled vector the engine already put in the sink; there is
-                 * no token to emit, and `eos` ends the request below. */
-                if (!s.first_tok_us) s.first_tok_us = mono_us();
-            } else if (e.produces_token && res.token) {
-                if (!s.first_tok_us) s.first_tok_us = mono_us();
-                r.output.push_back(res.token[i]);
-                const TokenLogprobs* lp =
-                    res.lp && res.first_row[i] >= 0 && r.sp.n_probs >= 0
-                        ? &res.lp[res.first_row[i]] : nullptr;
-                if (lp && lp->token < 0) lp_failed = true;
-                else overflowed = !server::sink_push(r.sink, res.token[i], lp, pushed_ns);
-                /* The conv window absorbed this chunk; the cursor advances one committed
-                 * position, as in decode. */
-                s.conv_cursor = (int32_t)((s.conv_cursor + 1) % (W ? W : 1));
-            }
-            /* --draft-suffix: index this chunk now, behind the token it just pushed, so the first
-             * decode does not index the whole prompt at once (suffix.h, S-06). */
-            if (cfg_.draft_suffix && r.may_speculate) suffix_index(s, r);
         } else {
             int32_t a = res.n_accepted ? res.n_accepted[i] : 0;
             if (a < 0) a = 0;
@@ -3621,7 +3874,8 @@ int Scheduler::commit(StepResult& res) {
 
         /* A request the next step carries finishes now but keeps its blocks, which that step
          * writes; its commit finds the request not running and returns them. */
-        const bool carried = next_open_ && s.entry_next >= 0;
+        const bool carried = (next_open_ && s.entry_next >= 0) ||
+                             (slice_more && group_.holds(s.slot));
 
         /* Finish. emit() already stops at max_tokens, so the resize below is a backstop: a >=
          * test that can only be == is easy to break quietly later. */
@@ -3664,6 +3918,8 @@ int Scheduler::commit(StepResult& res) {
     m_.prefill_tokens += step_prefill_tok_;
     m_.decode_tokens += step_decode_tok_;
     ++m_.steps;
+    /* The group is over with its last sub-step: nothing is held for it after this commit. */
+    if (slice_step && plan_.slice_last) group_ = ChunkGroup{};
 
     /* Every entry is retired, so anything deferred on this step, or on a drafter snapshot that
      * block_end() / serial_end() has since cleared, can be released: every pass naming them was
@@ -3729,8 +3985,10 @@ void Scheduler::step_finished() {
     /* The window ages by all elapsed time, idle included; only the busy part is added as time the
      * tokens took. */
     const double aged = std::chrono::duration<double>(step_end - last_step_at_).count();
-    /* --prefill-interleave auto's two step costs (interleave_steps). */
-    if (wall > 0 && cfg_.prefill_interleave < 0)
+    /* The learned step costs: --prefill-interleave auto's (interleave_steps) and --chunk-slices
+     * auto's m law (chunk_slice_count). A chunk group's sub-step is neither a chunk step nor a
+     * decode step -- it lasts C/m + D -- so it teaches nothing here (S-02). */
+    if (wall > 0 && plan_.slice_m == 0 && (cfg_.prefill_interleave < 0 || cfg_.chunk_slices < 0))
         step_cost_locked(plan_.phase != RAD_PHASE_DECODE, wall);
     if (wall > 0) {
         constexpr double kWindowS = 1.0;
