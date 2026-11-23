@@ -307,7 +307,9 @@ The runs, all under `runs/local/` and reproducible with the configs as committed
 `x01-off-s1..3` (`RAD_IDLE_CHARS=190000`, phase list `c1,c1b,c8,pf6,pf20,stall1,stall4,idle`),
 `x01-long8-on-s1..2` and `x01-long8-off-s1..2` (phase `long8`, `RAD_LONG8_CHARS=140000`), and
 `x01-verify-on` (`idle`, `RADIANCE_DEBUG_TIER_VERIFY=1`); the off ones with `RAD_PREFIX_CACHE_MIB=0` in
-front of `scripts/backlog/run.sh`.
+front of `scripts/backlog/run.sh`. They ran on this branch's `coupled03.yaml` before P-16's
+`draft-depth-load-from: 1` landed (it merged after them), and the two arms of each pair differ in nothing
+but the tier, which is what the A/B measures.
 
 ## 2. Merge bar (lossless items)
 
