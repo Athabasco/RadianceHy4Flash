@@ -1,23 +1,11 @@
 #!/usr/bin/env python3
 """probe.py <port> <out.json> <phases,comma>: sampled (T 0.9, seeded) phases for the general-levers note.
 phases: c1, c8, think (c1, reasoning high), c4, pf6 (prefill ~6K), pf20 (prefill ~20K), c1s (64 tok), c8s (48 tok)."""
-import json, sys, threading, time, urllib.request, os, random
+import json, sys, threading, time, urllib.request, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from prompts import CODE_PROMPTS as P, SRC, long_prompt
 PORT, OUT, PH = int(sys.argv[1]), sys.argv[2], sys.argv[3].split(",")
 BASE = f"http://127.0.0.1:{PORT}"
-src = open("/root/work/claude-scratch/hy4flash/work/u3/bench.py").read()
-P = eval(src[src.index("CODE_PROMPTS = ["):src.index("GREEDY = ")].split("=", 1)[1])
-SRC = "/root/work/claude-scratch/hy4flash/src"
-def long_prompt(chars, seed):
-    files = []
-    for d in ("core", "arch/hyv4flash", "libavx", "libr4d", "core/server", "core/sched"):
-        p = os.path.join(SRC, d)
-        files += [os.path.join(p, f) for f in sorted(os.listdir(p)) if f.endswith((".cpp", ".h", ".hip"))]
-    rnd = random.Random(seed); rnd.shuffle(files); parts, n = [], 0
-    for f in files:
-        t = open(f, errors="replace").read()[: max(0, chars - n)]
-        parts.append(f"// ===== {os.path.relpath(f, SRC)} =====\n{t}"); n += len(t)
-        if n >= chars: break
-    return f"[review {seed}-{time.time()}] Review the following C++ code for bugs, then summarise the design.\n\n" + "\n".join(parts)
 def get(p): return urllib.request.urlopen(BASE + p, timeout=10).read().decode()
 def find(d, k):
     if isinstance(d, dict):
@@ -44,10 +32,18 @@ def metrics():
             except ValueError: pass
     return m
 SEED = [1000]
+def temperature():
+    # RAD_TEMP, else TEMP when it holds a number: a measuring host often sets TEMP to a directory
+    # (it is a system variable, so a value that is not a number is ignored).
+    want, v = os.environ.get("RAD_TEMP"), os.environ.get("RAD_TEMP") or os.environ.get("TEMP") or "0.9"
+    try: return float(v)
+    except ValueError:
+        if want: sys.exit(f"probe.py: RAD_TEMP '{want}' is not a number")
+        return 0.9
 def request(content, n, effort="none"):
     SEED[0] += 1
     body = {"model": "hy4-flash", "messages": [{"role": "user", "content": content}], "max_tokens": n,
-            "temperature": float(os.environ.get("TEMP", "0.9")), "top_p": 1.0, "seed": SEED[0], "reasoning_effort": effort, "stream": True,
+            "temperature": temperature(), "top_p": 1.0, "seed": SEED[0], "reasoning_effort": effort, "stream": True,
             "stream_options": {"include_usage": True}, "ignore_eos": True}
     req = urllib.request.Request(BASE + "/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
     t0 = time.time(); tf = None; gen = 0; pt = 0
@@ -127,12 +123,14 @@ for ph in PH:
     elif ph == "think": R["phases"].append(phase("think", [P[4]], 384, "high"))
     elif ph == "c1s": R["phases"].append(phase("c1s", [P[0]], 64))
     elif ph == "c8s": R["phases"].append(phase("c8s", [P[i] for i in range(8)], 48))
-    elif ph == "pf6": R["phases"].append(phase("pf6", [long_prompt(22000, 7)], 2))
-    elif ph == "pf20": R["phases"].append(phase("pf20", [long_prompt(72000, 9)], 2))
+    elif ph == "pf6": R["phases"].append(phase("pf6", [long_prompt(22000, 7, stamp=True)], 2))
+    elif ph == "pf20": R["phases"].append(phase("pf20", [long_prompt(72000, 9, stamp=True)], 2))
     elif ph == "pf2": R["phases"].append(phase("pf2", [long_prompt(7400, 5)], 2))
     elif ph == "stall1": R["phases"].append(stall("stall1", 1, 22000))
     elif ph == "stall4": R["phases"].append(stall("stall4", 4, 22000))
     elif ph.startswith("tail"):  # tailN: prompt of ~N chars lone, to size small prefill steps
         R["phases"].append(phase(ph, [long_prompt(int(ph[4:]), 3)], 2))
-    elif ph == "pf6c": R["phases"].append(phase("pf6c", [long_prompt(22000, 7)], 2))
+    elif ph == "pf6c": R["phases"].append(phase("pf6c", [long_prompt(22000, 7, stamp=True)], 2))
+    else: sys.exit(f"probe.py: no phase '{ph}'; phases: c1 c1b c1s c2 c4 c8 c8s think pf2 pf6 pf6c pf20 "
+                  "stall1 stall4 tailN nowarm")
 json.dump(R, open(OUT, "w"), indent=1)
