@@ -36,6 +36,7 @@
 #include <sys/stat.h>
 
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <fstream>
@@ -2018,6 +2019,118 @@ TEST(a_prompt_resumed_from_the_prefix_cache_returns_what_a_cold_run_does) {
         CHECK((*r)["completion_probabilities"] == cold["completion_probabilities"]);
     }
     CHECK_EQ(s.stop(), 0);
+}
+
+/* Whether a RADIANCE_LOG_STEPS log has a step line that was issued ahead (its plan made by
+ * step_next, its pass released before the loop reached the step) and carries `field`: `ctx=0` is an
+ * entry with no context, which only a sequence's first chunk has, and ` ck=` an entry that restores
+ * the recurrent half of a prefix hit. */
+bool ahead_step_has(const std::string& log, const char* field) {
+    for (size_t at = log.find(" ahead "); at != std::string::npos;
+         at = log.find(" ahead ", at + 1)) {
+        const size_t eol = log.find('\n', at);
+        if (log.substr(at, eol - at).find(field) != std::string::npos) return true;
+    }
+    return false;
+}
+
+/* Blocks until the server has decoded a step, so a request posted next arrives while a sequence is
+ * running: the scheduler then plans its admission into a step issued ahead, where an arrival at an
+ * idle engine is planned and released by the loop itself. */
+bool decoding(int port) {
+    for (int i = 0; i < 4000; ++i) {
+        if (metric(port, "radiance:engine_steps_decode_total") > 0) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return false;
+}
+
+/* An admission carried by a step issued ahead starts from state slots the engine cleared, like the
+ * admission the loop releases itself. The KV manager only notes the slots a new sequence took; the
+ * zeroing runs at the top of the step loop, which for an ahead step comes after that step's pass.
+ * The slot the admission takes holds a finished request's state there, so the first chunk would
+ * read it and the zeroing would then wipe the state that chunk computed. The reply, and every
+ * probability in it, must be the one the same prompt gets on an idle engine, whose first step the
+ * loop plans itself. */
+TEST(an_admission_issued_ahead_starts_from_a_cleared_state) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> p = prompt_ids(61, 60), filler = prompt_ids(62, 40);
+    Server s;
+    REQUIRE(s.start(world().qwen35, kPlain, { "RADIANCE_LOG_STEPS=1" }));
+    /* A finished request first, so the pool's state slots hold a request's state: the admissions
+     * below take a slot the pool has handed out before. */
+    (void)post(s.port, "/completion", completion(filler, 16));
+    /* Idle: the loop plans this admission and releases it after clearing its slots. */
+    const json alone = post(s.port, "/completion", completion(p, 12, 0.0, 0, 3));
+    /* Beside a decoder, which keeps a sequence running when the request arrives. */
+    Call d;
+    REQUIRE(d.send(s.port, "POST", "/completion", completion(filler, 200).dump()));
+    REQUIRE(decoding(s.port));
+    const json together = post(s.port, "/completion", completion(p, 12, 0.0, 0, 3));
+    std::string body;
+    CHECK_EQ(d.read(&body), 200);
+    CHECK_EQ(s.stop(), 0);
+    const std::vector<int32_t> ta = tokens_of(alone), tb = tokens_of(together);
+    if (tb != ta) fprintf(stderr, "    alone    %s\n    together %s\n", show(ta).c_str(),
+                          show(tb).c_str());
+    REQUIRE(alone.contains("completion_probabilities"));
+    CHECK_EQ(ta.size(), (size_t)12);
+    CHECK(tb == ta);
+    CHECK(together["completion_probabilities"] == alone["completion_probabilities"]);
+    CHECK(ahead_step_has(s.output(), "ctx=0"));
+}
+
+/* A prefix hit's recurrent half is copied into the state slots before the release that runs the
+ * step reading them. A step issued ahead was already released when the loop reaches its restore
+ * point, so its first chunk would read a slot holding neither the snapshot nor what that chunk
+ * computed, and the restore would then wipe what it did: the reply would differ from a cold run's.
+ * Here it must be the cold server's, for the hit the loop restores itself and for the one issued
+ * ahead. */
+TEST(a_prefix_hit_issued_ahead_restores_before_the_step_that_reads_it) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> head = prompt_ids(63, 200), filler = prompt_ids(64, 40);
+    std::vector<int32_t> b = head;
+    for (int32_t t : prompt_ids(65, 90)) b.push_back(t);
+    json cold;
+    {
+        Server s;
+        REQUIRE(s.start(world().qwen35, kPlain));
+        cold = post(s.port, "/completion", completion(b, 12, 0.0, 0, 3));
+        CHECK_EQ(s.stop(), 0);
+    }
+    Server s;
+    REQUIRE(s.start(world().qwen35,
+                    { "--num-speculative-tokens", "0", "--checkpoint-interval", "64" },
+                    { "RADIANCE_LOG_STEPS=1" }));
+    /* The head's own request, so the cache holds a checkpoint inside b's shared head (200 tokens
+     * ends one at 192 or below, every 64 tokens). */
+    (void)post(s.port, "/completion", completion(head, 8));
+    /* Idle: the loop restores the hit before the step that reads it. */
+    const json idle = post(s.port, "/completion", completion(b, 12, 0.0, 0, 3));
+    /* Beside a decoder: the same hit rides a step issued ahead. */
+    Call d;
+    REQUIRE(d.send(s.port, "POST", "/completion", completion(filler, 200).dump()));
+    REQUIRE(decoding(s.port));
+    const json ahead = post(s.port, "/completion", completion(b, 12, 0.0, 0, 3));
+    std::string body;
+    CHECK_EQ(d.read(&body), 200);
+    CHECK_EQ(s.stop(), 0);
+    const int64_t c1 = timing(idle, "cache_n"), c2 = timing(ahead, "cache_n");
+    const std::vector<int32_t> tc = tokens_of(cold), ti = tokens_of(idle), t = tokens_of(ahead);
+    if (t != tc || ti != tc)
+        fprintf(stderr, "    idle     %s\n    ahead    %s\n    cold     %s\n", show(ti).c_str(),
+                show(t).c_str(), show(tc).c_str());
+    if (!(c1 > 0 && c2 > 0)) fprintf(stderr, "    cached: idle %lld, ahead %lld\n", (long long)c1,
+                                     (long long)c2);
+    REQUIRE(cold.contains("completion_probabilities"));
+    CHECK_EQ(tc.size(), (size_t)12);
+    CHECK(c1 > 0);
+    CHECK(c2 > 0);
+    CHECK(ti == tc);
+    CHECK(t == tc);
+    CHECK(idle["completion_probabilities"] == cold["completion_probabilities"]);
+    CHECK(ahead["completion_probabilities"] == cold["completion_probabilities"]);
+    CHECK(ahead_step_has(s.output(), " ck="));
 }
 
 /* What a -v server's block drafter proposed ("drafter 'dflash2': sequence N proposes t1 .. tk"),

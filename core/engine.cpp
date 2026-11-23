@@ -1497,17 +1497,23 @@ int Engine::step_loop() {
          * whose pinned rows could not be allocated rides the same deferred path. */
         int bst = RAD_OK;
 
-        /* RADIANCE_LOG_STEPS: one line per step with its phase and each sequence's slot, query
-         * length and context. Off by default (one line per decode step). */
+        /* RADIANCE_LOG_STEPS: one line per step with its phase, whether it was issued ahead (its
+         * plan made by step_next and its pass released before the loop reached it), and each
+         * sequence's slot, query length, context and the checkpoint it restores from. Off by
+         * default (one line per decode step). */
         static const bool log_steps = std::getenv("RADIANCE_LOG_STEPS") != nullptr;
         if (log_steps) {
             std::string s = fmt("step %d %s n_seq=%lld n_tok=%lld", b->step,
                                 b->phase == RAD_PHASE_PREFILL ? "prefill" :
                                 b->phase == RAD_PHASE_DECODE  ? "decode"  : "MIXED",
                                 (long long)b->n_seq, (long long)b->n_tok);
-            for (int i = 0; i < b->n_seq && i < 8; ++i)
+            if (issued) s += " ahead";
+            for (int i = 0; i < b->n_seq && i < 8; ++i) {
                 s += fmt("  [%d] slot=%d q=%d ctx=%d", i, plan.e[(size_t)i].slot,
                          plan.e[(size_t)i].n_tokens, plan.e[(size_t)i].ctx_len);
+                if (plan.e[(size_t)i].ckpt_restore >= 0)
+                    s += fmt(" ck=%d", (int)plan.e[(size_t)i].ckpt_restore);
+            }
             RAD_INFO("%s", s.c_str());
         }
 
