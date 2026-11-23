@@ -3,6 +3,19 @@ cmake_minimum_required(VERSION 3.21)
 # read from abi/rad_abi.h below.
 project(radiance VERSION 2.2.0 LANGUAGES C CXX)
 
+# A shared compiler cache for the whole tree: host files and device kernels alike run through
+# ccache when it is installed. The HIP launcher is read when enable_language(HIP) initializes the
+# HIP language further down, so setting it here covers every device compilation; when HIP stays
+# off the variable simply goes unused. A launcher the operator configured wins
+# (-DCMAKE_CXX_COMPILER_LAUNCHER=tool keeps its tool; the empty string keeps no launcher).
+find_program(RAD_CCACHE_PROGRAM ccache)
+if(RAD_CCACHE_PROGRAM AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
+  set(CMAKE_CXX_COMPILER_LAUNCHER "${RAD_CCACHE_PROGRAM}" CACHE STRING
+      "The compiler cache launcher for host files (ccache)" FORCE)
+  set(CMAKE_HIP_COMPILER_LAUNCHER "${RAD_CCACHE_PROGRAM}" CACHE STRING
+      "The compiler cache launcher for device kernels (ccache)" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
