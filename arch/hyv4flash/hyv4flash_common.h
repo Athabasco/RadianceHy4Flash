@@ -48,6 +48,10 @@ struct Shape {
      * and is set for both; ix_i8 selects the int8 codes. */
     bool ix_fp8 = false;
     bool ix_i8 = false;
+    /* RADIANCE_HY4_IDX_POOL_F32=0..3 (backlog F-17, lossy, opt-in): the pool's f64 arithmetic in
+     * f32, bit 0 the norm's mean-square sum and bit 1 the trig -- the same law in a different
+     * precision. Off (0) by default: f64 is libref's and HF's. */
+    int ix_pool_f32 = 0;
     /* Engram: `layers` are layer indices (the config's ids are one above them) */
     std::vector<int> engram_layers;
     std::vector<int64_t> engram_rows;   /* each layer's table, the sum of its head moduli */

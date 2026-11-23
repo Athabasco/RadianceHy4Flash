@@ -179,13 +179,14 @@ struct Indexer {
                        RAD_INT("rotary_dim", R), RAD_F64("eps", s.eps),
                        RAD_F64("theta", s.theta_sparse), RAD_STR("mode", "imrope_gptj"),
                        RAD_STR("sections", s.mrope_sparse.c_str()), RAD_INT("block_size", r),
-                       RAD_STR("dtype", "bf16") },
+                       RAD_INT("norm_f32", s.ix_pool_f32), RAD_STR("dtype", "bf16") },
                      { wv, wg, ape, pool_gain }, { w.stage, w.bpos, w.page }, {})
                 : mk(b, pool_op,
                      { RAD_RANGE("M", 1, w.work), RAD_INT("n", D), RAD_INT("ratio", r),
                        RAD_INT("rotary_dim", R), RAD_F64("eps", s.eps),
                        RAD_F64("theta", s.theta_sparse), RAD_STR("mode", "gptj"),
-                       RAD_INT("block_size", r), RAD_STR("dtype", "bf16") },
+                       RAD_INT("block_size", r), RAD_INT("norm_f32", s.ix_pool_f32),
+                       RAD_STR("dtype", "bf16") },
                      { wv, wg, ape, pool_gain }, { w.stage, w.bpos, w.page }, {});
         }
         HY4_NEED(op_pool, s.ix_i8    ? "idx_pool_gated_i8 (RADIANCE_HY4_INDEXER=int8)"
@@ -289,6 +290,7 @@ struct Indexer {
                              { RAD_RANGE("M", 1, w.work), RAD_INT("n", D), RAD_INT("ratio", r),
                                RAD_INT("rotary_dim", R), RAD_F64("eps", s.eps),
                                RAD_F64("theta", s.theta_sparse), RAD_STR("mode", "gptj"),
+                               RAD_INT("norm_f32", s.ix_pool_f32),
                                RAD_STR("dtype", "bf16") },
                              { wv, wg, ape, pool_gain }, { w.stage, w.zero_pos },
                              { t_group_keys.buf });

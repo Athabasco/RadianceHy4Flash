@@ -943,6 +943,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         s.ix_fp8 = s.ix_i8 || (ix && !std::strcmp(ix, "fp8"));   /* the packed-page wiring */
         if (s.ix_fp8 && s.ix_dim != 128)
             return refuse("RADIANCE_HY4_INDEXER=fp8/int8 needs an indexer head of 128 (the packed page)");
+        /* The pool's f64 arithmetic in f32 (backlog F-17, lossy, opt-in), a half at a time: bit 0
+         * the norm's mean-square sum, bit 1 the trig. 0 (the default) keeps libref's f64 form. */
+        const char* pf = std::getenv("RADIANCE_HY4_IDX_POOL_F32");
+        if (pf && *pf && (pf[1] || *pf < '0' || *pf > '3'))
+            return refuse("RADIANCE_HY4_IDX_POOL_F32 is 0 (the default, f64) to 3 (sum and trig "
+                          "in f32): bit 0 the norm's sum, bit 1 the trig");
+        s.ix_pool_f32 = pf && *pf ? *pf - '0' : 0;
     }
 
     /* The token embedding and the head. The release ships its own lm_head (`tie_word_embeddings`

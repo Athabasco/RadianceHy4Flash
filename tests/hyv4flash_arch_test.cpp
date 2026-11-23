@@ -606,6 +606,40 @@ TEST(the_quantised_indexers_swap_the_key_cache_and_the_score_for_the_dsa_forms) 
     CHECK_EQ(bad.rc, RAD_E_UNSUPPORTED);
 }
 
+/* RADIANCE_HY4_IDX_POOL_F32 (backlog F-17): "1" puts `norm_f32` 1 on the pool ops (the mean
+ * square's sum and the trig in f32), unset or "0" puts 0 there -- the default form, libref's f64 --
+ * and the rest of the declaration is the same either way. Anything else is refused. */
+TEST(the_f32_pool_switch_reaches_the_pool_ops_and_nothing_else) {
+    /* RADIANCE_HY4_IDX_POOL_F32=0..3 (backlog F-17): the value goes to every pool op's `norm_f32`
+     * unchanged, and nothing else changes -- the same ops, the same dtype, the same count. */
+    const char* values[] = { "0", "1", "2", "3" };
+    for (int on = 0; on < 5; ++on) {   /* unset, then the four values */
+        if (on) setenv("RADIANCE_HY4_IDX_POOL_F32", values[on - 1], 1);
+        Declared d;
+        unsetenv("RADIANCE_HY4_IDX_POOL_F32");
+        REQUIRE_EQ(d.rc, RAD_OK);
+        const RadBuilder& b = d.b;
+        const int want = on ? on - 1 : 0;
+        CHECK_EQ(count_op(b, "idx_pool_gated"), 2);
+        int seen = 0;
+        for (const auto& o : b.ops)
+            if (o.op == "idx_pool_gated") {
+                CHECK_EQ(pint(&o, "norm_f32"), want);
+                CHECK_EQ(pstr(&o, "dtype"), std::string("bf16"));
+                ++seen;
+            }
+        CHECK_EQ(seen, 2);
+        CHECK_EQ(count_op(b, "idx_score"), 2);
+    }
+    /* Outside 0..3: refused by name, not clamped. */
+    for (const char* bad_value : { "4", "12", "x", " " }) {
+        setenv("RADIANCE_HY4_IDX_POOL_F32", bad_value, 1);
+        Declared bad;
+        unsetenv("RADIANCE_HY4_IDX_POOL_F32");
+        CHECK_EQ(bad.rc, RAD_E_UNSUPPORTED);
+    }
+}
+
 /* WP15: the tower and the 3-D positions. With room for an encoder pass (--mm-max-patches) and a
  * config that states the tower, the M-RoPE sections and the media ids, the program declares the
  * encoder (pictures and video, 4 patches a row, the mini tower's 4 x 4 position grid), every
