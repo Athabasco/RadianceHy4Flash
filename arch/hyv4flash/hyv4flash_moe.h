@@ -133,7 +133,16 @@ struct MoeWire {
         w.ids = decl_b(b, nm.f("moe.expert_ids"), RAD_I32, { T, k });
         w.ew = decl_b(b, nm.f("moe.expert_weights"), RAD_F32, { T, k });
         w.eoff = decl_b(b, nm.f("moe.expert_offsets"), RAD_I32, { s.n_expert_r + 1 });
-        w.ecnt = decl_b(b, nm.f("moe.expert_counts"), RAD_I32, { s.n_expert_r });
+        /* P-02: the model's routing table (rad_route_table), a row a layer at the model's expert
+         * count -- the core's pitch, whatever share of the experts this rank computes -- each
+         * router writing its layer's row (Wire::ecnt_pitch), so a report copies nothing. PERSIST:
+         * no declared op reads the counts (the report is a handoff, not an op), so as a transient
+         * a later buffer could alias them and a wide prefill chunk would corrupt the heat counts
+         * (qwen4exp_fp8.cpp's moe_ecnt). */
+        w.ecnt = decl_b(b, nm.f("moe.expert_counts"), RAD_I32, { s.n_layer, s.n_expert },
+                        RAD_BUF_PERSIST);
+        if (w.ecnt) RAD_ARCH_TRY(rad_route_table(b, w.ecnt));
+        w.ecnt_pitch = s.n_expert;
         w.sorted = decl_b(b, nm.f("moe.expert_sorted"), RAD_I32, { T * k });
         w.egu = bf("moe.expert_gate_up", { T * k, 2 * F });
         w.eff.x = bf("moe.expert_ff", { T * k, F });
