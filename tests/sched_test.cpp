@@ -17,7 +17,6 @@
 #include <cstring>
 #include <new>
 #include <string>
-#include <thread>
 #include <unistd.h>
 
 using namespace rad;
@@ -4093,49 +4092,6 @@ TEST(interleave_auto_fits_decode_steps_in_a_quarter_of_a_chunk_step) {
     h.sch.note_step_cost(true, 0.8);
     h.sch.note_step_cost(false, 0.05);
     CHECK_EQ(h.sch.interleave_steps(), 2);  /* 0.125 / 0.05 */
-}
-
-/* auto's chunk mean takes only steps whose prefill reached the stager's floor: a prompt's
- * remainder, its tail and a resumed delta are chunks too, but their step is no chunk step's, and
- * feeding it pulls the mean down, so fewer decode-only steps follow the real chunks. */
-TEST(interleave_auto_feeds_the_chunk_mean_only_at_the_stager_floor) {
-    auto steps = [](int64_t rows, int64_t stage_rows) {
-        Fixture f;
-        f.build();
-        f.cfg.prefill_interleave = -1;
-        f.cfg.prefill_interleave_share = 1.0;
-        CHECK_OK(f.start());
-        f.sch.set_stage_rows(stage_rows);
-        f.sch.note_step_cost(false, 0.04);
-        f.sch.note_step_cost(true, 0.4, rows);
-        return f.sch.interleave_steps();
-    };
-    /* The stager's 1025 rows round down to a 1024-row step, as busy_cap's floor does. */
-    CHECK_EQ(steps(64, 1025), 1);       /* a remainder under the floor: no sample */
-    CHECK_EQ(steps(1023, 1025), 1);
-    CHECK_EQ(steps(1024, 1025), 10);    /* 1.0 * 0.4 / 0.04 */
-    CHECK_EQ(steps(1984, 1025), 10);
-    /* No stager: no floor to reach, so every chunk step is a sample, as before. */
-    CHECK_EQ(steps(64, 0), 10);
-}
-
-/* step_finished hands the chunk mean the prefill the step carried: a real tail step, timed well
- * above the decode step fed beside it, does not become a chunk sample. */
-TEST(interleave_auto_skips_the_wall_time_of_a_tail_step) {
-    Fixture f;
-    f.build();
-    f.cfg.prefill_interleave = -1;
-    f.cfg.prefill_interleave_share = 1.0;
-    CHECK_OK(f.start());
-    f.sch.set_stage_rows(1025);
-    f.sch.note_step_cost(false, 0.001);
-    const uint64_t p = f.submit(64, 4);       /* a whole prompt under the floor: a tail */
-    CHECK(f.sch.step() != nullptr);
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    f.commit_plain(12);
-    f.sch.step_finished();
-    CHECK(f.sch.find(p) != nullptr);
-    CHECK_EQ(f.sch.interleave_steps(), 1);
 }
 
 /* auto schedules the measured count after every chunk beside a decoder, holds nothing for a lone
@@ -9147,7 +9103,7 @@ TEST(sim_burst_of_long_prompts) {
         std::vector<std::pair<uint64_t, size_t>> before;
         for (const StepEntry& e : p.e) before.push_back({ e.seq, e.req->output.size() });
         CHECK_OK(f.commit(7, 0, [&](const StepEntry& e) { return random_accept(rng, e); }));
-        f.sch.note_step_cost(P > 0, dt, P);
+        f.sch.note_step_cost(P > 0, dt);
         t += dt;
         if (waiting) dec_s += dt * (double)decoders;
         for (const auto& b : before) {

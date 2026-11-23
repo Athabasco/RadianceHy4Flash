@@ -1529,23 +1529,14 @@ int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget
  * takes the first decode-only step. Both are wall times read off step_finished, so under auto
  * which steps carry a chunk follows the device's timing and differs from run to run; a number
  * schedules the same steps every time. */
-void Scheduler::step_cost_locked(bool chunk, double seconds, int64_t prefill_rows) {
-    /* A chunk step's time is a sample of a chunk step's cost only when the prefill it carried
-     * reached the stager's floor (the smallest step the stager overlaps, rounded down to the
-     * quantum as busy_cap does): a prompt's remainder, its tail and a resumed delta are chunks
-     * too, but their step is no chunk step, and feeding it pulls the mean down so fewer
-     * decode-only steps follow the real chunks. Without a stager there is no floor to reach. */
-    if (chunk && prefill_rows >= 0 && stage_rows_ > 0) {
-        const int64_t Q = std::max<int64_t>(geo_.quantum, 1);
-        if (prefill_rows < std::max(Q, stage_rows_ / Q * Q)) return;
-    }
+void Scheduler::step_cost_locked(bool chunk, double seconds) {
     double& ema = chunk ? ema_chunk_s_ : ema_decode_s_;
     ema = ema > 0.0 ? ema + kInterleaveEma * (seconds - ema) : seconds;
 }
 
-void Scheduler::note_step_cost(bool chunk, double seconds, int64_t prefill_rows) {
+void Scheduler::note_step_cost(bool chunk, double seconds) {
     std::lock_guard<std::mutex> lk(mu_);
-    if (seconds > 0) step_cost_locked(chunk, seconds, prefill_rows);
+    if (seconds > 0) step_cost_locked(chunk, seconds);
 }
 
 int64_t Scheduler::interleave_steps() const {
@@ -3419,7 +3410,7 @@ void Scheduler::step_finished() {
     const double aged = std::chrono::duration<double>(step_end - last_step_at_).count();
     /* --prefill-interleave auto's two step costs (interleave_steps). */
     if (wall > 0 && cfg_.prefill_interleave < 0)
-        step_cost_locked(plan_.phase != RAD_PHASE_DECODE, wall, step_prefill_tok_);
+        step_cost_locked(plan_.phase != RAD_PHASE_DECODE, wall);
     if (wall > 0) {
         constexpr double kWindowS = 1.0;
         const double f = std::exp(-aged / kWindowS);

@@ -569,12 +569,9 @@ public:
     /* --prefill-interleave: the decode-only steps that follow a chunk run beside decoding
      * sequences. N as configured; under auto, from the measured step costs (see the definition).
      * Visible for tests, as is note_step_cost, which feeds auto a step's wall time as
-     * step_finished does: `chunk` for a step that carried a prefill chunk, else a decode step.
-     * `prefill_rows` is the prefill the step carried; a chunk step under the stager's floor is no
-     * chunk sample and is ignored. -1: the caller states no rows and the sample is taken as
-     * given. */
+     * step_finished does: `chunk` for a step that carried a prefill chunk, else a decode step. */
     int64_t interleave_steps() const;
-    void    note_step_cost(bool chunk, double seconds, int64_t prefill_rows = -1);
+    void    note_step_cost(bool chunk, double seconds);
 
 private:
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
@@ -878,12 +875,11 @@ private:
     int64_t held_prefill_ = 0;
     /* --prefill-interleave auto: the decode-only steps after a chunk (interleave_steps), sized by
      * the running means of a step that carried a chunk and of a decode step, in seconds, fed by
-     * step_finished. A chunk step feeds the chunk mean only at the stager's floor
-     * (step_cost_locked). */
+     * step_finished. */
     static constexpr double  kInterleaveEma = 0.25;
     static constexpr int64_t kInterleaveAutoMax = 64;
     double  ema_chunk_s_ = 0.0, ema_decode_s_ = 0.0;
-    void    step_cost_locked(bool chunk, double seconds, int64_t prefill_rows);
+    void    step_cost_locked(bool chunk, double seconds);
     /* --mixed-step-target-ms: learned mixed-step cap and whether this planning pass has a decoder
      * whose output latency the cap protects. */
     MixedStepTarget mixed_target_;

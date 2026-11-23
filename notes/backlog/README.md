@@ -32,3 +32,8 @@ Since the backlog was written, these decisions were made:
 the engine refuses to serve under it (Incompatible) and its failure mode is a full card reset, so it buys the smallest
 of the three lossless memory levers at the highest price. Number, sources and the verify steps a lane would run:
 `closed/M-13.md`.
+- **S-04 (interleave EMA at the stager floor):** closed without code. On the served lane the decode-only run after a big
+chunk does not lengthen (16 against 17.5 steps, medians over the two arrival windows) because since S-01 the samples
+that hold the mean down are 1984-row chunks that cost 0.010 s, which a floor on rows keeps; where the change does act
+it doubles the hold and costs the arrival's TTFT +0.29 s (1 decoder) and +0.92 s (4). Numbers, tables and commands:
+`closed/S-04.md`.
