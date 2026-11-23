@@ -468,6 +468,16 @@ if(TARGET kbench_mutant_test AND TARGET rad-kbench AND TARGET libref)
   endif()
 endif()
 
+# ================================================================== rad-heat-replay's floor
+#
+# heat_replay_test runs rad-heat-replay itself on a synthetic route trace, so it needs the tool
+# built. It touches no card (the tool models heat on the host).
+if(TARGET heat_replay_test AND TARGET rad-heat-replay)
+  target_compile_definitions(heat_replay_test PRIVATE
+    RAD_HEAT_REPLAY_BIN="$<TARGET_FILE:rad-heat-replay>")
+  add_dependencies(heat_replay_test rad-heat-replay)
+endif()
+
 # ================================================================== the device selftest
 #
 # r4d_selftest is the only check of libr4d's fusion claims: rows declaring a fused kernel
