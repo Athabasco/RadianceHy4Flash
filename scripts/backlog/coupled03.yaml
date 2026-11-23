@@ -13,9 +13,11 @@ models:
     ngram-placement: ram
     max-model-len: 65536
     max-num-batched-tokens: 2048
+    checkpoint-interval: 1984         # a quantum under the batch: no remainder step sharing a step with decode rows
     max-num-seqs: 8
     mm-max-patches: 0
     prefix-resume: nearest
+    prefix-cache-mib: 16384
     busy-prefill-chunk: auto
     num-speculative-tokens: 5
     draft-window: fixed
@@ -24,4 +26,5 @@ models:
     draft-depth: adaptive
     draft-depth-stop: 0.3
     draft-depth-load: on
+    draft-depth-load-from: 1
     draft-suffix: on

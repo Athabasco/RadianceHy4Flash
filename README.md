@@ -42,6 +42,13 @@ models:
     ngram-placement: ram              # Engram tables in host RAM, off the cards
     max-model-len: 1000000
     max-num-batched-tokens: 2048
+    checkpoint-interval: 1984         # a quantum under the batch: a chunk sharing its step with
+                                      # decoding sessions lands on the interval boundary, so an
+                                      # interval is one step instead of two (arrival TTFT -16 %
+                                      # at one decoder, -12 % at four on the iks-A lane). Chunks
+                                      # are a quantum shorter than 2048 rows, so a long prompt's
+                                      # answer may differ from a 2048-chunk step at tie level (no
+                                      # dtype, kernel or accumulation changes)
     max-num-seqs: 8
     mm-max-patches: 0                 # no vision
     prefix-resume: nearest

@@ -2,8 +2,14 @@
 """probe.py <port> <out.json> <phases,comma>: sampled (T 0.9, seeded) phases for the general-levers note.
 phases: c1, c8, think (c1, reasoning high), c4, pf6 (prefill ~6.7K tokens: 22,000 characters of tree source),
 pf20 (prefill ~24.9K: 72,000), pf2 (~2.4K: 7,400), stall1 / stall4 (a ~5.7K arrival while 1 / 4 decoders run),
-tailN (a prompt of ~N characters), c1s (64 tok), c8s (48 tok). The token counts are the ones the backlog's own
-runs measured on these phases, so a lane's ttft compares with the numbers in notes/backlog/."""
+tailN (a prompt of ~N characters), c1s (64 tok), c8s (48 tok), idle (a finished conversation's KV
+leaves VRAM for the experts and its prefix still resumes; RAD_IDLE_CHARS, RAD_IDLE_WAIT_S), long8
+(the item's eight long conversations at once, then idle, demand and return; RAD_LONG8_CHARS), and
+longctx (eight ~46K-token sessions: a prefill wave of one token each, then the same eight prompts
+decoded 128 tokens, so all eight are at long context together: the shape notes/backlog/refs/notes/
+longctx.md measured as N8 48K, where the stager overflows its ring -- longctx-pre / longctx-decode in
+the JSON). The token counts are the ones the backlog's own runs measured on these phases, so a lane's
+ttft compares with the numbers in notes/backlog/."""
 import json, sys, threading, time, urllib.request, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from prompts import CODE_PROMPTS as P, SRC, long_prompt
@@ -92,6 +98,112 @@ def stall(name, nbg, chars, ntok=420):
     o = {"name": name, "bg": nbg, "arrival_prompt": r["prompt"], "arrival_ttft": round(r["ttft"], 3), "arrive_at": round(ta, 2), "first_at": round(ta + r["ttft"], 2),
          "typical_gap_ms": round(typ[len(typ) // 2], 1) if typ else None, "worst_gaps_ms": gaps, "metrics": md, "clients": nbg, "mono_ns": [0, 0]}
     print(json.dumps({k: v for k, v in o.items() if k != "metrics"}), flush=True); time.sleep(2); return o
+def view(at):
+    """What the views the host-tier check reads say, at one moment: the KV pool in VRAM and the expert
+    slab that borrows its spare room (/stats), and the tier's bytes, counters and stored sessions
+    (/sessions). `expert_units` is the residency per tier -- the item's gain is `vram` growing by the
+    units the finished conversation's blocks were holding -- and `slab_mib` is the lent VRAM the
+    experts hold, against `lend_mib`, the most the KV pool lets them borrow."""
+    t = json.loads(get("/stats")); o = json.loads(get("/sessions"))
+    p, mv, oc, st = o.get("pool", {}), o.get("moved", {}), o.get("occupancy", {}), o.get("stall", {})
+    ex = find(t, "experts") or {}
+    tiers = [r for r in (ex.get("tiers") or []) if isinstance(r, dict)]
+    return {"at": at,
+            "kv_mib": round(t.get("kv_bytes_used") or 0, 0) / 2**20, "kv_total_mib": round(t.get("kv_bytes_total") or 0, 0) / 2**20,
+            "kv_tokens_cached": t.get("kv_tokens_cached"), "kv_tokens_used": t.get("kv_tokens_used"),
+            "hit_cuts": t.get("hit_cut_tokens"),
+            "expert_n_units": ex.get("n_units"),
+            "expert_units": {r.get("name"): r.get("units") for r in tiers},
+            "expert_mib": {r.get("name"): round((r.get("bytes") or 0) / 2**20, 1) for r in tiers},
+            "slab_mib": round((ex.get("flex_bytes") or 0) / 2**20, 1),
+            "lend_mib": round((ex.get("flex_capacity") or 0) / 2**20, 1),
+            "routed": ex.get("routed"), "routed_res": ex.get("routed_res"),
+            "promotions": ex.get("promotions"), "demotions": ex.get("demotions"),
+            "starved_slab": ex.get("starved_slab"),
+            "host_on": o.get("enabled"), "host_mib": round((oc.get("host_bytes") or 0) / 2**20, 1),
+            "host_cap_mib": round((oc.get("host_cap_bytes") or 0) / 2**20, 1),
+            "to_host": mv.get("to_host"), "promoted": mv.get("promoted"), "dropped": mv.get("dropped"),
+            "held_back": mv.get("held_back"), "restores": st.get("restores"),
+            "pool_mib": round((p.get("bytes_used") or 0) / 2**20, 1),
+            "stored": [{k: s.get(k) for k in ("tokens", "idle_s", "on_device", "on_host", "resume_tokens")}
+                       for s in o.get("sessions", [])]}
+def hits(fn):
+    """Run fn and report the prompt tokens it took from the prefix cache, from /metrics' own counters
+    (`vllm:prefix_cache_hits_total`, and the attention blocks `radiance:attn_cached_tokens_total`)."""
+    def c():
+        m = {}
+        for ln in get("/metrics").splitlines():
+            if ln.startswith("#") or not ln.strip(): continue
+            k, _, v = ln.rpartition(" "); n = k.split("{")[0]
+            try: m[n] = m.get(n, 0) + float(v)
+            except ValueError: pass
+        return m
+    m0 = c(); r = fn(); m1 = c()
+    d = lambda k: m1.get(k, 0) - m0.get(k, 0)
+    r["hit_tokens"] = int(d("vllm:prefix_cache_hits_total"))
+    r["attn_cached_tokens"] = int(d("radiance:attn_cached_tokens_total"))
+    return r
+def delta(a, b, k):
+    """A cumulative counter's change between two views."""
+    return (b.get(k) or 0) - (a.get(k) or 0)
+def idle(chars):
+    """The host-tier check (X-01): a conversation that finishes and goes idle, a decode-only request
+    that makes the experts ask for VRAM back, then the same prefix again (a resume) against a cold
+    prefill of the same size. Read with `prefix-cache-mib: 0` and with it set: the difference is the
+    tier's, in /stats' kv bytes and /sessions' host bytes, moved counters and resume tokens, and in
+    the expert units the decode-only request can then make resident (expert_vram_units here, with
+    slab_mib against lend_mib: the VRAM the experts hold against the most the KV pool lends them)."""
+    wait = float(os.environ.get("RAD_IDLE_WAIT_S", 5))
+    pA, pB = long_prompt(chars, 71), long_prompt(chars, 72, stamp=True)   # pB is a cold arrival
+    v = [view("start")]
+    a = hits(lambda: request(pA, 4)); v.append(view("conversation"))
+    time.sleep(wait); v.append(view("idle"))
+    d = request(P[0], 64); v.append(view("demanded"))
+    r = hits(lambda: request(pA, 4)); v.append(view("resume"))
+    c = hits(lambda: request(pB, 4)); v.append(view("cold"))
+    o = {"name": "idle", "chars": chars, "wait_s": wait,
+         "prompt": [a["prompt"], r["prompt"], c["prompt"]],
+         "conv_ttft": round(a["ttft"], 3), "idle_d_ttft": round(d["ttft"], 3),
+         "resume_ttft": round(r["ttft"], 3), "cold_ttft": round(c["ttft"], 3),
+         "resume_hit_tokens": r["hit_tokens"], "resume_attn_cached": r["attn_cached_tokens"],
+         "cold_hit_tokens": c["hit_tokens"], "cold_attn_cached": c["attn_cached_tokens"],
+         "conv_decode_tps": round(a["dec"], 1),
+         # the item's gain, at each step of the check: the expert units resident in VRAM and the slab
+         # holding them; the demand's hit rate is the first effect of the units it promoted
+         "expert_vram_units": {x["at"]: (x["expert_units"] or {}).get("vram") for x in v},
+         "slab_mib": {x["at"]: x["slab_mib"] for x in v},
+         "lend_mib": {x["at"]: x["lend_mib"] for x in v},
+         "demand_routed": delta(v[2], v[3], "routed"), "demand_routed_res": delta(v[2], v[3], "routed_res"),
+         "views": v}
+    print(json.dumps({k: x for k, x in o.items() if k != "views"}), flush=True)
+    for x in v: print(json.dumps(x), flush=True)
+    time.sleep(2)
+    return o
+def long8(chars, gen=32):
+    """The item's multi-session case (M longctx, 8 sessions of ~50K tokens: 391K cached tokens): eight
+    long conversations at once, then idle, then a decode-only request that asks the experts for the
+    VRAM they hold, then the same eight back. With `prefix-cache-mib: 0` the pool keeps their blocks
+    and the expert loan cannot have them; with it set the blocks move to host, the slab grows
+    (slab_mib against lend_mib) and the return pass still hits the prefix cache."""
+    v = [view("start")]
+    pr = [long_prompt(chars, 80 + i) for i in range(8)]
+    a = phase("long8a", pr, gen); v.append(view("finished"))
+    time.sleep(float(os.environ.get("RAD_IDLE_WAIT_S", 5))); v.append(view("idle"))
+    dq = request(P[0], 64); v.append(view("demanded"))
+    r = hits(lambda: phase("long8b", pr, gen)); v.append(view("resume"))
+    o = {"name": "long8", "chars": chars, "gen": gen, "tokens": a["prompt"][0],
+         "first_ttft": a["ttft"], "first_agg_tps": round(a["agg_tps"], 1), "first_hit": round(a["hit"], 4),
+         "resume_ttft": r["ttft"], "resume_agg_tps": round(r["agg_tps"], 1),
+         "resume_hit_tokens": r["hit_tokens"], "demand_ttft": round(dq["ttft"], 3),
+         "demand_hit": round(delta(v[2], v[3], "routed_res") / max(1, delta(v[2], v[3], "routed")), 4),
+         "kv_mib": {x["at"]: x["kv_mib"] for x in v}, "host_mib": {x["at"]: x["host_mib"] for x in v},
+         "expert_vram_units": {x["at"]: (x["expert_units"] or {}).get("vram") for x in v},
+         "slab_mib": {x["at"]: x["slab_mib"] for x in v}, "lend_mib": {x["at"]: x["lend_mib"] for x in v},
+         "views": v}
+    print(json.dumps({k: x for k, x in o.items() if k != "views"}), flush=True)
+    for x in v: print(json.dumps(x), flush=True)
+    time.sleep(2)
+    return o
 def phase(name, prompts, n=256, effort="none"):
     res = [None] * len(prompts)
     def w(i): res[i] = request(prompts[i], n, effort)
@@ -115,6 +227,14 @@ def phase(name, prompts, n=256, effort="none"):
     print(json.dumps({k: (round(v, 3) if isinstance(v, float) else v) for k, v in o.items() if k not in ("stats", "metrics")}), flush=True)
     time.sleep(2)
     return o
+def longctx(chars=140000, n=8, ntok=128):
+    # Eight sessions arrive and fill. One prompt each, built once, so both waves carry the same
+    # strings -- what a prefix-cache hit needs (at 46K they can still be evicted: check the log's
+    # `cache` figure, which a re-prefill sets to 0).
+    ps = [long_prompt(chars, 40 + i, stamp=True) for i in range(n)]
+    pre = phase("longctx-pre", ps, 1)
+    dec = phase("longctx-decode", ps, ntok)
+    return {"prefill": pre, "decode": dec}
 R = {"phases": []}
 if "nowarm" not in PH: request(P[11], 48); request(P[10], 48)
 for ph in PH:
@@ -134,7 +254,10 @@ for ph in PH:
     elif ph == "stall4": R["phases"].append(stall("stall4", 4, 22000))
     elif ph.startswith("tail"):  # tailN: prompt of ~N chars lone, to size small prefill steps
         R["phases"].append(phase(ph, [long_prompt(int(ph[4:]), 3)], 2))
+    elif ph == "longctx": R["phases"].append(longctx())
     elif ph == "pf6c": R["phases"].append(phase("pf6c", [long_prompt(22000, 7, stamp=True)], 2))
+    elif ph == "idle": R["phases"].append(idle(int(os.environ.get("RAD_IDLE_CHARS", 72000))))
+    elif ph == "long8": R["phases"].append(long8(int(os.environ.get("RAD_LONG8_CHARS", 140000))))
     else: sys.exit(f"probe.py: no phase '{ph}'; phases: c1 c1b c1s c2 c4 c8 c8s think pf2 pf6 pf6c pf8 pf20 "
-                  "stall1 stall4 tailN nowarm")
+                  "longctx stall1 stall4 tailN idle long8 nowarm")
 json.dump(R, open(OUT, "w"), indent=1)

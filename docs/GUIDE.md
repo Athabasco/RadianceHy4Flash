@@ -1288,6 +1288,28 @@ A longer chunk holds the device longer per step, but the prefill a decode step w
 sooner: four decoders with a long prompt beside them finished in 29.5 s at a 2048 chunk and 31.9 s at
 512.
 
+**An interval a quantum under the batch: one step an interval.** A chunk that shares its step with
+decoding sequences has to leave them their rows, so it is the batch less those rows -- a quantum
+short of the interval boundary when the interval is the batch itself (2032 of 2048 beside one
+decoder). The next step then takes the last rows up to the boundary, and on a hybrid model that
+short step carries the checkpoint and arms its own run of decode-only interleave steps: every
+interval runs two steps, and the arrival's time to first token pays for the interleave run, not for
+the short step's 40-65 ms. `checkpoint-interval: 1984` under `max-num-batched-tokens: 2048` puts the
+boundary a quantum lower, so the chunk is the whole interval and a quantum of the batch (64 rows;
+eight sequences at five drafts take 48) stays free for decode: `RADIANCE_LOG_STEPS=1` shows one step
+an interval where it showed two (2033 · 17 · 2033 · 17 · 1601 -> 1985 · 1985 · 1729 at a 5.7K
+arrival beside one decoder). On the `iks-A` lane (TP2, u3, 210 W, `scripts/backlog/nospec.yaml`
+and the same file with the line removed, three runs a side) arrival TTFT fell from 2.63 to 2.20 s
+at one decoder (-16 %) and from 2.75 to 2.41 s at four (-12 %), with the decoders' typical gap
+unchanged (13.3 / 18.3 ms), the worst stall unchanged (573 / 594 to 563 / 583 ms) and a lone
+prefill unchanged (pf2 0.653 -> 0.667 s, pf20 7.169 -> 7.141 s). Set the interval
+to the batch less a quantum, not to some smaller number: what removes the remainder step is that the
+chunk still fills the batch. The chunks are a quantum shorter than 2048 rows, so a prompt's chunks
+are tiled differently than at 2048 and a served answer can differ the way it does between any two
+chunk sizes (a prompt that is one chunk either way comes out bit-identical, greedy with logprobs,
+and a 5.7K prompt's logprobs move as far as they do under `max-num-batched-tokens: 1984`); no dtype,
+kernel or accumulation width changes.
+
 **Decoders beside a chunk: `prefill-interleave: N`.** A step that carries a chunk takes the
 chunk's time, and every sequence decoding beside it waits that long for its next token. With
 `prefill-interleave: 2`, after a step that carried a chunk while other sequences were decoding,
@@ -2699,7 +2721,7 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 |---|---|---|
 | `placement: MODE` | auto | `all_vram`, `layer_offload`, `expert_tiered`, `auto` |
 | `deterministic: true` | off | pin placement to the loader's plan, so the resident set cannot change under the heat engine |
-| `checkpoint-interval: N` | 2048 | linear-attention state checkpoint interval, in tokens |
+| `checkpoint-interval: N` | 2048 | linear-attention state checkpoint interval, in tokens. It also caps a prompt's chunk (§4.5), so under a `max-num-batched-tokens: 2048` a chunk that shares its step with decoding sequences leaves a remainder step every interval; `1984` (a quantum less) keeps one step an interval with a quantum of the batch free for decode (the `iks-A` lane: -16 % arrival TTFT at one decoder, -12 % at four) |
 | `prefill-span: N` | 1 | checkpoint intervals one step may carry of a prefill alone in its step, from the prompt's second interval on (several prompts prefilling with nothing decoding take such steps one at a time, the fewest tokens left first); needs `max-num-batched-tokens` of N intervals. Every other step is planned at the budget less the extra intervals, and the checkpoints inside a span are not written (§4.5) |
 | `prefill-span-pass: MODE` | piece | the routed (MoE) block's pass of a spanned step: `piece`, a pass a checkpoint interval; `step`, one pass over the whole step where the model runs such a step serially (Flash-Next at one and two ranks), so each expert's weight is read once for all the step's rows. More arena (the expert planes are a step tall) and output that differs from piece passes at tie level; needs `prefill-span` above 1 (§4.5) |
 | `prefill-span-min: N` | auto | the shortest prompt, in tokens, a prefill spans for. `auto`: eight intervals where routed experts are staged from host memory, 0 elsewhere; `0` spans every lone prefill from its second interval on (§4.5) |
@@ -4566,7 +4588,12 @@ routed layers, `RADIANCE_XS_PACE`: -1 spread, N per layer, 0 off; default spread
 off with one; `RADIANCE_XS_EARLY_PUBLISH=0` restores the old order). The heat engine's parameters can be
 set for A/B runs with `RADIANCE_HEAT_DECAY`, `_HYSTERESIS`, `_MIN_GAIN`, `_CREDIT_CAP` and `_MOVES`;
 the startup log says what is in force. `RADIANCE_ROUTE_TRACE=<file>` records rank 0's routing for
-`rad-heat-replay`.
+`rad-heat-replay`, whose `--layer-min N` replays the trace with every layer held at N resident units
+(the thin layers raised at the start from the layers above N, so the slab does not grow, clamped to
+what the slab can hold; a swap whose demotion would take a layer under N is abandoned) and prints
+what the floor costs the hit rate. The exit report's `mover:` line counts promotions, demotions and
+prefetches, and a `stager:` line follows it whenever the prefill stager ran: the routed layers, the
+units it staged and their bytes, the copies, and the units no buffer had room for (read in place).
 
 `/server_info` reports what a running process serves: the model, the cards, the KV cache, the draft
 depth and the wire, as the startup log does.
