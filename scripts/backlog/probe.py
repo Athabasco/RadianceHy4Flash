@@ -2,7 +2,8 @@
 """probe.py <port> <out.json> <phases,comma>: sampled (T 0.9, seeded) phases for the general-levers note.
 phases: c1, c8, think (c1, reasoning high), c4, pf6 (prefill ~6.7K tokens: 22,000 characters of tree source),
 pf20 (prefill ~24.9K: 72,000), pf2 (~2.4K: 7,400), stall1 / stall4 (a ~5.7K arrival while 1 / 4 decoders run),
-tailN (a prompt of ~N characters), c1s (64 tok), c8s (48 tok), greedy (three prompts and one 5.7K arrival
+arr60 (a ~60K-token arrival 2 s into one decoder, RAD_ARRIVE_S: S-10's "TTFT of a 60K prompt after 2 s
+of decode"), tailN (a prompt of ~N characters), c1s (64 tok), c8s (48 tok), greedy (three prompts and one 5.7K arrival
 at temperature 0 with ignore_eos off: the text itself, as gen / chars / sha256, so two runs' answers
 compare byte for byte -- the merge bar's first clause), idle (a finished conversation's KV
 leaves VRAM for the experts and its prefix still resumes; RAD_IDLE_CHARS, RAD_IDLE_WAIT_S), long8
@@ -82,13 +83,13 @@ def request_gaps(content, n):
             ln = raw.decode(errors="replace").strip()
             if ln.startswith("data:") and ln[5:].strip() != "[DONE]": ts.append(time.time() - t0)
     return ts
-def stall(name, nbg, chars, ntok=420):
+def stall(name, nbg, chars, ntok=420, after=1.5):
     out = {}; bg = [None] * nbg
     def w(i): bg[i] = request_gaps(P[i], ntok)
     th = [threading.Thread(target=w, args=(i,)) for i in range(nbg)]
     m0 = metrics(); t0 = time.time()
     for t in th: t.start()
-    time.sleep(1.5); ta = time.time() - t0
+    time.sleep(after); ta = time.time() - t0
     r = request(long_prompt(chars, 31 + nbg), 8); tb = time.time() - t0
     for t in th: t.join()
     m1 = metrics(); md = {k.split(":")[1]: m1[k] - m0.get(k, 0) for k in m1 if m1[k] != m0.get(k, 0)}
@@ -286,6 +287,9 @@ for ph in PH:
     elif ph == "pf8": R["phases"].append(phase("pf8", [long_prompt(22000, 61 + i) for i in range(8)], 2))
     elif ph == "stall1": R["phases"].append(stall("stall1", 1, 22000))
     elif ph == "stall4": R["phases"].append(stall("stall4", 4, 22000))
+    elif ph == "arr60":  # S-10: the whole prompt's loan recalled once, read as TTFT under decode
+        R["phases"].append(stall("arr60", 1, int(os.environ.get("RAD_ARR60_CHARS", 174000)),
+                                 after=float(os.environ.get("RAD_ARRIVE_S", 2.0))))
     elif ph.startswith("tail"):  # tailN: prompt of ~N chars lone, to size small prefill steps
         R["phases"].append(phase(ph, [long_prompt(int(ph[4:]), 3)], 2))
     elif ph == "greedy": R["phases"].append(greedy())
@@ -294,5 +298,5 @@ for ph in PH:
     elif ph == "idle": R["phases"].append(idle(int(os.environ.get("RAD_IDLE_CHARS", 72000))))
     elif ph == "long8": R["phases"].append(long8(int(os.environ.get("RAD_LONG8_CHARS", 140000))))
     else: sys.exit(f"probe.py: no phase '{ph}'; phases: c1 c1b c1s c2 c4 c8 c8s think pf2 pf6 pf6c pf8 pf20 "
-                  "greedy longctx stall1 stall4 tailN idle long8 nowarm")
+                  "greedy longctx stall1 stall4 arr60 tailN idle long8 nowarm")
 json.dump(R, open(OUT, "w"), indent=1)

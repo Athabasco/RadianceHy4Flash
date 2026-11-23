@@ -93,6 +93,7 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.kv_resident_blocks = m.kv_resident_blocks;
     o.kv_stream_misses = m.kv_stream_misses;
     o.kv_stream_bytes_in = m.kv_stream_bytes_in;
+    o.kv_loan_recalls = m.kv_loan_recalls;
 
     /* vLLM's gpu_prefix_cache_hit_rate means attention caching. The linear-checkpoint hit
      * rate has a different granularity (spec §7.3) and is reported separately, not averaged

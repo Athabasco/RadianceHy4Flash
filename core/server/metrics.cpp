@@ -226,6 +226,7 @@ void Metrics::sample(const SchedMetrics& m) {
     c_cut_tokens_.advance_to(m.hit_cut_tokens);
     c_kv_stream_misses_.advance_to((double)m.kv_stream_misses);
     c_kv_stream_bytes_.advance_to((double)m.kv_stream_bytes_in);
+    c_kv_loan_recalls_.advance_to((double)m.kv_loan_recalls);
     g_linear_hit_.set(m.linear_hit_rate);
 }
 
@@ -313,6 +314,10 @@ std::string Metrics::render() const {
     w.counter("radiance:kv_stream_misses_total",
               "Blocks copied into a streamed KV group's ring from the host mirror.",
               L, c_kv_stream_misses_.get());
+    w.counter("radiance:kv_loan_recalls_total",
+              "Loan recalls: KV blocks taken back from the expert slab for a sequence that ran out "
+              "of the blocks the cache held. Each one drains the mover and walks the pool.",
+              L, c_kv_loan_recalls_.get());
     /* Labelled by direction; the resolve only copies in. */
     w.help("radiance:kv_stream_bytes_total",
            "Bytes a streamed KV group's resolve moved, by direction.", "counter");
