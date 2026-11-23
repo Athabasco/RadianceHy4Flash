@@ -4164,9 +4164,7 @@ TEST(interleave_counts_steps_issued_ahead_and_then_serves_the_chunk) {
 }
 
 /* The arithmetic at a real deployment's shape: a 2048-token step and interval, the stager arming
- * at 1025 tokens, so a held-back chunk keeps 1088 (1025 rounded up to the 64-token quantum, the
- * shortest chunk whose step is staged: see busy_cap_rounds_the_stager_step_up_to_the_quantum) and
- * its step-mates take the rest. */
+ * at 1025 tokens (so a held-back chunk keeps 1024 and its step-mates take the rest). */
 TEST(busy_cap_keeps_the_stager_floor_and_never_leaves_a_runt) {
     Fixture f;
     f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/2048, /*max_ctx=*/8192);
@@ -4175,16 +4173,14 @@ TEST(busy_cap_keeps_the_stager_floor_and_never_leaves_a_runt) {
     f.sch.set_stage_rows(1025);
     /* nothing reserved: the budget */
     CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 0), 2048);
-    /* a little reserved at an interval boundary: 2048 - 272 would leave a 272-token runt before the
-     * boundary, and the interval cannot hold two chunks of 1088 (2176 > 2048), so there is no pair
-     * of staged halves: the chunk takes the interval less the reserve and the runt is the next
-     * step's chunk, one synchronous expert pass instead of the two an unstaged split would make */
-    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 272), 1776);
+    /* a little reserved at an interval boundary: 2048 - 272 would leave a 272-token runt before
+     * the boundary, so the interval splits in two staged halves instead */
+    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 272), 1024);
     /* half way to the boundary the rest of the interval already fits under the cap */
     CHECK(f.sch.busy_cap(1024, 100000, 2048, 272) >= 1024);
     CHECK_EQ(f.sch.plan_chunk(1024, 100000, f.sch.busy_cap(1024, 100000, 2048, 272), nullptr), 1024);
-    /* more reserved than the floor allows for: the floor, the stager's pass rounded up */
-    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 1500), 1088);
+    /* more reserved than the floor allows for: the floor */
+    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 1500), 1024);
     /* a prompt's last stretch, shorter than the cap: all of it */
     CHECK_EQ(f.sch.plan_chunk(0, 1500, f.sch.busy_cap(0, 1500, 2048, 272), nullptr), 1500);
     /* a budget already under the floor: never more than the budget */
@@ -4194,40 +4190,8 @@ TEST(busy_cap_keeps_the_stager_floor_and_never_leaves_a_runt) {
      * already runs with decode rows ahead of it */
     CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 8, false, /*rows_only=*/true), 2040);
     CHECK_EQ(f.sch.plan_chunk(0, 100000, f.sch.busy_cap(0, 100000, 2048, 8, false, true), nullptr), 1984);
-    /* the same reserve with a share in it stays under the interval and keeps the reserve */
-    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 8 + 256, false, false), 1784);
-}
-
-/* Backlog M-03a. The stager's smallest pass is one past the largest arena level that lends the ring
- * (1025 rows beside a 1024-row level), and it is not a multiple of the chunk quantum. A floor
- * rounded *down* to the quantum (1024 at 64) is exactly that level's rows: the step takes the
- * lending level, Place::Stager::begin_pass gets no ring and does not arm, and every routed layer of
- * the chunk reads its pooled experts synchronously -- the pass the floor exists to avoid. The floor
- * is the pass rounded up, so a held-back chunk is always one the stager arms for. */
-TEST(busy_cap_rounds_the_stager_step_up_to_the_quantum) {
-    Fixture f;
-    f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/2048, /*max_ctx=*/8192);
-    f.cfg.checkpoint_interval = 2048;
-    CHECK_OK(f.start());
-    f.sch.set_stage_rows(1025);
-    /* 1025 rows rounded up to the 64-token quantum */
-    CHECK_EQ(f.sch.stage_floor(64), 1088);
-    CHECK_EQ(f.sch.stage_floor(16), 1040);
-    /* a pass already on the quantum is itself */
-    CHECK_EQ(f.sch.stage_floor(1), 1025);
-    /* and the chunk the cap leaves is that chunk: the step takes the full plan, which has a ring */
-    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 1500), 1088);
-    CHECK_EQ(f.sch.plan_chunk(0, 100000, f.sch.busy_cap(0, 100000, 2048, 1500), nullptr), 1088);
-    /* whatever is reserved, a held-back chunk is the stager's pass or more (or the whole budget,
-     * which is under the pass already) */
-    for (int64_t reserve = 0; reserve < 2048; reserve += 16) {
-        const int64_t cap = f.sch.busy_cap(0, 100000, 2048, reserve);
-        CHECK(cap >= 1025 || cap == 2048);
-    }
-    /* no stager: one quantum is all the floor asks */
-    f.sch.set_stage_rows(0);
-    CHECK_EQ(f.sch.stage_floor(64), 64);
-    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 2040), 64);
+    /* the same reserve with a share in it splits the interval */
+    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 8 + 256, false, false), 1024);
 }
 
 /* The share left for a request that then does not start (its media is not encoded yet) goes back

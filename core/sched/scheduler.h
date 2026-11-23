@@ -541,10 +541,6 @@ public:
      * engine after init. --busy-prefill-chunk keeps a held-back chunk at or above it (busy_cap).
      * Also logs the resolved policy at startup. */
     void    set_stage_rows(int64_t rows);
-    /* That step as a chunk length: rounded up to the chunk quantum, and one quantum with no stager
-     * (busy_cap's floor). Rounded down to the quantum it is the arena level the stager does not arm
-     * for, so the shortest staged chunk is the step rounded up. */
-    int64_t stage_floor(int64_t quantum) const;
     /* The shortest prefill that spans, in tokens (0: every one alone in its step), set once by
      * the engine after init. Where routed experts are read from host memory, the arena a spanned
      * step takes is room the experts lose for it, which on a short prompt costs more than the span
