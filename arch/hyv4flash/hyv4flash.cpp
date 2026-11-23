@@ -157,6 +157,10 @@ struct Model {
     int64_t n_weights = 0;
     Trunk tr{};
     AttnWire aw_sparse{}, aw_sliding{};
+    /* P-04: the prefill sequences' bounds rebased to 0, once a step (op_rebase, issued before the
+     * layers and declared there too: declaration order is liveness), read by both wires. */
+    rad_buf cu_prefill = 0;
+    rad_op op_rebase = 0;
     IndexWire iw{};
     MoeWire mw{};
     EngramWire ew{};
@@ -698,10 +702,12 @@ static int buffers(RadBuilder* b, Model& m) {
         (s.is_sliding[(size_t)l] ? any_sliding : any_sparse) = true;
         (s.is_moe[(size_t)l] ? any_moe : any_dense) = true;
     }
+    m.cu_prefill = decl_b(b, nm.f("cu_prefill"), RAD_I32, { g.max_seqs + 1 });
+    if (!m.cu_prefill) return RAD_E_INVAL;
     if (any_sparse)
-        RAD_ARCH_TRY(m.aw_sparse.declare(b, nm, s, s.sparse_r, T, g.max_seqs, "sparse"));
+        RAD_ARCH_TRY(m.aw_sparse.declare(b, nm, s, s.sparse_r, T, m.cu_prefill, "sparse"));
     if (any_sliding)
-        RAD_ARCH_TRY(m.aw_sliding.declare(b, nm, s, s.sliding_r, T, g.max_seqs, "sliding"));
+        RAD_ARCH_TRY(m.aw_sliding.declare(b, nm, s, s.sliding_r, T, m.cu_prefill, "sliding"));
     if (any_sparse) RAD_ARCH_TRY(m.iw.declare(b, nm, s, g));
     if (any_moe) RAD_ARCH_TRY(m.mw.declare(b, nm, s, g, m.arm));
     if (any_dense) {
@@ -1037,6 +1043,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.op_stream = decl_copy(b, T, E, RAD_BF16, m.x0, m.tr.h);
     HY4_NEED(m.embed, "embed_lookup");
     HY4_NEED(m.op_stream, "cast");
+    /* P-04: one rebase a step for every layer's prefill attention, declared where step() issues it. */
+    m.op_rebase = mk(b, "sub_i32", { RAD_RANGE("M", 1, g.max_seqs + 1) }, {}, {}, { m.cu_prefill });
+    HY4_NEED(m.op_rebase, "sub_i32");
     RAD_ARCH_TRY(m.t_embed.declare(b, nm, T, "embed", -1, RAD_BF16, E, m.x0));
 
     if (!s.engram_layers.empty()) {
@@ -1246,6 +1255,14 @@ static void step(RadCtx* c, const RadBatch* batch) {
     m.t_embed.step(c, brows(m.x0, T), T);
     for (int64_t j = 0; j < s.hc; ++j)
         RAD_ISSUE_N(c, m.op_stream, T, brows(m.x0, T), bcol(m.tr.h, j * E, E, T));
+
+    /* P-04: the prefill sequences' bounds rebased to 0, once for every layer (both geometries'
+     * absorbed prefill instance and the non-absorbed attention read m.cu_prefill). */
+    if (p.P > 0 && p.T > p.DT) {
+        const int32_t* cu = batch->cu_seqlens + p.D;
+        RAD_ISSUE_N(c, m.op_rebase, p.P + 1, praw(cu, RAD_I32, p.P + 1), praw(cu, RAD_I32, 1),
+                    brows(m.cu_prefill, p.P + 1));
+    }
 
     /* A junction (WP16.2) runs the chain from a block's reduction to the next block's input norm
      * in one launch; the taps behind it read what the chain would have left. */

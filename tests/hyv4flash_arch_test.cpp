@@ -330,6 +330,9 @@ TEST(every_step_kind_is_lint_clean) {
         CHECK(c.step_fail.empty());
         const int dense = count_issued(b, c, "attn_kv_sink");
         const int sel = count_issued(b, c, "mla_attn_sel_sink");
+        /* P-04: the prefill sequences' bounds are rebased once a step, into the one buffer
+         * every layer of both geometries reads; a step with no prefill sequence rebases nothing. */
+        CHECK_EQ(count_issued(b, c, "sub_i32"), cs.pq.empty() ? 0 : 1);
         if (!std::strcmp(cs.what, "fresh prefill")) {
             CHECK_EQ(dense, 3);       /* every layer non-absorbed */
             CHECK_EQ(sel, 0);
@@ -361,6 +364,7 @@ TEST(every_step_kind_is_lint_clean) {
     hyv4flash::step(&c, &k->b);
     CHECK_LINT(a.b, &c);
     CHECK_EQ(count_issued(a.b, c, "attn_kv_sink"), 0);
+    CHECK_EQ(count_issued(a.b, c, "sub_i32"), 1);   /* P-04: absorbed on every layer, rebased once */
 }
 
 /* WP13.0: a verify step that crosses the dense limit issues other ops (the selection) than one of
