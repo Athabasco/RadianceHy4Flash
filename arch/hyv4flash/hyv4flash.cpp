@@ -616,25 +616,35 @@ static int drafter(RadBuilder* b, Model& m) {
     }
     Decl d{ b, m, (int)(s.n_layer + s.dfly_layers), access, &m.df.w, 1, &defer };
     const int64_t E = s.n_embd;
-    struct { const char* name; const char* src; bool gain; int64_t rows, cols; bool linear; } one[] = {
-        { "dfly.fusion.weight", "mtp_fusion.eh_proj.weight", false, E, 2 * E, true },
-        { "dfly.fusion_embed_norm.weight", "mtp_fusion.enorm.weight", true, E, 0 },
-        { "dfly.fusion_hidden_norm.weight", "mtp_fusion.hnorm.weight", true, E, 0 },
-        { "dfly.fusion_gate", "mtp_fusion.gate", true, E, 0 },
-        { "dfly.correct_embed_norm.weight", "hidden_correction.embed_norm.weight", true, E, 0 },
-        { "dfly.correct_hidden_norm.weight", "hidden_correction.hidden_norm.weight", true, E, 0 },
-        { "dfly.correct_gate.weight", "hidden_correction.gate_proj.weight", false, E, 2 * E, true },
-        { "dfly.correct_up.weight", "hidden_correction.up_proj.weight", false, E, 2 * E, true },
-        { "dfly.correct_down.weight", "hidden_correction.down_proj.weight", false, E, E, true },
-        { "dfly.output_norm.weight", "final_norm.weight", true, E, 0 },
-        { "dfly.confidence.weight", "confidence_head.proj.weight", false, 1, E },
-        { "dfly.confidence.bias", "confidence_head.proj.bias", true, 1, 0 },
+    /* The correction's three linears split over the ranks as the drafter's own declare reads them
+     * (hyv4flash_dfly.h): gate and up by rows, down by columns. A plain weight takes this rank's
+     * share here, which the drafter's bf16 gemm_nt reads directly; a quantised one stays whole and
+     * the drafter's Lin slices its views. */
+    Decl ds{ b, m, (int)(s.n_layer + s.dfly_layers), access, &m.df.w, s.world, &defer };
+    const bool chain_split = s.world > 1 && E % s.world == 0;
+    const int chain_row = chain_split ? RAD_SHARD_ROW : RAD_SHARD_NONE;
+    const int chain_col = chain_split ? RAD_SHARD_COL : RAD_SHARD_NONE;
+    struct { const char* name; const char* src; bool gain; int64_t rows, cols; bool linear; int shard; } one[] = {
+        { "dfly.fusion.weight", "mtp_fusion.eh_proj.weight", false, E, 2 * E, true, RAD_SHARD_NONE },
+        { "dfly.fusion_embed_norm.weight", "mtp_fusion.enorm.weight", true, E, 0, false, RAD_SHARD_NONE },
+        { "dfly.fusion_hidden_norm.weight", "mtp_fusion.hnorm.weight", true, E, 0, false, RAD_SHARD_NONE },
+        { "dfly.fusion_gate", "mtp_fusion.gate", true, E, 0, false, RAD_SHARD_NONE },
+        { "dfly.correct_embed_norm.weight", "hidden_correction.embed_norm.weight", true, E, 0, false, RAD_SHARD_NONE },
+        { "dfly.correct_hidden_norm.weight", "hidden_correction.hidden_norm.weight", true, E, 0, false, RAD_SHARD_NONE },
+        { "dfly.correct_gate.weight", "hidden_correction.gate_proj.weight", false, E, 2 * E, true, chain_row },
+        { "dfly.correct_up.weight", "hidden_correction.up_proj.weight", false, E, 2 * E, true, chain_row },
+        { "dfly.correct_down.weight", "hidden_correction.down_proj.weight", false, E, E, true, chain_col },
+        { "dfly.output_norm.weight", "final_norm.weight", true, E, 0, false, RAD_SHARD_NONE },
+        { "dfly.confidence.weight", "confidence_head.proj.weight", false, 1, E, false, RAD_SHARD_NONE },
+        { "dfly.confidence.bias", "confidence_head.proj.bias", true, 1, 0, false, RAD_SHARD_NONE },
     };
     for (const auto& w : one) {
         const char* name = nm.f("%s", w.name);
         RAD_ARCH_TRY(map_copy(b, name, nm.ckpt("%s.%s", dp, w.src)));
-        if (w.gain) RAD_ARCH_TRY(d.f32(name, { w.rows }));
-        else RAD_ARCH_TRY(w.linear ? d.linear(name, { w.rows, w.cols }) : d.mat(name, { w.rows, w.cols }));
+        Decl& dd = w.shard == RAD_SHARD_NONE ? d : ds;
+        if (w.gain) RAD_ARCH_TRY(dd.f32(name, { w.rows }));
+        else RAD_ARCH_TRY(w.linear ? dd.linear(name, { w.rows, w.cols }, w.shard)
+                                   : dd.mat(name, { w.rows, w.cols }, w.shard));
     }
     /* A draft-owned embedding (vLLM loads `dfly_layers.embed_tokens` where the checkpoint has
      * one, else shares the target's). Declared only where the model has it. */

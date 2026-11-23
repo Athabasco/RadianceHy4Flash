@@ -15,13 +15,13 @@ namespace {
 /* The `mini` preset as rad-convert records its config: 3 layers (sparse, sliding, sparse; layer 0
  * dense, 1-2 latent MoE), two streams, an Engram in front of layer 1, dense limit 16. `wide` is
  * `mini4`: 4 sparse and 8 sliding heads and 8 experts, so four ranks hold whole heads. */
-MetaKV mini_meta(bool wide = false, int64_t ff_exp = 128) {
+MetaKV mini_meta(bool wide = false, int64_t ff_exp = 128, int64_t n_embd = 128) {
     RadModelMeta m{};
     m.arch_id = "hyv4flash";
     m.name = "test-hy4-mini";
     m.quant = "";
     m.n_layers = 3;
-    m.n_embd = 128;
+    m.n_embd = n_embd;
     m.n_head = 2;
     m.n_head_kv = 2;
     m.head_dim = 8;
@@ -1379,8 +1379,8 @@ namespace {
  * group_topk * ratio. `two` is mini6d2's shape on mini's trunk: two draft layers, both over layer
  * 2 for the selection and layers 2 and 0 for the cache (0 is refused, so `two` uses 2 twice for
  * the selection and the test that wants distinct caches edits the keys). */
-MetaKV dfly_meta(int layers = 1, bool wide = false) {
-    MetaKV k = mini_meta(wide);
+MetaKV dfly_meta(int layers = 1, bool wide = false, int64_t n_embd = 128) {
+    MetaKV k = mini_meta(wide, 128, n_embd);
     k.set("dfly_num_hidden_layers", std::to_string(layers).c_str());
     k.set("dfly_target_kv_layers", layers == 1 ? "2" : "2 2");
     k.set("dfly_target_index_layer", layers == 1 ? "2" : "2 2");
@@ -1722,7 +1722,9 @@ TEST(dfly2_reads_quantised_linears_as_the_trunk_does) {
     const char* lin[] = { "attn_q_a", "attn_gate", "ffn_gate_up" };
     for (const int world : { 1, 2 }) {
         for (int rank = 0; rank < world; ++rank) {
-            DeclDfly d(5, dfly_meta(1, true), world, rank, dfly_i8_encs);
+            /* 256 wide, so that a rank's correction K (128 at two ranks) is a whole scale group:
+             * the down is a K split, and mini's 128 does not divide into 128-wide groups. */
+            DeclDfly d(5, dfly_meta(1, true, 256), world, rank, dfly_i8_encs);
             REQUIRE_EQ(d.rc, RAD_OK);
             if (!d.df().served) fprintf(stderr, "%s\n", d.df().why.c_str());
             REQUIRE(d.df().served);
@@ -1752,6 +1754,15 @@ TEST(dfly2_reads_quantised_linears_as_the_trunk_does) {
             }
             CHECK(find_w(b, "dfly.blk.0.attn_kv_b.weight")->d.dtype == RAD_BF16);
             CHECK(find_w(b, "dfly.blk.0.attn_q_a.weight") != nullptr);
+            /* The correction slices with it, its down as a K split in whole scale groups. */
+            CHECK_EQ(find_w(b, "dfly.correct_gate.weight")->d.shard,
+                     world > 1 ? (int)RAD_SHARD_ROW : (int)RAD_SHARD_NONE);
+            CHECK_EQ(find_w(b, "dfly.correct_down.weight")->d.shard,
+                     world > 1 ? (int)RAD_SHARD_COL : (int)RAD_SHARD_NONE);
+            CHECK(d.df().c_g.q && d.df().c_u.q && d.df().c_d.q);
+            CHECK_EQ(pint(b.op_of(d.df().c_g.lin.op), "N"), d.df().E / world);
+            CHECK_EQ(pint(b.op_of(d.df().c_d.lin.op), "K"), d.df().E / world);
+            CHECK(d.df().op_ar_c != 0 || world == 1);
             /* One engine step, lint clean, the query pass issuing the int8 chain. */
             auto trunk = kit(b, std::vector<int>(2, 6), {});
             trunk->b.positions_h = trunk->pos.data();
@@ -1910,11 +1921,13 @@ TEST(dfly2_configurations_it_cannot_serve_are_refused_by_name) {
 
 /* §3.6 (WP13.6): at 2 and 4 ranks the draft splits as the trunk's sparse layers -- whole heads a
  * rank in q_b, kv_b, the gate and the sinks (rows) and the output projection (columns), the MLP's
- * width (gate_up's rows of each half, down's columns), everything else whole -- its ops run this
- * rank's heads and width, each layer reduces twice (o_proj, the MLP) exactly before the norm or
- * residual that reads the sum, and each chain step ranks this rank's vocabulary shard (global ids,
- * the pair plane), gathers every rank's pairs and merges; one engine step lint clean on every rank.
- * At one rank none of the three TP ops is declared and the weights are whole and unsharded. */
+ * width (gate_up's rows of each half, down's columns), the correction's gate and up by their rows
+ * and its down by columns (one exact reduction of the chain's delta a step, before the residual),
+ * everything else whole -- its ops run this rank's heads and width, each layer reduces twice
+ * (o_proj, the MLP) exactly before the norm or residual that reads the sum, and each chain step
+ * ranks this rank's vocabulary shard (global ids, the pair plane), gathers every rank's pairs and
+ * merges; one engine step lint clean on every rank. At one rank none of the three TP ops is
+ * declared and the weights are whole and unsharded. */
 TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
     struct Want { const char* name; int shard; int dim; };
     const Want wants[] = {
@@ -1929,8 +1942,9 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
         { "dfly.blk.0.attn_kv_a.weight", RAD_SHARD_NONE, -1 },
         { "dfly.blk.0.attn_norm.weight", RAD_SHARD_NONE, -1 },
         { "dfly.fusion.weight", RAD_SHARD_NONE, -1 },
-        { "dfly.correct_gate.weight", RAD_SHARD_NONE, -1 },
-        { "dfly.correct_down.weight", RAD_SHARD_NONE, -1 },
+        { "dfly.correct_gate.weight", RAD_SHARD_ROW, 0 },
+        { "dfly.correct_up.weight", RAD_SHARD_ROW, 0 },
+        { "dfly.correct_down.weight", RAD_SHARD_COL, 1 },
     };
     for (const bool wide : { false, true }) {
         DeclDfly one(5, dfly_meta(1, wide));
@@ -1946,7 +1960,7 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
                 CHECK_EQ(w.d.n_row_parts, 0);
             }
         const int64_t H = wide ? 4 : 2, ff = one.df().ff;
-        CHECK(one.df().op_ar_o == 0 && one.df().op_ar_y == 0);
+        CHECK(one.df().op_ar_o == 0 && one.df().op_ar_y == 0 && one.df().op_ar_c == 0);
         for (int world : { 2, 4 }) {
             if (!wide && world == 4) continue;   /* mini's 2 sparse heads */
             for (int rank = 0; rank < world; ++rank) {
@@ -1976,6 +1990,27 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
                 CHECK_EQ(pint(b.op_of(L.p_down.op), "K"), ff / world);
                 CHECK_EQ(pint(b.op_of(df.steps[0].op_head), "n_vocab"), 320 / world);
                 CHECK_EQ(pint(b.op_of(df.steps[0].op_topk), "vocab_off"), 320 / world * rank);
+                /* The correction's three linears are this rank's width too, and its down's partial
+                 * sum is reduced exactly before the residual and the proposal law read it. */
+                CHECK_EQ(pint(b.op_of(df.c_g.op), "N"), df.E / world);
+                CHECK_EQ(pint(b.op_of(df.c_g.op), "K"), 2 * df.E);
+                CHECK_EQ(pint(b.op_of(df.c_u.op), "N"), df.E / world);
+                CHECK_EQ(pint(b.op_of(df.c_u.op), "K"), 2 * df.E);
+                CHECK_EQ(pint(b.op_of(df.c_d.op), "N"), df.E);
+                CHECK_EQ(pint(b.op_of(df.c_d.op), "K"), df.E / world);
+                CHECK_EQ(pint(b.op_of(df.steps[0].op_silu), "n"), df.E / world);
+                /* The chain's buffers are this rank's slice too: gate and up rows, the down's K. */
+                const RecBuf* bg = find_b(b, "dfly.chain_gate");
+                const RecBuf* bu = find_b(b, "dfly.chain_up");
+                const RecBuf* bgu = find_b(b, "dfly.chain_gate_up");
+                const RecBuf* ba = find_b(b, "dfly.chain_act");
+                REQUIRE(bg && bu && bgu && ba);
+                CHECK_EQ(bg->d.shape[1], df.E / world);
+                CHECK_EQ(bu->d.shape[1], df.E / world);
+                CHECK_EQ(bgu->d.shape[1], 2 * df.E / world);
+                CHECK_EQ(ba->d.shape[1], df.E / world);
+                CHECK(df.op_ar_c != 0);
+                CHECK_EQ(pint(b.op_of(df.op_ar_c), "exact"), 1);
                 for (const auto& st : df.steps) CHECK(st.op_gather != 0 && st.op_merge != 0);
                 CHECK(df.op_ar_o != 0 && df.op_ar_y != 0 && df.op_ar_o != df.op_ar_y);
                 /* One engine step: the trunk step, the empty context pass, the query pass. */
@@ -1987,17 +2022,22 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
                                      world);
                 CHECK_PASSES(b, ps);
                 CHECK_EQ(ps[1]->issues.size(), (size_t)0);
-                int ar = 0, ga = 0, me = 0, tk = 0;
+                int ar = 0, ga = 0, me = 0, tk = 0, arc = 0;
                 size_t i_out = SIZE_MAX, i_ar = SIZE_MAX, i_post = SIZE_MAX, i_down = SIZE_MAX,
                        i_ar2 = SIZE_MAX, i_add2 = SIZE_MAX;
+                std::vector<size_t> chain;
                 const auto& is = ps[2]->issues;
                 for (size_t i = 0; i < is.size(); ++i) {
                     const rad_op op = is[i].op;
                     if (op == df.op_ar_o || op == df.op_ar_y) ++ar;
+                    if (op == df.op_ar_c) ++arc;
+                    bool add = false;
                     for (const auto& st : df.steps) {
                         ga += op == st.op_gather;
                         me += op == st.op_merge;
+                        add = add || op == st.op_add;
                     }
+                    if (op == df.c_d.op || op == df.op_ar_c || add) chain.push_back(i);
                     if (op == df.steps[0].op_topk) ++tk;
                     if (op == L.p_out.op) i_out = i;
                     if (op == df.op_ar_o) i_ar = i;
@@ -2007,13 +2047,21 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
                     if (op == L.op_add2) i_add2 = i;
                 }
                 CHECK_EQ(ar, 2);
+                CHECK_EQ(arc, 5);
+                REQUIRE_EQ(chain.size(), (size_t)15);
+                for (int r = 0; r < 5; ++r) {
+                    CHECK_EQ(is[chain[3 * r]].op, df.c_d.op);
+                    CHECK_EQ(is[chain[3 * r + 1]].op, df.op_ar_c);
+                    CHECK_EQ(is[chain[3 * r + 2]].op, df.steps[r].op_add);
+                    CHECK_EQ(is[chain[3 * r + 1]].n, 2 * df.E);
+                }
                 CHECK_EQ(ga, 5);
                 CHECK_EQ(me, 5);
                 CHECK_EQ(tk, 1);
                 CHECK(i_out < i_ar && i_ar < i_post);
                 CHECK(i_down < i_ar2 && i_ar2 < i_add2);
                 /* Exact reductions, in place over the draft's own buffers. */
-                for (rad_op op : { df.op_ar_o, df.op_ar_y })
+                for (rad_op op : { df.op_ar_o, df.op_ar_y, df.op_ar_c })
                     CHECK_EQ(pint(b.op_of(op), "exact"), 1);
             }
         }
