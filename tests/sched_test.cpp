@@ -10545,3 +10545,36 @@ TEST(a_group_s_checkpoint_is_taken_and_committed_on_its_last_slice) {
     CHECK_EQ(f.sch.find(p)->output.size(), (size_t)1);
     CHECK_EQ(f.sch.find(d)->output.size(), (size_t)5);
 }
+
+/* A preemption inside a group would hand the blocks its remaining sub-steps write to the next
+ * sequence: the fleet's room check waits for the group, then goes through again. */
+TEST(preemption_waits_for_a_group_s_last_slice) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/4);
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(496, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().slice_m, 4);
+
+    const int64_t free0 = f.kv.free_blocks(0);
+    CHECK_EQ(f.sch.preempt_until([] { return false; }), 0);
+    CHECK_EQ((int)f.sch.find(d)->state, (int)ReqState::Running);
+    CHECK_EQ(f.sch.metrics().preemptions, (int64_t)0);
+    CHECK_EQ(f.kv.free_blocks(0), free0);
+
+    f.commit_plain(20);
+    const RadBatch* nb = f.sch.step();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_seq, 2);                  /* the group's next sub-step, still */
+    f.commit_plain(21);
+    REQUIRE(f.sch.step() != nullptr);        /* sub-step 2 */
+    f.commit_plain(22);
+    REQUIRE(f.sch.step() != nullptr);        /* sub-step 3 */
+    f.commit_plain(23);                      /* the group is over */
+
+    CHECK_EQ(f.sch.preempt_until([] { return false; }), 2);   /* both runners, as outside */
+    (void)p;
+}

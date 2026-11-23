@@ -676,6 +676,11 @@ int64_t Scheduler::evict_prefix_until(const std::function<bool()>& enough) {
 
 int Scheduler::preempt_until(const std::function<bool()>& enough) {
     std::lock_guard<std::mutex> lk(mu_);
+    /* A group's rows are frozen to its last sub-step: the chunk's remaining sub-steps write the
+     * layers above them into the same blocks, and a decoder's row is the base the plugin carries
+     * across them. Preempting one mid-group would hand its blocks to the next sequence while the
+     * group still writes them. The wait is one chunk of sub-steps, so the group finishes first. */
+    if (group_.active) return 0;
     int n = 0;
     while (!running_.empty() && !enough()) {
         preempt_back();
