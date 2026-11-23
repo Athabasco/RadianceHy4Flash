@@ -9595,13 +9595,15 @@ TEST(a_block_drafters_rows_are_issued_ahead_with_their_own_prefix_unless_a_seque
 namespace {
 
 /* `n_dec` sequences decoding (`drafts` drafts a step each) when a `prompt`-token prefill arrives,
- * at a 512-token budget and interval. Returns each step's chunk of the prefill until it has
- * produced its first token, and checks every step against the pools it is built into. */
+ * at a `max_tok`-token budget and `interval`-token checkpoint interval. Returns each step's chunk
+ * of the prefill until it has produced its first token, and checks every step against the pools it
+ * is built into. */
 std::vector<int32_t> chunks_beside_decoders(int64_t headroom, int n_dec, int drafts, int prompt,
-                                            int priority, int64_t* max_step = nullptr) {
+                                            int priority, int64_t* max_step = nullptr,
+                                            int64_t max_tok = 512, int64_t interval = 512) {
     Fixture f;
-    f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/8192);
-    f.cfg.checkpoint_interval = 512;
+    f.build(/*blocks=*/8192, /*states=*/64, max_tok, /*max_ctx=*/8192);
+    f.cfg.checkpoint_interval = interval;
     f.cfg.decode_headroom = headroom;
     f.cfg.n_spec = drafts;
     CHECK_OK(f.start());
@@ -9708,5 +9710,55 @@ TEST(decode_rows_past_the_headroom_take_the_budget) {
         CHECK_EQ(c.size(), 8u);
         for (size_t i = 0; i < c.size(); ++i) CHECK_EQ(c[i], i % 2 ? 64 : 448);
         CHECK(top <= 512 + 16);
+    }
+}
+
+/* The served fork config puts the interval a quantum under the batch (`max-num-batched-tokens: 2048`,
+ * `checkpoint-interval: 1984`), where the leftover quantum already holds the decoders' rows: the chunk
+ * is the whole interval with and without the headroom, so the flag leaves the served schedule alone
+ * step for step (the lane measured the two equal). What it adds there is the step's row capacity, and
+ * so the activation arena, which `step_tok` sizes. */
+TEST(decode_headroom_leaves_the_served_interval_schedule_alone) {
+    for (int pri = 0; pri < 2; ++pri) {
+        int64_t with_top = 0, without_top = 0;
+        const std::vector<int32_t> with = chunks_beside_decoders(64, 4, 0, 8000, pri, &with_top, /*max_tok=*/2048,
+                                                                 /*interval=*/1984);
+        const std::vector<int32_t> without = chunks_beside_decoders(0, 4, 0, 8000, pri, &without_top, 2048, 1984);
+        CHECK_EQ(with.size(), 5u);
+        /* 1984 x 4 = 7936, then the last 64 rows. */
+        for (size_t i = 0; i + 1 < with.size(); ++i) CHECK_EQ(with[i], 1984);
+        CHECK_EQ(with.back(), 64);
+        CHECK_EQ(without.size(), with.size());
+        for (size_t i = 0; i < with.size(); ++i) CHECK_EQ(without[i], with[i]);
+        CHECK_EQ(with_top, 1984 + 4);
+        CHECK_EQ(without_top, 1984 + 4);
+    }
+    Config c;
+    c.max_tok = 2048;
+    c.checkpoint_interval = 1984;
+    c.decode_headroom = 0;
+    const int64_t bare = step_tok(c);
+    c.decode_headroom = 64;
+    CHECK_EQ(bare, 2048);
+    CHECK_EQ(step_tok(c), 2048 + 64);               /* the arena and the step's rows, not the chunk */
+}
+
+/* At the interval equal to the budget the leftover quantum is empty, so without the headroom every
+ * interval beside decoders is a 1984-row chunk (the last 64-quantum under the budget minus the decode
+ * rows) and a 64-row remainder step to the boundary; with it an interval is one 2048-row step, which
+ * is the defect the item measured at 2048. */
+TEST(decode_headroom_carries_the_whole_interval_at_the_served_budget) {
+    for (int pri = 0; pri < 2; ++pri) {
+        int64_t top = 0;
+        const std::vector<int32_t> with = chunks_beside_decoders(64, 4, 0, 8000, pri, &top, /*max_tok=*/2048,
+                                                                 /*interval=*/2048);
+        CHECK_EQ(with.size(), 4u);
+        for (size_t i = 0; i + 1 < with.size(); ++i) CHECK_EQ(with[i], 2048);
+        CHECK_EQ(with.back(), 1856);                /* 8000 - 3 x 2048 */
+        CHECK_EQ(top, 2052);
+        const std::vector<int32_t> without = chunks_beside_decoders(0, 4, 0, 8000, pri, nullptr, 2048, 2048);
+        CHECK_EQ(without.size(), 7u);
+        for (size_t i = 0; i + 1 < without.size(); ++i) CHECK_EQ(without[i], i % 2 ? 64 : 1984);
+        CHECK_EQ(without.back(), 1856);
     }
 }
