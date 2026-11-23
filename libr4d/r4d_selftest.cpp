@@ -37635,12 +37635,22 @@ static void device_phase(const Plugin& pl) {
         if (sel("moe_gemm_iqr")) {
             if (!g_case) std::printf("\nthe grouped MoE GEMM over IQR experts, against the dense IQR GEMM\n");
             static const MoeIqrShape kIqr[] = {
-                /* the (tile, run) grid: a decode step's rows */
+                /* the run-tile grid: a decode step's rows */
                 { "decode gate/up", 4, 16, 128, 64, 4, 3, 768, 512, 2560, 2560, 2, false, 0 },
                 { "decode gate/up, a dropped slot", 4, 16, 128, 64, 4, 3, 768, 512, 2560, 2560, 2, false, 1 },
                 { "decode down", 4, 16, 256, 64, 4, 3, 2560, 2560, 512, 256, 1, true, 0 },
                 { "verify gate/up, runs of several rows", 4, 16, 128, 16, 4, 6, 768, 512, 2560, 2560, 2, false, 2 },
                 { "verify down", 3, 16, 256, 16, 4, 6, 2560, 2560, 512, 256, 1, true, 2 },
+                /* a c8 DFly2 verify's heights over 512 experts: the run tiles' numbering, whose
+                 * blocks are the runs' own tiles and not 16-row tiles of sorted rows */
+                { "verify gate/up, T 16", 4, 16, 128, 512, 4, 4, 512, 256, 1280, 1280, 2, false, 0 },
+                { "verify gate/up, T 128", 4, 16, 128, 512, 4, 32, 512, 256, 1280, 1280, 2, false, 1 },
+                /* a coupled draft's verify step at one row: six tokens of eight slots, where the
+                 * runs of three and more rows now take their own tile */
+                { "verify gate/up, T 48", 4, 16, 128, 512, 8, 6, 512, 256, 1280, 1280, 2, false, 0 },
+                { "verify gate/up, T 480", 4, 16, 128, 512, 4, 120, 512, 256, 1280, 1280, 2, false, 2 },
+                { "verify gate/up, T 768", 4, 16, 128, 512, 4, 192, 512, 256, 1280, 1280, 2, false, 0 },
+                { "verify down, T 768", 4, 16, 128, 512, 4, 192, 256, 128, 512, 512, 1, true, 0 },
                 /* the run map: a prefill chunk's rows */
                 { "prefill gate/up", 4, 16, 128, 32, 4, 64, 768, 512, 2560, 2560, 2, false, 0 },
                 { "prefill gate/up, dropped slots", 3, 16, 128, 32, 4, 64, 768, 512, 2560, 2560, 2, false, 37 },
