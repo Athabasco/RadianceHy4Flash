@@ -3473,7 +3473,9 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   host arena; a device gather (vram, ram) reads and writes them over the link. A prefill chunk's
   `engram_ids` also hashes up to two steps of the following prompt (`RadBatch::n_ahead`) into
   `ahead_ids`, and the gather hands them to libavx's reader thread (the friend's `ahead_ids`), so the
-  next chunk's rows are read while this one computes; `RADIANCE_HY4_ENGRAM_AHEAD=0` turns it off.
+  next chunk's rows are read while this one computes. A device gather ignores them, so the hashing
+  runs only where the gather goes to the host; `RADIANCE_HY4_ENGRAM_AHEAD=0` turns it off and any
+  other value hashes them at every placement (the A/B arm).
   Before this the plugin's device-domain ids made a disk-placed table crash the first prefill.
 - **The pipelined prefill at TP4** (`RADIANCE_HY4_PIPE=1`, off by default). A step wider than a band
   runs as two row pieces: piece 0's junction (the `add`, the `overlap 1` exact all-reduce, the

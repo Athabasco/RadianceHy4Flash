@@ -367,6 +367,53 @@ TEST(every_step_kind_is_lint_clean) {
     CHECK_EQ(count_issued(a.b, c, "sub_i32"), 1);   /* P-04: absorbed on every layer, rebased once */
 }
 
+/* P-05 (audit F15): the ahead ids are hashed only where a gather reads them. A prefill step with
+ * a following prompt hashes them into eg.ids_ahead and hands them to the gather only when the
+ * step's embed_lookup_q dispatches to the host domain (the table on disk, read by libavx's
+ * reader thread); a device gather ignores them, so their hashing is skipped. RADIANCE_HY4_ENGRAM_-
+ * AHEAD=1 hashes them at every placement (the A/B arm), =0 never. */
+TEST(the_ahead_ids_are_hashed_only_for_a_host_gather) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    rad_op gather_h = 0;
+    for (size_t i = 0; i < d.b.ops.size() && !gather_h; ++i)
+        if (d.b.ops[i].op == "embed_lookup_q") gather_h = (rad_op)(i + 1);
+    REQUIRE(gather_h != 0);
+    auto k = kit(d.b, {}, { 12 }, 0);
+    k->b.positions_h = k->pos.data();
+    k->b.n_ahead = 7;
+    const int64_t T = k->b.n_tok;
+    auto run = [&](bool host, const char* env) {
+        if (env) setenv("RADIANCE_HY4_ENGRAM_AHEAD", env, 1);
+        else     unsetenv("RADIANCE_HY4_ENGRAM_AHEAD");
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        if (host) c.host_ops.push_back(gather_h);
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(d.b, &c);
+        const RecIssue* ids = issue_of(d.b, c, "engram_ids");
+        const RecIssue* g = issue_of(d.b, c, "embed_lookup_q");
+        REQUIRE(ids != nullptr);
+        REQUIRE(g != nullptr);
+        const bool forced = env && *env && std::strcmp(env, "0") != 0;
+        const bool off = env && std::strcmp(env, "0") == 0;
+        const bool on = !off && (forced || host);
+        if (on) {
+            CHECK_EQ(ids->opd[0].rows, T + 7);          /* the ahead tokens ride the same read */
+            CHECK_EQ(g->opd.back().kind, (uint8_t)RAD_OPK_BUF);
+            CHECK_EQ(g->opd.back().rows, (int64_t)7);   /* the ahead ids go to the host gather */
+        } else {
+            CHECK_EQ(ids->opd[0].rows, T);              /* the device gather ignores them */
+            CHECK_EQ(g->opd.back().kind, (uint8_t)RAD_OPK_NONE);
+        }
+    };
+    run(false, nullptr);        /* device gather: no ahead hashing */
+    run(true, nullptr);         /* host gather (disk-placed table): the read-ahead runs */
+    run(false, "1");            /* the A/B arm: hashed for a device gather too */
+    run(true, "0");             /* never hashed */
+    unsetenv("RADIANCE_HY4_ENGRAM_AHEAD");
+}
+
 /* WP13.0: a verify step that crosses the dense limit issues other ops (the selection) than one of
  * the same shape just below it, and the core's recording key holds only the rounded context bound.
  * The plugin's pass key must therefore tell the two apart, or the second step of a request that
