@@ -752,6 +752,24 @@ private:
     std::vector<ReqStat> scratch_reqs_;
     int64_t              pub_at_us_ = 0;
 
+    /* The sinks a commit owes a wake: it pushes with the wake deferred (Sink::push) because it
+     * holds mu_ while it pushes, and flush_wakes issues them once the lock is gone, so a woken
+     * HTTP thread does not land on the step lock. Cleared at the start of every commit and sized
+     * at init, so a step allocates nothing. See WakeFlush. */
+    std::vector<void*>   wake_sinks_;
+    bool                 push_deferred(void* sink, int32_t token, const TokenLogprobs* lp,
+                                       int64_t now);
+    void                 push_progress(void* sink, int32_t processed, int32_t total,
+                                       int32_t cached);
+    void                 flush_wakes();
+    /* commit declares one before its lock, so it is destroyed after it: the deferred wakes go
+     * out with mu_ released. */
+    struct WakeFlush {
+        Scheduler& sch;
+        explicit WakeFlush(Scheduler& s) : sch(s) { s.wake_sinks_.clear(); }
+        ~WakeFlush() { sch.flush_wakes(); }
+    };
+
     std::vector<std::unique_ptr<SchedReq>> reqs_;   /* by slot */
     std::vector<int32_t> free_slots_;
     std::vector<int32_t> free_cards_;   /* card indices not held by any sequence; see SchedReq::card */
