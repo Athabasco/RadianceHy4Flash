@@ -157,7 +157,11 @@ int main() {
         std::vector<uint16_t> x((size_t)M * xp);
         std::vector<float> w((size_t)N * K);
         for (auto& v : x) v = f2b(nd(rng));
-        for (auto& v : w) v = nd(rng) * 0.03f;
+        std::vector<uint16_t> packed(w.size());
+        for (size_t i = 0; i < w.size(); ++i) {
+            packed[i] = f2b(nd(rng) * 0.03f);
+            w[i] = b2f(packed[i]);
+        }
         RadTensor t[3]{};
         t[0].data = x.data();
         t[0].dtype = RAD_BF16;
@@ -179,7 +183,7 @@ int main() {
         t[2].shape[1] = N;
         t[2].stride[0] = yp;
         t[2].stride[1] = 1;
-        RadParam p[4]{};
+        RadParam p[5]{};
         p[0] = { "M", RAD_P_INT, M };
         p[1] = { "N", RAD_P_INT, N };
         p[2] = { "K", RAD_P_INT, K };
@@ -203,6 +207,14 @@ int main() {
             }
             for (int c = N; c < yp; ++c) bad += y[(size_t)r * yp + c] != -7.25f;
         }
+        std::vector<float> packed_y(y.size(), -7.25f);
+        t[1].dtype = RAD_BF16;
+        t[1].data = packed.data();
+        p[4] = { "weight_bf16", RAD_P_INT, 1 };
+        a.n_p = 5;
+        t[2].data = packed_y.data();
+        const int packed_rc = r4d_rad_gemm_nt_f32(&a, nullptr);
+        bad += packed_rc != RAD_OK || std::memcmp(y.data(), packed_y.data(), y.size() * sizeof(float));
         if (rc != RAD_OK || bad) {
             std::printf("FAIL %s at M=%d N=%d K=%d against its model (rc %d): %d words\n",
                         emu_last_kernel, M, N, K, rc, bad);
