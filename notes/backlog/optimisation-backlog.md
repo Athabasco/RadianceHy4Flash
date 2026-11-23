@@ -716,6 +716,17 @@ Measured basis: §2.6 (stall probe of this note) and the BetterBench workload ph
 #### S-08 `publish()` rebuilds the request table every busy step under `mu_`; sink wakes inside `mu_`
 - Area scheduler · PL · Gain a few us a step · Conf high · Effort S
 - Change: `scheduler.cpp:4013-4027` (idle publishes throttled to 20 ms, busy ones not), `:1025-1075`; `:3086, 3172, 3232` -> `core/server/sink.cpp:97` (collect sinks, notify after unlock).
+- Done: the item's lane (`9f989727`, `057be7ff`): `local` (TP2, `nospec.yaml`, 210 W read back), three runs an arm and
+  four interleaved, `greedy` byte-identical (the same four sha256 in every run), `c8` 301.5 -> 301.7 tok/s over the
+  blocks and 309.1 -> 312.1 interleaved (255 steps either way, 25.34 -> 25.32 ms a step), `c1` 71.5 / 75.0 both,
+  `stall1` cold arrival 2.261 / 2.262 / 2.236 -> 2.315 / 2.429 / 2.316 s over the blocks and 2.296 / 3.047 ->
+  2.195 / 2.160 interleaved, inside the lane's 0.9 s spread. The item's op, the same throwaway `RAD_INFO` in both
+  binaries (`commit()`'s `mu_` from before the lock to after the unlock, `publish()`'s around its `mu_` section):
+  `commit()` 26.7 -> 6.5 us a step at `c8` and 6.8 -> 1.8 at `c1`, so the step's scheduler critical section 32 -> 11 us
+  at `c8` (4-8x shorter; a second pair, under heavier host load, read 143 -> 17 us, so the ratio holds and the absolute
+  numbers do not); `publish()` 5.1 -> 5.6 us at `c8`, a wash — at `c8`'s 25 ms steps the 20 ms throttle never fires —
+  and 4.33 -> 3.32 at `c1`'s 13.6 ms ones, where it rebuilds the table on 52 % of the steps instead of all of them.
+  21 us of a 25 ms step is 0.08 %, which is why the served rates do not move: the item's gain is measured on the op.
 
 #### S-09 Prefix lookup / publish hash the whole context per attempt under `mu_`
 - Area scheduler/memory · BI · Gain 0.1-0.5 ms a turn at 64K (est.) · Conf medium · Effort S

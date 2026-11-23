@@ -4870,6 +4870,12 @@ sleeping card to do it.
 curl -s -H "Authorization: Bearer $KEY" localhost:8000/diagnostics | jq '.findings'
 ```
 
+Before the report the bring-up logs one `startup: <phase> in <x.x> s (at <y.y> s)` line per phase:
+`declare` (with `arena levels` in it), `plan` (with `host pool pin` in it), `weights` (the one pass
+over the container and the Engram table copies), `kv`, `contexts`, `settle` and `ready`, where `in`
+is the phase's own duration and `at` the seconds since the engine started; the n-gram table and
+container-pass lines give their own duration and take only the `(at <y.y> s)` suffix.
+
 ### 7.2 Messages and what they mean
 
 | Message | Meaning | Action |

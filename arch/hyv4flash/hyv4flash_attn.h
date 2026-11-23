@@ -67,9 +67,11 @@ struct AttnWire {
     rad_buf gate = 0;     /* [T, H*v] attn_gate's logits */
     rad_buf ag = 0;       /* [T, H*v] gated */
     rad_buf o = 0;        /* [T, n] o_proj's output */
-    rad_buf cu_p = 0;     /* [max_seqs + 1] i32: the prefill sequences' bounds rebased to 0 */
+    rad_buf cu_p = 0;     /* [max_seqs + 1] i32: the prefill sequences' bounds rebased to 0; the
+                             model's one buffer (P-04), written once a step by Model::op_rebase,
+                             read by every layer of both geometries */
     int declare(RadBuilder* b, Names& nm, const Shape& s, const AttnGeom& a, int64_t T,
-                int64_t seqs, const char* tag) {
+                rad_buf cu_prefill, const char* tag) {
         auto bf = [&](const char* n, std::initializer_list<int64_t> shape) {
             return decl_b(b, nm.f("%s.%s", tag, n), RAD_BF16, shape);
         };
@@ -89,7 +91,7 @@ struct AttnWire {
         gate = bf("attn_gate", { T, a.v_width() });
         ag = bf("attn_gated", { T, a.v_width() });
         o = bf("o_proj", { T, s.n_embd });
-        cu_p = decl_b(b, nm.f("%s.cu_prefill", tag), RAD_I32, { seqs + 1 });
+        cu_p = cu_prefill;
         return qa && q_nope && q_rope && row && q_lat && lat && q_full && latc && kvb && k && v && ao &&
                        gate && ag && o && cu_p
                    ? RAD_OK
@@ -124,7 +126,7 @@ struct Attn {
      * [0, DT)) with `stable 1`, whose bytes do not depend on the step's other rows or streams, and
      * prefill rows ([DT, T)) with `stable 0`, the fast form. */
     rad_op op_absorb = 0, op_paged = 0, op_paged_pf = 0, op_sel = 0, op_sel_pf = 0, op_expand = 0;
-    rad_op op_lat_copy = 0, op_kvb = 0, op_split = 0, op_qn_copy = 0, op_qr_copy = 0, op_dense = 0, op_rebase = 0;
+    rad_op op_lat_copy = 0, op_kvb = 0, op_split = 0, op_qn_copy = 0, op_qr_copy = 0, op_dense = 0;
     rad_op op_gate = 0, op_post_norm = 0, op_ar = 0;
     rad_op op_expand_gate = 0;   /* the expansion with the gate folded in, where a library has it */
     /* G-3c: the expansion, the gate and the rotated int8 codes attn_output reads, in one launch, for
@@ -374,9 +376,6 @@ struct Attn {
                       { kv_b }, { in_ }, { out_ });
         };
         op_absorb = proj("absorb", w.q_nope, w.q_lat);
-        /* The prefill sequences' bounds rebased to 0: the absorbed prefill instance's and the
-         * non-absorbed attention's. */
-        op_rebase = mk(b, "sub_i32", { RAD_RANGE("M", 1, g.max_seqs + 1) }, {}, {}, { w.cu_p });
         /* Decode-class rows: one a stream and its speculation rows. */
         const int64_t DTmax = std::max<int64_t>(1, std::min<int64_t>(T, g.max_logit_rows));
         auto paged_op = [&](int64_t rows, int stable, std::initializer_list<rad_buf> in) {
@@ -443,7 +442,6 @@ struct Attn {
         HY4_NEED(op_lat_copy && op_kvb, "cast / gemm_nt");
         HY4_NEED(op_split, "mla_kv_split");
         HY4_NEED(op_qn_copy && op_qr_copy, "cast");
-        HY4_NEED(op_rebase, "sub_i32");
         HY4_NEED(op_dense, "attn_kv_sink");
 
         op_gate = mk(b, "gate_mul",
@@ -554,7 +552,8 @@ struct Attn {
 
     /* The absorbed attention over the paged cache: the decode sequences [0, D) (rows [0, DT))
      * with the stable instance, then, when `prefill`, the prefill sequences [D, S) (rows
-     * [DT, T)) with the fast one over their bounds rebased to 0. */
+     * [DT, T)) with the fast one over their bounds rebased to 0 (`w.cu_p`, rebased once a step
+     * by the trunk: Model::op_rebase). */
     void paged(RadCtx* c, const RadBatch* batch, const StepPlan& p, bool prefill) const {
         const auto* kb = kv_batch(batch, kv);
         const int64_t pitch = kb->block_table_pitch, D = p.D, DT = p.DT, L = s.kv_lora,
@@ -566,9 +565,6 @@ struct Attn {
                         RAD_W(sinks), brows(w.lat, DT));
         const int64_t M = p.T - DT;
         if (!prefill || p.P <= 0 || M <= 0) return;
-        const int32_t* cu = batch->cu_seqlens + D;
-        RAD_ISSUE_N(c, op_rebase, p.P + 1, praw(cu, RAD_I32, p.P + 1), praw(cu, RAD_I32, 1),
-                    brows(w.cu_p, p.P + 1));
         RAD_ISSUE_N(c, op_paged_pf, M, brow_slice(w.q_lat, DT, M, H * L),
                     brow_slice(w.q_rope, DT, M, H * R), kv_cache(kv, layer),
                     praw2(kb->block_table + D * pitch, RAD_I32, p.P, pitch),
@@ -595,6 +591,7 @@ struct Attn {
     void dense(RadCtx* c, const RadBatch* batch, const StepPlan& p) const {
         const int64_t T = p.T, DT = p.DT, M = T - DT, L = s.kv_lora, R = a.qk_rope,
                       H = a.heads, N = a.qk_nope, Q = a.qk();
+        (void)batch;
         RAD_ISSUE_N(c, op_lat_copy, M, bcol_at(w.row, DT, L + R, 0, L, M),
                     brow_slice(w.latc, DT, M, L));
         RAD_ISSUE_N(c, op_kvb, M, brow_slice(w.latc, DT, M, L), RAD_W(kv_b),
@@ -608,9 +605,6 @@ struct Attn {
         qr.cols = R;
         RAD_ISSUE_N(c, op_qn_copy, M, brow_slice(w.q_nope, DT, M, H * N), qn);
         RAD_ISSUE_N(c, op_qr_copy, M, brow_slice(w.q_rope, DT, M, H * R), qr);
-        const int32_t* cu = batch->cu_seqlens + p.D;
-        RAD_ISSUE_N(c, op_rebase, p.P + 1, praw(cu, RAD_I32, p.P + 1), praw(cu, RAD_I32, 1),
-                    brows(w.cu_p, p.P + 1));
         RAD_ISSUE_N(c, op_dense, M, brow_slice(w.q_full, DT, M, H * Q),
                     brow_slice(w.k, DT, M, H * Q), brow_slice(w.v, DT, M, H * a.v),
                     brows(w.cu_p, p.P + 1), brows(w.cu_p, p.P + 1), RAD_W(sinks),

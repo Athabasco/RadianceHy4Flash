@@ -355,6 +355,8 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     completed_.reserve((size_t)cfg.max_seqs);
     committed_.reserve((size_t)cfg.max_seqs);
     by_id_.reserve((size_t)cfg.max_seqs * 2);
+    /* At most one deferred wake per stream in a step, and a step has at most max_seqs of them. */
+    wake_sinks_.reserve((size_t)cfg.max_seqs);
     hit_blocks_.resize(prog.kv_groups.size());
     for (auto& v : hit_blocks_) v.reserve(64);
     return RAD_OK;
@@ -3639,11 +3641,34 @@ void Scheduler::promote_next() {
 }
 
 /* ------------------------------------------------------------------ commit */
+/* commit's token pushes: the sink takes the wake it owes the stream, and commit issues it from
+ * flush_wakes, which WakeFlush runs once it has released mu_ (item S-08). */
+bool Scheduler::push_deferred(void* sink, int32_t token, const TokenLogprobs* lp, int64_t now) {
+    bool owed = false;
+    const bool ok = server::sink_push_deferred(sink, token, lp, now, &owed);
+    if (owed) wake_sinks_.push_back(sink);
+    return ok;
+}
+
+void Scheduler::push_progress(void* sink, int32_t processed, int32_t total, int32_t cached) {
+    bool owed = false;
+    server::sink_prompt_progress_deferred(sink, processed, total, cached, &owed);
+    if (owed) wake_sinks_.push_back(sink);
+}
+
+void Scheduler::flush_wakes() {
+    for (void* sink : wake_sinks_) server::sink_wake(sink);
+    wake_sinks_.clear();
+}
+
 /* This may run while the card still runs the drafter's passes behind the step (Engine::StepOut::
  * early). It therefore issues no device work and allocates nothing: what it releases (KV blocks,
  * StepSlot cards, prefix-cache publications) may still be read by those passes, and is reused only
  * by work the engine issues after waiting for step_end_. */
 int Scheduler::commit(StepResult& res) {
+    /* The wakes its pushes owe go out once mu_ is gone: a stream woken while the step lock is
+     * still held would only bounce off that lock on its own core (item S-08). */
+    WakeFlush wakes(*this);
     std::lock_guard<std::mutex> lk(mu_);
     if (!step_open_) return RAD_E_STATE;
     /* The step's tokens are pushed at one time (Sink::push). */
@@ -3719,8 +3744,7 @@ int Scheduler::commit(StepResult& res) {
                  * not at this sequence's next ensure(), which may be steps away. */
                 kv_->trim_window(r.id, r.n_computed);
                 step_prefill_tok_ += e.n_tokens;
-                server::sink_prompt_progress(r.sink, r.n_computed, (int32_t)r.prompt.size(),
-                                             r.n_cached);
+                push_progress(r.sink, r.n_computed, (int32_t)r.prompt.size(), r.n_cached);
                 /* Once, when the prompt is fully placed: the usage block's admission accounting.
                  * `n_cached` is what the prefix cache supplied. */
                 if (r.n_computed >= (int64_t)r.prompt.size()) {
@@ -3740,7 +3764,7 @@ int Scheduler::commit(StepResult& res) {
                         res.lp && res.first_row[i] >= 0 && r.sp.n_probs >= 0
                             ? &res.lp[res.first_row[i]] : nullptr;
                     if (lp && lp->token < 0) lp_failed = true;
-                    else overflowed = !server::sink_push(r.sink, res.token[i], lp, pushed_ns);
+                    else overflowed = !push_deferred(r.sink, res.token[i], lp, pushed_ns);
                     /* The conv window absorbed this chunk; the cursor advances one committed
                      * position, as in decode. */
                     s.conv_cursor = (int32_t)((s.conv_cursor + 1) % (W ? W : 1));
@@ -3803,7 +3827,7 @@ int Scheduler::commit(StepResult& res) {
                     res.lp && res.first_row[i] >= 0 && r.sp.n_probs >= 0
                         ? &res.lp[res.first_row[i] + j] : nullptr;
                 if (lp_failed || (lp && lp->token < 0)) { lp_failed = true; return; }
-                if (!server::sink_push(r.sink, t, lp, pushed_ns)) overflowed = true;
+                if (!push_deferred(r.sink, t, lp, pushed_ns)) overflowed = true;
             };
             /* On a tree step the accepted drafts are the path's nodes, in path order. */
             const int32_t* path = res.path ? res.path + (size_t)i * RAD_SCHED_MAX_SPEC : nullptr;
@@ -4592,17 +4616,28 @@ SchedMetrics Scheduler::metrics() const {
 void Scheduler::publish(bool idle) {
     const int64_t now = mono_us();
     if (idle && now - pub_at_us_ < 20000) return;
+    /* The request table is the expensive half of the copy: a walk of reqs_ with a block-table
+     * lookup per group per request, a prefix-cache probe and a sort, under mu_. A busy step used
+     * to rebuild it every step, a few us at 8-16 requests (audit D-17), for observers that poll
+     * at dashboard rates: it is rebuilt at most every 20 ms now, while the metrics copy beside it,
+     * which is a handful of counters, still goes with every step. So /metrics' counters and the
+     * delta a phase's measurement takes never lose a step to a skipped publication. */
+    const bool table = now - pub_tbl_us_ >= 20000;
     {
         std::lock_guard<std::mutex> lk(mu_);
         scratch_m_ = metrics_locked();
-        scratch_reqs_.resize(reqs_.size());
-        scratch_reqs_.resize((size_t)requests_locked(scratch_reqs_.data(), (int)scratch_reqs_.size()));
+        if (table) {
+            scratch_reqs_.resize(reqs_.size());
+            scratch_reqs_.resize(
+                (size_t)requests_locked(scratch_reqs_.data(), (int)scratch_reqs_.size()));
+        }
     }
     if (!pub_mu_.try_lock()) return;
     pub_m_ = scratch_m_;
-    pub_reqs_.swap(scratch_reqs_);
+    if (table) pub_reqs_.swap(scratch_reqs_);
     pub_mu_.unlock();
     pub_at_us_ = now;
+    if (table) pub_tbl_us_ = now;
 }
 
 SchedMetrics Scheduler::observed_metrics() const {
