@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """probe.py <port> <out.json> <phases,comma>: sampled (T 0.9, seeded) phases for the general-levers note.
-phases: c1, c8, think (c1, reasoning high), c4, pf6 (prefill ~6K), pf20 (prefill ~20K), c1s (64 tok), c8s (48 tok)."""
+phases: c1, c8, think (c1, reasoning high), c4, pf6 (prefill ~6.7K tokens: 22,000 characters of tree source),
+pf20 (prefill ~24.9K: 72,000), pf2 (~2.4K: 7,400), stall1 / stall4 (a ~5.7K arrival while 1 / 4 decoders run),
+tailN (a prompt of ~N characters), c1s (64 tok), c8s (48 tok). The token counts are the ones the backlog's own
+runs measured on these phases, so a lane's ttft compares with the numbers in notes/backlog/."""
 import json, sys, threading, time, urllib.request, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from prompts import CODE_PROMPTS as P, SRC, long_prompt

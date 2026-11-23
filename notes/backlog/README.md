@@ -9,7 +9,7 @@ container `hy4-flash-iqr-v4-u3.rad` (keptn/hy4-flash-iqr-v4).
 | `audit/{A..E}-*.md`, `audit/COMMON.md` | the five read-only code audits the items cite: op lists, kernel fact sheets, thread and wake maps, longer derivations |
 | `refs/kernels/*.md`, `refs/notes/*.md` | the earlier notes the backlog cites |
 | `CARDS.md` | how cards built from the backlog work: lanes, merge bar, lossy items, working from outside |
-| `../../scripts/backlog/` | the measuring tools and configs of §2: `run.sh`, `probe.py`, `bench.py`, `agg.py`, `layer.py`, `profdiff.py`, `profagg.py`, `attr.py`, `prompts.py` and the configs, with `lane.sh`, `lanes.sh`, `lane-cfg.py` and `lane-pair.sh` that make them lane-aware (§1.1) |
+| `../../scripts/backlog/` | the measuring tools and configs of §2: `run.sh`, `probe.py`, `bench.py`, `agg.py`, `layer.py`, `profdiff.py`, `profagg.py`, `attr.py`, `prompts.py`, `demangle.py` and the configs, with `lane.sh`, `lanes.sh`, `lane-cfg.py` and `lane-pair.sh` that make them lane-aware (§1.1) |
 
 How paths in the backlog map onto this directory:
 
