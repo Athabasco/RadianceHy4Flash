@@ -18,6 +18,7 @@
 #include <functional>
 #include <new>
 #include <string>
+#include <thread>
 #include <unistd.h>
 
 using namespace rad;
@@ -1549,13 +1550,23 @@ TEST(observers_read_what_the_engine_thread_published) {
         CHECK_EQ(seen[(size_t)i].prompt_tokens, live[(size_t)i].prompt_tokens);
     }
 
-    /* An idle publication inside 20 ms of the last one is skipped; a step's never is. */
+    /* An idle publication inside 20 ms of the last one is skipped, as it always was. A step's
+     * publication carries its metrics and leaves the request table alone: the table is a walk of
+     * the whole queue for observers that poll at dashboard rates, so it is rebuilt at most every
+     * 20 ms, while the counters a scraper takes a delta of go with every step. */
     f.submit(160, 8);
     f.sch.publish(/*idle=*/true);
     CHECK_EQ(f.sch.observed_metrics().queue_depth, 1);
     f.sch.publish(/*idle=*/false);
     CHECK_EQ(f.sch.observed_metrics().queue_depth, 2);
+    CHECK_EQ(f.sch.observed_requests(seen.data(), 8), 3);   /* still the last table */
+    /* Wait out the table's interval: the next publication that finds it elapsed rebuilds it. */
+    for (int i = 0; i < 400 && f.sch.observed_requests(seen.data(), 8) != 4; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        f.sch.publish(/*idle=*/false);
+    }
     CHECK_EQ(f.sch.observed_requests(seen.data(), 8), 4);
+    CHECK_EQ(f.sch.observed_metrics().queue_depth, 2);
 }
 
 /* The sequences of one API request are added under one lock hold, each accepted or refused on its
@@ -7255,6 +7266,41 @@ TEST(shutdown_fails_each_sink_with_the_status_that_stopped_the_engine) {
         CHECK_EQ(s->status(), (int)RAD_E_UNSUPPORTED);
         CHECK_EQ(std::string(s->why() ? s->why() : ""), std::string("the engine stopped"));
     }
+}
+
+/* A step's tokens reach a sleeping stream without the step lock held: commit's pushes take the
+ * wake and commit issues it once mu_ is gone, so the woken HTTP thread does not land on the lock
+ * the step holds (item S-08). The consumer sleeps for five seconds, so only the step's own wake
+ * can return it. */
+TEST(a_step_wakes_its_streams_once_it_has_released_the_step_lock) {
+    server::Sink sink;
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+
+    /* The prompt's step emits its first token too; it is read out so that the stream is empty
+     * when the consumer goes to sleep below, which is what makes the next push owe a wake. */
+    CHECK(f.submit_to(&sink, /*n_prompt=*/8, /*max_tokens=*/8) != 0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    server::SinkToken drop[8];
+    CHECK_EQ(sink.read(drop, 8), 1);
+
+    std::atomic<bool> woke{false};
+    std::thread consumer([&] { woke.store(sink.wait(5000), std::memory_order_release); });
+    for (int i = 0; i < 500 && !sink.consumer_asleep(); ++i)
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    CHECK(sink.consumer_asleep());
+
+    CHECK(f.sch.step() != nullptr);         /* a decode step: it emits one token */
+    const auto t0 = std::chrono::steady_clock::now();
+    f.commit_plain();
+    consumer.join();
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(woke.load(std::memory_order_acquire));
+    CHECK(ms < 1000.0);                     /* the step's wake, not the consumer's 5 s timeout */
+    CHECK_EQ(sink.n_produced(), 2);
 }
 
 /* A request's own draft counts and admission time reach its sink, so a response can report them
