@@ -2047,6 +2047,11 @@ TEST(preemption_takes_the_lowest_priority_victim_and_requeues_it_to_the_front) {
 
     CHECK_EQ(f.sch.metrics().preemptions, 1);
     CHECK_EQ(f.sch.metrics().preempted_waiting, 1);
+    /* The publish was handed A's kept chain (SchedReq::chain), the one its admission hashed: a
+     * recompute's prompt costs the same blocks twice otherwise. */
+    REQUIRE(f.pc.published.size() == 1);
+    CHECK_EQ(f.pc.published[0].seq, a);
+    CHECK_EQ(f.pc.published[0].chain_blocks, 10);   /* 160 tokens in 16-token blocks */
 }
 
 /* ================================================================== the step batch */
@@ -6626,6 +6631,13 @@ TEST(a_failed_admission_gives_back_its_checkpoint_hit) {
 
     REQUIRE(f.sch.step() != nullptr);
     CHECK_EQ(f.pc.lookups, 3);
+    /* The second attempt was handed the chain the first one took (SchedReq::chain): a request
+     * that waits for room does not hash its prompt again on every round. r's lookup came first,
+     * with nothing kept yet. */
+    REQUIRE(f.pc.chain_blocks.size() == 3);
+    CHECK_EQ(f.pc.chain_blocks[0], 0);              /* r, its first and only lookup */
+    CHECK_EQ(f.pc.chain_blocks[1], 0);              /* a's first attempt */
+    CHECK_EQ(f.pc.chain_blocks[2], 37);             /* a's retry: 600 tokens in 16-token blocks */
     CHECK_EQ(f.sch.find(a)->n_computed, 256);
     CHECK_EQ(f.sch.plan().e[0].ckpt_restore, 5);
     SchedMetrics m = f.sch.metrics();
