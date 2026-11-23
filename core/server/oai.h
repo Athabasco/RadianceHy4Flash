@@ -142,6 +142,12 @@ struct OaiRequest {
     std::string last_user;
     std::string peer;             /* the handler sets it from the transport; "" in-process */
     int64_t     t_received_ns = -1;   /* HttpRequest::t_received_ns, for timings' ttft and total */
+    /* Request prep phase times, steady_clock ns: this request's own share of parsing its body,
+     * rendering the chat template, tokenising the prompt, compiling its grammar and being
+     * submitted to the scheduler. -1 where the path has no such phase (/v1/completions renders
+     * no template). Set by the request parsers and serve(); logged by record(). */
+    int64_t     prep_parse_ns = -1, prep_render_ns = -1, prep_encode_ns = -1,
+                prep_grammar_ns = -1, prep_submit_ns = -1;
     bool parse_tools = false;
     /* The reply parser this request's render produced. Per request, not per server: it binds the
      * model's format to the tools this call sent, so concurrent requests may need different
