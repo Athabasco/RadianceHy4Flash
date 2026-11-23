@@ -335,6 +335,13 @@ struct Ffn {
                                         nm.f("blk.%d.ffn_down_shexp", l),
                                         nm.ckpt("%s.shared_experts", mp), s.n_ff_shared_r, xf,
                                         w.sout, w.sgu, w.sff, &lat_in, in_codes));
+            /* K-01: the two Lins whose activation codes are one -- latent_in and the shared arm's
+             * gate_up -- in one launch, both products written where their own launches write them.
+             * Each part's blocks are its own launch's, so the bytes are the two launches'. */
+            if (dual_fuse_on()) {
+                const int rc = lat_in.declare_dual(b, shared.gate_up, xf, w.lat.x, w.sgu, T);
+                RAD_ARCH_TRY(rc);
+            }
             op_join = mk(b, "add",
                          { RAD_RANGE("M", 1, T), RAD_INT("n", s.n_embd), RAD_STR("dtype", "bf16") },
                          {}, { w.routed, w.sout }, { w.routed });
