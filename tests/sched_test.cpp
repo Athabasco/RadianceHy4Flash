@@ -2697,6 +2697,81 @@ TEST(no_adapters_no_slot_array) {
     CHECK_EQ(on_bytes - off_bytes, (f.cfg.max_tok * 4 + 255) / 256 * 256);
 }
 
+TEST(prefill_tail_maps_mixed_outputs_and_anchors_to_original_rows) {
+    StepPlan plan;
+    plan.phase = RAD_PHASE_MIXED;
+    plan.n_seq_decode = 1;
+    plan.n_tok_decode = 2;
+    int32_t cu[] = {0, 2, 6, 9};
+    int32_t pos[] = {40, 41, 0, 1, 2, 3, 12, 13, 14};
+    int32_t ids[] = {0, 1, 8, 8};
+    int32_t rope[27];
+    for (int i = 0; i < 27; ++i) rope[i] = 100 + i;
+    DeriveInput in;
+    in.plan = &plan;
+    in.cu_seqlens = cu;
+    in.positions = pos;
+    in.out_ids = ids;
+    in.n_out = 4;
+    in.n_tok = 9;
+    in.n_seq = 3;
+    in.rope_pos = rope;
+    for (bool anchors : {false, true}) {
+        const auto* fn = derive_row(derive_index(anchors ? "prefill_tail_anchors" : "prefill_tail"));
+        REQUIRE(fn);
+        int32_t out[48] = {};
+        int64_t used = 0;
+        CHECK_OK(fn->fn(in, out, 48, &used));
+        const std::vector<int> expected = anchors ? std::vector<int>{0, 1, 5, 8}
+                                                  : std::vector<int>{0, 1, 8};
+        const int m = (int)expected.size();
+        CHECK_EQ(used, 9 + 5 * m);
+        CHECK_EQ(out[0], m);
+        CHECK_EQ(out[1], 2);
+        CHECK_EQ(out[4], anchors ? 3 : 2);
+        CHECK_EQ(out[5], m);
+        CHECK_EQ(out[6], 0);
+        CHECK_EQ(out[8], m - 2);
+        for (int i = 0; i < m; ++i) {
+            CHECK_EQ(out[9 + i], expected[i]);
+            CHECK_EQ(out[9 + m + i], pos[expected[i]]);
+            for (int j = 0; j < 3; ++j)
+                CHECK_EQ(out[9 + (2 + j) * m + i], rope[j * 9 + expected[i]]);
+        }
+    }
+    in.n_out = 0;
+    int32_t empty = -1;
+    int64_t used = 0;
+    CHECK_OK(derive_row(derive_index("prefill_tail"))->fn(in, &empty, 1, &used));
+    CHECK_EQ(used, 1);
+    CHECK_EQ(empty, 0);
+}
+
+TEST(prefill_tail_translates_an_interior_checkpoint_into_the_suffix) {
+    StepPlan plan;
+    plan.phase = RAD_PHASE_PREFILL;
+    int32_t cu[] = {0, 8};
+    int32_t pos[] = {20, 21, 22, 23, 24, 25, 26, 27};
+    int32_t ids[] = {7, 4, 5, 6, 7};  /* sampling plus a scored suffix */
+    DeriveInput in;
+    in.plan = &plan;
+    in.cu_seqlens = cu;
+    in.positions = pos;
+    in.out_ids = ids;
+    in.n_out = 5;
+    in.n_tok = 8;
+    in.n_seq = 1;
+    in.ckpt_cut = 6;
+    int32_t out[24] = {};
+    int64_t n = 0;
+    CHECK_OK(derive_row(derive_index("prefill_tail"))->fn(in, out, 24, &n));
+    CHECK_EQ(out[0], 4);
+    CHECK_EQ(n, 17);
+    CHECK_EQ(out[n - 3], 0);
+    CHECK_EQ(out[n - 2], 2);
+    CHECK_EQ(out[n - 1], 4);
+}
+
 TEST(state_chunk_bounds_split_a_long_prefill_at_absolute_multiples) {
     DeriveInput in;
     StepPlan plan;

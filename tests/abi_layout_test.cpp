@@ -58,8 +58,8 @@ std::vector<Row> cpp_rows() {
     };
 }
 
-/* The layout at RAD_ABI_VERSION 43 / RAD_FORMAT_VER 2 (see the file header). */
-constexpr uint32_t kTableAbi = 43, kTableFormat = 2;
+/* The layout at RAD_ABI_VERSION 44 / RAD_FORMAT_VER 2 (see the file header). */
+constexpr uint32_t kTableAbi = 44, kTableFormat = 2;
 const AbiRow kTable[] = {
 #include "abi_layout_table.h"
 };
@@ -232,7 +232,8 @@ TEST(the_checkpoint_cut_fields_are_appended_past_the_old_ends) {
     CHECK_EQ(sizeof(RadArchProbe), (size_t)128);
     CHECK_EQ(offsetof(RadBatch, ckpt_cut), (size_t)480);
     CHECK_EQ(offsetof(RadBatch, ckpt_cu), (size_t)488);
-    CHECK_EQ(sizeof(RadBatch), (size_t)496);
+    CHECK_EQ(offsetof(RadBatch, prefill_tail_h), (size_t)496);
+    CHECK_EQ(sizeof(RadBatch), (size_t)504);
 }
 
 RAD_TEST_MAIN()

@@ -367,6 +367,79 @@ TEST(every_step_kind_is_lint_clean) {
     CHECK_EQ(count_issued(a.b, c, "sub_i32"), 1);   /* P-04: absorbed on every layer, rebased once */
 }
 
+TEST(last_layer_keeps_cache_writers_at_chunk_height_and_queries_at_output_height) {
+    RadBuilder b;
+    bf16_encs(&b);
+    b.encs.push_back({ "attn_q_a.", enc_i8(true) });
+    b.encs.push_back({ "attn_kv_a.", enc_i8(true) });
+    auto mk = mini_meta();
+    mk.set("kv_lora_rank", "56");  /* kv_a's 64 output channels admit an int8 weight */
+    auto ctx = build_ctx();
+    G3Env env;
+    REQUIRE_EQ(hyv4flash::declare(&b, mk.meta(), &ctx), RAD_OK);
+    const auto& last = hyv4flash::models[0]->layers.back();
+    REQUIRE(last.attn.kv_a.fed);
+    REQUIRE(last.attn.q_a.op_q);
+    for (int outputs : {0, 1}) {
+        auto k = kit(b, {}, {12}, 10);
+        k->b.positions_h = k->pos.data();
+        k->b.n_out = outputs;
+        int32_t tail[] = {outputs, 0, 0, outputs, 0, outputs, 11, 21};
+        k->b.prefill_tail_h = tail;
+        RadCtx c{ .b = &b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK_LINT(b, &c);
+        CHECK(c.step_fail.empty());
+        auto height = [&](rad_op op) {
+            int64_t total = 0;
+            for (const auto& issue : c.issues)
+                if (issue.op == op) total += issue.n;
+            return total;
+        };
+        CHECK_EQ(height(last.attn.q_a.op_q), 12);
+        CHECK_EQ(height(last.attn.kv_a.op), 12);
+        CHECK_EQ(height(last.ix.key.op), 12);
+        CHECK_EQ(height(last.ix.op_work), 12);
+        CHECK_EQ(height(last.ix.op_tail), 12);
+        CHECK_EQ(height(last.attn.q_a.op), outputs);
+        CHECK_EQ(height(last.ix.op_select), outputs);
+        CHECK_EQ(height(last.attn.op_sel_pf), outputs);
+        CHECK_EQ(height(last.attn.out.op), outputs);
+        CHECK_EQ(height(hyv4flash::models[0]->op_head), outputs);
+    }
+}
+
+TEST(compact_dense_prefill_keeps_full_keys_and_restores_gather_indices) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const auto& m = *hyv4flash::models[0];
+    const auto& last = m.layers.back();
+    auto k = kit(d.b, {}, {6, 4});
+    k->b.positions_h = k->pos.data();
+    int32_t tail[] = {2, 0, 0, 1, 2, 0, 1, 2, 5, 9, 5, 3};
+    k->b.prefill_tail_h = tail;
+    RadCtx c{ .b = &d.b, .batch = &k->b };
+    hyv4flash::step(&c, &k->b);
+    CHECK_LINT(d.b, &c);
+    CHECK(c.step_fail.empty());
+    int dense = 0;
+    std::vector<int64_t> restored;
+    for (const auto& issue : c.issues) {
+        if (issue.op == last.attn.op_dense) {
+            ++dense;
+            CHECK_EQ(issue.n, 2);
+            CHECK_EQ(issue.opd[0].rows, 2);
+            CHECK_EQ(issue.opd[1].rows, 10);
+            CHECK_EQ(issue.opd[2].rows, 10);
+            CHECK(issue.opd[3].kind != issue.opd[4].kind);
+        }
+        if (issue.op == m.unpack_hidden)
+            restored.push_back(issue.opd[1].offset / m.s.n_embd);
+    }
+    CHECK_EQ(dense, 1);
+    CHECK((restored == std::vector<int64_t>{9, 5}));
+}
+
 /* WP13.0: a verify step that crosses the dense limit issues other ops (the selection) than one of
  * the same shape just below it, and the core's recording key holds only the rounded context bound.
  * The plugin's pass key must therefore tell the two apart, or the second step of a request that

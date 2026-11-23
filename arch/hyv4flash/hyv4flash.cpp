@@ -182,6 +182,8 @@ struct Model {
      * over the ranks (exactly: one non-zero term) before they replace the lookup's. */
     rad_buf mm_rows = 0;
     rad_op op_mm_scatter = 0, op_mm_copy = 0, op_mm_reduce = 0;
+    rad_buf tail_meta = 0;
+    rad_op pack_h = 0, pack_post = 0, unpack_hidden = 0;
     Dfly df{};       /* DFly2, the block drafter (hyv4flash_dfly.h) */
     int arm = kArmBf16;   /* the routed arms' activation codes (Ffn::arm) */
     /* The pipelined prefill (docs/TP4.md, "the pipelined prefill"): a chunk wider than two shape
@@ -828,6 +830,11 @@ static int trunk_layer(RadBuilder* b, Model& m, int l, MoeFP8::Src* msrc) {
     }
     RAD_ARCH_TRY(lay.attn.declare_core(b, nm, ap, lay.sliding ? 0 : m.iw.sel,
                                        lay.sliding ? 0 : m.iw.len, lay.sliding ? 0 : m.iw.nsel));
+    if (l + 1 == s.n_layer) {
+        m.pack_h = decl_copy(b, T, s.hc * E, RAD_BF16, m.tr.h, m.tr.h);
+        m.pack_post = decl_copy(b, T, s.hc, RAD_F32, m.tr.post, m.tr.post);
+        HY4_NEED(m.pack_h && m.pack_post, "cast (last layer streams and post)");
+    }
     RAD_ARCH_TRY(lay.hc_attn.declare_post(b, s, T, m.tr.h, m.tr.post, m.tr.y));
     RAD_ARCH_TRY(lay.t_mid.declare(b, nm, T, "resid_mid", l, RAD_BF16, s.hc * E, m.tr.h));
 
@@ -1111,6 +1118,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 if (v) rad_buf_concurrent(b, v);
     }
     RAD_ARCH_TRY(m.t_final.declare(b, nm, T, "final_hidden", -1, RAD_BF16, E, m.final_hidden));
+    m.unpack_hidden = decl_copy(b, T, E, RAD_BF16, m.final_hidden, m.final_hidden);
+    HY4_NEED(m.unpack_hidden, "cast (last layer hidden)");
     m.op_gather = mk(b, "gather_rows",
                      { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", E),
                        RAD_STR("dtype", "bf16") },
@@ -1151,6 +1160,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (why_not) rad_note(b, "the vision tower is declared and not served: %s", why_not);
     }
 
+    if (!taps_on() && !m.calib.on()) {
+        RadBufDecl d{};
+        d.dtype = RAD_I32;
+        d.rank = 1;
+        d.shape[0] = 7 + 2 * g.max_seqs + (s.mrope ? 5 : 2) * g.max_logit_rows;
+        d.kind = RAD_BUF_DERIVED;
+        d.domain = RAD_DOMAIN_DEVICE;
+        d.derive = m.df.served ? "prefill_tail_anchors" : "prefill_tail";
+        m.tail_meta = rad_decl_buffer(b, nm.f("prefill_tail"), &d);
+        if (!m.tail_meta) return RAD_E_INVAL;
+    }
     int64_t n_sparse = 0, n_moe = 0;
     for (int64_t l = 0; l < s.n_layer; ++l) {
         n_sparse += !s.is_sliding[(size_t)l];
@@ -1217,6 +1237,21 @@ static StepPlan plan(const Model& m, const RadBatch* batch) {
     return p;
 }
 
+/* In-place row moves issue disjoint slices: kernels copy in parallel within a launch.
+ * Pack low to high, expand high to low, including when two spans overlap each other. */
+static void move_rows(RadCtx* c, rad_op op, rad_buf buf, int64_t width, int64_t src,
+                      int64_t dst, int64_t n) {
+    if (src == dst) return;
+    const int64_t gap = std::abs(dst - src);
+    for (int64_t done = 0; done < n;) {
+        const int64_t count = std::min(n - done, gap);
+        const int64_t at = dst < src ? done : n - done - count;
+        RAD_ISSUE_N(c, op, count, brow_slice(buf, src + at, count, width),
+                    brow_slice(buf, dst + at, count, width));
+        done += count;
+    }
+}
+
 static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = *models[rad_slot(c)];
     const auto& s = m.s;
@@ -1276,6 +1311,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
 
     /* A junction (WP16.2) runs the chain from a block's reduction to the next block's input norm
      * in one launch; the taps behind it read what the chain would have left. */
+    RadBatch compact{};
+    const RadBatch* queries = batch;
+    QueryRows rows{nullptr, T};
     bool entered = false;   /* the previous junction ran this layer's connection and input norm */
     for (size_t i = 0; i < m.layers.size(); ++i) {
         const Layer& l = m.layers[i];
@@ -1289,35 +1327,82 @@ static void step(RadCtx* c, const RadBatch* batch) {
         l.t_attn_post.step(c, brows(m.tr.post, T), T);
         if (!entered)
             RAD_ISSUE_N(c, l.op_attn_norm, T, brows(m.tr.x, T), RAD_W(l.attn_gain), brows(m.tr.xn, T));
-        if (!l.attn.front(c, batch)) return;
+        StepPlan lp = p;
+        const int32_t* meta = batch->prefill_tail_h;
+        if (i + 1 == m.layers.size() && m.tail_meta && meta && p.P && meta[0] < T) {
+            lp.T = meta[0];
+            rows.n = lp.T;
+            if (rows.n) {
+                lp.DT = meta[1];
+                const auto* device = static_cast<const int32_t*>(rad_buf_ptr(c, m.tail_meta));
+                const int64_t first_id = 4 + p.S + p.P;
+                rows.ids = meta + first_id;
+                compact = *batch;
+                compact.n_tok = lp.T;
+                compact.n_tok_decode = lp.DT;
+                compact.cu_seqlens = device + 2;
+                rows.pf_cu = device + 2 + p.S + 1;
+                compact.positions = device + first_id + lp.T;
+                compact.positions_h = meta + first_id + lp.T;
+                /* An interior checkpoint is a single sequence. The retained queries are a
+                 * suffix. Only a cut inside that suffix can split its MoE pass. */
+                if (batch->ckpt_cut) {
+                    const int64_t ck = first_id + (batch->rope_pos ? 5 : 2) * lp.T;
+                    const int cut = meta[ck + 1];
+                    compact.ckpt_cut = cut > 0 && cut < lp.T ? cut : 0;
+                    compact.ckpt_cu = compact.ckpt_cut ? device + ck : nullptr;
+                }
+                compact.rope_pos = batch->rope_pos ? compact.positions + lp.T : nullptr;
+                queries = &compact;
+            }
+        }
+        if (!l.attn.front(c, batch, queries, rows)) return;
         m.calib.after_front(c, (int)i, l.attn, T);
         /* A pass on a streamed group's ring attends through the selection at every context
          * (hyv4flash_attn.h); every sparse layer of a pass agrees, the view being the pass's. */
-        StepPlan lp = p;
         if (!l.sliding && !lp.select && l.attn.ring_bound(c, batch)) lp.select = true;
-        if (!l.sliding && !l.ix.step(c, batch, lp)) return;
-        if (!l.sliding) m.df.snap_step(c, (int)i, m.iw, T, lp.select);
+        if (!l.sliding && !l.ix.step(c, batch, lp, queries, rows)) return;
+        if (!rows.n) {
+            const auto* kb = kv_batch(batch, l.attn.kv);
+            if (!l.j_mid && kb && kb->stream) kv_stage_next(c, l.attn.kv, l.attn.layer);
+            return;
+        }
+        if (!l.sliding) m.df.snap_step(c, (int)i, m.iw, lp.select, rows);
         const bool jm = (bool)l.j_mid;
         const bool je = (bool)l.j_end;
-        l.attn.core(c, batch, lp, m.iw.sel, m.iw.len, m.iw.nsel, jm);
+        l.attn.core(c, batch, lp, m.iw.sel, m.iw.len, m.iw.nsel, jm, queries, rows);
+        if (rows.ids)
+            rows.spans([&](int64_t src, int64_t dst, int64_t n) {
+                move_rows(c, m.pack_h, m.tr.h, s.hc * E, src, dst, n);
+                move_rows(c, m.pack_post, m.tr.post, s.hc, src, dst, n);
+            });
+        const bool pipe_tail = pipe && jm && je;
+        auto junction = [&](const Junction& j) {
+            if (pipe_tail) {
+                pipe_issue(c, [&] { j.step(c, 0, rows.n, pipe_lane()); });
+                pipe_join(c);
+            } else {
+                j.step(c, rows.n);
+            }
+        };
         if (jm) {
             /* With both junctions split, the pieces below are this junction: running it whole here
              * as well would add the connection twice (and reduce twice). */
-            if (!(pipe && je)) l.j_mid.step(c, T);
-            l.attn.tail_taps(c, T);
+            if (!pipe_tail || rows.ids) junction(l.j_mid);
+            l.attn.tail_taps(c, rows.n);
         }
-        m.calib.after_attn(c, (int)i, T);
-        if (!jm) l.hc_attn.post_add(c, m.tr.y, m.tr.post, m.tr.h, T);
-        l.t_mid.step(c, brows(m.tr.h, T), T);
+        m.calib.after_attn(c, (int)i, rows.n);
+        if (!jm) l.hc_attn.post_add(c, m.tr.y, m.tr.post, m.tr.h, rows.n);
+        l.t_mid.step(c, brows(m.tr.h, rows.n), rows.n);
 
-        if (!jm) l.hc_ffn.pre(c, m.tr.h, m.tr.x, m.tr.post, T);
-        l.t_ffn_x.step(c, brows(m.tr.x, T), T);
-        l.t_ffn_post.step(c, brows(m.tr.post, T), T);
+        if (!jm) l.hc_ffn.pre(c, m.tr.h, m.tr.x, m.tr.post, rows.n);
+        l.t_ffn_x.step(c, brows(m.tr.x, rows.n), rows.n);
+        l.t_ffn_post.step(c, brows(m.tr.post, rows.n), rows.n);
         if (!jm)
-            RAD_ISSUE_N(c, l.op_ffn_norm, T, brows(m.tr.x, T), RAD_W(l.ffn_gain), brows(m.tr.xn, T));
-        l.t_ffn_in.step(c, brows(m.tr.xn, T), T);
-        m.calib.after_ffn_norm(c, (int)i, T);
-        if (pipe && jm && je) {
+            RAD_ISSUE_N(c, l.op_ffn_norm, rows.n, brows(m.tr.x, rows.n), RAD_W(l.ffn_gain), brows(m.tr.xn, rows.n));
+        l.t_ffn_in.step(c, brows(m.tr.xn, rows.n), rows.n);
+        m.calib.after_ffn_norm(c, (int)i, rows.n);
+        if (pipe_tail && !rows.ids) {
             /* The pipelined prefill: piece 0's junction exposed, then piece 1's junction beside
              * piece 0's arms, then piece 0's junction beside piece 1's arms. Every piece's chain
              * steps inside its rows (the reduction sums the same rank order element by element),
@@ -1332,10 +1417,10 @@ static void step(RadCtx* c, const RadBatch* batch) {
             pipe_issue(c, [&] { l.j_mid.step(c, 0, n0, pipe_lane()); });
             pipe_join(c);
             pipe_issue(c, [&] { l.j_mid.step(c, n0, n1, pipe_lane()); });
-            l.ffn.body(c, T, 0, n0);
+            l.ffn.body(c, rows.n, 0, n0);
             pipe_join(c);
             pipe_issue(c, [&] { l.j_end.step(c, 0, n0, pipe_lane()); });
-            l.ffn.body(c, T, n0, n1);
+            l.ffn.body(c, rows.n, n0, n1);
             l.ffn.route_report(c);
             pipe_join(c);
             pipe_issue(c, [&] { l.j_end.step(c, n0, n1, pipe_lane()); });
@@ -1343,21 +1428,30 @@ static void step(RadCtx* c, const RadBatch* batch) {
             entered = je && l.j_end.tail;
             continue;
         }
-        if (!l.ffn.step(c, batch, je)) return;
+        if (!l.ffn.step(c, queries, je)) return;
         if (je) {
-            l.j_end.step(c, T);
-            l.ffn.tail_taps(c, T);
+            junction(l.j_end);
+            l.ffn.tail_taps(c, rows.n);
         }
-        m.calib.after_ffn(c, (int)i, T);
-        if (!je) l.hc_ffn.post_add(c, m.tr.y, m.tr.post, m.tr.h, T);
-        l.t_resid.step(c, brows(m.tr.h, T), T);
+        m.calib.after_ffn(c, (int)i, rows.n);
+        if (!je) l.hc_ffn.post_add(c, m.tr.y, m.tr.post, m.tr.h, rows.n);
+        l.t_resid.step(c, brows(m.tr.h, rows.n), rows.n);
         entered = je && l.j_end.tail;
     }
-    if (!entered) m.hc_head.pre(c, m.tr.h, m.tr.x, 0, T);
-    m.t_hc_head.step(c, brows(m.tr.x, T), T);
+    if (!entered) m.hc_head.pre(c, m.tr.h, m.tr.x, 0, rows.n);
+    m.t_hc_head.step(c, brows(m.tr.x, rows.n), rows.n);
     if (!entered)
-        RAD_ISSUE_N(c, m.op_norm, T, brows(m.tr.x, T), RAD_W(m.final_gain), brows(m.final_hidden, T));
-    m.t_final.step(c, brows(m.final_hidden, T), T);
+        RAD_ISSUE_N(c, m.op_norm, rows.n, brows(m.tr.x, rows.n), RAD_W(m.final_gain), brows(m.final_hidden, rows.n));
+    m.t_final.step(c, brows(m.final_hidden, rows.n), rows.n);
+    if (rows.ids) {
+        /* The sampler and the next draft pass both address the original trunk rows. */
+        for (int64_t end = rows.n; end > 0;) {
+            int64_t start = end - 1;
+            while (start && rows.ids[start - 1] + 1 == rows.ids[start]) --start;
+            move_rows(c, m.unpack_hidden, m.final_hidden, E, start, rows.ids[start], end - start);
+            end = start;
+        }
+    }
     if (batch->n_out > 0) {
         RAD_ISSUE_N(c, m.op_gather, batch->n_out, brows(m.final_hidden, T),
                     praw(batch->out_ids, RAD_I32, batch->n_out), brows(m.logit_input, batch->n_out));
