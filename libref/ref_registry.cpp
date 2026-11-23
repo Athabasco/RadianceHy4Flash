@@ -261,7 +261,7 @@ static const RadParamSpec pMlaExpandGate[] = { P_INT("M"), P_INT("heads"), P_INT
 static const RadOperandSpec oMlaExpandGate[] = { OPD("x"), WGT("w"), OPD("g"), OUT("y") };
 static const RadParamSpec pIdxPoolGated[] = { P_INT("M"), P_INT("n"), P_INT("ratio"),
     P_INT("rotary_dim"), P_F64("eps"), P_F64("theta"), P_STR("mode"), P_STRO("sections"),
-    P_INTO("block_size"), P_STR("dtype") };
+    P_INTO("block_size"), P_INTO("norm_f32"), P_STR("dtype") };
 static const RadOperandSpec oIdxPoolGated[] = { OPD("k"), WGT("wv"), WGT("wg"), WGT("ape"),
     WGT("gain"), OPD("pos"), OPD_O("page"), INOUT_O("cache"), OUT_O("out") };
 static const RadOperandSpec oIdxPoolGatedFp8[] = { OPD("k"), WGT("wv"), WGT("wg"), WGT("ape"),

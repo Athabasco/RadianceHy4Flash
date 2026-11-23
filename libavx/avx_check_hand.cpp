@@ -5244,6 +5244,31 @@ static void hy4_cases(std::vector<Hand>& hs) {
         hs.push_back(std::move(h));
     }
     {
+        /* F-17 (RADIANCE_HY4_IDX_POOL_F32=1..3), a half at a time: `norm_f32` bit 0 the mean
+         * square's sum and bit 1 the trig in f32, the same order and law at f32 precision. The key
+         * is rounded to bf16 either way (a step of 2^-8), so both forms are held against libref's
+         * f64: the sum alone at 1e-4 (its 128-term error is 7.6e-6 relative, far under the step),
+         * the trig at 1e-3 (a phase error of the angle's own size, 4096 rad here, is 2.4e-4). */
+        for (const auto& v : { std::pair<int, double>{ 1, 1e-4 }, std::pair<int, double>{ 3, 1e-3 } }) {
+            const int64_t W = 4, n = 128, ratio = 4, rd = 64;
+            Hand h(v.first == 1 ? "norm_f32=1: the mean square's sum in f32"
+                                : "norm_f32=3: the mean square and the trig in f32",
+                   "idx_pool_gated", v.second);
+            h.dense(RAD_BF16, { W * ratio, n }, hfill(551))
+             .dense(RAD_F32, { n, n }, hfill(552, 0.125f))
+             .dense(RAD_F32, { n, n }, hfill(553, 0.125f))
+             .dense(RAD_F32, { ratio, n }, hfill(554))
+             .dense(RAD_F32, { n }, hfill(555))
+             .dense(RAD_I32, { W }, [](int64_t i) { return (float)(4 * i + 4096); })
+             .none()
+             .none()
+             .dense(RAD_BF16, { W, n }, sent_bf16, true)
+             .pi("M", W).pi("n", n).pi("ratio", ratio).pi("rotary_dim", rd).pf("eps", 1e-5)
+             .pf("theta", 1e7).ps("mode", "gptj").pi("norm_f32", v.first).ps("dtype", "bf16");
+            hs.push_back(std::move(h));
+        }
+    }
+    {
         const int64_t W = 3, n = 16;
         Hand h("two groups naming one page are refused before any write", "idx_pool_gated", 0.0);
         h.dense(RAD_F32, { W * 4, n }, hfill(531))

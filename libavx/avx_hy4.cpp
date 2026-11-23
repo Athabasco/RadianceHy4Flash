@@ -769,6 +769,11 @@ int pool_gated(const RadArgs* a, bool fp8, bool i8 = false) {
     const double theta = (double)p_f32(a, "theta", 0);
     const char* mode = p_str(a, "mode", "");
     const bool gptj = !std::strcmp(mode, "gptj"), imrope = !std::strcmp(mode, "imrope_gptj");
+    /* norm_f32 (backlog F-17, RADIANCE_HY4_IDX_POOL_F32=1..3): bit 0 the mean square's sum and
+     * bit 1 the inverse frequency's pow in f32 instead of f64 (the cos and sin are f32 here in
+     * every form). Off by default: f64 is libref's law. */
+    const int nf32 = p_int(a, "norm_f32", 0);
+    const bool f32sum = (nf32 & 1) != 0, f32trig = (nf32 & 2) != 0;
     if (n < 1 || ratio < 1 || ratio > 16 || rd < 2 || rd > n || (rd & 1) || !(eps > 0) ||
         !std::isfinite(eps) || !(theta > 1.0) || (!gptj && !imrope))
         return RAD_E_SHAPE;
@@ -826,10 +831,12 @@ int pool_gated(const RadArgs* a, bool fp8, bool i8 = false) {
         if (std::adjacent_find(seen.begin(), seen.end()) != seen.end()) return RAD_E_INVAL;
     }
     /* The rotary's cos and sin for the rotated channels at every group, from the pair's inverse
-     * frequency in double as libref does. */
+     * frequency in double as libref does (f32 when `f32trig`). */
     std::vector<float> inv_freq((size_t)(rd / 2));
     for (int64_t i = 0; i < rd / 2; ++i)
-        inv_freq[(size_t)i] = (float)(1.0 / std::pow(theta, (double)(2 * i) / (double)rd));
+        inv_freq[(size_t)i] = f32trig
+            ? 1.0f / std::pow((float)theta, (float)(2 * i) / (float)rd)
+            : (float)(1.0 / std::pow(theta, (double)(2 * i) / (double)rd));
     const float* ifq = inv_freq.data();
 
     HY4_PAR_DYN(W * 2 * n * n * ratio)
@@ -863,9 +870,17 @@ int pool_gated(const RadArgs* a, bool fp8, bool i8 = false) {
             for (int64_t s = 0; s < ratio; ++s) acc += val[s * n + c] * (e[s] / den);
             y[c] = acc;
         }
-        double sq = 0;
-        for (int64_t c = 0; c < n; ++c) sq += (double)y[c] * (double)y[c];
-        const float inv = 1.0f / std::sqrt((float)(sq / (double)n) + eps);
+        /* The mean square: libref's n-term sum in f64, or in f32 the same order (F-17). */
+        float inv;
+        if (f32sum) {
+            float sq = 0;
+            for (int64_t c = 0; c < n; ++c) sq += y[c] * y[c];
+            inv = 1.0f / std::sqrt(sq / (float)n + eps);
+        } else {
+            double sq = 0;
+            for (int64_t c = 0; c < n; ++c) sq += (double)y[c] * (double)y[c];
+            inv = 1.0f / std::sqrt((float)(sq / (double)n) + eps);
+        }
         auto rnd = [&](float v) { return fp8 ? v : narrow1(k.dtype, v); };
         for (int64_t c = 0; c < n; ++c) z[c] = rnd(ldt(&gain, c * gain.stride[0]) * (y[c] * inv));
         for (int64_t i = 0; i < rd / 2; ++i) {

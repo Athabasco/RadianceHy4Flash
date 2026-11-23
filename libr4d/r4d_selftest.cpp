@@ -28247,7 +28247,8 @@ static bool idx_pool_run(const Plugin& pl, const RadKernelInfo* ref, int64_t W, 
                          const std::vector<int32_t>& hpage, int64_t pages,
                          std::vector<uint16_t>* dev_out, std::vector<uint16_t>* dev_cache,
                          std::vector<uint16_t>* ref_out, std::vector<uint16_t>* ref_cache,
-                         std::string* err, int64_t k_off = 0, int64_t pos_off = 0) {
+                         std::string* err, int64_t k_off = 0, int64_t pos_off = 0,
+                         int norm_f32 = 0) {
     const RadKernelInfo* r = find(pl, "idx_pool_gated_f32");
     const int64_t n = 128, ratio = 4;
     std::vector<uint16_t> gb((size_t)n);
@@ -28305,6 +28306,7 @@ static bool idx_pool_run(const Plugin& pl, const RadKernelInfo* ref, int64_t W, 
                                  PF("eps", 1e-5), PF("theta", 1e7),
                                  PS("mode", imrope ? "imrope_gptj" : "gptj"), PS("dtype", "bf16") };
     if (imrope) ps.push_back(PS("sections", "12 10 10"));
+    if (norm_f32) ps.push_back(PI("norm_f32", norm_f32));
     RadArgs a;
     std::memset(&a, 0, sizeof a);
     a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
@@ -28393,9 +28395,101 @@ static void idx_pool_case(const Plugin& pl) {
     }
 }
 
-/* idx_pool_gated_fp8 against libref on the same bytes: the packed u8 cache pages (codes and the
- * scale at byte 128; the last four bytes of a page and skipped pages untouched) and q/scale. The
- * device keeps libref's order for every sum, so the bytes must match. */
+/* idx_pool_gated with `norm_f32` (backlog F-17, RADIANCE_HY4_IDX_POOL_F32=1 in the plugin): the
+ * norm's mean-square sum and the rotary's pow / cos / sin in f32 instead of f64, in libref's order.
+ * It is lossy by design and bounded: the 128-term f32 sum is within 128 * 2^-24 = 7.6e-6 relative
+ * (halved by the rsqrt), each f32 pow / cos / sin within 2 ulp (2.4e-7), so the key before its bf16
+ * rounding moves by under 1e-5 relative -- 400 times under the bf16 step (2^-8) that the default
+ * form rounds to. Checked against libref's f64 form: every element that moves moves by at most two
+ * bf16 ulp, and only the elements sitting inside that band of a rounding boundary move at all, so
+ * the moved share is small and the rel_l2 of the buffer stays far under the op's 6e-3. The switch
+ * must also leave the f64 form's bytes alone (idx_pool_case above runs with it absent). */
+static void idx_pool_f32_case(const Plugin& pl) {
+    const char* what = "idx_pool_gated with norm_f32";
+    const RadKernelInfo* r = find(pl, "idx_pool_gated_f32");
+    const RadKernelInfo* ref = usel_libref_row("idx_pool_gated");
+    if (!r) { ok(what, false, "row absent"); return; }
+    if (!ref) { skip(what, "libref's idx_pool_gated unavailable"); return; }
+    const int64_t n = 128, ratio = 4, W = 37, pages = W + 8;
+    std::vector<uint16_t> hk((size_t)(W * ratio * n));
+    for (size_t i = 0; i < hk.size(); ++i) hk[i] = h_to_bf16(1.7f * ix_rf(11, (uint32_t)i));
+    std::vector<float> hwv((size_t)(n * n)), hwg((size_t)(n * n)), hape((size_t)(ratio * n)),
+                       hgain((size_t)n);
+    for (size_t i = 0; i < hwv.size(); ++i) { hwv[i] = 0.15f * ix_rf(12, (uint32_t)i);
+                                              hwg[i] = 0.15f * ix_rf(13, (uint32_t)i); }
+    for (size_t i = 0; i < hape.size(); ++i) hape[i] = ix_rf(14, (uint32_t)i);
+    for (size_t i = 0; i < hgain.size(); ++i) hgain[i] = 1.0f + 0.2f * ix_rf(15, (uint32_t)i);
+    std::vector<int32_t> hpage((size_t)W);
+    for (int64_t w = 0; w < W; ++w) hpage[(size_t)w] = (int32_t)(pages - 1 - w);
+    /* Two position ranges: the first groups of a sequence, and the model's own top, where theta
+     * 1e7 over a 64-wide rotary (R = qk_rope) gives the first pair an angle of ~6e4 rad by 65536
+     * tokens. An f32 angle's own representation is exact up to 2^24, but the trig of a large
+     * argument loses phase in proportion to it, so the two ranges are the trig's good and its
+     * worst case and both are held to the same bound. */
+    const int32_t pbase[2] = { 0, 4096 }, pstride[2] = { 4, 1613 };
+    const char* prange[2] = { "near positions", "positions to 62k" };
+    /* Near the start the f32 move is under half a bf16 ulp, so nothing is expected to move and the
+     * case only holds the bound; at the model's top the trig's phase error is of the order of the
+     * bf16 step, so it must both move and stay inside the bound. The norm's sum alone is 500 times
+     * smaller than that step at either range and is not expected to move anything. */
+    const char* vname[4] = { "", "sum", "trig", "sum+trig" };
+    for (int v = 1; v < 4; ++v) {
+        const char* vn = vname[v];
+        for (int pr = 0; pr < 2; ++pr) {
+            const bool mustmove = (v & 2) != 0 && pr == 1;
+            for (int mode = 0; mode < 2; ++mode) {
+                const bool imrope = mode == 1;
+                std::vector<int32_t> hpos((size_t)((imrope ? 3 : 1) * W));
+                for (int64_t w = 0; w < W; ++w) {
+                    hpos[(size_t)w] = pbase[pr] + (int32_t)w * pstride[pr];
+                    if (imrope) {
+                        hpos[(size_t)(W + w)] = pbase[pr] / 3 + (int32_t)(w * (pstride[pr] / 2 + 1));
+                        hpos[(size_t)(2 * W + w)] =
+                            pbase[pr] / 5 + (int32_t)(w * (pstride[pr] / 4 + 1));
+                    }
+                }
+                const char* tag = imrope ? "imrope_gptj" : "gptj";
+                std::vector<uint16_t> dout, dcache, rout, rcache;
+                std::string err;
+                if (!idx_pool_run(pl, ref, W, imrope, true, hk, hwv, hwg, hape, hgain, hpos, W,
+                                  hpage, pages, &dout, &dcache, &rout, &rcache, &err, 0, 0, v)) {
+                    ok(fmt("%s=%s (%s, %s)", what, vn, tag, prange[pr]).c_str(), false, err);
+                    continue;
+                }
+                int64_t no = 0, nc = 0; int uo = 0, uc = 0;
+                ix_cmp_bf16(dout, rout, &no, &uo);
+                ix_cmp_bf16(dcache, rcache, &nc, &uc);
+                /* The buffer's rel_l2 and the largest absolute move against its own rms: the second
+                 * is the one that survives cancellation, where a key near zero moves by a whole
+                 * bf16 ulp for a tiny absolute move and a ulp count says nothing. */
+                double num = 0.0, den = 0.0, mx = 0.0;
+                for (size_t i = 0; i < dout.size(); ++i) {
+                    const double a = (double)h_bf16(dout[i]), b = (double)h_bf16(rout[i]);
+                    num += (a - b) * (a - b);
+                    den += b * b;
+                    mx = std::max(mx, std::fabs(a - b));
+                }
+                const double rel = den > 0.0 ? std::sqrt(num / den) : 0.0;
+                const double rms = dout.empty() ? 0.0 : std::sqrt(den / (double)dout.size());
+                const double absr = rms > 0.0 ? mx / rms : 0.0;
+                const double share_o = 100.0 * (double)no / (double)dout.size();
+                const double share_c = 100.0 * (double)nc / (double)dcache.size();
+                /* A switch the row ignores would pass every bound above with nothing moved, so
+                 * where a move is expected the share has a floor as well as a ceiling. */
+                const bool moved = !mustmove || no > 0;
+                const bool pass = share_o <= 2.0 && share_c <= 2.0 && rel <= 1e-3 && absr <= 2e-2 &&
+                                  moved;
+                ok(fmt("%s=%s (%s, %s): out %lld of %zu differ (%.2f %%, max %d ulp), cache %lld "
+                       "of %zu (%.2f %%, max %d ulp), rel_l2 %.1e, max|d|/rms %.1e "
+                       "(bound: 2 %%, 1e-3, 2e-2)",
+                       what, vn, tag, prange[pr], (long long)no, dout.size(), share_o, uo,
+                       (long long)nc, dcache.size(), share_c, uc, rel, absr).c_str(),
+                   pass);
+            }
+        }
+    }
+}
+
 static void idx_pool_fp8_case(const Plugin& pl, bool i8 = false) {
     const char* what = i8 ? "idx_pool_gated_i8 against libref" : "idx_pool_gated_fp8 against libref";
     const char* row_name = i8 ? "idx_pool_gated_i8" : "idx_pool_gated_fp8";
@@ -37338,6 +37432,7 @@ static void device_phase(const Plugin& pl) {
     if (sel("idx_pool_gated_f32")) {
         if (!g_case) std::printf("\nthe indexer's group key, against libref\n");
         idx_pool_case(pl);
+        idx_pool_f32_case(pl);
     }
 
     if (sel("idx_pool_gated_fp8")) {

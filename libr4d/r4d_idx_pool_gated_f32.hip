@@ -6,6 +6,7 @@
 //   p_s[c]   = exp(gat_s[c] - max_s gat) / sum_s exp(..)         s ascending
 //   y[c]     = sum_s val_s[c] * p_s[c]
 //   z[c]     = bf16( gain[c] * (y[c] * rsqrt(sum_c y^2 / n + eps)) )      the sum in f64
+//                                                                        (`norm_f32` bit 0: f32)
 //   then the last `rotary_dim` channels of z, adjacent pairs, rotated at pos[w] and rounded again.
 //
 // One thread a channel, 128 threads; a workgroup pools GPW groups so one read of a weight row serves
@@ -13,6 +14,14 @@
 // run j ascending with a separate multiply and add (the unit is built -ffp-contract=off), the exp,
 // the trig and the sum of squares are f64 and the norm's sum runs in channel order on one thread per
 // group, so the result is byte-equal to libref: the order of every sum is libref's.
+//
+// `norm_f32` (opt-in, backlog F-17; off by default, RADIANCE_HY4_IDX_POOL_F32=1..3 in the plugin)
+// runs the f64 arithmetic of the key in f32, which RDNA4 issues at 1/16 rate, one half at a time:
+// bit 0 the norm's sum of squares (same order, ~7.6e-6 relative, halved by the sqrt), bit 1 the
+// trig's inv_freq and cos / sin (the phase error grows with the angle, |ang| * 2^-24: nothing near
+// the start of a sequence, a whole bf16 step for the fastest pair at the model's top). Not
+// byte-equal to libref either way. The exp of the gate stays f64 in every form (it is neither the
+// norm nor the trig).
 //
 // n 128 and ratio 4 are compiled in; `rotary_dim`, the rope mode (gptj, or imrope_gptj with
 // sections), eps and theta are runtime values. The key is written to cache[page[w]] and/or out[w];
@@ -54,7 +63,7 @@ __device__ __forceinline__ int imrope_comp(int j, int sec_h, int sec_w) {
     uint16_t* __restrict__ cache, uint16_t* __restrict__ out, int W, int k_ld, int out_ld,      \
     long cache_pitch, int pages, int pos_ld, int rd, float eps, double theta, int sec_h,        \
     int sec_w, int gain_bf16, uint8_t* __restrict__ q8, float* __restrict__ qs, long q_ld,      \
-    long qs_ld, float norm, int i8
+    long qs_ld, float norm, int i8, int f32n
 /* FP8 (idx_pool_gated_fp8): nothing is rounded to bf16; the f32 key goes through the 128-wide
  * Hadamard (r4d_fwht_wave, a wave a group, four consecutive channels a lane), times `norm`, and into
  * E4M3 codes at a power-of-two scale: dsa_pool's packed page (`cache` as bytes, the scale at byte
@@ -129,11 +138,19 @@ __device__ __forceinline__ void idx_pool_gated_body(IDX_POOL_PARAMS) {
     }
     __syncthreads();
 
-    /* The mean square, in channel order and in f64, one thread a group: libref's sum exactly. */
+    /* The mean square, in channel order and in f64, one thread a group: libref's sum exactly. With
+     * `f32n & 1` (F-17) the same order in f32: 128 terms, ~7.6e-6 relative at worst, halved by the
+     * sqrt, against 3.9e-3 for the bf16 step the key is rounded to below. */
     if (c < GPW) {
-        double sq = 0.0;
-        for (int i = 0; i < kN; ++i) sq += (double)ys[c][i] * (double)ys[c][i];
-        rs[c] = __fdiv_rn(1.0f, __fsqrt_rn((float)(sq / (double)kN) + eps));
+        if (f32n & 1) {
+            float sq = 0.0f;
+            for (int i = 0; i < kN; ++i) sq = sq + ys[c][i] * ys[c][i];
+            rs[c] = __fdiv_rn(1.0f, __fsqrt_rn(__fdiv_rn(sq, (float)kN) + eps));
+        } else {
+            double sq = 0.0;
+            for (int i = 0; i < kN; ++i) sq += (double)ys[c][i] * (double)ys[c][i];
+            rs[c] = __fdiv_rn(1.0f, __fsqrt_rn((float)(sq / (double)kN) + eps));
+        }
     }
     __syncthreads();
 
@@ -158,9 +175,13 @@ __device__ __forceinline__ void idx_pool_gated_body(IDX_POOL_PARAMS) {
             const int i = rc >> 1;
             const int comp = IMROPE ? imrope_comp(i, sec_h, sec_w) : 0;
             const int pv = IMROPE ? pos[(size_t)w * pos_ld + comp] : pos[w];
-            const float inv_freq = (float)(1.0 / pow(theta, (double)(2 * i) / (double)rd));
+            const bool f32t = (f32n & 2) != 0;
+            const float inv_freq =
+                f32t ? __fdiv_rn(1.0f, powf((float)theta, __fdiv_rn((float)(2 * i), (float)rd)))
+                     : (float)(1.0 / pow(theta, (double)(2 * i) / (double)rd));
             const float ang = (float)pv * inv_freq;
-            const float cs = (float)cos((double)ang), sn = (float)sin((double)ang);
+            const float cs = f32t ? cosf(ang) : (float)cos((double)ang);
+            const float sn = f32t ? sinf(ang) : (float)sin((double)ang);
             const float x0 = ys[g][c & ~1], x1 = ys[g][(c & ~1) | 1];
             if (FP8) r = (rc & 1) ? x1 * cs + x0 * sn : x0 * cs - x1 * sn;
             else
@@ -240,7 +261,8 @@ void idx_pool_gated_kernel(IDX_POOL_PARAMS) {
     if (CH::on) r4d_chain_wait();
     idx_pool_gated_body<GPW, IMROPE, FP8>(k, wv, wg, ape, gain, pos, page, cache, out, W, k_ld,
                                           out_ld, cache_pitch, pages, pos_ld, rd, eps, theta,
-                                          sec_h, sec_w, gain_bf16, q8, qs, q_ld, qs_ld, norm, i8);
+                                          sec_h, sec_w, gain_bf16, q8, qs, q_ld, qs_ld, norm, i8,
+                                          f32n);
     if (CH::on) r4d_chain_done();
 }
 #undef IDX_POOL_PARAMS
@@ -357,6 +379,8 @@ static int pool_entry(const RadArgs* a, RadStream stream, bool fp8, bool i8 = fa
 
     const int gain_bf16 = gn->dtype == RAD_BF16;
     const bool chain = r4d_geti_or(a, "chain", 0) != 0;
+    /* norm_f32 (F-17): the mean square and the trig in f32. Off unless asked: f64 is libref's. */
+    const int f32n = r4d_geti_or(a, "norm_f32", 0);
     const bool wide = W >= kWideMinW;
     const int gpw = wide ? kWideGroups : 1;
     const unsigned grid = (unsigned)((W + gpw - 1) / gpw);
@@ -369,7 +393,7 @@ static int pool_entry(const RadArgs* a, RadStream stream, bool fp8, bool i8 = fa
              (const int32_t*)r4d_p(pg), (uint16_t*)r4d_wp(ca), (uint16_t*)r4d_wp(ou), (int)W,    \
              (int)kp, (int)op, (long)cache_pitch, (int)pages, (int)pos_ld, (int)rd, eps_f,       \
              (double)theta_f, (int)sec_h, (int)sec_w, gain_bf16, (uint8_t*)r4d_wp(q8),          \
-             (float*)r4d_wp(qs), (long)q_ld, (long)qs_ld, norm, i8 ? 1 : 0)
+             (float*)r4d_wp(qs), (long)q_ld, (long)qs_ld, norm, i8 ? 1 : 0, f32n)
 #define R4D_IPOOL_CH(G_, IM_) (chain ? R4D_IPOOL(G_, IM_, r4dchain) : R4D_IPOOL(G_, IM_, R4dUnchained))
     if (wide) return imrope ? R4D_IPOOL_CH(kWideGroups, true) : R4D_IPOOL_CH(kWideGroups, false);
     return imrope ? R4D_IPOOL_CH(1, true) : R4D_IPOOL_CH(1, false);
