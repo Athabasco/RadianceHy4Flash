@@ -1431,6 +1431,8 @@ TEST(dfly2_is_a_block_drafter_of_block_depth_plus_one_with_window_1) {
         CHECK_EQ(dd.window, (int64_t)1);
         CHECK_EQ(dd.mask_token, 319);
         CHECK_EQ(dd.proposal_pitch, (int64_t)depth);
+        /* D-06: a short block of 4 rows (3 proposals) where the block is longer */
+        CHECK_EQ(d.b.drafter_short, depth >= 4 ? (int64_t)4 : (int64_t)0);
         CHECK(dd.proposal != 0);
         CHECK(!d.b.drafter_shared && d.b.drafter_parents == 0);
         /* No KV group of its own; the snapshots and the proposal persist. */
@@ -1520,6 +1522,81 @@ TEST(an_engine_step_with_dfly2_is_lint_clean_and_the_query_pass_touches_no_trunk
         for (const auto& is : ps[0]->issues) snap += is.op == df.snap[0].op_sel;
         CHECK_EQ(snap, 1);
     }
+}
+
+/* D-06 (#91): DFly2 also serves a short block (rad_drafter_short_block) of 4 rows, the anchor and 3
+ * masks, which the core stages under load (--draft-short-from): 3 proposals, two chain rounds fewer
+ * at depth 5. The draft is causal (dfly_sel gives a row the keys up to its own position), so the
+ * short pass is the full pass's first rows. Declared only where the drafter's block is longer; the
+ * query pass takes either block, finds each anchor row and each round's row at its block's own
+ * stride, and runs one round a proposal (coupled: one draw a round); any other block is refused. */
+TEST(dfly2_serves_a_short_block_of_four_rows) {
+    for (int depth : { 5, 4, 3 }) {
+        DeclDfly d(depth);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        CHECK_EQ(d.b.drafter_short, depth >= 4 ? (int64_t)4 : (int64_t)0);
+    }
+    for (int world : { 1, 2 })
+        for (int coupled : { 0, 1 }) {
+            MetaKV mk = dfly_meta();
+            RadBuilder b;
+            bf16_encs(&b);
+            RadBuildCtx ctx = spec_ctx(0, world, 5);
+            ctx.draft_coupling = coupled;
+            int rc = 0;
+            const std::string err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
+            if (rc != RAD_OK) fputs(err.c_str(), stderr);
+            REQUIRE_EQ(rc, RAD_OK);
+            const auto& df = hyv4flash::models[0]->df;
+            REQUIRE(df.served);
+            CHECK_EQ(b.drafter_short, (int64_t)4);
+            REQUIRE(df.op_row0_lo != 0);
+            CHECK_EQ(pint(b.op_of(df.op_row0), "step"), 6);
+            CHECK_EQ(pint(b.op_of(df.op_row0_lo), "step"), 4);
+            for (int64_t blk : { (int64_t)6, (int64_t)4 }) {
+                const int64_t rounds = blk - 1;
+                auto trunk = kit(b, std::vector<int>(2, 6), {});
+                trunk->b.positions_h = trunk->pos.data();
+                auto ctxp = context_pass(b, *trunk);
+                Query qp(b, 2, blk, rounds);
+                auto ps = run_passes(b, hyv4flash::step, { trunk.get(), ctxp.get(), qp.k.get() }, 0,
+                                     world);
+                for (const auto& c : ps) {
+                    if (!c->step_fail.empty()) fprintf(stderr, "%s\n", c->step_fail.c_str());
+                    CHECK(c->step_fail.empty());
+                }
+                CHECK_LINT(b, ps[0].get(), ps[1].get(), ps[2].get());
+                const auto q = issued_ops(b, *ps[2]);
+                auto count = [&](const char* op) {
+                    return (int64_t)std::count(q.begin(), q.end(), std::string(op));
+                };
+                CHECK_EQ(count("logits_gemm"), rounds);
+                CHECK_EQ(count("row_topk"), rounds);
+                CHECK_EQ(count("mtp_couple_propose"), coupled ? rounds : 0);
+                /* each anchor and each round's row found at this block's stride */
+                int row0 = 0, row0_lo = 0, rowk = 0, rowk_lo = 0;
+                for (const auto& is : ps[2]->issues) {
+                    row0 += is.op == df.op_row0;
+                    row0_lo += is.op == df.op_row0_lo;
+                    for (const auto& st : df.steps) {
+                        rowk += is.op == st.op_rowk;
+                        rowk_lo += st.op_rowk_lo && is.op == st.op_rowk_lo;
+                    }
+                }
+                CHECK_EQ(row0, blk == 6 ? 1 : 0);
+                CHECK_EQ(row0_lo, blk == 4 ? 1 : 0);
+                CHECK_EQ(rowk, blk == 6 ? 5 : 0);
+                CHECK_EQ(rowk_lo, blk == 4 ? 3 : 0);
+            }
+            /* a block the drafter declared neither way is refused, by name */
+            auto trunk = kit(b, std::vector<int>(2, 6), {});
+            trunk->b.positions_h = trunk->pos.data();
+            auto ctxp = context_pass(b, *trunk);
+            Query bad(b, 2, 5, 4);
+            auto ps = run_passes(b, hyv4flash::step, { trunk.get(), ctxp.get(), bad.k.get() }, 0,
+                                 world);
+            CHECK(!ps[2]->step_fail.empty());
+        }
 }
 
 /* WP13.8 (kernels/dfly2.md §8.2): under --draft-coupling the chain declares the planes the engine
