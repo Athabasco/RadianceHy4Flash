@@ -3685,6 +3685,10 @@ id in both stages). Taps at TP are rank 0's.
 `--draft-window adaptive` is the core's and applies to any block drafter; `--draft-suffix on` runs
 beside DFly2 (a suffix chain is cut to `num-speculative-tokens`, with a warning: the probe states the
 depth fixed when the container has the drafter).
+DFly2 also serves a short block of 4 rows (3 proposals) at depth 4 and 5, which the core stages per
+step under load with `draft-short-from: N` (from N decoding sequences on; off by default for a chain
+drafter). The draft is causal, so the short pass is the full one's first rows and the verify is
+unchanged.
 
 **Coupled proposals** (`--draft-coupling on`, WP13.8; kernels/dfly2.md §8.2). DFly2 has no candidate
 lattice (its predecessor dependence is the correction head plus the lm_head), so the coupled draw is
