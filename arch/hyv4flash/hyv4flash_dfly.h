@@ -128,7 +128,12 @@ struct Dfly {
         char buf[256];
         why.clear();
         auto no = [&](const char* fmt, auto... a) {
-            if (why.empty()) {
+            if (!why.empty()) return;
+            /* A message with no arguments is taken as written: giving it to std::snprintf would
+             * read any % in it as a conversion with nothing behind it. */
+            if constexpr (sizeof...(a) == 0) {
+                why = fmt;
+            } else {
                 std::snprintf(buf, sizeof buf, fmt, a...);
                 why = buf;
             }
