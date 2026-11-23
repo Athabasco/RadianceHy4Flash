@@ -203,7 +203,7 @@ void Metrics::sample(const SchedMetrics& m) {
     c_suffix_steps_.advance_to(m.suffix_steps);
     c_suffix_rows_.advance_to(m.suffix_rows);
     c_suffix_accepted_.advance_to(m.suffix_accepted);
-    c_suffix_held_ahead_.advance_to(m.suffix_held_ahead);
+    c_ahead_refused_suffix_hot_.advance_to(m.ahead_refused_suffix_hot);
     c_attn_cached_.advance_to(m.attn_cached_tokens);
     c_linear_cached_.advance_to(m.linear_cached_tokens);
     c_prefix_queries_.advance_to(m.prefix_queries);
@@ -487,7 +487,8 @@ std::string Metrics::render() const {
               "Of those rows, the drafts accepted.", L, c_suffix_accepted_.get());
     w.counter("radiance:suffix_held_ahead_total",
               "Decode steps not issued ahead of the previous commit because the sequence's "
-              "history ended in a recurring pattern (--draft-suffix).", L, c_suffix_held_ahead_.get());
+              "history ended in a recurring pattern (--draft-suffix).", L,
+              c_ahead_refused_suffix_hot_.get());
 
     /* Decoupled prefix caching (spec §7.3). vllm:gpu_prefix_cache_hit_rate is the attention hit
      * rate, as in vLLM. The linear side hits at a different granularity (whole checkpoints, not

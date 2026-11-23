@@ -4190,6 +4190,7 @@ static bool ahead_arming(int64_t interleave) {
         issued = f.sch.step_next() != nullptr;
     }
     CHECK(issued);                                      /* the chunk's step is the one issued ahead */
+    CHECK_EQ(f.sch.metrics().ahead_refused_held, interleave > 0 ? (int64_t)1 : (int64_t)0);
     const bool ahead = f.sch.prefill_continues(/*next_plan=*/true);
     f.commit_plain(12);
     f.sch.promote_next();
@@ -6770,6 +6771,7 @@ TEST(a_step_is_issued_ahead_only_once_the_requests_speculation_is_fixed) {
     f.commit_plain();
     CHECK(f.sch.step() != nullptr);                 /* the first decode */
     CHECK(f.sch.step_next() == nullptr);            /* the sampler has not started it */
+    CHECK_EQ(f.sch.metrics().ahead_refused_grammar, (int64_t)1);
 
     Request* r = f.sch.find(id);
     REQUIRE(r != nullptr);
@@ -6807,6 +6809,7 @@ TEST(the_room_gate_refuses_an_admission_issued_ahead) {
     /* 32 blocks of prompt: far past the six the pool has free beside the runner. */
     const uint64_t w = f.submit(500, 8);
     CHECK(f.sch.step_next() == nullptr);            /* the gate's wait is no admission, ahead too */
+    CHECK_EQ(f.sch.metrics().ahead_refused_waiting, (int64_t)1);
     Request* wr = f.sch.find(w);
     REQUIRE(wr != nullptr);
     CHECK_EQ((int)wr->state, (int)ReqState::Waiting);
@@ -6845,6 +6848,7 @@ TEST(no_step_is_issued_ahead_behind_one_that_ends_its_requests) {
         f.sch.expect_draft(id, 4);
         const int64_t free_before = f.kv.free_blocks(0);
         const bool issued = f.sch.step_next() != nullptr;
+        CHECK_EQ(f.sch.metrics().ahead_refused_ends_every, issued ? (int64_t)0 : (int64_t)1);
         if (!issued) CHECK_EQ(f.kv.free_blocks(0), free_before);
         return issued;
     };
@@ -7274,6 +7278,13 @@ BatchRows read_rows(const RadBatch* b, const StepPlan& p, const FakeKV& kv) {
     return r;
 }
 
+/* The scheduler's count of the steps it did not issue ahead, by reason (S-07). */
+int64_t refused_total(const SchedMetrics& m) {
+    return m.ahead_refused_waiting + m.ahead_refused_held + m.ahead_refused_mid_prompt +
+           m.ahead_refused_grammar + m.ahead_refused_suffix_hot + m.ahead_refused_ends_every +
+           m.ahead_refused_kv;
+}
+
 struct AheadRun {
     std::vector<BatchRows> steps;
     std::vector<std::vector<int32_t>> out;
@@ -7282,6 +7293,9 @@ struct AheadRun {
     int ahead = 0;                  /* steps that ran issued ahead */
     int mixed_ahead = 0;            /* of those, the mixed ones (a chunk beside decode rows) */
     int64_t steps_ahead_counter = 0;/* the scheduler's own count of them */
+    int64_t offers = 0;             /* step_next() calls made once a step was in flight */
+    int64_t refusals = 0;           /* of those, the ones that issued nothing */
+    SchedMetrics metrics;           /* the scheduler's counters at the end */
     int card_host_disagree = 0;
 };
 
@@ -7346,7 +7360,8 @@ void ahead_finish(Fixture& f, const std::vector<uint64_t>& ids, AheadRun& run) {
         run.out.push_back(f.sch.find(id)->output);
         run.held.push_back((int64_t)f.kv.block_table(id, 0).size());
     }
-    run.steps_ahead_counter = f.sch.metrics().steps_ahead;
+    run.metrics = f.sch.metrics();
+    run.steps_ahead_counter = run.metrics.steps_ahead;
 }
 
 /* Every step built by step() after the commit. */
@@ -7414,6 +7429,8 @@ AheadRun ahead_pipelined(int n_spec, int steps, const AheadScript& sc = AheadScr
             if (n_spec > 0) f.sch.expect_draft(e.seq, n_spec);
         }
         const RadBatch* nb = f.sch.step_next();
+        ++run.offers;
+        if (!nb) ++run.refusals;
         if (nb) {
             AdvanceArgs tr = f.sch.advance_args(0);
             tr.mode = ADV_TRUNK;
@@ -7548,6 +7565,8 @@ TEST(a_chunk_held_back_by_the_shares_is_left_to_the_step_after_the_commit) {
     const AheadRun b = ahead_pipelined(0, T, sc);
     CHECK(b.ahead > 0);
     CHECK(b.ahead < T);                   /* the capped chunk's step was not issued ahead */
+    CHECK(b.metrics.ahead_refused_held > 0);   /* and says the shares held it back */
+    CHECK_EQ(b.metrics.steps_ahead + refused_total(b.metrics), b.offers);
     REQUIRE_EQ(a.steps.size(), b.steps.size());
     for (size_t t = 0; t < a.steps.size(); ++t) CHECK(a.steps[t] == b.steps[t]);
     CHECK(a.out == b.out);
@@ -7565,6 +7584,8 @@ TEST(a_queue_of_two_arrivals_is_admitted_after_the_commit) {
     const AheadRun b = ahead_pipelined(0, T, sc);
     CHECK(b.ahead > 0);
     CHECK(b.ahead < T);
+    CHECK(b.metrics.ahead_refused_waiting > 0);  /* the second arrival waits for step() */
+    CHECK_EQ(b.metrics.steps_ahead + refused_total(b.metrics), b.offers);
     REQUIRE_EQ(a.steps.size(), b.steps.size());
     for (size_t t = 0; t < a.steps.size(); ++t) CHECK(a.steps[t] == b.steps[t]);
     CHECK(a.out == b.out);
@@ -7602,6 +7623,45 @@ TEST(a_chunk_issued_ahead_keeps_the_order_of_the_sequences) {
     for (size_t t = 0; t < a.steps.size(); ++t) CHECK(a.steps[t] == b.steps[t]);
     CHECK(a.out == b.out);
     CHECK(a.phases == b.phases);
+}
+
+/* A step left to step() for its shape: a prompt continuing on its own carries no decode row, so
+ * it is not a mixed step and is counted as mid-prompt. The scheduler's counts and steps_ahead are
+ * every step_next the engine made, and the run is the reference run's. */
+TEST(a_prompt_that_continues_alone_is_counted_as_mid_prompt) {
+    const int T = 4;
+    AheadScript sc;
+    sc.prompts = { 2000 };   /* longer than one checkpoint chunk */
+    const AheadRun a = ahead_reference(0, T, sc);
+    const AheadRun b = ahead_pipelined(0, T, sc);
+    CHECK_EQ(b.offers, (int64_t)T);
+    CHECK_EQ(b.refusals, (int64_t)T);
+    CHECK_EQ(b.metrics.steps_ahead, (int64_t)0);
+    CHECK_EQ(b.metrics.ahead_refused_mid_prompt, (int64_t)T);
+    CHECK_EQ(refused_total(b.metrics), (int64_t)T);
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    for (size_t t = 0; t < a.steps.size(); ++t) CHECK(a.steps[t] == b.steps[t]);
+    CHECK(a.out == b.out);
+}
+
+/* A next step the request's own context cannot hold is counted as KV: the head drafted deeper
+ * than the context has room for, so the step after the commit is the one that plans within it. */
+TEST(a_context_that_does_not_fit_the_next_step_is_counted_as_kv) {
+    Fixture f;
+    f.build(/*blocks=*/64, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/160);
+    f.cfg.n_spec = 8;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(150, 0);
+    REQUIRE(f.sch.step() != nullptr);          /* the prompt */
+    f.commit_plain();
+    f.sch.find(a)->speculation_fixed = true;
+    int32_t draft[4] = { 11, 12, 13, 14 };
+    CHECK_OK(f.sch.set_draft(a, draft, 4));    /* this step: 1 + 4 tokens, to 155 */
+    REQUIRE(f.sch.step() != nullptr);
+    f.sch.expect_draft(a, 8);                  /* the head's next chain wants 9 more tokens */
+    CHECK(f.sch.step_next() == nullptr);       /* 155 + 9 past the 160 context */
+    CHECK_EQ(f.sch.metrics().ahead_refused_kv, (int64_t)1);
+    CHECK_EQ(refused_total(f.sch.metrics()), (int64_t)1);
 }
 
 /* ================================================================== a block drafter on the card */
@@ -8206,6 +8266,7 @@ TEST(no_step_is_issued_ahead_for_a_scored_request_the_step_in_flight_finishes) {
     f.commit_plain();
     REQUIRE(f.sch.step() != nullptr);
     CHECK(f.sch.step_next() == nullptr);
+    CHECK_EQ(f.sch.metrics().ahead_refused_ends_every, (int64_t)1);   /* the row it finishes */
     f.commit_plain();                              /* the second token: finished */
     CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
     CHECK_EQ(f.kv.free_blocks(0), before);
@@ -9644,7 +9705,7 @@ TEST(without_a_recurrence_or_with_the_flag_off_the_heads_draft_is_verified_as_be
         CHECK(!f.sch.find(a)->draft_suffix);
         commit_one(f, 3, 900);
         CHECK_EQ(f.sch.metrics().suffix_steps, (int64_t)0);
-        CHECK_EQ(f.sch.metrics().suffix_held_ahead, (int64_t)0);
+        CHECK_EQ(f.sch.metrics().ahead_refused_suffix_hot, (int64_t)0);
     }
 }
 
@@ -9779,10 +9840,10 @@ TEST(a_sequence_in_a_recurring_pattern_is_not_issued_ahead) {
         const RadBatch* nb = f.sch.step_next();
         if (hot) {
             CHECK(nb == nullptr);
-            CHECK_EQ(f.sch.metrics().suffix_held_ahead, (int64_t)1);
+            CHECK_EQ(f.sch.metrics().ahead_refused_suffix_hot, (int64_t)1);
         } else {
             CHECK(nb != nullptr);
-            CHECK_EQ(f.sch.metrics().suffix_held_ahead, (int64_t)0);
+            CHECK_EQ(f.sch.metrics().ahead_refused_suffix_hot, (int64_t)0);
         }
     }
 }
@@ -9983,7 +10044,7 @@ TEST(a_block_drafters_rows_are_issued_ahead_with_their_own_prefix_unless_a_seque
         const RadBatch* nb = f.sch.step_next();
         if (hot) {
             CHECK(nb == nullptr);
-            CHECK_EQ(f.sch.metrics().suffix_held_ahead, (int64_t)1);
+            CHECK_EQ(f.sch.metrics().ahead_refused_suffix_hot, (int64_t)1);
         } else {
             REQUIRE(nb != nullptr);
             std::vector<int> q;

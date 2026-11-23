@@ -402,6 +402,12 @@ public:
     void            expect_draft(uint64_t id, int n);
     const RadBatch* step_next();
     const RadBatch* step_next_locked();
+    /* Why step_next_locked did not issue the next step ahead of the commit, counted per reason in
+     * SchedMetrics::ahead_refused_* (S-07). The first check that refuses names it; a staging
+     * failure is not one of these. */
+    enum class AheadRefused : uint8_t {
+        Waiting, Held, MidPrompt, Grammar, SuffixHot, EndsEvery, Kv };
+    const RadBatch* refuse_ahead(AheadRefused why);
     /* Whether the step just issued likely ends every request it carries; step_next_locked then
      * issues nothing behind it. */
     bool            ends_every_request() const;
