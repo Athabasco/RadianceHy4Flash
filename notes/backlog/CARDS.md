@@ -77,7 +77,10 @@ scripts/backlog/lane.sh --env iks-A               # what a lane exports: port, m
   `72,000`) — the backlog's 6.7K / 24.9K prompts, because `prompts.py` walks the corpus in the same `shuffle`
   order its own tools did — `stall1` / `stall4` (a 5,698 / 5,881-token arrival on one and on four running
   decoders), and the small prompts `pf2` (2,385: `7,400`), `tailN` (`N` characters, e.g. `tail400`: 159) and
-  `c1s` / `c8s`. It prints each phase as JSON and writes
+  `c1s` / `c8s`, and `idle` (a conversation of `RAD_IDLE_CHARS` characters that finishes and idles for
+  `RAD_IDLE_WAIT_S` s, a decode-only request that makes the experts ask for VRAM back, the same prefix again
+  (the resume) and a cold prefill of the same size, with `/stats` and `/sessions` read at each step: the
+  host tier's `prefix-cache-mib` check, X-01). It prints each phase as JSON and writes
   `out.json`; phases are comma-separated (`c1,c8,pf6,pf20,stall1,stall4,pf2,tail400`), `nowarm` skips the two warmup
   requests, and an unknown phase is refused instead of leaving a hole in the run. Its requests are sampled at
   `RAD_TEMP` (default 0.9, seeded per request); a host whose `TEMP` is a directory is not a temperature and is
