@@ -10,7 +10,6 @@ container `hy4-flash-iqr-v4-u3.rad` (keptn/hy4-flash-iqr-v4).
 | `refs/kernels/*.md`, `refs/notes/*.md` | the earlier notes the backlog cites |
 | `CARDS.md` | how cards built from the backlog work: lanes, merge bar, lossy items, working from outside |
 | `closed/<ID>.md` | items closed without code: the number, the reason, and what an operator or a later card needs from them |
-| `M-03a.md` | a card whose code is done but which needs a lane (`CARDS.md` §6): what changed, what passed without a card, and the lane checks that are still open |
 | `../../scripts/backlog/` | the measuring tools and configs of §2: `run.sh`, `probe.py`, `bench.py`, `agg.py`, `layer.py`, `profdiff.py`, `profagg.py`, `attr.py`, `prompts.py`, `demangle.py` and the configs, with `lane.sh`, `lanes.sh`, `lane-cfg.py` and `lane-pair.sh` that make them lane-aware (§1.1) |
 
 How paths in the backlog map onto this directory:
@@ -33,3 +32,7 @@ Since the backlog was written, these decisions were made:
 the engine refuses to serve under it (Incompatible) and its failure mode is a full card reset, so it buys the smallest
 of the three lossless memory levers at the highest price. Number, sources and the verify steps a lane would run:
 `closed/M-13.md`.
+- **M-03a (stager arms at 1024 rows, the busy-chunk floor's off-by-one):** closed without code. In the served config a
+step of 1024 rows has no ring to copy into, so `min_rows` is not the lever, and where the floor binds (two 1024-row
+chunks a step) the step is 2048 rows and already staged: the lane measured the same `stage_layers`, the same h2d bytes
+and the same ms before and after rounding the floor up. Number, lane and runs: `closed/M-03a.md`.
