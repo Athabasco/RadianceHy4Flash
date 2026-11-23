@@ -255,12 +255,39 @@ def phase(name, prompts, n=256, effort="none"):
          "ms_step": 1000 * (hi - lo) / max(1, steps) if len(prompts) == 1 else None,
          "tok_per_step": sum(r["gen"] for r in res) / max(1, steps),
          "mono_ns": [ns0, ns1], "all_decoding_s": [lo - t0, hi - t0], "stats": sd, "metrics": md,
+         "stage_layers": s1.get("stage_layers"),
          "hit": sd.get("routed_res", 0) / max(1, sd.get("routed", 1)),
          "routed_per_step": sd.get("routed", 0) / max(1, steps),
          "miss_units_per_step": (sd.get("routed", 0) - sd.get("routed_res", 0)) / max(1, steps)}
     print(json.dumps({k: (round(v, 3) if isinstance(v, float) else v) for k, v in o.items() if k not in ("stats", "metrics")}), flush=True)
     time.sleep(2)
     return o
+def resume(chars, extra=900, turns=3, ntok=4):
+    """A resumed turn (M-03 (b): the churn case, 213-450 tokens re-prefilled a turn, TTFT 0.69-0.72 s
+    on the audit host). The session's first turn fills the KV; each later turn is the same prompt with
+    this turn's rows appended, so the prefix cache covers all of it but those rows and the step that
+    remains is one lone small prefill step -- the one the item stages. Reports each turn's TTFT, its
+    prompt tokens, the rows it took from the prefix cache and the rows it had to prefill."""
+    first = long_prompt(chars, 90)
+    out = []
+    def turn(p):
+        s0 = stats()
+        r = hits(lambda: request(p, ntok))
+        s1 = stats()
+        r["stage_layers"] = s1.get("stage_layers")
+        return r
+    a = turn(first)
+    later = [turn(first + long_prompt(extra, 91 + i)) for i in range(turns)]
+    o = {"name": "resume", "chars": chars, "extra_chars": extra, "conv_prompt": a["prompt"],
+         "conv_ttft": round(a["ttft"], 3),
+         "turn_prompt": [r["prompt"] for r in later], "turn_hit": [r["hit_tokens"] for r in later],
+         "turn_prefill": [r["prompt"] - r["hit_tokens"] for r in later],
+         "turn_ttft": [round(r["ttft"], 3) for r in later],
+         "turn_attn_cached": [r["attn_cached_tokens"] for r in later],
+         "stage_layers": [r["stage_layers"] for r in later]}
+    print(json.dumps(o), flush=True); time.sleep(2)
+    return o
+
 def longctx(chars=140000, n=8, ntok=128):
     # Eight sessions arrive and fill. One prompt each, built once, so both waves carry the same
     # strings -- what a prefix-cache hit needs (at 46K they can still be evicted: check the log's
@@ -291,8 +318,10 @@ for ph in PH:
     elif ph == "greedy": R["phases"].append(greedy())
     elif ph == "longctx": R["phases"].append(longctx())
     elif ph == "pf6c": R["phases"].append(phase("pf6c", [long_prompt(22000, 7, stamp=True)], 2))
+    elif ph.startswith("resume"):  # resumeN: a ~N-character session, then N-row turns resumed
+        R["phases"].append(resume(int(ph[6:]), int(os.environ.get("RAD_RESUME_EXTRA", 900))))
     elif ph == "idle": R["phases"].append(idle(int(os.environ.get("RAD_IDLE_CHARS", 72000))))
     elif ph == "long8": R["phases"].append(long8(int(os.environ.get("RAD_LONG8_CHARS", 140000))))
     else: sys.exit(f"probe.py: no phase '{ph}'; phases: c1 c1b c1s c2 c4 c8 c8s think pf2 pf6 pf6c pf8 pf20 "
-                  "greedy longctx stall1 stall4 tailN idle long8 nowarm")
+                  "greedy longctx stall1 stall4 tailN idle long8 resumeN nowarm")
 json.dump(R, open(OUT, "w"), indent=1)
