@@ -154,21 +154,29 @@ __global__ __launch_bounds__((GATED ? 2u : 1u) * KW * kWave) R4D_WAVES(6)
 void iqr_gemv_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restrict__ XS,
                      uint16_t* __restrict__ Y, uint32_t N, uint32_t x_ld, uint32_t xs_ld,
                      GatedOut go) {
-    if (CH::on) r4d_chain_wait();
     using D = Dec<F, true>;
     constexpr uint32_t NW = (GATED ? 2u : 1u) * KW;
     __shared__ __attribute__((aligned(16))) int8_t s_tab[D::kTab];
     __shared__ float s_red[NW][16 * MT];
     const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1);
     const uint32_t wave0 = __builtin_amdgcn_readfirstlane(tid / kWave);
+    /* Gated, waves KW and up take the up rows' tile, n rows below the gate rows'. */
+    const uint32_t half = GATED ? wave0 / KW : 0u, wave = GATED ? wave0 % KW : wave0;
+    const uint32_t rt = blockIdx.x + half * (N / 32u);
+    /* Chained, the block sits in the poll while its predecessor runs (aql.cpp's chain plan), so the
+     * wave's first unit of the weight is issued before the acquire: a static weight's bytes are
+     * not written by any op of a pass (operand role RAD_OPD_WEIGHT, core/runtime/issue.cpp's
+     * haz_note orders no read of one), so the read cannot see a partial write, and the dwords it
+     * returns stay in registers across the acquire. The activation (X, XS) and the table staged
+     * below stay behind the wait; the plain form issues the same unit as it is. */
+    typename D::Raw cur, nxt;
+    if (CH::on) cur = D::fetch(c0, rt, wave, lane, wave < c0.nkb);
+    if (CH::on) r4d_chain_wait();
     Ctx c = c0;
     c.tab = s_tab;
     D::stage(s_tab, c, tid, NW * kWave);
     __syncthreads();
 
-    /* Gated, waves KW and up take the up rows' tile, n rows below the gate rows'. */
-    const uint32_t half = GATED ? wave0 / KW : 0u, wave = GATED ? wave0 % KW : wave0;
-    const uint32_t rt = blockIdx.x + half * (N / 32u);
     const uint32_t myrow = rt * 16u + (lane & 15u);
 
     float acc[16][MT];
@@ -181,7 +189,7 @@ void iqr_gemv_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restri
     for (uint32_t m = 0; m < MT; ++m) fsum[m] = 0.0f;
     uint32_t nflush = 0;
 
-    typename D::Raw cur = D::fetch(c, rt, wave, lane, wave < c.nkb), nxt;
+    if (!CH::on) cur = D::fetch(c, rt, wave, lane, wave < c.nkb);
     for (uint32_t kb = wave; kb < c.nkb; kb += KW) {
         if (kb + KW < c.nkb) nxt = D::fetch(c, rt, kb + KW, lane, true);
         uint32_t xv[MT];
@@ -355,7 +363,6 @@ __global__ __launch_bounds__((GATED ? 2u : 1u) * KW * kWave) R4D_WAVES(6)
 void iqr_m16_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restrict__ XS,
                     uint16_t* __restrict__ Y, uint32_t N, uint32_t M, uint32_t x_ld, uint32_t xs_ld,
                     GatedOut go) {
-    if (CH::on) r4d_chain_wait_vec();
     using D = Dec<F>;
     static_assert(!GATED || NT == 1u, "the gated form serves one token tile");
     constexpr bool BIAS = F::SC == kRowF32;
@@ -371,15 +378,21 @@ void iqr_m16_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restric
     };
     const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1);
     const uint32_t wave0 = __builtin_amdgcn_readfirstlane(tid / kWave);
+    /* Gated, waves KW and up take the up rows' tile, n rows below the gate rows'. */
+    const uint32_t half = GATED ? wave0 / KW : 0u, wave = GATED ? wave0 % KW : wave0;
+    const uint32_t rt = blockIdx.x + half * (N / 32u), row0 = rt * 16u;
+    /* Chained, the wave's first unit of the weight is issued before the acquire, as
+     * iqr_gemv_kernel's is (a static weight's bytes, read by no op of the pass); the token rows
+     * and the table staged below stay behind the wait. */
+    typename D::Raw cur, nxt;
+    if (CH::on) cur = D::fetch(c0, rt, wave, lane, wave < c0.nkb);
+    if (CH::on) r4d_chain_wait_vec();
     Ctx c = c0;
     c.tab = s_tab;
     uint8_t* const tr = s_tr + wave0 * kTrBytes;
     D::stage(s_tab, c, tid, NW * kWave);
     __syncthreads();
 
-    /* Gated, waves KW and up take the up rows' tile, n rows below the gate rows'. */
-    const uint32_t half = GATED ? wave0 / KW : 0u, wave = GATED ? wave0 % KW : wave0;
-    const uint32_t rt = blockIdx.x + half * (N / 32u), row0 = rt * 16u;
     /* Token tile j is tokens 16 j .. 16 j + 15; a column past M reads token M - 1. */
     uint32_t tok[NT];
     const int8_t* xrow[NT];
@@ -408,7 +421,7 @@ void iqr_m16_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restric
     };
     /* The weight and the first token tile are asked for a unit ahead of their WMMA steps, each
      * further tile's fragments a tile ahead (gemm_i8_kpar_kernel's order). */
-    typename D::Raw cur = D::fetch(c, rt, wave, lane, wave < c.nkb), nxt;
+    if (!CH::on) cur = D::fetch(c, rt, wave, lane, wave < c.nkb);
     i2v bc[8], bn[8], bq[2][8];
     bload(0u, wave, bc, wave < c.nkb);
     for (uint32_t kb = wave; kb < c.nkb; kb += KW) {
