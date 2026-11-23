@@ -555,8 +555,10 @@ public:
      * by the engine after init; false keeps every checkpoint at a chunk's end. */
     void    set_ckpt_inside(bool on) { ckpt_inside_ = on; builder_.set_ckpt_cut(on); }
     /* Whether the step just planned leaves a prompt with at least the stager's smallest pass still
-     * to prefill, so the next step most likely carries a chunk the stager arms for. With
-     * `next_plan`, the step issued ahead (`plan_next_`) is the one being released. */
+     * to prefill, so the next step most likely carries a chunk the stager arms for -- and that next
+     * step is not a held one (--prefill-interleave), which would drop what was staged. With
+     * `next_plan`, the step issued ahead (`plan_next_`) is the one being released; its hold is
+     * counted from its own shape, since promote_next() arms it after the release. */
     bool    prefill_continues(bool next_plan = false) const;
     /* Visible for tests: the most a prefill chunk at `n_computed` of a `n_target`-token sequence
      * may take of `budget` when `reserve` tokens of other work are still to be planned in the step

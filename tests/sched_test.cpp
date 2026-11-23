@@ -4165,6 +4165,92 @@ TEST(interleave_counts_steps_issued_ahead_and_then_serves_the_chunk) {
     CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
 }
 
+/* The stager's arming for the step after one issued ahead (S-03). Engine::arena_step releases the
+ * step issued ahead against its own plan, so it asks prefill_continues(next_plan), and the answer
+ * must be the one the same plan gets when the scheduler's own release reads it: nothing staged for
+ * a step the hold follows, the next chunk's experts staged for a step that carries one. Returns
+ * the answer for the step issued ahead; the caller says which it is. */
+static bool ahead_arming(int64_t interleave) {
+    Fixture f;
+    f.build();
+    f.cfg.prefill_interleave = interleave;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(64);
+    const uint64_t d = f.submit(100, 512);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    f.sch.find(d)->speculation_fixed = true;
+    const uint64_t p = f.submit(2000, 4);
+    CHECK(f.sch.step() != nullptr);                     /* the first chunk, released normally */
+    /* Commit the hold's decode-only steps until the step that carries a chunk is issued ahead. */
+    bool issued = f.sch.step_next() != nullptr;
+    for (int k = 0; !issued && k < 8; ++k) {
+        f.commit_plain(12);
+        CHECK(f.sch.step() != nullptr);
+        issued = f.sch.step_next() != nullptr;
+    }
+    CHECK(issued);                                      /* the chunk's step is the one issued ahead */
+    const bool ahead = f.sch.prefill_continues(/*next_plan=*/true);
+    f.commit_plain(12);
+    f.sch.promote_next();
+    bool chunk = false;
+    for (const StepEntry& e : f.sch.plan().e) if (e.seq == p && e.is_prefill) chunk = true;
+    CHECK(chunk);                                       /* the step issued ahead is the next chunk */
+    CHECK_EQ(f.sch.prefill_continues(), ahead);         /* released normally: the same answer */
+    return ahead;
+}
+
+/* No hold follows that chunk's step, so the step after it carries the next chunk: the stager is
+ * armed. */
+TEST(prefill_continues_ahead_arms_for_the_chunk_of_the_next_step) {
+    CHECK(ahead_arming(/*interleave=*/0));
+}
+
+/* The chunk's step arms the hold, whose decode-only step drops a chunk's experts: nothing is
+ * staged, as nothing is when the same step is released by step(). */
+TEST(prefill_continues_ahead_is_not_armed_for_a_step_the_hold_follows) {
+    CHECK(!ahead_arming(/*interleave=*/1));
+}
+
+/* The plan the stager asks about is the one the step issued ahead runs, not the open step's: the
+ * open step's last chunk finishes its prompt (nothing left to stage), while the admission the step
+ * issued ahead takes carries rows and must arm it. */
+TEST(prefill_continues_ahead_reads_the_step_issued_ahead_not_the_open_one) {
+    Fixture f;
+    f.build();
+    f.cfg.prefill_interleave = 0;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(64);
+    const uint64_t d = f.submit(100, 512);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    f.sch.find(d)->speculation_fixed = true;
+    const uint64_t p = f.submit(600, 4);                /* 256 + 256 + 88 */
+    f.sch.find(p)->speculation_fixed = true;
+    CHECK(f.sch.step() != nullptr);                     /* p's first chunk */
+    bool asked = false, open_leaves = true, ahead_leaves = false;
+    for (int k = 0; k < 8 && !asked; ++k) {
+        bool last = false;
+        for (const StepEntry& e : f.sch.plan().e)
+            if (e.seq == p && e.is_prefill && e.produces_token) last = true;
+        if (last) f.submit(2000, 4);                    /* arrives as p's last chunk runs */
+        const bool issued = f.sch.step_next() != nullptr;
+        if (last) {                                     /* p's rows all go in this step */
+            CHECK(issued);                              /* its chunk, issued ahead */
+            open_leaves  = f.sch.prefill_continues();
+            ahead_leaves = f.sch.prefill_continues(/*next_plan=*/true);
+            asked = true;
+            break;
+        }
+        f.commit_plain(12);
+        if (issued) f.sch.promote_next();
+        else CHECK(f.sch.step() != nullptr);
+    }
+    CHECK(asked);                                       /* p's last chunk went by */
+    CHECK(!open_leaves);                                /* nothing left of the open step's prompt */
+    CHECK(ahead_leaves);                                /* the step issued ahead carries a chunk */
+}
+
 /* The arithmetic at a real deployment's shape: a 2048-token step and interval, the stager arming
  * at 1025 tokens (so a held-back chunk keeps 1024 and its step-mates take the rest). */
 TEST(busy_cap_keeps_the_stager_floor_and_never_leaves_a_runt) {

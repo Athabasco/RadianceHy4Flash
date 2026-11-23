@@ -2479,8 +2479,10 @@ int Engine::arena_step(const RadBatch* b, bool ahead) {
     arena_last_ = arena_rows_[(size_t)level];
     if (arena_last_ >= arena_floor_) { arena_floor_ = arena_last_; arena_floor_ns_ = now; }
     /* Whether the step after this one continues a prompt, so the stager stages its first layers at
-     * this step's end. Released normally, that step is the plan the scheduler holds; issued ahead,
-     * `b` *is* that step, and its own plan (`plan_next_`) says whether it carries a chunk. */
+     * this step's end. Released normally, `b` is the step about to run and the scheduler holds its
+     * plan; issued ahead, `b` is the step issued ahead and its plan is the one the scheduler plans
+     * for it (`plan_next_`). Either way the question is whether that plan leaves a chunk, which is
+     * nothing to stage when the hold follows it. */
     const bool more = b->phase != RAD_PHASE_DECODE && sched_.prefill_continues(ahead);
     for (auto& r : ranks_) {
         const int64_t allow = r->arena_lent[(size_t)level];

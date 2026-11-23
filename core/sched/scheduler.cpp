@@ -2843,10 +2843,22 @@ bool Scheduler::prefill_continues(bool next_plan) const {
      * against `plan_next_`, the plan it runs. */
     if (stage_rows_ <= 0) return false;
     if (next_plan ? !next_open_ : !step_open_) return false;
-    /* The next step is held to decode rows (--prefill-interleave): experts staged for a chunk now
-     * would be dropped by that step. */
-    if (interleave_left_ > 0) return false;
     const StepPlan& p = next_plan ? plan_next_ : plan_;
+    /* The next step is held to decode rows (--prefill-interleave): experts staged for a chunk now
+     * would be dropped by that step. A plan the scheduler has released (step(), or promote_next()
+     * for one issued ahead) has armed the hold in interleave_left_ already; a step issued ahead is
+     * released against plan_next_ before that, so its hold is the one its own shape will arm. */
+    int64_t hold = interleave_left_;
+    if (next_plan && cfg_.prefill_interleave != 0) {
+        int64_t n_dec = 0;
+        bool continues = false;
+        for (const StepEntry& e : p.e) {
+            if (e.is_prefill) { if (!e.produces_token) continues = true; }
+            else ++n_dec;
+        }
+        hold = n_dec && continues ? interleave_steps() : 0;
+    }
+    if (hold > 0) return false;
     for (const StepEntry& e : p.e) {
         if (!e.is_prefill || e.slot < 0 || (size_t)e.slot >= reqs_.size() || !reqs_[(size_t)e.slot])
             continue;
