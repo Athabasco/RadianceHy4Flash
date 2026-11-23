@@ -1365,6 +1365,25 @@ decoders go from 12.3 to 9.5 tokens/s each, losing the cheap remainder steps the
 token from, which `--prefill-interleave N` gives back. The arena grew by 12.4 MiB a rank (of
 570 MiB).
 
+**On this fork's lane the same fix at the batch was measured** (`iks-A`, TP2, u3, three runs an arm,
+interleaved, `scripts/backlog/nospec.yaml` with the interval line removed against the same file with
+`decode-headroom: 0`): an interval beside four decoders goes from `MIXED 2036 | MIXED 20 | MIXED
+2036 | MIXED 20 | MIXED 1780` to `MIXED 2052 | MIXED 2052 | MIXED 1780` -- one step, the decoders'
+rows on top -- and arrival TTFT from 2.62 to 2.23 s at one decoder (-15 %) and from 2.76 to 2.43 s
+at four (-12 %), four runs an arm inside 2.23-2.31 s against 2.62-2.63 s without it, with the
+decoders' typical gap (13.3 / 18.2 ms), decode (13.57 ms a step, 72.5 tok/s) and a lone prefill
+(0.65-0.67 s at 2.4K, 7.17 s at 24.9K) unchanged. The chunks stay 2048 rows, so nothing is re-tiled:
+three greedy prompts and a 5.7K arrival came back byte-identical with and without the headroom and
+against the 2048 baseline (`probe.py ... greedy` prints the sha256), where the 1984 interval differs
+from 2048 on the 5.7K arrival as the paragraph above says. At the served
+`checkpoint-interval: 1984` the flag lands on the same steps rather than new ones -- 1988-row chunks
+with and without it, pinned by `sched_test` -- so the served config keeps its interval and pays the
+headroom only in arena rows: 64 here (7 x 1 rounded up), `step_tok` 2112, +43.34 MiB a rank of
+1.41 GiB. The two 1984 arms measured 2.08-4.25 s at one decoder over thirteen runs that day against
+2.23-2.31 s at 2048 with the headroom, so the interval line is now the redundant half of the pair:
+a config-only change can drop it, at the price of the served answers moving back to the 2048-chunk
+baseline text on prompts longer than one chunk.
+
 **A prefill alone in its step can carry several intervals** (`prefill-span: N`, default 1). A
 chunk ends on every checkpoint interval, so a prompt is otherwise prefilled one interval a step.
 With

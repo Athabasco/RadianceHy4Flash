@@ -42,13 +42,22 @@ models:
     ngram-placement: ram              # Engram tables in host RAM, off the cards
     max-model-len: 1000000
     max-num-batched-tokens: 2048
+    decode-headroom: auto             # decode rows on top of the batch: an interval is one step
+                                      # beside decoding sessions at the full 2048 rows (arrival
+                                      # TTFT -15 % at one decoder, -12 % at four on iks-A) and the
+                                      # chunks do not move, so the answers do not either. auto is
+                                      # 64 rows here (7 x 1, rounded up): step_tok 2112, the
+                                      # activation arena +43 MiB a rank
     checkpoint-interval: 1984         # a quantum under the batch: a chunk sharing its step with
                                       # decoding sessions lands on the interval boundary, so an
                                       # interval is one step instead of two (arrival TTFT -16 %
                                       # at one decoder, -12 % at four on the iks-A lane). Chunks
                                       # are a quantum shorter than 2048 rows, so a long prompt's
                                       # answer may differ from a 2048-chunk step at tie level (no
-                                      # dtype, kernel or accumulation changes)
+                                      # dtype, kernel or accumulation changes). Redundant beside
+                                      # decode-headroom at 2048, which measured equal or tighter and
+                                      # at the full chunk size; kept because S-01 delivered it and
+                                      # it is what the notes here were measured on
     max-num-seqs: 8
     mm-max-patches: 0                 # no vision
     prefix-resume: nearest
