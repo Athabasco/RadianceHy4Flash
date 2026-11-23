@@ -2148,7 +2148,7 @@ int Mover::retire(HeatEngine* heat, bool with_held) {
 
 std::string Mover::report() const {
     const double gib = 1.0 / 1073741824.0;
-    std::string s = fmt("mover: %llu dispatches, %llu promotions, %llu demotions, %llu staged "
+    std::string s = fmt("mover: %llu dispatches, %llu promotions, %llu demotions, %llu prefetches "
                         "(%.2f GiB h2d, %.2f GiB d2h)\n",
                         (unsigned long long)stats_.dispatches,
                         (unsigned long long)stats_.promotions,
@@ -2160,6 +2160,18 @@ std::string Mover::report() const {
              "slot; %llu slots quarantined\n",
              (unsigned long long)stats_.no_record, (unsigned long long)stats_.starved_slab,
              (unsigned long long)stats_.starved_pool, (unsigned long long)stats_.quarantined);
+    /* The prefill stager (stage_units): the routed layers' pooled units copied into a pass's
+     * buffers. Not `prefetched`, which counts the units heat moved into a slab slot: a long-context
+     * prefill stages terabytes through here and prefetches nothing, so the promotion line's
+     * "staged" read 0 beside /stats's staged bytes (M-16). `overflow` is the units no buffer had
+     * room for, read in place: a heavy pooled layer outgrowing the staging ring (M-04). */
+    if (stats_.stage_layers || stats_.stage_overflow)
+        s += fmt("  stager: %llu routed layers, %llu units staged (%.2f GiB) in %llu copies, %llu "
+                 "units no buffer had room for (read in place)\n",
+                 (unsigned long long)stats_.stage_layers,
+                 (unsigned long long)stats_.staged_units, (double)stats_.staged_bytes * gib,
+                 (unsigned long long)stats_.stage_copies,
+                 (unsigned long long)stats_.stage_overflow);
     if (stats_.donated)
         s += fmt("  %llu host copies given by lent units to budgeted victims, %llu such units moved "
                  "by a recall, %llu left past one with no free slot\n",
