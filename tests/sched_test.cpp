@@ -6778,6 +6778,44 @@ TEST(a_step_is_issued_ahead_only_once_the_requests_speculation_is_fixed) {
     CHECK(f.sch.step_next() != nullptr);
 }
 
+/* The room gate refuses to admit a fresh prompt beside a running sequence, and a step issued
+ * ahead takes that refusal the way step() does: the waiter stays queued, hit and all, for the step
+ * after the commit to decide. Taking the wait (kAdmitWait) as an admission moved the waiter into
+ * running_ with no card of its own (s.card stays -1) and a stale sched_tokens, staged a row the
+ * builder refuses, and then handed the hit back -- so the wait cost the prefix hit step() keeps
+ * across a bounce. */
+TEST(the_room_gate_refuses_an_admission_issued_ahead) {
+    Fixture f;
+    f.build(/*blocks=*/32, /*states=*/64, /*max_tok=*/512);
+    f.cfg.prefill_room_gate = true;
+    CHECK_OK(f.start());
+
+    const uint64_t d = f.submit(100, 64);
+    CHECK(f.sch.step() != nullptr);                 /* the decoder's prompt */
+    f.commit_plain();
+    Request* dr = f.sch.find(d);
+    REQUIRE(dr != nullptr);
+    dr->speculation_fixed = true;
+
+    /* An earlier request filled the cache: a prefix 304 tokens deep, resumed at the 256
+     * checkpoint, which leaves 6 blocks of the pool free beside the running decoder. */
+    f.pc.seed(304);
+    f.pc.lin = 256;
+    f.pc.src = 3;
+    CHECK(f.sch.step() != nullptr);                 /* the decoder's step, in flight */
+
+    /* 32 blocks of prompt: far past the six the pool has free beside the runner. */
+    const uint64_t w = f.submit(500, 8);
+    CHECK(f.sch.step_next() == nullptr);            /* the gate's wait is no admission, ahead too */
+    Request* wr = f.sch.find(w);
+    REQUIRE(wr != nullptr);
+    CHECK_EQ((int)wr->state, (int)ReqState::Waiting);
+    /* The hit is kept for the next attempt, where step()'s wait leaves it. */
+    CHECK_EQ(wr->n_computed, (int64_t)256);
+    CHECK_EQ((int)f.kv.block_table(w, 0).size(), 16);
+    CHECK_EQ((int64_t)f.sch.metrics().queue_depth, (int64_t)1);
+}
+
 /* No step is issued ahead behind one that ends every request it carries: its rows would
  * belong to finished requests, and a request arriving after the last token would wait out its
  * forward pass. The verify ends a request most likely when its drafts hold an end-of-generation

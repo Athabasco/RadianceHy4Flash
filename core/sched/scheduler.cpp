@@ -3222,7 +3222,10 @@ const RadBatch* Scheduler::step_next_locked() {
         admission_failure_ = AdmissionFailure::None;
         admission_reclaim_pending_ = false;
         const int as = room > 0 ? admit_one(s, room, areserve, 0) : RAD_E_FULL;
-        if (as < 0) { plan_next_.reset(); return nullptr; }
+        /* A wait is a refusal too (the prefill room gate, a recompute with no room): step() leaves
+         * the waiter in the queue for the next attempt, so this step is not issued ahead with it,
+         * and nothing of the attempt is undone -- a hit it took is kept, as step() keeps it. */
+        if (as != RAD_OK) { plan_next_.reset(); return nullptr; }
 
         Request& r = *s.req;
         StepEntry n;

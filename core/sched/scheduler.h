@@ -392,7 +392,8 @@ public:
      *               admission and at most one prompt chunk -- the one this step continues, or the
      *               one a spent hold left over. Null (step() runs after the commit instead) when
      *               only committed state can decide: media still encoding, a grammar, the
-     *               context's end, a pool that cannot grow, a chunk the step's own shares hold
+     *               context's end, a pool that cannot grow, an admission the pool's room or a
+     *               recompute's extent makes wait, a chunk the step's own shares hold
      *               back, or more than one prompt chunk to place.
      *   promote_next   once this step has committed: the next step becomes the open one.
      *
