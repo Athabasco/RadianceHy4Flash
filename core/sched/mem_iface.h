@@ -133,9 +133,6 @@ struct IKVManager {
     virtual int64_t  stream_misses() const { return 0; }
     virtual int64_t  stream_bytes_in() const { return 0; }
     virtual int64_t  stream_resident_blocks() const { return 0; }
-    /* The loan recalls taken so far: one per admission that ran out of the blocks the cache held
-     * and took the KV loan back from the expert slab (KVManager::loan_recalls). */
-    virtual int64_t  loan_recalls() const { return 0; }
 
     /* Tokens one block covers, or 0 for a stateful group. */
     virtual int64_t block_tokens(int32_t group) const = 0;
@@ -476,7 +473,6 @@ struct KVBinding final : IKVManager {
     int64_t stream_resident_blocks() const override {
         return m->stream_stats().resident_blocks;
     }
-    int64_t loan_recalls() const override { return m->loan_recalls(); }
     int64_t block_tokens(int32_t g) const override {
         const KVGroupPlan* p = m->plan(g);
         return p && p->paged() ? p->block_size : 0;

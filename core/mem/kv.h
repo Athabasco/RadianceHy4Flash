@@ -496,12 +496,6 @@ public:
     int     set_loan(int64_t tokens);
     int64_t loan_tokens() const { return loan_; }
 
-    /* The recalls taken over the manager's life: one per grow_for that had to take the loan back
-     * from the slab because a sequence ran out of the blocks the cache held. Each one drains the
-     * mover and walks the pool, so this is the arbiter's reclaim counter. Rank 0 only, as the loan
-     * itself is. */
-    int64_t loan_recalls() const { return loan_recalls_; }
-
     /* Recall hook. A request needing more blocks than the cache has in hand calls it with the
      * loan it can still afford, and the slab owner drains to that before returning, so admission
      * is decided against the whole carve. Without a hook, lent blocks are not recalled and the
@@ -802,7 +796,6 @@ private:
     std::vector<int64_t>  short_peak_;
     Pool*    pool_ = nullptr;
     int64_t  loan_ = 0;                     /* tokens lent from the top of every lendable group */
-    int64_t  loan_recalls_ = 0;             /* grow_for's recalls, for the reclaim counter */
     int64_t  flex_backed_ = 0;              /* set_flex: the bytes the carve backs at start */
     int64_t  flex_floor_loan_ = 0;          /* the loan the carve started at */
     int64_t  flex_room_ = 0;                /* set_flex_room */

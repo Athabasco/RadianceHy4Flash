@@ -4411,7 +4411,6 @@ SchedMetrics Scheduler::metrics_locked() const {
     m.kv_resident_blocks = kv_->stream_resident_blocks();
     m.kv_stream_misses   = kv_->stream_misses();
     m.kv_stream_bytes_in = kv_->stream_bytes_in();
-    m.kv_loan_recalls    = kv_->loan_recalls();
 
     if (pc_) { m.prefix_evictions = pc_->evictions();
                m.prefix_ckpt_evictions = pc_->ckpt_evictions();

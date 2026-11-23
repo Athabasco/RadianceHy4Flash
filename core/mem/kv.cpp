@@ -942,8 +942,6 @@ int KVManager::grow_for(int32_t g, int64_t blocks, bool* waiting_for_fleet) {
      * one group never lends more of another. */
     int64_t keep = (p.n_blocks - live) * p.block_size;
     if (keep > loan_) keep = loan_;
-    /* A recall that hands back nothing moves nothing in the slab, so only a shrinking loan that
-     * the mover made is counted (kv.h, loan_recalls()). */
     if (reclaim_) {
         const int rc = reclaim_(keep, waiting_for_fleet);
         if (rc == RAD_E_FULL) return rc;   /* a flex cache the fleet could not grow: the request waits */
@@ -953,7 +951,6 @@ int KVManager::grow_for(int32_t g, int64_t blocks, bool* waiting_for_fleet) {
                     (long long)short_by, (long long)keep, rad_strerror(rc));
             return rc;
         }
-        if (keep < loan_) ++loan_recalls_;
     }
     RAD_TRY(set_loan(keep));
     return free_usable_[(size_t)g] >= blocks ? RAD_OK : RAD_E_FULL;

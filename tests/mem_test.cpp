@@ -3918,7 +3918,6 @@ TEST(a_request_past_the_mark_takes_the_loan_back) {
     CHECK_OK(e.kv.add_sequence(1));
     CHECK_OK(e.kv.ensure(1, tokens));
     CHECK_EQ(calls, 1);                                 /* one recall for the whole request */
-    CHECK_EQ(e.kv.loan_recalls(), 1);                   /* and it is the reclaim counter's one */
     CHECK(asked >= 0 && asked < spare);
     CHECK_EQ(e.kv.loan_tokens(), asked);
     CHECK(e.kv.live_blocks(G_FULL) > idle);
@@ -3946,7 +3945,6 @@ TEST(a_recall_the_slab_cannot_make_refuses_the_request) {
     CHECK_OK(e.kv.add_sequence(1));
     CHECK(e.kv.ensure(1, (idle + all) / 2 * e.bs()) < 0);
     CHECK_EQ(e.kv.loan_tokens(), loan);
-    CHECK_EQ(e.kv.loan_recalls(), 0);                   /* nothing was recalled */
     CHECK_EQ(e.kv.live_blocks(G_FULL), idle);
     CHECK_EQ((int64_t)e.kv.block_table(1, G_FULL).size(), 0);
 }

@@ -68,9 +68,6 @@ struct SchedMetrics {
     int64_t kv_resident_blocks = 0;
     int64_t kv_stream_misses = 0;
     int64_t kv_stream_bytes_in = 0;
-    /* Cumulative loan recalls: KV blocks taken back from the expert slab for a sequence that ran
-     * out of the blocks the cache held. Each one drains the mover and walks the pool. */
-    int64_t kv_loan_recalls = 0;
 
     double  prefix_hit_rate = 0.0;    /* 0..1 */
     /* Cumulative prefix-cache evictions. They rise as reusable prefixes are dropped, while

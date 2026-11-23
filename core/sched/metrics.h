@@ -102,9 +102,6 @@ struct SchedMetrics {
     int64_t kv_resident_blocks = 0;
     int64_t kv_stream_misses = 0;
     int64_t kv_stream_bytes_in = 0;
-    /* Cumulative loan recalls (KVManager::loan_recalls): each one drains the mover and walks the
-     * pool, so a prompt that recalls once instead of per chunk shows here. */
-    int64_t kv_loan_recalls = 0;
 
     /* Prefix caching (§7.3). Attention and linear are reported separately because they hit at
      * different granularities. */
