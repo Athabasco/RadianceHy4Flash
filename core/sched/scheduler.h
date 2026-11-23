@@ -378,18 +378,21 @@ public:
 
     /* ---------------------------------------------------- the next step, before this one commits
      *
-     * A decode step's successor needs nothing the host learns from it: every row continues where
-     * the card's acceptance leaves it (sched/advance.h), with drafts proposed on the card, and the
-     * host can bound how far that is. So the next forward pass is issued while this one runs.
+     * A decode step's successor needs almost nothing the host learns from it: every row continues
+     * where the card's acceptance leaves it (sched/advance.h), with drafts proposed on the card,
+     * and the host can bound how far that is. A request admitted, or a prompt chunk continued, is
+     * likewise known at issue time -- the prompt is in the request and a chunk advances n_computed
+     * by its rows. So the next forward pass, mixed or not, is issued while this one runs.
      *
      *   expect_draft   after the drafter is issued: how many drafts the next step verifies for a
      *               sequence, capped at its window (under the adaptive policy possibly fewer
      *               than the rounds that ran).
-     *   step_next      plans and builds that step: every row of this one, as a device row, at
-     *               the furthest context it can reach. Null (step() runs after the commit
-     *               instead) when only committed state can decide: a request awaiting admission,
-     *               a prefill chunk to continue, a grammar, the context's end, or a pool that
-     *               cannot grow.
+     *   step_next      plans and builds that step: every row of this one that produces a token, as
+     *               a device row, at the furthest context it can reach, plus the head waiter's
+     *               admission and at most one continuing prompt chunk. Null (step() runs after the
+     *               commit instead) when only committed state can decide: media still encoding, a
+     *               grammar, the context's end, a pool that cannot grow, a held-back chunk, or
+     *               more than one prompt chunk to place.
      *   promote_next   once this step has committed: the next step becomes the open one.
      *
      * While the next step is open, commit() leaves continuing requests' blocks in place, and a
@@ -551,8 +554,9 @@ public:
      * by the engine after init; false keeps every checkpoint at a chunk's end. */
     void    set_ckpt_inside(bool on) { ckpt_inside_ = on; builder_.set_ckpt_cut(on); }
     /* Whether the step just planned leaves a prompt with at least the stager's smallest pass still
-     * to prefill, so the next step most likely carries a chunk the stager arms for. */
-    bool    prefill_continues() const;
+     * to prefill, so the next step most likely carries a chunk the stager arms for. With
+     * `next_plan`, the step issued ahead (`plan_next_`) is the one being released. */
+    bool    prefill_continues(bool next_plan = false) const;
     /* Visible for tests: the most a prefill chunk at `n_computed` of a `n_target`-token sequence
      * may take of `budget` when `reserve` tokens of other work are still to be planned in the step
      * and `shared` says rows are already planned ahead of it. Returns `budget` when

@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <new>
 #include <string>
 #include <unistd.h>
@@ -7152,17 +7153,40 @@ struct AheadRun {
     std::vector<BatchRows> steps;
     std::vector<std::vector<int32_t>> out;
     std::vector<int64_t> held;      /* paged blocks each sequence holds at the end */
+    std::vector<int32_t> phases;    /* plan phase of each step, in order */
     int ahead = 0;                  /* steps that ran issued ahead */
+    int64_t steps_ahead_counter = 0;/* the scheduler's own count of them */
     int card_host_disagree = 0;
 };
 
-void ahead_setup(Fixture& f, int n_spec, std::vector<uint64_t>& ids) {
+/* The requests a run is made of: the ones submitted before its first step, and requests that
+ * arrive while it runs. An arrival at step t is queued once step t is planned and before its
+ * commit, which is where a request arriving on the card's flight lands. */
+struct AheadScript {
+    std::vector<int> prompts{ 40, 56, 72 };
+    std::vector<std::pair<int, int>> arrivals;   /* {step, prompt length} */
+    std::function<void(Fixture&)> tweak;         /* config the run differs by */
+};
+
+void ahead_setup(Fixture& f, int n_spec, std::vector<uint64_t>& ids,
+                 const AheadScript& sc = AheadScript{}) {
     f.build();
     f.cfg.n_spec = n_spec;
+    if (sc.tweak) sc.tweak(f);
     CHECK_OK(f.start());
-    for (int n : { 40, 56, 72 }) {
+    for (int n : sc.prompts) {
         auto r = f.request(n, 0);
         r->speculation_fixed = true;     /* no grammar: the commit cannot change speculation */
+        ids.push_back(f.add(std::move(r)));
+    }
+}
+
+/* Queue the script's requests that arrive at this step, once its plan exists. */
+void ahead_arrivals(Fixture& f, const AheadScript& sc, std::vector<uint64_t>& ids, int t) {
+    for (const auto& a : sc.arrivals) {
+        if (a.first != t) continue;
+        auto r = f.request(a.second, 0);
+        r->speculation_fixed = true;
         ids.push_back(f.add(std::move(r)));
     }
 }
@@ -7196,23 +7220,27 @@ void ahead_finish(Fixture& f, const std::vector<uint64_t>& ids, AheadRun& run) {
         run.out.push_back(f.sch.find(id)->output);
         run.held.push_back((int64_t)f.kv.block_table(id, 0).size());
     }
+    run.steps_ahead_counter = f.sch.metrics().steps_ahead;
 }
 
 /* Every step built by step() after the commit. */
-AheadRun ahead_reference(int n_spec, int steps) {
+AheadRun ahead_reference(int n_spec, int steps, const AheadScript& sc = AheadScript{}) {
     Fixture f;
     std::vector<uint64_t> ids;
-    ahead_setup(f, n_spec, ids);
+    ahead_setup(f, n_spec, ids, sc);
     AheadRun run;
     const RadBatch* b = f.sch.step();
     if (!b) return run;
     run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+    run.phases.push_back((int32_t)f.sch.plan().phase);
     for (int t = 0; t < steps; ++t) {
+        ahead_arrivals(f, sc, ids, t);
         CHECK_OK(ahead_commit(f, t));
         ahead_publish(f, ids, n_spec, t + 1);
         b = f.sch.step();
         if (!b) break;
         run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+        run.phases.push_back((int32_t)f.sch.plan().phase);
     }
     ahead_finish(f, ids, run);
     return run;
@@ -7222,16 +7250,18 @@ AheadRun ahead_reference(int n_spec, int steps) {
  * acceptance into the StepSlots, the draft head's proposals into them, expect_draft and
  * step_next, the trunk advance on the new build, then the commit, the drafter's set_draft and
  * promote_next. */
-AheadRun ahead_pipelined(int n_spec, int steps) {
+AheadRun ahead_pipelined(int n_spec, int steps, const AheadScript& sc = AheadScript{}) {
     Fixture f;
     std::vector<uint64_t> ids;
-    ahead_setup(f, n_spec, ids);
+    ahead_setup(f, n_spec, ids, sc);
     AheadRun run;
     std::vector<StepSlot> slots((size_t)f.cfg.max_seqs);
     const RadBatch* b = f.sch.step();
     if (!b) return run;
     run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+    run.phases.push_back((int32_t)f.sch.plan().phase);
     for (int t = 0; t < steps; ++t) {
+        ahead_arrivals(f, sc, ids, t);
         /* The sampler's rows for step t: the drafts it agrees with, then its own token. */
         const StepPlan& p = f.sch.plan();
         std::vector<int32_t> y((size_t)b->n_out + 1, -1);
@@ -7248,7 +7278,9 @@ AheadRun ahead_pipelined(int n_spec, int steps) {
         for (int i = 0; i < acc.n_seq; ++i) adv_row(acc, i);
         for (const StepEntry& e : p.e) {
             const StepSlot& S = slots[(size_t)e.card];
-            if (S.acc != ahead_acc(e.seq, t, e.n_spec) || S.tok[0] != ahead_tok(e.seq, t))
+            /* A chunk that does not reach the prompt's end samples nothing to check. */
+            if (e.dev_out >= 0 &&
+                (S.acc != ahead_acc(e.seq, t, e.n_spec) || S.tok[0] != ahead_tok(e.seq, t)))
                 ++run.card_host_disagree;
             /* The draft head's proposals for step t + 1 (ADV_ROUND / ADV_TAKE on a card). */
             for (int j = 0; j < n_spec; ++j)
@@ -7273,6 +7305,7 @@ AheadRun ahead_pipelined(int n_spec, int steps) {
             if (!b) break;
         }
         run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+        run.phases.push_back((int32_t)f.sch.plan().phase);
     }
     ahead_finish(f, ids, run);
     return run;
@@ -7311,6 +7344,104 @@ TEST(a_step_issued_ahead_equals_the_step_built_after_the_commit) {
             CHECK(b.held[i] <= a.held[i] + 1);
         }
     }
+}
+
+/* A prefill chunk carried ahead: a long prompt whose chunks are split by the checkpoint interval
+ * runs beside a decoding sequence, so the step after each commit is mixed (a decode row plus the
+ * prompt's next chunk). That chunk starts where the in-flight one ends -- the host knows, since a
+ * prefill advances n_computed by exactly its rows -- and takes the budget the rows behind it
+ * leave. Issued ahead it must be the same chunk, in the same batch, with the same phase. */
+TEST(a_mid_prompt_chunk_is_issued_ahead) {
+    const int T = 16;
+    AheadScript sc;
+    sc.prompts = { 40, 900 };
+    const AheadRun a = ahead_reference(0, T, sc);
+    const AheadRun b = ahead_pipelined(0, T, sc);
+    CHECK_EQ(b.ahead, T);
+    CHECK_EQ(b.steps_ahead_counter, (int64_t)b.ahead);
+    CHECK_EQ(b.card_host_disagree, 0);
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    REQUIRE_EQ(a.steps.size(), (size_t)T + 1);
+    for (size_t t = 0; t < a.steps.size(); ++t) {
+        const bool same = a.steps[t] == b.steps[t];
+        CHECK(same);
+        if (!same) std::fprintf(stderr, "    step %zu differs\n", t);
+        CHECK_EQ(a.steps[t].bad_slots, 0);
+        CHECK_EQ(b.steps[t].bad_slots, 0);
+    }
+    CHECK(a.out == b.out);
+    CHECK(a.phases == b.phases);
+    int mixed = 0;
+    for (int32_t ph : b.phases) if (ph == RAD_PHASE_MIXED) ++mixed;
+    CHECK(mixed >= 2);                       /* the chunk's steps ran beside decode rows */
+}
+
+/* A newcomer carried ahead: a request arriving while the step before it flies is admitted into the
+ * step issued ahead (media ready, the context fits), so its first chunk is planned, staged and
+ * launched without waiting for the commit. The run then carries that prompt's next chunks beside
+ * the decoding sequences, as above. */
+TEST(an_admission_is_issued_ahead) {
+    const int T = 16;
+    AheadScript sc;
+    sc.arrivals.push_back({ 2, 300 });
+    const AheadRun a = ahead_reference(0, T, sc);
+    const AheadRun b = ahead_pipelined(0, T, sc);
+    CHECK_EQ(b.ahead, T);                    /* every step after the first ran ahead */
+    CHECK_EQ(b.steps_ahead_counter, (int64_t)b.ahead);
+    CHECK_EQ(b.card_host_disagree, 0);
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    REQUIRE_EQ(a.steps.size(), (size_t)T + 1);
+    for (size_t t = 0; t < a.steps.size(); ++t) {
+        const bool same = a.steps[t] == b.steps[t];
+        CHECK(same);
+        if (!same) std::fprintf(stderr, "    step %zu differs\n", t);
+        CHECK_EQ(a.steps[t].bad_slots, 0);
+        CHECK_EQ(b.steps[t].bad_slots, 0);
+    }
+    CHECK(a.out == b.out);
+    CHECK(a.phases == b.phases);
+    /* The arrival is in step 3 in both runs: admitted ahead, it is the step after the step it
+     * arrived in, not the one after that. */
+    REQUIRE_EQ(a.steps.size(), (size_t)T + 1);
+    CHECK_EQ(a.steps[3].seq.size(), (size_t)4);
+    CHECK_EQ(a.steps[2].seq.size(), (size_t)3);
+}
+
+/* A chunk the step's shares hold back is left to the step after the commit: the budget the rows it
+ * made room for did not use goes back to the chunk there (step()'s reclaim), so the chunk issued
+ * ahead would be a shorter one than the full step plans. */
+TEST(a_chunk_held_back_by_the_shares_is_left_to_the_step_after_the_commit) {
+    const int T = 12;
+    AheadScript sc;
+    sc.prompts = { 40, 900 };
+    sc.tweak = [](Fixture& f) {
+        f.cfg.busy_prefill_chunk = 128;   /* under the 256-token checkpoint chunk */
+    };
+    const AheadRun a = ahead_reference(0, T, sc);
+    const AheadRun b = ahead_pipelined(0, T, sc);
+    CHECK(b.ahead > 0);
+    CHECK(b.ahead < T);                   /* the capped chunk's step was not issued ahead */
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    for (size_t t = 0; t < a.steps.size(); ++t) CHECK(a.steps[t] == b.steps[t]);
+    CHECK(a.out == b.out);
+    CHECK(a.phases == b.phases);
+}
+
+/* Two requests arriving in the same step: step() would admit as many as fit, so the step issued
+ * ahead (which admits the head only) is left to the step after the commit. */
+TEST(a_queue_of_two_arrivals_is_admitted_after_the_commit) {
+    const int T = 12;
+    AheadScript sc;
+    sc.arrivals.push_back({ 2, 300 });
+    sc.arrivals.push_back({ 2, 340 });
+    const AheadRun a = ahead_reference(0, T, sc);
+    const AheadRun b = ahead_pipelined(0, T, sc);
+    CHECK(b.ahead > 0);
+    CHECK(b.ahead < T);
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    for (size_t t = 0; t < a.steps.size(); ++t) CHECK(a.steps[t] == b.steps[t]);
+    CHECK(a.out == b.out);
+    CHECK(a.phases == b.phases);
 }
 
 /* ================================================================== a block drafter on the card */

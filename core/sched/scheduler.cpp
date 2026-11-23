@@ -2835,16 +2835,19 @@ const RadBatch* Scheduler::step() {
 }
 
 /* ------------------------------------------------------------------ media */
-bool Scheduler::prefill_continues() const {
+bool Scheduler::prefill_continues(bool next_plan) const {
     std::lock_guard<std::mutex> lk(mu_);
     /* Only the step being released has a plan to read. Between a commit and the next step (an
      * encoder pass is prepared there) `plan_` is the committed step's, whose requests in_step() no
-     * longer holds: a cancel and reap may have released one. */
-    if (stage_rows_ <= 0 || !step_open_) return false;
+     * longer holds: a cancel and reap may have released one. A step issued ahead is released
+     * against `plan_next_`, the plan it runs. */
+    if (stage_rows_ <= 0) return false;
+    if (next_plan ? !next_open_ : !step_open_) return false;
     /* The next step is held to decode rows (--prefill-interleave): experts staged for a chunk now
      * would be dropped by that step. */
     if (interleave_left_ > 0) return false;
-    for (const StepEntry& e : plan_.e) {
+    const StepPlan& p = next_plan ? plan_next_ : plan_;
+    for (const StepEntry& e : p.e) {
         if (!e.is_prefill || e.slot < 0 || (size_t)e.slot >= reqs_.size() || !reqs_[(size_t)e.slot])
             continue;
         const int64_t left = reqs_[(size_t)e.slot]->seq_len() - ((int64_t)e.ctx_len + e.n_tokens);
@@ -2958,25 +2961,60 @@ bool Scheduler::ends_every_request() const {
 
 const RadBatch* Scheduler::step_next_locked() {
     if (!step_open_ || next_open_ || plan_.e.empty()) return nullptr;
-    /* An admission is a decision about the pool and the queue that the full step makes. */
-    if (!waiting_.empty()) return nullptr;
     /* Once the hold is spent, the held chunk goes into the next full step rather than waiting
      * behind decode steps issued ahead. */
     if (held_prefill_ > 0 && interleave_left_ == 0) return nullptr;
     /* Before the loop below, which reserves the next step's KV. */
     if (ends_every_request()) return nullptr;
 
+    const bool hold_prefill = cfg_.prefill_interleave != 0 && interleave_left_ > 0;
+    /* The experiments that split a chunk against a learned target read that target where the
+     * chunk is planned; a step is left to them as before. */
+    const bool prefill_ahead = !hold_prefill && !mixed_target_active_;
+    /* The head of the queue, when the full step would admit it: fresh, its media encoded, a free
+     * slot and card, and room in the context. A request still to be encoded is left to the
+     * engine (a step issued ahead in front of it would keep the encoders idle), and one step()
+     * would fail is failed there, not here. */
+    bool admit_head = false;
+    if (!waiting_.empty()) {
+        if (!prefill_ahead) return nullptr;
+        /* step() admits as many waiters as the budget and the slots take, so one behind the head
+         * would make the step after the commit differ from this plan: it is left to that step. */
+        if (waiting_.size() > 1) return nullptr;
+        SchedReq& w = *reqs_[(size_t)waiting_[0]];
+        if (!w.req || w.req->state != ReqState::Waiting) return nullptr;
+        if (ctx_limit_ > 0 &&
+            (w.seq_len() > ctx_limit_ || (!w.req->embed && w.seq_len() == ctx_limit_)))
+            return nullptr;
+        if ((int64_t)running_.size() >= cfg_.max_seqs || free_cards_.empty()) return nullptr;
+        if (!w.req->media || media_ready(w)) admit_head = true;
+        else return nullptr;
+    }
+
     plan_next_.reset();
     plan_next_.spec_is_tree = tree_;
+
+    /* The row (at most one) that continues a prompt. A prefill chunk advances n_computed by
+     * exactly its rows, so the host knows where the next chunk starts before the commit; a
+     * second continuing chunk, or a hold, is left to the step built after the commit. */
+    const StepEntry* continuing = nullptr;
+    int32_t n_continuing = 0;
     for (const StepEntry& e : plan_.e) {
+        if (!e.is_prefill || e.produces_token) continue;
+        if (++n_continuing > 1) return nullptr;
+        continuing = &e;
+    }
+    if (continuing && !prefill_ahead) return nullptr;
+
+    for (const StepEntry& e : plan_.e) {
+        if (!e.produces_token) continue;   /* a continuing chunk, planned below */
         if (e.slot < 0 || (size_t)e.slot >= reqs_.size()) return nullptr;
         SchedReq& s = *reqs_[(size_t)e.slot];
         if (!s.req || s.req->state != ReqState::Running || !s.running) return nullptr;
         Request& r = *s.req;
-        /* A mid-prompt chunk continues as a prefill from where the host knows it is. A grammar
-         * that cannot rewind decides at commit whether the next step may speculate; one that can,
-         * or no grammar, keeps its answer. */
-        if (!e.produces_token || !r.speculation_fixed) return nullptr;
+        /* A grammar that cannot rewind decides at commit whether the next step may speculate; one
+         * that can, or no grammar, keeps its answer. */
+        if (!r.speculation_fixed) return nullptr;
         /* --draft-suffix: a sequence whose history ended in a recurring pattern at the last commit
          * is likely to continue it; its next step is built after the commit, where the lookup can
          * read the committed end (a step issued ahead is made on the card from the head's drafts). */
@@ -3019,22 +3057,203 @@ const RadBatch* Scheduler::step_next_locked() {
         plan_next_.n_tok += want;
         if (d > plan_next_.n_spec) plan_next_.n_spec = d;
     }
-    plan_next_.phase        = RAD_PHASE_DECODE;
-    plan_next_.n_seq_decode = (int64_t)plan_next_.e.size();
-    plan_next_.n_tok_decode = plan_next_.n_tok;
+    /* A step with no decode row beside its prefill row is not a mixed step. */
+    if (plan_next_.e.empty()) { plan_next_.reset(); return nullptr; }
+    const size_t n_dec = plan_next_.e.size();
+
+    const int64_t budget0 = cfg_.prefill_span > 1 ? geo_.shared_tok : cfg_.max_tok;
+    const int64_t Q = std::max<int64_t>(geo_.quantum, 1);
+    const bool share_step = cfg_.busy_prefill_chunk != 0;
+    const int64_t share_tok = std::max<int64_t>(Q, budget0 / 8 / Q * Q);
+    const int64_t dec_row_tok =
+        1 + std::max<int64_t>(std::max<int64_t>((int64_t)draft_.next_depth(),
+                                                (int64_t)draft_.step_window()),
+                              cfg_.draft_suffix ? (int64_t)cfg_.draft_suffix_max : 0);
+    const bool admit_possible = !waiting_.empty() && !free_cards_.empty() &&
+                                (int64_t)running_.size() < cfg_.max_seqs;
+    auto planned_tok = [&](int32_t slot) -> int64_t {
+        for (const StepEntry& pe : plan_next_.e)
+            if (pe.slot == slot) return (int64_t)pe.n_tokens;
+        return 0;
+    };
+
+    /* ------------------------------------------------------------- the next chunk */
+    /* The step that follows this one spends its budget on the same running set in the same
+     * priority order. Walk that order to the chunk: what comes before it has its row in
+     * plan_next_ already (it sampled a token, or was a last chunk) and takes its budget; what
+     * comes after it is what busy_cap holds the chunk back for. */
+    if (continuing) {
+        const int32_t pf_slot = continuing->slot;
+        /* The step after the commit sees each request advanced by the row it carries here. A prompt
+         * chunk that reaches the prompt's end leaves a decode row there, and counts as one for the
+         * shares this step plans with (step() plans the next step from the committed view). */
+        auto pf_after = [&](const SchedReq& sr) -> bool {
+            const Request& rr = *sr.req;
+            int64_t nc = rr.n_computed;
+            if (sr.entry >= 0 && (size_t)sr.entry < plan_.e.size()) {
+                const StepEntry& ce = plan_.e[(size_t)sr.entry];
+                if (ce.is_prefill) nc += ce.n_tokens;
+            }
+            return nc < (int64_t)rr.prompt.size() || nc + 1 < sr.seq_len();
+        };
+        int64_t budget_at_pf = budget0, behind_dec = 0, behind_pf = 0;
+        if (share_step) {
+            for (int32_t slot : running_) {
+                if (pf_after(*reqs_[(size_t)slot])) ++behind_pf;
+                else behind_dec += dec_row_tok;
+            }
+        }
+        for (int32_t slot : running_) {
+            if (slot == pf_slot) break;   /* step() takes the row's own share before planning it */
+            budget_at_pf -= planned_tok(slot);
+            if (share_step) {
+                if (pf_after(*reqs_[(size_t)slot])) --behind_pf;
+                else behind_dec -= dec_row_tok;
+            }
+        }
+
+        SchedReq& ps = *reqs_[(size_t)pf_slot];
+        const Request& pr = *ps.req;
+        const int64_t start  = pr.n_computed + continuing->n_tokens;
+        const int64_t target = ps.seq_len();
+        const int64_t shares = share_step ? behind_pf + (admit_possible ? 1 : 0) : 0;
+        const int64_t reserve = share_step ? behind_dec + share_tok * shares : 0;
+        const int64_t cap = busy_cap(start, target, budget_at_pf, reserve,
+                                     !plan_next_.e.empty(), shares == 0, 0, behind_dec);
+        const int64_t end = chunk_end(pr, target);
+        int64_t ckpt = -1;
+        int64_t want = plan_chunk(start, end, cap, &ckpt, pr.checkpoint_at, &pr);
+        if (want <= 0 && cap < budget_at_pf && prog_ && prog_->encoder.bidirectional)
+            want = plan_chunk(start, end, budget_at_pf, &ckpt, pr.checkpoint_at, &pr);
+        /* The step that follows this one would run the chunk alone if the chunk spent the budget
+         * the decode rows behind it need: that is not the mixed step this issues ahead. */
+        if (want <= 0 || plan_next_.n_tok + want > budget0) {
+            plan_next_.reset();
+            return nullptr;
+        }
+        /* A chunk the shares held back is planned after the commit, where the budget they did not
+         * use goes back to it (step()'s reclaim): issuing it ahead would pin the shorter chunk. */
+        if (want < plan_chunk(start, end, budget_at_pf, nullptr, pr.checkpoint_at, &pr)) {
+            plan_next_.reset();
+            return nullptr;
+        }
+        /* No preemption from here: a request in flight holds its blocks until this step commits,
+         * so a shortfall is the step after the commit's to fix. */
+        if (kv_->ensure_from(pr.id, start + want, pr.n_computed) < 0) {
+            plan_next_.reset();
+            return nullptr;
+        }
+        /* A snapshot the store dropped since the hit was taken: step() gives the hit back and
+         * prefills again, which only the step after the commit can do. */
+        if (ps.ckpt_src >= 0 && !kv_->checkpoint_held(ps.ckpt_src)) {
+            plan_next_.reset();
+            return nullptr;
+        }
+        StepEntry n;
+        n.req            = &pr;
+        n.seq            = pr.id;
+        n.slot           = pf_slot;
+        n.card           = ps.card;
+        n.n_tokens       = (int32_t)want;
+        n.ctx_len        = (int32_t)start;
+        n.n_spec         = 0;
+        n.n_accepted     = 1;          /* one-based; a prefill rolls nothing back */
+        n.conv_cursor    = ps.conv_cursor;
+        n.draft          = ps.draft;
+        n.n_draft        = 0;
+        n.is_prefill     = true;
+        n.produces_token = (start + want >= target);
+        n.ckpt_restore   = ps.ckpt_src;   /* consumed once by this step's chunk */
+        ps.ckpt_src      = -1;
+        ps.n_draft       = 0;
+        ps.sched_tokens  = (int32_t)want;
+        if (ps.req) { ps.req->n_draft = 0; ps.req->draft = nullptr; ps.req->draft_parent = nullptr; }
+        if (ckpt > 0) reserve_ckpt(n, pr, ckpt, (int32_t)(ckpt - start - 1));
+        plan_next_.e.push_back(n);
+        plan_next_.n_tok += want;
+    }
+
+    /* ----------------------------------------------------------------- an admission */
+    /* The step after this one admits with what the running rows leave it: the same budget and
+     * the same queue the full step would find. */
+    int32_t admit_slot = -1;
+    if (admit_head) {
+        const int32_t slot = waiting_[0];
+        SchedReq& s = *reqs_[(size_t)slot];
+        const int64_t room = budget0 - plan_next_.n_tok;
+        const int64_t areserve =
+            share_step && !s.req->embed && waiting_.size() > 1 &&
+            (int64_t)plan_next_.e.size() + 1 < cfg_.max_seqs && free_cards_.size() > 1
+                ? share_tok : 0;
+        admit_full_ = 0;
+        admit_next_step_ = false;
+        admission_failure_ = AdmissionFailure::None;
+        admission_reclaim_pending_ = false;
+        const int as = room > 0 ? admit_one(s, room, areserve, 0) : RAD_E_FULL;
+        if (as < 0) { plan_next_.reset(); return nullptr; }
+
+        Request& r = *s.req;
+        StepEntry n;
+        n.req            = &r;
+        n.seq            = r.id;
+        n.slot           = slot;
+        n.card           = s.card;
+        n.n_tokens       = s.sched_tokens;
+        n.ctx_len        = (int32_t)r.n_computed;
+        n.n_spec         = 0;
+        n.n_accepted     = 1;
+        n.conv_cursor    = s.conv_cursor;
+        n.draft          = s.draft;
+        n.n_draft        = 0;
+        n.is_prefill     = true;
+        n.produces_token = (r.n_computed + s.sched_tokens >= s.seq_len());
+        n.ckpt_restore   = s.ckpt_src;
+        s.ckpt_src       = -1;
+        r.n_draft        = 0;
+        r.draft          = nullptr;
+        r.draft_parent   = nullptr;
+        if (s.pending_ckpt > 0)
+            reserve_ckpt(n, r, s.pending_ckpt, (int32_t)(s.pending_ckpt - r.n_computed - 1));
+        s.entry = (int32_t)plan_next_.e.size();
+        plan_next_.e.push_back(n);
+        plan_next_.n_tok += s.sched_tokens;
+        queue_insert(running_, slot);
+        queue_erase(waiting_, slot);
+        admit_slot = slot;
+    }
+
+    plan_next_.phase        = plan_next_.e.size() > n_dec ? RAD_PHASE_MIXED : RAD_PHASE_DECODE;
+    plan_next_.n_seq_decode = (int64_t)n_dec;
+    plan_next_.n_tok_decode = 0;
+    for (size_t i = 0; i < n_dec; ++i) plan_next_.n_tok_decode += plan_next_.e[i].n_tokens;
     {
         int64_t k = 0;
         int32_t row = 0;
         for (StepEntry& e : plan_next_.e) {
             e.dev_tok = (int32_t)(k + e.n_tokens - 1 - e.n_spec);
-            e.dev_out = row;
+            e.dev_out = e.produces_token ? row : -1;
             e.dev_aux = e.n_spec;
-            row += 1 + e.n_spec;
+            if (e.produces_token) row += 1 + e.n_spec;
             k += e.n_tokens;
         }
     }
     const RadBatch* b = builder_.build(plan_next_, *kv_, step_);
-    if (!b) { plan_next_.reset(); return nullptr; }
+    if (!b) {
+        /* A failed staging hands the admission back to the queue, as step() does. */
+        for (StepEntry& e : plan_next_.e) {
+            SchedReq& s = *reqs_[(size_t)e.slot];
+            s.entry_next = -1;
+            if (e.slot != admit_slot) continue;
+            if (e.ckpt_restore >= 0) undo_hit(s);
+            s.running = false;
+            s.req->state = ReqState::Waiting;
+            queue_erase(running_, s.slot);
+            queue_insert(waiting_, s.slot);
+            admit_slot = -1;
+        }
+        plan_next_.reset();
+        return nullptr;
+    }
     for (size_t i = 0; i < plan_next_.e.size(); ++i)
         reqs_[(size_t)plan_next_.e[i].slot]->entry_next = (int32_t)i;
     next_open_ = true;
@@ -3063,15 +3282,33 @@ void Scheduler::promote_next() {
             s.req->draft_parent = tree_ && plan_.e[i].n_spec ? s.draft_par : nullptr;
         }
     }
-    ++m_.steps_decode;
-    /* A step issued ahead during a hold is one of its decode-only steps. */
-    if (interleave_left_ > 0) {
-        --interleave_left_;
-        if (held_prefill_ > 0) ++m_.steps_held;
+    /* The step was planned by step_next_locked, so its shape and its effect on the next hold are
+     * counted here the way step() counts them when it plans the step itself. */
+    switch (plan_.phase) {
+        case RAD_PHASE_PREFILL: ++m_.steps_prefill; break;
+        case RAD_PHASE_MIXED:   ++m_.steps_mixed;   break;
+        default:                ++m_.steps_decode;  break;
+    }
+    if (cfg_.prefill_interleave != 0) {
+        if (plan_.phase == RAD_PHASE_DECODE) {
+            /* A step issued ahead during a hold is one of its decode-only steps. */
+            if (interleave_left_ > 0) {
+                --interleave_left_;
+                if (held_prefill_ > 0) ++m_.steps_held;
+            }
+        } else {
+            bool continues = false;
+            int64_t n_dec = 0;
+            for (const StepEntry& e : plan_.e) {
+                if (e.is_prefill) { if (!e.produces_token) continues = true; }
+                else ++n_dec;
+            }
+            interleave_left_ = n_dec && continues ? interleave_steps() : 0;
+        }
     }
     ++m_.steps_ahead;
     for (const StepEntry& e : plan_.e)
-        if (e.n_spec == 0) ++m_.decode_rows_unspeculated;
+        if (!e.is_prefill && e.n_spec == 0) ++m_.decode_rows_unspeculated;
     step_start_ = std::chrono::steady_clock::now();
     ++step_;
     step_open_ = true;
