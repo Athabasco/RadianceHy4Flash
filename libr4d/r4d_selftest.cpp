@@ -1502,7 +1502,7 @@ static bool attn_verify_bits_case(const Plugin& pl, const char* name, int64_t gq
     for (int64_t j = 0; j < q_len; ++j)
         eq += !std::memcmp(&ver[(size_t)(j * row)], &one[(size_t)(j * row)], (size_t)row * 2);
     const bool good = rc == RAD_OK && eq == q_len;
-    while (g_allocs.size() > mark) { hipFree(g_allocs.back()); g_allocs.pop_back(); }
+    while (g_allocs.size() > mark) { (void)hipFree(g_allocs.back()); g_allocs.pop_back(); }
     if (!quiet || !good)
         ok(tag.c_str(), good, fmt("rc=%d, rows bit-equal %lld/%lld", rc, (long long)eq, (long long)q_len));
     return good;
@@ -30848,7 +30848,7 @@ static void gather_two_rank(const Plugin& pl, const std::vector<int>& devs, cons
        "rc " + std::to_string(a.rc_launch) + "/" + std::to_string(b.rc_launch));
 
     /* What each rank sent, rebuilt on the host rather than read from the device. */
-    auto sent = [numel](int rank, int64_t i) -> uint32_t {
+    auto sent = [](int rank, int64_t i) -> uint32_t {
         if ((i & 1) == 0) return (uint32_t)(rank * 124160 + (int)i + 1);
         uint32_t u; const float v = (float)(rank + 1) * 0.5f + (float)(i - 1);
         std::memcpy(&u, &v, 4);
