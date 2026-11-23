@@ -283,6 +283,7 @@ for ph in PH:
     elif ph == "pf6": R["phases"].append(phase("pf6", [long_prompt(22000, 7, stamp=True)], 2))
     elif ph == "pf20": R["phases"].append(phase("pf20", [long_prompt(72000, 9, stamp=True)], 2))
     elif ph == "pf2": R["phases"].append(phase("pf2", [long_prompt(7400, 5)], 2))
+    elif ph == "pf8": R["phases"].append(phase("pf8", [long_prompt(22000, 61 + i) for i in range(8)], 2))
     elif ph == "stall1": R["phases"].append(stall("stall1", 1, 22000))
     elif ph == "stall4": R["phases"].append(stall("stall4", 4, 22000))
     elif ph.startswith("tail"):  # tailN: prompt of ~N chars lone, to size small prefill steps
@@ -292,6 +293,6 @@ for ph in PH:
     elif ph == "pf6c": R["phases"].append(phase("pf6c", [long_prompt(22000, 7, stamp=True)], 2))
     elif ph == "idle": R["phases"].append(idle(int(os.environ.get("RAD_IDLE_CHARS", 72000))))
     elif ph == "long8": R["phases"].append(long8(int(os.environ.get("RAD_LONG8_CHARS", 140000))))
-    else: sys.exit(f"probe.py: no phase '{ph}'; phases: c1 c1b c1s c2 c4 c8 c8s think pf2 pf6 pf6c pf20 "
+    else: sys.exit(f"probe.py: no phase '{ph}'; phases: c1 c1b c1s c2 c4 c8 c8s think pf2 pf6 pf6c pf8 pf20 "
                   "greedy longctx stall1 stall4 tailN idle long8 nowarm")
 json.dump(R, open(OUT, "w"), indent=1)
