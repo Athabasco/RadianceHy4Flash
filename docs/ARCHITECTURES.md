@@ -3793,10 +3793,48 @@ and a chunk that is held back reads its routed experts synchronously (the arriva
 0.1-0.2 s for 2-5x TTFT and are not recommended. Both mixed-step rows predate the stager floor: the learned cap pushed its
 chunks under the 1024-row step there, where the routed experts are read synchronously. The scheduler now never sizes a mixed
 chunk under the stager floor (one quantum when the model arms no stager), missing a target shorter than one floor-sized step
-rather than breaking the floor, so this knob now runs between the `busy-prefill-chunk: 1024` row (0.67-0.68 s of stall) and
-`auto`, and both rows are to be re-taken on a lane. Keep `auto` for a server whose arrivals matter more than the decoders' cadence
+rather than breaking the floor, so this knob now runs between the `busy-prefill-chunk: 1024` row and `auto`, and both rows are
+superseded by the ones below. Keep `auto` for a server whose arrivals matter more than the decoders' cadence
 (batch or agent traffic): there is no setting below about 0.37 s of stall in this sweep, and nothing here changes a greedy
 token. Prefix cache and KV pool are unchanged (configuration only).
+
+**The two mixed-step rows re-taken after the stager floor (2026-11-23, `local` lane, TP2, u3, 210 W, on `e714c086`).**
+BetterBench's `work/sweep` is not in this tree, so the rows above cannot be re-run here; these are `scripts/backlog/probe.py`'s
+phases `c1,c8,pf6,pf20,stall1,stall4` at `RADIANCE_LOG_STEPS=1`, whose arrival is a 5.7K prompt behind 1 and 4 decoders (the
+phase starts with the decoders on and sends the prompt 1.5 s in), one to three runs a side, alternating, one server a run:
+
+    scripts/backlog/lane.sh local 'scripts/backlog/run.sh <tag> <cfg> c1,c8,pf6,pf20,stall1,stall4 RADIANCE_LOG_STEPS=1'
+
+with `<cfg>` = `scripts/backlog/nospec.yaml`, or that file with `mixed-step-target-ms: 150` / `: 300` (or
+`busy-prefill-chunk: 512` / `: 1024`) added. `before` is the tree with the item reverted, `after` is HEAD; the two are the
+same server otherwise, so the difference is the clamp. The tree is the one the change lands on, after the mixed step is
+issued ahead (`#11`), which is why even `auto`'s three chunks begin with a 1984-row one. The machine drifts between windows --
+the flag-off row below, taken by both binaries in the same code path, spreads 2.40-2.85 s -- so the arms of one window are
+compared with each other, and within a window the two arms' decode and cold prefill agree to 1-8 %.
+
+| setting | arrival TTFT 1 / 4 decoders | worst stall 1 / 4 | the arrival's mixed chunks | prefill ms a token |
+|---|---|---|---|---|
+| `auto` (flag off; 1 run a side) | 2.40, 2.85 / 2.42, 2.48 s | 0.60, 0.78 / 0.58, 0.60 s | 3 x 1728-1984 | 0.42-0.50 |
+| `busy-prefill-chunk: 1024` (2 runs) | 3.70, 3.80 / 3.67, 3.74 s | 0.38 / 0.39-0.41 s | 6 x 704-1024 | 0.65-0.67 |
+| `busy-prefill-chunk: 512` (2 runs) | 5.24, 5.83 / 4.83, 5.02 s | 0.25, 0.38 / 0.27 s | 12 x 192-512 | 0.92-1.02 |
+| `mixed-step-target-ms: 300`, before | 4.62, 4.78 / 4.90, 5.36 s | 0.42-0.44 / 0.30 s | 9 x 112-1984, then 192-624 | 0.81-0.84 |
+| `mixed-step-target-ms: 300`, after | 3.41, 3.41 / 3.79, 3.95 s | 0.44 / 0.41 s | 5 x 704-1984 | 0.60 |
+| `mixed-step-target-ms: 150`, before | 6.62, 8.87, 6.25 / 6.79, 7.73, 6.77 s | 0.44-0.75 / 0.18-0.19 s | 20-28 x 64-1984 | 1.10-1.56 |
+| `mixed-step-target-ms: 150`, after | 3.47, 3.51, 3.35 / 3.79, 3.96, 3.73 s | 0.44-0.50 / 0.39-0.42 s | 5 x 704-1984 | 0.59-0.62 |
+
+Reading: under the floor the learned cap went to 112-624 rows a chunk at 300 ms and 64-256 at 150 ms -- under even the
+explicit 512-row one, once the 1984-row chunk the stager issues ahead of the decoders is spent -- so the arrival was cut into
+20-28 steps and paid 1.10-1.56 ms a token against 0.59-0.62 at the floor. The clamp moves the knob onto the 1024-row row:
+5 chunks of 704-1984 and then 704-1024, 0.60 ms a token, 3.44 / 3.83 s at 150 ms and 3.41 / 3.87 s at 300 ms against
+7.25 / 7.10 and 4.70 / 5.13 before (-52 % and -27 % at one decoder, -46 % and -25 % at four); the explicit
+`busy-prefill-chunk: 1024` row is 3.75 / 3.71 s, the 0.3 s being the ahead chunk a target in milliseconds cannot shrink.
+The stall that buys is the floor's: at four decoders 0.19 to 0.41 s at 150 ms and 0.30 to 0.41 s at 300 ms, and at one
+decoder its mean of 0.55 s over the three before-runs becomes 0.46 s, because the worst gap is now the 1984-row chunk both
+arms pay. That is less stall than `auto`'s 0.58-0.78 s for 1.0-1.4 s more arrival: the flag moves along the same frontier as
+`busy-prefill-chunk`, a little stall for a lot of arrival, instead of buying stall with a slower one. Nothing else moved in
+either arm: decode 70.8-71.9 tok/s at one stream and 281-308 at eight (one after-run of the 300 arm, in a window whose cold
+prefill reads 2.02 s, gave 60.6), cold prefill 1.93-2.02 s at 6.7K and 7.05-7.19 s at 24.9K, the decoders' typical gap
+12.9-13.0 / 18.2-18.5 ms.
 
 `checkpoint-interval` sits under every row of this sweep and costs nothing: the rows above were taken at the default 2048
 interval under a 2048-token batch, where an arrival's chunk stops a quantum short of the interval boundary and every
