@@ -32,3 +32,7 @@ Since the backlog was written, these decisions were made:
 the engine refuses to serve under it (Incompatible) and its failure mode is a full card reset, so it buys the smallest
 of the three lossless memory levers at the highest price. Number, sources and the verify steps a lane would run:
 `closed/M-13.md`.
+- **M-03a (stager arms at 1024 rows, the busy-chunk floor's off-by-one):** closed without code. In the served config a
+step of 1024 rows has no ring to copy into, so `min_rows` is not the lever, and where the floor binds (two 1024-row
+chunks a step) the step is 2048 rows and already staged: the lane measured the same `stage_layers`, the same h2d bytes
+and the same ms before and after rounding the floor up. Number, lane and runs: `closed/M-03a.md`.
