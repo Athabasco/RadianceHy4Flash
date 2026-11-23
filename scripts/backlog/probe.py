@@ -2,15 +2,17 @@
 """probe.py <port> <out.json> <phases,comma>: sampled (T 0.9, seeded) phases for the general-levers note.
 phases: c1, c8, think (c1, reasoning high), c4, pf6 (prefill ~6.7K tokens: 22,000 characters of tree source),
 pf20 (prefill ~24.9K: 72,000), pf2 (~2.4K: 7,400), stall1 / stall4 (a ~5.7K arrival while 1 / 4 decoders run),
-tailN (a prompt of ~N characters), c1s (64 tok), c8s (48 tok), longctx (eight ~46K-token sessions:
+tailN (a prompt of ~N characters), c1s (64 tok), c8s (48 tok), greedy (three prompts and one 5.7K arrival
+at temperature 0 with ignore_eos off: the text itself, as gen / chars / sha256, so two runs' answers
+compare byte for byte -- the merge bar's first clause), longctx (eight ~46K-token sessions:
 a prefill wave of one token each, then the same eight prompts decoded 128 tokens, so all eight are at
 long context together: the shape notes/backlog/refs/notes/longctx.md measured as N8 48K, where the
 stager overflows its ring -- longctx-pre / longctx-decode in the JSON). The token counts are the ones
 the backlog's own runs measured on these phases, so a lane's ttft compares with the numbers in
 notes/backlog/."""
-import json, sys, threading, time, urllib.request, os
+import hashlib, json, sys, threading, time, urllib.request, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from prompts import CODE_PROMPTS as P, SRC, long_prompt
+from prompts import CODE_PROMPTS as P, GREEDY, SRC, long_prompt
 PORT, OUT, PH = int(sys.argv[1]), sys.argv[2], sys.argv[3].split(",")
 BASE = f"http://127.0.0.1:{PORT}"
 def get(p): return urllib.request.urlopen(BASE + p, timeout=10).read().decode()
@@ -96,6 +98,38 @@ def stall(name, nbg, chars, ntok=420):
     o = {"name": name, "bg": nbg, "arrival_prompt": r["prompt"], "arrival_ttft": round(r["ttft"], 3), "arrive_at": round(ta, 2), "first_at": round(ta + r["ttft"], 2),
          "typical_gap_ms": round(typ[len(typ) // 2], 1) if typ else None, "worst_gaps_ms": gaps, "metrics": md, "clients": nbg, "mono_ns": [0, 0]}
     print(json.dumps({k: v for k, v in o.items() if k != "metrics"}), flush=True); time.sleep(2); return o
+def greedy_text(content, n=256):
+    # Temperature 0 and ignore_eos off: no sampler noise and no cut-off, so the only thing that can
+    # change the text is the step's chunking or a kernel's arithmetic.
+    body = {"model": "hy4-flash", "messages": [{"role": "user", "content": content}], "max_tokens": n,
+            "temperature": 0.0, "top_p": 1.0, "reasoning_effort": "none", "stream": True,
+            "stream_options": {"include_usage": True}, "ignore_eos": False}
+    req = urllib.request.Request(BASE + "/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
+    text = []; gen = 0
+    with urllib.request.urlopen(req, timeout=3600) as r:
+        for raw in r:
+            ln = raw.decode(errors="replace").strip()
+            if not ln.startswith("data:"): continue
+            d = ln[5:].strip()
+            if d == "[DONE]": break
+            ev = json.loads(d)
+            if ev.get("usage"): gen = ev["usage"].get("completion_tokens", 0)
+            for ch in ev.get("choices", []):
+                c = ch.get("delta", {}).get("content") or ""
+                if c: text.append(c)
+    s = "".join(text)
+    return {"gen": gen, "chars": len(s), "sha256": hashlib.sha256(s.encode()).hexdigest()}
+
+def greedy():
+    # The three short prompts are one chunk either way; the 5.7K one is not, so it is the prompt whose
+    # chunks a budget change re-tiles -- it shows whether two arms' chunk boundaries and row sets
+    # agree where they matter.
+    out = [greedy_text(p) for p in GREEDY]
+    out.append(dict(greedy_text(long_prompt(22000, 5701, stamp=False), 64), name="arrival5.7K"))
+    res = {"name": "greedy", "texts": out}
+    print(json.dumps(res), flush=True)
+    return res
+
 def phase(name, prompts, n=256, effort="none"):
     res = [None] * len(prompts)
     def w(i): res[i] = request(prompts[i], n, effort)
@@ -145,8 +179,9 @@ for ph in PH:
     elif ph == "stall4": R["phases"].append(stall("stall4", 4, 22000))
     elif ph.startswith("tail"):  # tailN: prompt of ~N chars lone, to size small prefill steps
         R["phases"].append(phase(ph, [long_prompt(int(ph[4:]), 3)], 2))
+    elif ph == "greedy": R["phases"].append(greedy())
     elif ph == "longctx": R["phases"].append(longctx())
     elif ph == "pf6c": R["phases"].append(phase("pf6c", [long_prompt(22000, 7, stamp=True)], 2))
     else: sys.exit(f"probe.py: no phase '{ph}'; phases: c1 c1b c1s c2 c4 c8 c8s think pf2 pf6 pf6c pf20 "
-                  "longctx stall1 stall4 tailN nowarm")
+                  "greedy longctx stall1 stall4 tailN nowarm")
 json.dump(R, open(OUT, "w"), indent=1)
