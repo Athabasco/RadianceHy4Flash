@@ -10546,6 +10546,156 @@ TEST(a_group_s_checkpoint_is_taken_and_committed_on_its_last_slice) {
     CHECK_EQ(f.sch.find(d)->output.size(), (size_t)5);
 }
 
+/* A chunk that restores from a prefix hit is one whole pass: the restore is consumed by the
+ * chunk's first (and only) pass, so a slice would start every sub-step from the same snapshot
+ * and write the same positions again. */
+TEST(a_chunk_that_restores_from_a_prefix_hit_is_never_sliced) {
+    Fixture f;
+    f.build(/*blocks=*/16384, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/16384,
+            /*windowed=*/false, /*linear=*/true);
+    f.prog.meta.n_layers = 8;
+    f.cfg.checkpoint_interval = 256;         /* a recurrent hit resumes at a snapshot */
+    f.cfg.chunk_slices = 4;
+    f.cfg.slice_layers_ok = true;
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 512);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    f.pc.seed(304);                          /* the attention blocks match 304 tokens deep ... */
+    f.pc.lin = 256;                          /* ... the last snapshot is at 256 */
+    f.pc.src = 3;
+    const uint64_t p = f.submit(1000, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    const StepPlan& pl = f.sch.plan();
+    REQUIRE_EQ((int)pl.e.size(), 2);
+    REQUIRE(pl.e[1].ckpt_restore >= 0);
+    CHECK_EQ(pl.slice_m, 0);
+    (void)d;
+    (void)p;
+}
+
+/* A checkpoint inside the chunk would be a position whose state the remaining sub-steps have not
+ * written yet (a window's tail snapshot): the chunk runs whole, so its state is whole at it. */
+TEST(a_checkpoint_inside_a_chunk_is_never_sliced) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/2048, /*max_ctx=*/4096,
+            /*windowed=*/true, /*linear=*/false);
+    f.cfg.chunk_slices = 4;
+    f.cfg.slice_layers_ok = true;
+    f.cfg.checkpoint_interval = 2048;        /* no interval snapshot inside a 1000-row chunk */
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 512);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(1000, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    const StepPlan& pl = f.sch.plan();
+    REQUIRE_EQ((int)pl.e.size(), 2);
+    REQUIRE(pl.e[1].ckpt_slot >= 0);
+    REQUIRE(pl.e[1].ckpt_tok + 1 < pl.e[1].n_tokens);
+    CHECK_EQ(pl.slice_m, 0);
+    (void)d;
+    (void)p;
+}
+
+/* The group freezes its decoders' rows, so a draft in flight would have its verify window's
+ * positions recomputed by every sub-step: a draft beside a chunk leaves the chunk whole. */
+TEST(a_draft_beside_a_chunk_leaves_the_chunk_whole) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/4);
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 512);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    int32_t draft[4] = { 21, 22, 23, 24 };
+    CHECK_OK(f.sch.set_draft(d, draft, 4));
+    const uint64_t p = f.submit(496, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().n_spec, 4);
+    CHECK_EQ(f.sch.plan().slice_m, 0);
+    (void)p;
+}
+
+/* The embedding rows are scattered into the token rows once, on the group's first sub-step; the
+ * plugin carries them to the rest. The chunk's rows are the same on every sub-step. */
+TEST(a_group_scatters_its_media_on_the_first_slice_only) {
+    Fixture f;
+    media_fixture(f, /*max_tok=*/512, /*bidi=*/0);
+    f.prog.meta.n_layers = 8;
+    f.cfg.chunk_slices = 4;
+    f.cfg.slice_layers_ok = true;
+    f.cfg.checkpoint_interval = 0;           /* the chunk is the whole prompt, not cut short */
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    const uint64_t p = f.add(with_run(f, 400, 200, 100, mm::Kind::Image));
+    CHECK(p != 0);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(f.sch.plan().slice_m, 4);
+    CHECK_EQ(b->n_tok, 401);                 /* the chunk's 400 rows and the decoder's */
+    CHECK_EQ(b->n_mm_rows, 100);
+    const int64_t n_tok = b->n_tok;
+
+    for (int32_t j = 1; j < 4; ++j) {
+        const RadBatch* nb = f.sch.step_next();
+        if (j < 3) {
+            REQUIRE(nb != nullptr);
+            CHECK_EQ(nb->n_tok, n_tok);
+            CHECK_EQ(nb->n_mm_rows, 0);
+        }
+        f.commit_plain(20 + j);
+        if (j < 3) f.sch.promote_next();
+    }
+    (void)d;
+    (void)p;
+}
+
+/* Nothing is admitted inside a group: a newcomer waits for the last sub-step, and the chunk's
+ * rows and blocks stay what they were. */
+TEST(admission_waits_for_a_group_s_last_slice) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/4);
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(496, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().slice_m, 4);
+
+    const uint64_t q = f.submit(64, 8);
+    CHECK_EQ((int)f.sch.find(q)->state, (int)ReqState::Waiting);
+    f.commit_plain(20);
+    const RadBatch* nb = f.sch.step();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(f.sch.plan().slice_j, 1);
+    REQUIRE_EQ(nb->n_seq, 2);                /* the group's rows, not the newcomer's */
+    CHECK_EQ((int)f.sch.find(q)->state, (int)ReqState::Waiting);
+
+    f.commit_plain(21);
+    REQUIRE(f.sch.step() != nullptr);        /* sub-step 2 */
+    CHECK_EQ(f.sch.plan().slice_j, 2);
+    CHECK_EQ((int)f.sch.find(q)->state, (int)ReqState::Waiting);
+    f.commit_plain(22);
+    REQUIRE(f.sch.step() != nullptr);        /* sub-step 3, the last */
+    CHECK_EQ(f.sch.plan().slice_j, 3);
+    CHECK(f.sch.plan().slice_last);
+    CHECK_EQ((int)f.sch.find(q)->state, (int)ReqState::Waiting);
+
+    f.commit_plain(23);                      /* the last sub-step ends the group */
+    REQUIRE(f.sch.step() != nullptr);        /* and only now is the newcomer planned */
+    CHECK_EQ((int)f.sch.find(q)->state, (int)ReqState::Running);
+    CHECK_EQ(f.sch.plan().slice_m, 0);
+    (void)d;
+    (void)p;
+}
+
 /* A preemption inside a group would hand the blocks its remaining sub-steps write to the next
  * sequence: the fleet's room check waits for the group, then goes through again. */
 TEST(preemption_waits_for_a_group_s_last_slice) {
@@ -10577,4 +10727,46 @@ TEST(preemption_waits_for_a_group_s_last_slice) {
 
     CHECK_EQ(f.sch.preempt_until([] { return false; }), 2);   /* both runners, as outside */
     (void)p;
+}
+
+/* A cancel inside a group is recorded and acted on at its end: the row keeps its place (the
+ * chunk's rows below it read the same state) and its blocks until the last sub-step commits. */
+TEST(a_cancel_mid_group_keeps_the_decoder_s_row_until_the_last_slice) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/4);
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(496, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().slice_m, 4);
+
+    const int64_t free0 = f.kv.free_blocks(0);
+    CHECK_OK(f.sch.cancel(d));
+    CHECK_EQ((int)f.sch.find(d)->state, (int)ReqState::Cancelled);
+    CHECK_EQ(f.kv.free_blocks(0), free0);    /* still the group's: the next sub-step writes it */
+    /* the server drains the closed request and reaps it, which the group defers */
+    CHECK_EQ(f.sch.reap(d), RAD_OK);
+
+    f.commit_plain(20);                      /* the cancelled row commits nothing */
+    REQUIRE_EQ(f.sch.find(d)->output.size(), (size_t)1);
+    const RadBatch* nb = f.sch.step();
+    REQUIRE(nb != nullptr);
+    REQUIRE_EQ(nb->n_seq, 2);                /* it keeps its place */
+    CHECK_EQ(f.sch.plan().e[0].seq, d);
+    CHECK_EQ(f.kv.free_blocks(0), free0);
+
+    f.commit_plain(21);
+    REQUIRE(f.sch.step() != nullptr);        /* sub-step 2 */
+    CHECK_EQ(f.sch.plan().e[0].seq, d);
+    CHECK(f.sch.find(d) != nullptr);         /* held: its row is still planned */
+    f.commit_plain(22);
+    REQUIRE(f.sch.step() != nullptr);        /* sub-step 3 */
+    CHECK_EQ(f.kv.free_blocks(0), free0);
+
+    f.commit_plain(23);                      /* the last sub-step lets it go */
+    CHECK(f.sch.find(d) == nullptr);
+    CHECK(f.kv.free_blocks(0) > free0);
+    CHECK_EQ(f.sch.find(p)->output.size(), (size_t)1);
 }
