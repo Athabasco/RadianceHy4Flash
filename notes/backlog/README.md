@@ -32,6 +32,15 @@ Since the backlog was written, these decisions were made:
 the engine refuses to serve under it (Incompatible) and its failure mode is a full card reset, so it buys the smallest
 of the three lossless memory levers at the highest price. Number, sources and the verify steps a lane would run:
 `closed/M-13.md`.
+- **S-01(b) (`--decode-headroom`, FP-3):** closed without code. S-01(a)'s `checkpoint-interval: 1984` already leaves no
+remainder step in the served schedule (three `MIXED` steps an arrival, both arms of every run), so at the served geometry
+the flag has no step to remove and only grows the arena (1.39 -> 1.43 GiB a rank, +43.34 MiB); at 2048 rows it reaches
+exactly the schedule (a) reaches, inside noise and with a larger arena. The cherry-pick is reverted, the harness it
+needed stays. Numbers, lanes and what a later card would need: `closed/S-01b.md`.
+- **M-03a (stager arms at 1024 rows, the busy-chunk floor's off-by-one):** closed without code. In the served config a
+step of 1024 rows has no ring to copy into, so `min_rows` is not the lever, and where the floor binds (two 1024-row
+chunks a step) the step is 2048 rows and already staged: the lane measured the same `stage_layers`, the same h2d bytes
+and the same ms before and after rounding the floor up. Number, lane and runs: `closed/M-03a.md`.
 - **S-04 (interleave EMA at the stager floor):** closed without code. On the served lane the decode-only run after a big
 chunk does not lengthen (16 against 17.5 steps, medians over the two arrival windows) because since S-01 the samples
 that hold the mean down are 1984-row chunks that cost 0.010 s, which a floor on rows keeps; where the change does act
