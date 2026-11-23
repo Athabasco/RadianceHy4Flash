@@ -147,6 +147,14 @@ struct SchedReq {
      * fit would inflate the prompt and hit totals. */
     int32_t  hit_attn = 0;
     bool     hit_owed = false;
+
+    /* This request's block chain, hashed once and kept (PrefixChain): the lookup that admits it
+     * and the publish that hands its blocks back walk the same blocks, and a request that waits
+     * for room is looked up again on every scheduling round -- a 64K prompt is 4096 block hashes,
+     * spent under the scheduler's lock. The chain describes the text, so preemption keeps it; it
+     * is stamped by request id, so a recycled slot starts over, and PCBinding checks the stamp. A
+     * cache, filled from a const gate: it changes no decision. */
+    mutable PrefixChain chain;
     /* Why that hit was cut, for the counters (SchedMetrics::hit_cut_*): to nothing, or to a
      * snapshot more than an interval below it. */
     enum class HitCut : uint8_t { None, NoSnapshot, Window, Adopt, ResumedBelow };

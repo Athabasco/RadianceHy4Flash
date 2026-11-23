@@ -496,6 +496,8 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.ckpt_src = -1;
     s.hit_attn = 0;
     s.hit_owed = false;
+    /* The slot's chain belonged to whatever request held it: drop it rather than trust it. */
+    s.chain.reset();
     /* Slots are reused: a request that inherited `restore_waited` would never wait for a deferred
      * release and its restore would be cut. */
     s.restore_waited = false;
@@ -739,7 +741,7 @@ bool Scheduler::publish_prefix(SchedReq& s) {
             pub_blocks_[i] = kv_->block_table(s.req->id, cg[i]);
         }
         if (ok) {
-            const int rc = pc_->insert(*s.req, pub_blocks_, s.req->n_computed);
+            const int rc = pc_->insert(*s.req, pub_blocks_, s.req->n_computed, &s.chain);
             if (rc < 0)
                 RAD_DEBUG("prefix cache: request %llu not published: %s",
                           (unsigned long long)s.req->id, rad_strerror(rc));
@@ -1690,7 +1692,8 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve,
             cap.tokens = std::max<int64_t>(0, (int64_t)r.prompt.size() - draft_refill_);
             cap.max_give_back = 2 * draft_refill_;
         }
-        const CacheHit h = pc_->lookup(r, &hit_blocks_, draft_refill_ > 0 ? &cap : nullptr);
+        const CacheHit h = pc_->lookup(r, &hit_blocks_, draft_refill_ > 0 ? &cap : nullptr,
+                                       &s.chain);
         if (h.given_back > 0) {
             m_.draft_refill_tokens += h.given_back;
             ++m_.draft_refills;
@@ -2008,7 +2011,7 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
          * loop this gate exists to stop. The exact-mode grid floor is folded in as a bound too
          * -- crediting less than admission adopts only delays a re-admission by one round,
          * crediting more reopens the loop. */
-        const CacheHit h = pc_->lookup(r, nullptr, nullptr);
+        const CacheHit h = pc_->lookup(r, nullptr, nullptr, &s.chain);
         int64_t hit = h.n_attn_tokens;
         if (geo_.checkpoints() && h.n_linear_tokens < hit) hit = h.n_linear_tokens;
         if (geo_.exact && hit > 0) hit = geo_.grid_floor(hit);
