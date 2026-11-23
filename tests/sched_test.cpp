@@ -4200,7 +4200,8 @@ TEST(busy_cap_keeps_the_stager_floor_and_never_leaves_a_runt) {
  * At an interval equal to the batch the same chunk stops a quantum short of the boundary (1984)
  * and every interval runs a second, 64-row step that carries the checkpoint -- short in wall time
  * (40-65 ms) but it arms its own run of decode-only interleave steps, which is the arrival TTFT
- * the note measures (-27 % / -14 % there; 2.96 -> 2.43 s and 2.80 -> 2.44 s on the TP2 lane). */
+ * the note measures (-27 % / -14 % in its own runs; three runs a side on the iks-A lane give
+ * 2.63 -> 2.20 s and 2.75 -> 2.41 s). */
 TEST(an_interval_a_quantum_under_the_batch_leaves_no_remainder_step) {
     for (const int64_t interval : { (int64_t)2048, (int64_t)1984 }) {
         Fixture f;

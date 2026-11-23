@@ -1297,11 +1297,12 @@ interval runs two steps, and the arrival's time to first token pays for the inte
 the short step's 40-65 ms. `checkpoint-interval: 1984` under `max-num-batched-tokens: 2048` puts the
 boundary a quantum lower, so the chunk is the whole interval and a quantum of the batch (64 rows;
 eight sequences at five drafts take 48) stays free for decode: `RADIANCE_LOG_STEPS=1` shows one step
-an interval where it showed two (2032 · 16 · 2032 · 16 · 1600 -> 1984 · 1984 · 1728 at a 5.7K
-arrival beside one decoder). On the served lane (TP2, u3, 210 W, `scripts/backlog/nospec.yaml`, a
-5.7K arrival three times) arrival TTFT fell from 2.96 to 2.43 s at one decoder (-18 %) and from 2.80
-to 2.44 s at four (-13 %), with the decoders' typical gap unchanged (13.7 / 18.3 ms) and a lone
-prefill unchanged (pf2 0.725 -> 0.747 s, pf20 7.080 -> 7.057 s on the iks-A lane). Set the interval
+an interval where it showed two (2033 · 17 · 2033 · 17 · 1601 -> 1985 · 1985 · 1729 at a 5.7K
+arrival beside one decoder). On the `iks-A` lane (TP2, u3, 210 W, `scripts/backlog/nospec.yaml`
+and the same file with the line removed, three runs a side) arrival TTFT fell from 2.63 to 2.20 s
+at one decoder (-16 %) and from 2.75 to 2.41 s at four (-12 %), with the decoders' typical gap
+unchanged (13.3 / 18.3 ms), the worst stall unchanged (573 / 594 to 563 / 583 ms) and a lone
+prefill unchanged (pf2 0.653 -> 0.667 s, pf20 7.169 -> 7.141 s). Set the interval
 to the batch less a quantum, not to some smaller number: what removes the remainder step is that the
 chunk still fills the batch. The chunks are a quantum shorter than 2048 rows, so a prompt's chunks
 are tiled differently than at 2048 and a served answer can differ the way it does between any two
@@ -2720,7 +2721,7 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 |---|---|---|
 | `placement: MODE` | auto | `all_vram`, `layer_offload`, `expert_tiered`, `auto` |
 | `deterministic: true` | off | pin placement to the loader's plan, so the resident set cannot change under the heat engine |
-| `checkpoint-interval: N` | 2048 | linear-attention state checkpoint interval, in tokens. It also caps a prompt's chunk (§4.5), so under a `max-num-batched-tokens: 2048` a chunk that shares its step with decoding sequences leaves a remainder step every interval; `1984` (a quantum less) keeps one step an interval with a quantum of the batch free for decode (-18 % arrival TTFT at one decoder, -13 % at four on the TP2 lane) |
+| `checkpoint-interval: N` | 2048 | linear-attention state checkpoint interval, in tokens. It also caps a prompt's chunk (§4.5), so under a `max-num-batched-tokens: 2048` a chunk that shares its step with decoding sequences leaves a remainder step every interval; `1984` (a quantum less) keeps one step an interval with a quantum of the batch free for decode (the `iks-A` lane: -16 % arrival TTFT at one decoder, -12 % at four) |
 | `prefill-span: N` | 1 | checkpoint intervals one step may carry of a prefill alone in its step, from the prompt's second interval on (several prompts prefilling with nothing decoding take such steps one at a time, the fewest tokens left first); needs `max-num-batched-tokens` of N intervals. Every other step is planned at the budget less the extra intervals, and the checkpoints inside a span are not written (§4.5) |
 | `prefill-span-pass: MODE` | piece | the routed (MoE) block's pass of a spanned step: `piece`, a pass a checkpoint interval; `step`, one pass over the whole step where the model runs such a step serially (Flash-Next at one and two ranks), so each expert's weight is read once for all the step's rows. More arena (the expert planes are a step tall) and output that differs from piece passes at tie level; needs `prefill-span` above 1 (§4.5) |
 | `prefill-span-min: N` | auto | the shortest prompt, in tokens, a prefill spans for. `auto`: eight intervals where routed experts are staged from host memory, 0 elsewhere; `0` spans every lone prefill from its second interval on (§4.5) |
