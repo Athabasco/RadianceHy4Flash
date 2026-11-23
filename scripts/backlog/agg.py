@@ -3,6 +3,9 @@
 per-kernel exclusive time (end - max(start, previous end on its queue)), grouped into categories; and the card's idle
 time between consecutive stamped passes is not visible (1 pass in N) -- compare wall with the probe's ms/step."""
 import csv, json, sys, collections, subprocess, re, statistics
+import demangle
+FILT = demangle.path()  # c++filt locally, the ROCm SDK's llvm-cxxfilt on iks
+if not FILT: sys.exit("agg.py: no c++filt or llvm-cxxfilt, neither on PATH nor next to the tree's compiler")
 rows = list(csv.DictReader(open(sys.argv[1])))
 R = json.load(open(sys.argv[2]))
 TOP = int(sys.argv[sys.argv.index("--top") + 1]) if "--top" in sys.argv else 40
@@ -10,7 +13,7 @@ for r in rows:
     for k in ("pass", "seq", "start_ns", "end_ns", "records", "ordered", "chained", "queue"): r[k] = int(r[k] or 0)
 rows = [r for r in rows if r["start_ns"] and r["end_ns"]]
 names = sorted({r["kernel"] for r in rows})
-dem = dict(zip(names, subprocess.run(["c++filt"] + names, capture_output=True, text=True).stdout.split("\n")))
+dem = dict(zip(names, subprocess.run([FILT] + names, capture_output=True, text=True).stdout.split("\n")))
 def short(n):
     d = re.sub(r"\(anonymous namespace\)::", "", dem[n]); d = re.sub(r"^void ", "", d)
     return re.sub(r"<.*", "", d.split("(")[0])[:46]
