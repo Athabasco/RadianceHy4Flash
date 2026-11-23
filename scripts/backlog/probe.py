@@ -120,8 +120,9 @@ def phase(name, prompts, n=256, effort="none"):
     time.sleep(2)
     return o
 def longctx(chars=140000, n=8, ntok=128):
-    # Eight sessions arrive and fill. One prompt each, built once: the second wave must carry the
-    # same strings or it misses the prefix cache and prefills again instead of decoding.
+    # Eight sessions arrive and fill. One prompt each, built once, so both waves carry the same
+    # strings -- what a prefix-cache hit needs (at 46K they can still be evicted: check the log's
+    # `cache` figure, which a re-prefill sets to 0).
     ps = [long_prompt(chars, 40 + i, stamp=True) for i in range(n)]
     pre = phase("longctx-pre", ps, 1)
     dec = phase("longctx-decode", ps, ntok)

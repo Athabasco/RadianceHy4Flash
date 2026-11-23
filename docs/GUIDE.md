@@ -4566,7 +4566,12 @@ routed layers, `RADIANCE_XS_PACE`: -1 spread, N per layer, 0 off; default spread
 off with one; `RADIANCE_XS_EARLY_PUBLISH=0` restores the old order). The heat engine's parameters can be
 set for A/B runs with `RADIANCE_HEAT_DECAY`, `_HYSTERESIS`, `_MIN_GAIN`, `_CREDIT_CAP` and `_MOVES`;
 the startup log says what is in force. `RADIANCE_ROUTE_TRACE=<file>` records rank 0's routing for
-`rad-heat-replay`.
+`rad-heat-replay`, whose `--layer-min N` replays the trace with every layer held at N resident units
+(the thin layers raised at the start from the layers above N, so the slab does not grow, clamped to
+what the slab can hold; a swap whose demotion would take a layer under N is abandoned) and prints
+what the floor costs the hit rate. The exit report's `mover:` line counts promotions, demotions and
+prefetches, and a `stager:` line follows it whenever the prefill stager ran: the routed layers, the
+units it staged and their bytes, the copies, and the units no buffer had room for (read in place).
 
 `/server_info` reports what a running process serves: the model, the cards, the KV cache, the draft
 depth and the wire, as the startup log does.
