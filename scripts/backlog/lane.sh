@@ -8,8 +8,9 @@
 #   scripts/backlog/lane.sh --env [lane]                 print the lane's exports
 #   scripts/backlog/lane.sh --in-tree <lane> <b64>       run a command inside an unpacked iks tree
 #
-# A lane sets RAD_LANE, RAD_PORT, RAD_MODEL, RAD_HOST_POOL_MIB, RAD_NGRAM, RAD_BIN, RADIANCE_HOME,
-# RAD_LANE_DIR (the lane's run directory, under runs/<lane>) and runs the command there:
+# A lane sets RAD_LANE, RAD_PORT, RAD_MODEL, RAD_HOST_POOL_MIB, RAD_NGRAM, RAD_PREFIX_CACHE_MIB,
+# RAD_BIN, RADIANCE_HOME, RAD_LANE_DIR (the lane's run directory, under runs/<lane>) and runs the
+# command there:
 #
 #   local   here, as it is: the cards come from `gpu2` and from <lock dir>/gpu.lock, which one local
 #           lane run holds at a time, so two of them never share the pair or the port.
@@ -36,7 +37,8 @@ case $1 in
          # a remote lane's paths are under the home on that host, not this one's: show it as `~`
          vhome=${HOME:-/root}
          for v in RAD_LANE RAD_HOST RAD_REPO RAD_PORT RAD_MODEL RAD_HOST_POOL_MIB RAD_NGRAM \
-                  RAD_BIN RADIANCE_HOME RAD_RUNS RAD_LANE_DIR RAD_LANE_LOCK_DIR RAD_CARDS; do
+                  RAD_PREFIX_CACHE_MIB RAD_BIN RADIANCE_HOME RAD_RUNS RAD_LANE_DIR \
+                  RAD_LANE_LOCK_DIR RAD_CARDS; do
            val=${!v}
            [ "$RAD_HOST" = local ] || val=${val//"$vhome"/\~}
            printf 'export %s=%q\n' "$v" "$val"

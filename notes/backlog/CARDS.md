@@ -77,7 +77,14 @@ scripts/backlog/lane.sh --env iks-A               # what a lane exports: port, m
   `72,000`) — the backlog's 6.7K / 24.9K prompts, because `prompts.py` walks the corpus in the same `shuffle`
   order its own tools did — `stall1` / `stall4` (a 5,698 / 5,881-token arrival on one and on four running
   decoders), and the small prompts `pf2` (2,385: `7,400`), `tailN` (`N` characters, e.g. `tail400`: 159) and
-  `c1s` / `c8s`. It prints each phase as JSON and writes
+  `c1s` / `c8s`, `idle` (a conversation of `RAD_IDLE_CHARS` characters that finishes and idles for
+  `RAD_IDLE_WAIT_S` s, a decode-only request that makes the experts ask for VRAM back, the same prefix again
+  (the resume) and a cold prefill of the same size, with `/stats` and `/sessions` read at each step: the
+  host tier's `prefix-cache-mib` check, X-01) and `long8` (the item's multi-session case: eight
+  conversations of `RAD_LONG8_CHARS` characters at once, then the same idle, demand and return passes).
+  Both read the experts' side of the same views, because that is what the freed VRAM is for:
+  `expert_units` and `slab_mib` are the residency and the lent VRAM the experts hold, `lend_mib` the most
+  the KV pool lets them borrow, and `routed` / `routed_res` the demand's hit rate. It prints each phase as JSON and writes
   `out.json`; phases are comma-separated (`c1,c8,pf6,pf20,stall1,stall4,pf2,tail400`), `nowarm` skips the two warmup
   requests, and an unknown phase is refused instead of leaving a hole in the run. Its requests are sampled at
   `RAD_TEMP` (default 0.9, seeded per request); a host whose `TEMP` is a directory is not a temperature and is
@@ -201,6 +208,108 @@ Greedy text is unchanged, which is the merge bar's first clause: the three `GREE
 0 (256 tokens, `reasoning_effort: none`, `ignore_eos` off) come back 256 / 256 / 103 tokens and
 `9f77180a9ab097fb…` / `285d021c7e9a5bdf…` / `d3d2aa2a1091868e…` sha256, both configs, byte for byte — the rule
 picks how many candidates a step verifies, not the token the law emits.
+
+### 1.3 X-01: the host KV tier on, in the served configs (local lane)
+
+The served configs carry `prefix-cache-mib: 16384` (`scripts/backlog/*.yaml`, as `README.md:55` does). The
+item's claim is "640 units (3 points) per idle 65K session", its verify step "/stats VRAM units after
+idle". `idle` with `RAD_IDLE_CHARS=190000` sends one conversation of 58,903 tokens, lets it finish and
+idle, sends a decode-only request so the experts ask for VRAM, then the same prefix again and a cold
+prefill of the same size. Three servers with the tier on and three with `RAD_PREFIX_CACHE_MIB=0`, local
+lane, one build, phase list `c1,c1b,c8,pf6,pf20,stall1,stall4,idle`, all rc=0 and `server-exit=0`:
+
+| `idle`, `/stats` + `/sessions` | tier on, s1 / s2 / s3 | tier off, s1 / s2 / s3 |
+|---|---|---|
+| expert units in VRAM, before the conversation | 19,194 | 18,749 |
+| … with the conversation (58,903 tokens) live | 17,413 / 17,418 / 17,405 | 16,956 / 16,957 / 16,950 |
+| … 5 s after it finished (idle) | 17,982 | 16,975 / 16,975 / 16,963 |
+| … after a 64-token decode-only request (demanded) | 19,194 / 19,192 / 19,194 | 18,173 |
+| expert slab, lent VRAM, MiB (idle → demanded) | 7,178 → 8,809 / 8,808 / 8,815 | 5,644 → 7,362 / 7,363 / 7,369 |
+| the loan's cap, MiB (idle → demanded) | 7,260 → 8,997 | 5,763 → 7,480 (cap 8,306) |
+| KV in VRAM, MiB (idle → demanded) | 0 → 0.8 | 1,494 → 1,494 |
+| the demand's routed-unit hit | 0.9826 / 0.9823 / 0.9826 | 0.9686 / 0.9684 / 0.9672 |
+| resume TTFT, 58,896 cached tokens | 0.100 / 0.106 / 0.098 s | 0.031 / 0.031 / 0.030 s (from VRAM) |
+| the same prompt cold | 18.62 / 18.63 / 18.68 s | 18.79 / 18.77 / 18.81 s |
+
+The gain, at the same point of the same phase list: with the tier on the experts hold **1,021 more units
+and 1,447 MiB more lent VRAM** (19,194 units / 8,809 MiB against 18,173 / 7,362), for one idle 58,903-token
+session — the item's 640 units per 65K session, and more, because the conversation's blocks are 819 MiB and
+the pooled KV it leaves behind (107,284 tokens with the phases before it) is 1,493 MiB, and the loan counts
+what sits above the highest held block (`core/mem/kv.cpp`'s `spare_tokens`). Within a run the tier gives all
+of it back (19,194 → 19,194 units, the loan's whole 8,997 MiB); the tier off leaves 576 units and 825 MiB
+of the loan held, and its demand misses 1.4 points more (0.9686 against 0.9826). The host restore costs
+0.07 s more than a VRAM hit and 18.5 s less than the re-prefill the item is about.
+
+End to end, the same six servers, median of three (ms a step / tok/s / ms of TTFT / s to first token):
+
+| phase | tier on | tier off | `baseline/local.md` (tier off) |
+|---|---|---|---|
+| `c1` | 13.720 | 13.750 | 13.710 |
+| `c1b` | 13.394 | 13.389 | 13.403 |
+| `c8` | 309.0 | 306.4 | 309.1 |
+| `pf6` | 1,949 | 1,946 | 1,968 |
+| `pf20` | 7,131 | 7,147 | 7,173 |
+| `stall1` | 2.732 | 3.037 | 3.04 |
+| `stall4` | 2.804 | 2.869 | 2.87 |
+
+Nothing is worse: `c1`/`c1b`/`c8`/`pf6`/`pf20` are level with the tier off (inside 1%), and the arrival
+stalls are better by 0.30 s (`stall1`, all three reps 2.707–2.732 against 3.037–3.078) and 0.07 s
+(`stall4`), in the item's direction: the phases before them leave cached prefixes in VRAM that the tier
+takes to host, so the loan the arrival's prefill wants is there. `stall1` at 3.04 s is also what
+`baseline/local.md` has, measured at `dd4c2255` with no tier, so the 0.30 s is not build drift.
+
+The item's "Why" is 8 sessions at 16K–60K, not one: `long8` sends eight conversations of
+`RAD_LONG8_CHARS=140000` characters at once (37,872–46,720 tokens each, 350K tokens in all — the M longctx
+shape, and near the pool's own limit, `refs/notes/longctx.md`), lets them finish, demands, and sends the
+same eight back. Two servers each way:
+
+| `long8`, `/stats` + `/sessions` | tier on, s1 / s2 | tier off, s1 / s2 |
+|---|---|---|
+| expert units in VRAM, before | 19,194 | 19,228 / 19,229 |
+| … once the eight finished (idle) | 17,982 / 19,194 | 15,821 / 14,611 |
+| … after the decode-only demand | 19,194 / 19,193 | 15,817 / 15,819 |
+| expert slab, MiB (idle → demanded) | 7,132 → 8,771 / 8,804 → 8,723 | 3,971 → 3,842 / 2,238 → 3,970 |
+| the loan's cap, MiB (demanded) | 8,997 | 4,109 |
+| KV in VRAM, MiB (idle → demanded) | 0 → 1.7 | 4,886 → 4,888 |
+| host memory held, tier and snapshots, MiB (idle) | 7,045 / 6,732 | 1,985 / 2,090 |
+| the demand's routed-unit hit | 0.9797 / 0.9862 | 0.9427 / 0.9325 |
+| the eight back: TTFT, first → last | 0.57 – 3.91 s | 0.62 – 2.91 s |
+| … from the cache, tokens | 347,456 / 344,240 | 346,176 / 347,456 |
+
+Eight idle sessions hold 4,886 MiB of VRAM KV (351,096 tokens) with the tier off, and the experts lose all
+of it: at the same point in the same run they hold 15,818 units and a 3,906 MiB slab against 19,193 and
+8,747 with the tier on, **3,375 units and 4,841 MiB** more, and the demand's hit rate is 4–5 points higher
+(0.943/0.933 against 0.980/0.986). The eight returns cost the same either way, 0.6–3.9 s against 26.8–117 s
+cold — 4.88 GiB over the link is a fraction of the re-prefill — so at 8 long sessions the tier's price is
+the 4.9 GiB copied to host memory (7.0 GiB held there with the snapshot store; the tier-off server's
+1,985 MiB is the snapshots alone) and its gain is the experts' VRAM, which is what the item's decode
+190 → 148 tok/s is made of.
+
+Byte-identical: one more `idle` server with `RADIANCE_DEBUG_TIER_VERIFY=1`, which hashes every entry as it
+leaves VRAM and compares on the way back (`TierExec::verify_note` / `verify_check`, and the replicated
+group's sum against rank 1's): 58,903 tokens out, 58,896 back from the host tier, **no "came back
+different", no "differ between rank" and no failed move in the server log**, and the resume costs 1.141 s
+against 0.100 s without the hashing — the check ran. That plus the served output: the tier moves bytes
+between memory, it computes nothing, and the resume's 58,896 hit tokens are the same text the cold run
+prefills in 18.6 s.
+
+Sizing against the host side: 16,384 MiB holds 1,177,348 tokens (the startup log's own count), i.e. 18
+sessions of this size at 0.89 GiB each — E-K1/M-01's idle pinned memory, which is where the item sizes it
+from. Host RAM: `MemAvailable` read 109 GiB during the A/B and 44 GiB at the low point during the
+`long8` runs (where the model's file is being read again and /stats' occupancy read up to 7.0 GiB), so
+its 16 GiB fits beside the 39.5 GiB host pool (19.73 GiB a rank) and the 2.2 GiB of snapshot slots.
+
+`docs/GUIDE.md` already documents the tier — §4.8 gives the size, the 57 KiB a 4-token entry, what stays in
+VRAM, and the "KV in VRAM stays high with one session and nothing moves" row in the troubleshooting table —
+so it needed no change for this card; the numbers above are the lane's.
+
+The runs, all under `runs/local/` and reproducible with the configs as committed: `x01-on-s1..3` and
+`x01-off-s1..3` (`RAD_IDLE_CHARS=190000`, phase list `c1,c1b,c8,pf6,pf20,stall1,stall4,idle`),
+`x01-long8-on-s1..2` and `x01-long8-off-s1..2` (phase `long8`, `RAD_LONG8_CHARS=140000`), and
+`x01-verify-on` (`idle`, `RADIANCE_DEBUG_TIER_VERIFY=1`); the off ones with `RAD_PREFIX_CACHE_MIB=0` in
+front of `scripts/backlog/run.sh`. They ran on this branch's `coupled03.yaml` before P-16's
+`draft-depth-load-from: 1` landed (it merged after them), and the two arms of each pair differ in nothing
+but the tier, which is what the A/B measures.
 
 ## 2. Merge bar (lossless items)
 

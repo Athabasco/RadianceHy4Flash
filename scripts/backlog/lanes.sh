@@ -11,6 +11,13 @@
 # smaller host pool and the Engram out of host RAM, because iks has 112 GB and two u3 servers
 # cannot both pin ~60 GiB (docs/GUIDE.md §4.3, notes/backlog/CARDS.md §1).
 #
+# The prefix cache's host tier (`prefix-cache-mib`) is pinned host memory beside `host-pool-mib` × tp
+# and the Engram table when the latter is in RAM, so it is sized with the lane's host memory too:
+# 16384 MiB is the served value (README); the iks lanes hold half of it, 8192 MiB, because their host
+# pool is half as large on a 112 GB host that two u3 servers share. `RAD_PREFIX_CACHE_MIB=0
+# scripts/backlog/lane.sh <lane> 'scripts/backlog/run.sh ...'` runs a lane with the tier off, for the
+# before and after of an item about it.
+#
 # lane_env <lane> exports the lane's settings; everything else here is a helper over them.
 
 RAD_LANES="local iks-A iks-B"
@@ -51,21 +58,24 @@ lane_env() {  # lane_env [lane]: export RAD_* for the lane (default: $RAD_LANE, 
       RAD_MODEL=${RAD_MODEL:-/srv/models/hy4-flash-iqr-v4/hy4-flash-iqr-v4-u3.rad}
       RAD_HOST_POOL_MIB=39000
       RAD_NGRAM=ram
+      RAD_PREFIX_CACHE_MIB=${RAD_PREFIX_CACHE_MIB:-16384}
       ;;
     iks-A)
       RAD_PORT=8042
       RAD_MODEL=${RAD_MODEL:-$(homedir)/models/hy4-flash-iqr-v4/hy4-flash-iqr-v4-u3.rad}
       RAD_HOST_POOL_MIB=16000
       RAD_NGRAM="ram=/dev/shm/radiance-ngram"
+      RAD_PREFIX_CACHE_MIB=${RAD_PREFIX_CACHE_MIB:-8192}
       ;;
     iks-B)
       RAD_PORT=8043
       RAD_MODEL=${RAD_MODEL:-$(homedir)/models/hy4-flash-iqr-v4/hy4-flash-iqr-v4-u3.rad}
       RAD_HOST_POOL_MIB=16000
       RAD_NGRAM="disk=$(homedir)/ngram"
+      RAD_PREFIX_CACHE_MIB=${RAD_PREFIX_CACHE_MIB:-8192}
       ;;
   esac
-  export RAD_PORT RAD_MODEL RAD_HOST_POOL_MIB RAD_NGRAM
+  export RAD_PORT RAD_MODEL RAD_HOST_POOL_MIB RAD_NGRAM RAD_PREFIX_CACHE_MIB
 }
 
 lane_name() {  # the tree's name under ~/moebius-gpu on iks (RAD_IKS_NAME overrides)
@@ -93,7 +103,8 @@ lane_power() {  # lane_power: print each card's power cap; 1 if one is not the 2
 lane_begin() {  # lane_begin <lane>: the lane's env, its directories and the power cap read back
   lane_env "$1" || return 2
   echo "lane $RAD_LANE on $RAD_HOST, port $RAD_PORT, model $RAD_MODEL" \
-       "host-pool $RAD_HOST_POOL_MIB MiB, ngram $RAD_NGRAM"
+       "host-pool $RAD_HOST_POOL_MIB MiB, ngram $RAD_NGRAM," \
+       " prefix-cache $RAD_PREFIX_CACHE_MIB MiB"
   lane_power || echo "lane_begin: a card is not at the 210 W cap of the lane -- numbers from this run" \
                         "are not the lane's (notes/backlog/CARDS.md §1)" >&2
   date -u +'%Y-%m-%dT%H:%M:%SZ'
