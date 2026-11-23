@@ -3388,10 +3388,12 @@ per layer
            the E4M3 round trip (quant_act_fp8 one group a row, dequant), engram_norm,
            gemm_nt_bias key and value, engram_gate into the streams
   ihc_pre (hc_attn), rmsnorm (attn_norm)
-  q_a, rmsnorm, q_nope / q_rope; kv_a, rmsnorm on the latent, rope (gptj) on q_rope and the key,
+  q_a, rmsnorm, q_nope / q_rope; kv_a, rmsnorm on the latent, rope (gptj) on q_rope -- under
+  `rope_rows`, its row-form name -- and on the key,
   kv_store of the row [latent | key] as one KV head of (512 + 64) / 2; attn_gate
   [sparse] index_key, rmsnorm, qsa_work, idx_pool_gated into the indexer cache, qsa_tail_store;
-           selecting: index_query_nope / _rope, rope, index_head, idx_score, qsa_select(own 1)
+           selecting: index_query_nope / _rope, rope_rows, index_head, idx_score,
+           qsa_select(own 1)
   absorbed:     mla_project_kv absorb, mla_attn_paged_sink (window) or mla_attn_sel_sink, expand
                 and gate_mul as one mla_expand_gate (libr4d fuses it; libref / libavx run the pair)
   non-absorbed: the latent copied, gemm_nt kv_b, mla_kv_split, the query assembled, attn_kv_sink

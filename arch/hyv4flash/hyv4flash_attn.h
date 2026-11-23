@@ -266,7 +266,10 @@ struct Attn {
         op_kv_norm = decl_rmsnorm(b, T, L, s.eps, kv_gain, w.row, w.row);
         const char* sec = !s.mrope ? nullptr : sliding ? s.mrope_sliding.c_str()
                                                          : s.mrope_sparse.c_str();
-        op_q_rope = decl_rope_gptj(b, T, H, R, theta, w.q_rope, sec);
+        /* K-49: the query rope is the wide one -- H heads of pairs, so the row form drops
+         * `H` times the `sincosf` over a prefill chunk -- and the key rope is one head a row,
+         * where the launch would not take the row form at all (r4d_model_bf16.hip:1538). */
+        op_q_rope = decl_rope_gptj(b, T, H, R, theta, w.q_rope, sec, "rope_rows");
         op_k_rope = decl_rope_gptj(b, T, 1, R, theta, w.row, sec);
         HY4_NEED(op_kv_norm && op_q_rope && op_k_rope, "rmsnorm / rope (gptj)");
         /* The cache row as one KV head of (L + R) / 2, its first half in the K slot and the rest in
