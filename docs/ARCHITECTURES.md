@@ -3811,20 +3811,6 @@ removes the second step. The chunks are then a quantum shorter than 2048 rows, s
 way it does between any two chunk sizes -- measured against the 2048-chunk baseline as far as `max-num-batched-tokens: 1984`
 moves it, with a prompt that is one chunk either way bit-identical; no dtype, kernel or accumulation changes.
 
-`decode-headroom` (dartree `15434c6b`, FP-3) is the same fix at the batch instead of under it, and on `iks-A` (TP2, u3,
-three runs an arm interleaved, `scripts/backlog/nospec.yaml` with the interval line removed against the same file with
-`decode-headroom: 0`) it removes the second step at the full 2048 rows: `MIXED 2036 | MIXED 20 | MIXED 2036 | MIXED 20 |
-MIXED 1780` becomes `MIXED 2052 | MIXED 2052 | MIXED 1780` beside four decoders, arrival TTFT 2.62 -> 2.23 s at one
-(-15 %) and 2.76 -> 2.43 s at four (-12 %), four runs an arm inside 2.23-2.31 s, with the decoders' gap (13.3 / 18.2 ms),
-decode (13.57 ms a step) and a lone prefill unchanged. Because the chunks stay 2048 rows nothing is re-tiled: three greedy
-prompts and a 5.7K arrival came back byte-identical to the 2048 baseline (`probe.py ... greedy` prints the sha256), where
-the 1984 interval differs on the 5.7K arrival. At the served interval the flag lands on the same 1988-row steps, pinned by
-`sched_test`, so the served config keeps `checkpoint-interval: 1984` and pays it only in arena rows: 64 rows, `step_tok`
-2112, +43.34 MiB a rank of 1.41 GiB (`--decode-headroom 0` is the other side of that line). How `auto` sizes the
-headroom, its cap and the upstream numbers are in GUIDE §4.5; the two 1984 arms measured 2.08-4.25 s at one decoder over
-thirteen runs against 2.23-2.31 s at 2048 with the headroom, so dropping the interval line is a config-only change a later
-card can make.
-
 
 **Losslessness** is the gate, since a draft can never change the text: (1) `hyv4flash_arch_test`
 (the declared graph at one, two and four ranks, lint clean on every step kind, the query pass touching
