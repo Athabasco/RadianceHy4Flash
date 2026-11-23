@@ -922,10 +922,9 @@ int64_t KVManager::held_top(size_t i) const {
 }
 
 /* Takes back enough of the loan that `blocks` more can be handed out, without limit: the request
- * is already admitted and the budget says it fits. Recalls the shortfall plus the buffer, and the
- * blocks a sequence admitted with a length (`ahead`) still has to take, so a prompt recalls its
- * loan once rather than once a chunk. */
-int KVManager::grow_for(int32_t g, int64_t blocks, bool* waiting_for_fleet, int64_t ahead) {
+ * is already admitted and the budget says it fits. Recalls the shortfall plus the buffer, so a
+ * sequence growing a block at a time does not recall per block. */
+int KVManager::grow_for(int32_t g, int64_t blocks, bool* waiting_for_fleet) {
     if (g < 0 || g >= (int32_t)plans_.size()) return RAD_E_INVAL;
     const KVGroupPlan& p = plans_[(size_t)g];
     if (!p.paged()) return RAD_OK;
@@ -937,8 +936,7 @@ int KVManager::grow_for(int32_t g, int64_t blocks, bool* waiting_for_fleet, int6
         short_peak_[(size_t)g] = short_by;
 
     if (!lendable(g) || loan_ <= 0 || live_[(size_t)g] >= p.n_blocks) return RAD_E_FULL;
-    const int64_t buf = buf_blocks((size_t)g);
-    int64_t live = live_[(size_t)g] + short_by + (ahead > buf ? ahead : buf);
+    int64_t live = live_[(size_t)g] + short_by + buf_blocks((size_t)g);
     if (live > p.n_blocks) live = p.n_blocks;
     /* The loan, in tokens, that leaves this group `live` blocks. It only shrinks: a shortfall in
      * one group never lends more of another. */
@@ -969,41 +967,12 @@ int64_t KVManager::spare_tokens() {
         if (i < short_peak_.size()) short_peak_[i] -= short_peak_[i] / 8;
         if (!lendable(plans_[i].index)) continue;
         const KVGroupPlan& p = plans_[i];
-        /* The reserve comes before the buffer: a prompt admitted with its length has blocks still to
-         * take, and lending them to the slab here would only recall them at its next chunk. */
-        const int64_t ahead = pending_blocks(i);
-        const int64_t buf   = buf_blocks(i);
-        int64_t keep = held_top(i) + (ahead > buf ? ahead : buf);
+        int64_t keep = held_top(i) + buf_blocks(i);
         if (keep > p.n_blocks) keep = p.n_blocks;
         const int64_t t = (p.n_blocks - keep) * p.block_size;
         if (spare < 0 || t < spare) spare = t;
     }
     return spare > 0 ? spare : 0;
-}
-
-int64_t KVManager::pending_blocks(size_t i) const {
-    if (i >= plans_.size() || !lendable(plans_[i].index)) return 0;
-    const int64_t bs = plans_[i].block_size;
-    int64_t pending = 0;
-    for (const auto& kv : seqs_) {
-        const Seq& s = kv.second;
-        if (s.n_target <= s.n_tokens) continue;   /* grown past it: nothing left to reserve */
-        if (s.win[i].set) continue;               /* a ring recycles its slots: it reserves nothing */
-        /* Blocks still to take, above what the sequence holds. A prefix hit has already taken most
-         * of the prompt, so it only reserves the rest. */
-        const int64_t want = ceil_div(s.n_target, bs) - (int64_t)s.blocks[i].size();
-        if (want > 0) pending += want;
-    }
-    return pending;
-}
-
-int KVManager::reserve_ahead(uint64_t seq, int64_t n_tokens) {
-    Seq* s = find(seq);
-    if (!s) return RAD_E_NOTFOUND;
-    /* Only the length of the prompt, and only forwards: a later admission cannot shorten a prompt
-     * that is already being prefilled. */
-    if (n_tokens > s->n_target) s->n_target = n_tokens;
-    return RAD_OK;
 }
 
 int KVManager::set_loan(int64_t tokens) {
@@ -1251,10 +1220,6 @@ int KVManager::preempt(uint64_t id) {
         if (s->state[g] >= 0) { drop_state((int32_t)g, s->state[g]); s->state[g] = -1; }
     }
     s->n_tokens = 0;
-    /* The length it was admitted with goes too: a preempted sequence is waiting for room, and a
-     * reserve it cannot use would keep the loan out of the expert slab meanwhile. Re-admission
-     * arms it again (the scheduler's admission path). */
-    s->n_target = 0;
     ++seq_frees_;
     return RAD_OK;
 }
@@ -1590,16 +1555,7 @@ int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from,
                     *waiting_for_fleet = true;
                 return RAD_E_FULL;
             }
-            /* The blocks the rest of the prompt still has to take, when the sequence was admitted
-             * with its length (reserve_ahead): the recall below then buys the whole prompt's
-             * blocks in one go instead of one chunk's shortfall at a time. */
-            int64_t ahead = 0;
-            if (!s->win[g].set && s->n_target > n_tokens) {
-                ahead = ceil_div(s->n_target, p.block_size) - first
-                        - (int64_t)s->blocks[g].size() - need[g];
-                if (ahead < 0) ahead = 0;
-            }
-            RAD_TRY(grow_for((int32_t)g, need[g], waiting_for_fleet, ahead));
+            RAD_TRY(grow_for((int32_t)g, need[g], waiting_for_fleet));
         } else if (p.stateful() && s->state[g] < 0) {
             if (free_states_[g].empty()) return RAD_E_FULL;
         }

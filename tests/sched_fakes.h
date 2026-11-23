@@ -168,15 +168,6 @@ struct FakeKV : IKVManager {
     }
     bool has_runtime_window(uint64_t id) const override { return ring_floor.count(id) != 0; }
 
-    /* How long the scheduler told the cache each sequence would grow (KVManager::reserve_ahead),
-     * by sequence: the whole prompt, at admission, before its first chunk. */
-    std::unordered_map<uint64_t, int64_t> reserved;
-    int reserve_ahead(uint64_t id, int64_t n) override {
-        if (!seqs.count(id)) return RAD_E_NOTFOUND;
-        if (n > reserved[id]) reserved[id] = n;
-        return RAD_OK;
-    }
-
     void free_sequence(uint64_t id) override {
         auto it = seqs.find(id);
         if (it == seqs.end()) return;

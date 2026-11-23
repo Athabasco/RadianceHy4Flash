@@ -52,10 +52,6 @@ struct IKVManager {
     /* After a committed step, a window group frees what no later query can read
      * (KVManager::trim_window). */
     virtual void trim_window(uint64_t seq, int64_t keep_from) { (void)seq; (void)keep_from; }
-    /* How long an admitted sequence will grow, in tokens: its whole prompt, known at admission.
-     * A cache that lends KV to the expert slab recalls the loan for the prompt once instead of
-     * once a prefill chunk (KVManager::reserve_ahead). */
-    virtual int  reserve_ahead(uint64_t seq, int64_t n_tokens) { (void)seq; (void)n_tokens; return RAD_OK; }
     /* R-SWA (KVManager::declare_runtime_window): the W this group arms a sequence with, 0 when it
      * carries no runtime windows. The scheduler arms every sequence it admits with
      * set_window(seq, prompt length, W); a manager with no runtime window refuses it and the
@@ -441,7 +437,6 @@ struct KVBinding final : IKVManager {
         return m->ensure(s, n, k, waiting);
     }
     void trim_window(uint64_t s, int64_t k) override { m->trim_window(s, k); }
-    int  reserve_ahead(uint64_t s, int64_t n) override { return m->reserve_ahead(s, n); }
     int64_t runtime_window_tokens(int32_t g) const override { return m->runtime_window_tokens(g); }
     int  set_window(uint64_t s, int64_t lo, int64_t w) override { return m->set_window(s, lo, w); }
     bool runtime_window(uint64_t s, int32_t g, SeqWindow* o) const override {
