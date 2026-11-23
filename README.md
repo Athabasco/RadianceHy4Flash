@@ -40,7 +40,7 @@ models:
     placement: expert_tiered          # experts that do not fit stay in pinned host memory
     host-pool-mib: 39000
     ngram-placement: ram              # Engram tables in host RAM, off the cards
-    max-model-len: 65536
+    max-model-len: 1000000
     max-num-batched-tokens: 2048
     max-num-seqs: 8
     mm-max-patches: 0                 # no vision
