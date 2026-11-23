@@ -82,7 +82,10 @@ scripts/backlog/lane.sh --env iks-A               # what a lane exports: port, m
   (the resume) and a cold prefill of the same size, with `/stats` and `/sessions` read at each step: the
   host tier's `prefix-cache-mib` check, X-01) and `long8` (the item's multi-session case: eight
   conversations of `RAD_LONG8_CHARS` characters at once, then the same idle, demand and return passes).
-  Both read the experts' side of the same views, because that is what the freed VRAM is for:
+  `greedy` is the merge bar's first clause: three prompts and a 5.7K arrival at temperature 0 with
+  `ignore_eos` off, each as `gen` / `chars` / `sha256` of the text itself, so two arms' JSON compare byte for
+  byte (S-01b).
+  Both `idle` and `long8` read the experts' side of the same views, because that is what the freed VRAM is for:
   `expert_units` and `slab_mib` are the residency and the lent VRAM the experts hold, `lend_mib` the most
   the KV pool lets them borrow, and `routed` / `routed_res` the demand's hit rate. It prints each phase as JSON and writes
   `out.json`; phases are comma-separated (`c1,c8,pf6,pf20,stall1,stall4,pf2,tail400`), `nowarm` skips the two warmup
@@ -102,6 +105,10 @@ scripts/backlog/lane.sh --env iks-A               # what a lane exports: port, m
   `runs/` are not kept between calls (the tree is unpacked fresh each call), so copy back what a card needs.
 - **`profdiff.py <log> [rank] [min-ms] [top]`** and **`profagg.py <log> [rank]`**: two runs of a `profile-ops: true`
   config (`prof.yaml`, `cprof.yaml`) compared op by op.
+- **`steps.py <server.log> [--tail=N]`** the `RADIANCE_LOG_STEPS=1` log as the backlog reads a step: every
+  prefill-bearing step (`MIXED n_tok`, `prefill n_tok`) with the decode-only steps that ran before it, so one
+  interval beside decoders prints `MIXED 2057` with `decode-headroom` and `MIXED 2033 | 17 | MIXED 2033` without
+  it (S-01). It is a plain CPU tool over the text, so it runs on the lane or here over a copied-back log.
 - The configs are the served (local) ones: `nospec.yaml` (no drafter), `coupled03.yaml` (DFly2 coupled, 5 proposals),
   `cpv.yaml` (the same with debug logging), `cprof.yaml` (DFly2 + `profile-ops`), `nsv.yaml` / `nsv1984.yaml`
   (debug logging, and a 1984-token checkpoint interval), `prof.yaml` (`profile-ops`). `lane.sh` rewrites only a
