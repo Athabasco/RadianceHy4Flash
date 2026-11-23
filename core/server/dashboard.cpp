@@ -391,6 +391,19 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["prefill_chunks_capped"] = m.prefill_chunks_capped;
         o["steps_decode"]    = m.steps_decode;
         o["steps_held"]      = m.steps_held;
+        o["steps_ahead"]     = m.steps_ahead;
+        /* Why a step was not issued ahead (S-07): one count per reason, and the first check that
+         * refused names it. steps_ahead plus these is every step_next the engine made once a step
+         * was in flight, so the gap between `steps` and `steps_ahead` is explained here. */
+        o["steps_ahead_refused"] = {
+            { "waiting",    m.ahead_refused_waiting },
+            { "held",       m.ahead_refused_held },
+            { "mid_prompt", m.ahead_refused_mid_prompt },
+            { "grammar",    m.ahead_refused_grammar },
+            { "suffix_hot", m.ahead_refused_suffix_hot },
+            { "ends_every", m.ahead_refused_ends_every },
+            { "kv",         m.ahead_refused_kv },
+        };
         o["mixed_step_target_steps"] = m.mixed_step_target_steps;
         o["mixed_step_target_misses"] = m.mixed_step_target_misses;
         o["mixed_step_target_prefill_cap"] = m.mixed_step_target_prefill_cap;

@@ -118,12 +118,22 @@ struct SchedMetrics {
     int64_t lookup_held = 0;
     int64_t lookup_held_drafts = 0;
     int64_t lookup_held_hits = 0;
-    /* --draft-suffix: verifies that carried a suffix chain, their rows and accepted drafts, and the
-     * decode steps kept from being issued ahead by a recurring pattern. */
+    /* --draft-suffix: verifies that carried a suffix chain, their rows and accepted drafts. A
+     * decode step kept from being issued ahead by a recurring pattern is counted in
+     * ahead_refused_suffix_hot. */
     int64_t suffix_steps = 0;
     int64_t suffix_rows = 0;
     int64_t suffix_accepted = 0;
-    int64_t suffix_held_ahead = 0;
+    /* Why the next step was not issued ahead of the commit (rad::SchedMetrics::ahead_refused_*,
+     * S-07), one counter per reason; only the first check that refuses counts. Reported by
+     * /stats, with steps_ahead, as `steps_ahead_refused`. */
+    int64_t ahead_refused_waiting = 0;
+    int64_t ahead_refused_held = 0;
+    int64_t ahead_refused_mid_prompt = 0;
+    int64_t ahead_refused_grammar = 0;
+    int64_t ahead_refused_suffix_hot = 0;
+    int64_t ahead_refused_ends_every = 0;
+    int64_t ahead_refused_kv = 0;
     /* Per-position draft acceptance. The pooled `draft_acceptance` cannot tell a drafter that
      * decays with depth from one whose later rounds are broken. Per position j: verifies that
      * reached j (every earlier position accepted) and how many of those took j. */

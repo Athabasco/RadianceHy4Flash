@@ -181,12 +181,30 @@ struct SchedMetrics {
     int64_t lookup_held_drafts = 0;
     int64_t lookup_held_hits = 0;
     /* --draft-suffix (suffix.h): verifies that carried a suffix chain, the rows they carried and the
-     * drafts accepted; decode steps not issued ahead because the sequence was in a recurring
-     * pattern (where the lookup could run after the commit instead). */
+     * drafts accepted. A decode step not issued ahead because the sequence was in a recurring
+     * pattern is counted in SchedMetrics::ahead_refused_suffix_hot. */
     int64_t suffix_steps = 0;
     int64_t suffix_rows = 0;
     int64_t suffix_accepted = 0;
-    int64_t suffix_held_ahead = 0;
+    /* Why Scheduler::step_next_locked did not issue the next step ahead of the commit (S-07): one
+     * counter per reason, and only the first check that refuses counts. With steps_ahead they are
+     * every step_next the engine made once a step was in flight, so /stats can say where the gap
+     * between the engine's steps and engine_steps_ahead_total goes. A staging failure is not a
+     * reason: it is a failure, not a policy. */
+    int64_t ahead_refused_waiting = 0;     /* the queue head cannot be admitted here (a wait, a
+                                            * card, a slot, an encode owed), or a row of the step
+                                            * is no longer a running sequence */
+    int64_t ahead_refused_held = 0;        /* --prefill-interleave or --mixed-step-target left the
+                                            * step to step(), or the shares held a chunk back */
+    int64_t ahead_refused_mid_prompt = 0;  /* a second chunk wants the step, or the next step would
+                                            * carry a prefill row with no decode row beside it */
+    int64_t ahead_refused_grammar = 0;     /* a grammar that cannot rewind decides at the commit */
+    int64_t ahead_refused_suffix_hot = 0;  /* --draft-suffix: the history ended in a recurring
+                                            * pattern (suffix_held_ahead of old) */
+    int64_t ahead_refused_ends_every = 0;  /* the step in flight likely ends every request it
+                                            * carries, or brings a scored row to its last token */
+    int64_t ahead_refused_kv = 0;          /* the context limit, the KV pool, or a snapshot the
+                                            * store dropped */
 };
 
 

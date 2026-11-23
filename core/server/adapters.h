@@ -129,7 +129,7 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.lookup_proposals = m.lookup_proposals;     o.lookup_held = m.lookup_held;
     o.lookup_held_drafts = m.lookup_held_drafts; o.lookup_held_hits = m.lookup_held_hits;
     o.suffix_steps = m.suffix_steps;             o.suffix_rows = m.suffix_rows;
-    o.suffix_accepted = m.suffix_accepted;       o.suffix_held_ahead = m.suffix_held_ahead;
+    o.suffix_accepted = m.suffix_accepted;
     o.linear_hit_rate = m.linear_hit_rate;
     o.attn_cached_tokens = m.attn_cached_tokens;
     o.linear_cached_tokens = m.linear_cached_tokens;
@@ -153,6 +153,13 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.steps_prefill = m.steps_prefill;  o.steps_mixed = m.steps_mixed;
     o.steps_decode = m.steps_decode;
     o.steps_ahead = m.steps_ahead;
+    o.ahead_refused_waiting = m.ahead_refused_waiting;
+    o.ahead_refused_held = m.ahead_refused_held;
+    o.ahead_refused_mid_prompt = m.ahead_refused_mid_prompt;
+    o.ahead_refused_grammar = m.ahead_refused_grammar;
+    o.ahead_refused_suffix_hot = m.ahead_refused_suffix_hot;
+    o.ahead_refused_ends_every = m.ahead_refused_ends_every;
+    o.ahead_refused_kv = m.ahead_refused_kv;
     o.prefill_chunks_capped = m.prefill_chunks_capped;
     o.steps_held = m.steps_held;
     o.mixed_step_target_steps = m.mixed_step_target_steps;

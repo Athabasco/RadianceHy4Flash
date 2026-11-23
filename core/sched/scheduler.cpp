@@ -2991,10 +2991,26 @@ bool Scheduler::ends_every_request() const {
     return !plan_.e.empty();
 }
 
+/* S-07: name the reason the next step is left to the one after the commit, so /stats can say
+ * where the gap between the engine's steps and engine_steps_ahead_total goes. The first check that
+ * refuses counts; the reasons are in SchedMetrics::ahead_refused_*. */
+const RadBatch* Scheduler::refuse_ahead(AheadRefused why) {
+    switch (why) {
+        case AheadRefused::Waiting:   ++m_.ahead_refused_waiting;    break;
+        case AheadRefused::Held:      ++m_.ahead_refused_held;       break;
+        case AheadRefused::MidPrompt: ++m_.ahead_refused_mid_prompt; break;
+        case AheadRefused::Grammar:   ++m_.ahead_refused_grammar;    break;
+        case AheadRefused::SuffixHot: ++m_.ahead_refused_suffix_hot; break;
+        case AheadRefused::EndsEvery: ++m_.ahead_refused_ends_every; break;
+        case AheadRefused::Kv:        ++m_.ahead_refused_kv;         break;
+    }
+    return nullptr;
+}
+
 const RadBatch* Scheduler::step_next_locked() {
     if (!step_open_ || next_open_ || plan_.e.empty()) return nullptr;
     /* Before the loop below, which reserves the next step's KV. */
-    if (ends_every_request()) return nullptr;
+    if (ends_every_request()) return refuse_ahead(AheadRefused::EndsEvery);
 
     const bool hold_prefill = cfg_.prefill_interleave != 0 && interleave_left_ > 0;
     /* The experiments that split a chunk against a learned target read that target where the
@@ -3006,18 +3022,19 @@ const RadBatch* Scheduler::step_next_locked() {
      * would fail is failed there, not here. */
     bool admit_head = false;
     if (!waiting_.empty()) {
-        if (!prefill_ahead) return nullptr;
+        if (!prefill_ahead) return refuse_ahead(AheadRefused::Held);
         /* step() admits as many waiters as the budget and the slots take, so one behind the head
          * would make the step after the commit differ from this plan: it is left to that step. */
-        if (waiting_.size() > 1) return nullptr;
+        if (waiting_.size() > 1) return refuse_ahead(AheadRefused::Waiting);
         SchedReq& w = *reqs_[(size_t)waiting_[0]];
-        if (!w.req || w.req->state != ReqState::Waiting) return nullptr;
+        if (!w.req || w.req->state != ReqState::Waiting) return refuse_ahead(AheadRefused::Waiting);
         if (ctx_limit_ > 0 &&
             (w.seq_len() > ctx_limit_ || (!w.req->embed && w.seq_len() == ctx_limit_)))
-            return nullptr;
-        if ((int64_t)running_.size() >= cfg_.max_seqs || free_cards_.empty()) return nullptr;
+            return refuse_ahead(AheadRefused::Kv);
+        if ((int64_t)running_.size() >= cfg_.max_seqs || free_cards_.empty())
+            return refuse_ahead(AheadRefused::Waiting);
         if (!w.req->media || media_ready(w)) admit_head = true;
-        else return nullptr;
+        else return refuse_ahead(AheadRefused::Waiting);
     }
 
     plan_next_.reset();
@@ -3030,7 +3047,7 @@ const RadBatch* Scheduler::step_next_locked() {
     int32_t n_continuing = 0;
     for (const StepEntry& e : plan_.e) {
         if (!e.is_prefill || e.produces_token) continue;
-        if (++n_continuing > 1) return nullptr;
+        if (++n_continuing > 1) return refuse_ahead(AheadRefused::MidPrompt);
         continuing = &e;
     }
     /* The step after the commit sees each request advanced by the row it carries here: a chunk that
@@ -3052,17 +3069,18 @@ const RadBatch* Scheduler::step_next_locked() {
     if (pf_slot < 0 && held_prefill_ > 0 && interleave_left_ == 0) {
         for (int32_t slot : running_) {
             if (!pf_after(*reqs_[(size_t)slot])) continue;
-            if (pf_slot >= 0) return nullptr;
+            if (pf_slot >= 0) return refuse_ahead(AheadRefused::MidPrompt);
             pf_slot = slot;
         }
-        if (pf_slot < 0) return nullptr;   /* the hold outlived the prompt it held */
+        if (pf_slot < 0) return refuse_ahead(AheadRefused::Held);   /* the hold outlived its prompt */
     }
     if (pf_slot >= 0) {
-        if (!prefill_ahead) return nullptr;
+        if (!prefill_ahead) return refuse_ahead(AheadRefused::Held);
         /* One chunk and one admission: a second prompt that still wants a chunk shares that step's
          * budget with the first, so the whole step is left to step(). */
         for (int32_t slot : running_)
-            if (slot != pf_slot && pf_after(*reqs_[(size_t)slot])) return nullptr;
+            if (slot != pf_slot && pf_after(*reqs_[(size_t)slot]))
+                return refuse_ahead(AheadRefused::MidPrompt);
     }
 
     /* The rows of this step that produce a token, in the sequences' order -- which is the order
@@ -3073,21 +3091,23 @@ const RadBatch* Scheduler::step_next_locked() {
         if (s.entry < 0 || (size_t)s.entry >= plan_.e.size()) continue;
         const StepEntry& e = plan_.e[(size_t)s.entry];
         if (!e.produces_token || e.slot != slot) continue;   /* a continuing chunk, planned below */
-        if (!s.req || s.req->state != ReqState::Running || !s.running) return nullptr;
+        if (!s.req || s.req->state != ReqState::Running || !s.running)
+            return refuse_ahead(AheadRefused::Waiting);
         Request& r = *s.req;
         /* A grammar that cannot rewind decides at commit whether the next step may speculate; one
          * that can, or no grammar, keeps its answer. */
-        if (!r.speculation_fixed) return nullptr;
+        if (!r.speculation_fixed) return refuse_ahead(AheadRefused::Grammar);
         /* --draft-suffix: a sequence whose history ended in a recurring pattern at the last commit
          * is likely to continue it; its next step is built after the commit, where the lookup can
          * read the committed end (a step issued ahead is made on the card from the head's drafts). */
-        if (cfg_.draft_suffix && s.suffix_hot) { ++m_.suffix_held_ahead; return nullptr; }
+        if (cfg_.draft_suffix && s.suffix_hot) return refuse_ahead(AheadRefused::SuffixHot);
         /* A SCORED row (Request::token_scores, a /v1/systemone question) that the step in flight
          * brings to max_tokens gets no step issued ahead: it would run a whole forward pass for a
          * request that finishes at the commit, and max_tokens=1 pays a decode step after its
          * prefill. Scored rows only -- every other decode keeps the step of overlap it had. */
         if (r.token_scores && r.max_tokens > 0 &&
-            (int64_t)r.output.size() + 1 >= r.max_tokens) return nullptr;
+            (int64_t)r.output.size() + 1 >= r.max_tokens)
+            return refuse_ahead(AheadRefused::EndsEvery);
 
         /* The furthest context the row can reach: every position this step verifies committed,
          * counted from the last commit rather than this step's own bound (which would add a
@@ -3096,8 +3116,10 @@ const RadBatch* Scheduler::step_next_locked() {
         const int64_t ctx_up = r.n_computed + e.n_tokens;
         const int32_t d      = s.draft_next;
         const int64_t want   = 1 + d;
-        if (ctx_limit_ > 0 && ctx_up + want > ctx_limit_) return nullptr;
-        if (kv_->ensure_from(r.id, ctx_up + want, r.n_computed) < 0) return nullptr;
+        if (ctx_limit_ > 0 && ctx_up + want > ctx_limit_)
+            return refuse_ahead(AheadRefused::Kv);
+        if (kv_->ensure_from(r.id, ctx_up + want, r.n_computed) < 0)
+            return refuse_ahead(AheadRefused::Kv);
 
         StepEntry n;
         n.req            = &r;
@@ -3121,7 +3143,7 @@ const RadBatch* Scheduler::step_next_locked() {
         if (d > plan_next_.n_spec) plan_next_.n_spec = d;
     }
     /* A step with no decode row beside its prefill row is not a mixed step. */
-    if (plan_next_.e.empty()) { plan_next_.reset(); return nullptr; }
+    if (plan_next_.e.empty()) { plan_next_.reset(); return refuse_ahead(AheadRefused::MidPrompt); }
     const size_t n_dec = plan_next_.e.size();
 
     const int64_t budget0 = cfg_.prefill_span > 1 ? geo_.shared_tok : cfg_.max_tok;
@@ -3179,25 +3201,25 @@ const RadBatch* Scheduler::step_next_locked() {
          * the decode rows behind it need: that is not the mixed step this issues ahead. */
         if (want <= 0 || plan_next_.n_tok + want > budget0) {
             plan_next_.reset();
-            return nullptr;
+            return refuse_ahead(AheadRefused::MidPrompt);
         }
         /* A chunk the shares held back is planned after the commit, where the budget they did not
          * use goes back to it (step()'s reclaim): issuing it ahead would pin the shorter chunk. */
         if (want < plan_chunk(start, end, budget_at_pf, nullptr, pr.checkpoint_at, &pr)) {
             plan_next_.reset();
-            return nullptr;
+            return refuse_ahead(AheadRefused::Held);
         }
         /* No preemption from here: a request in flight holds its blocks until this step commits,
          * so a shortfall is the step after the commit's to fix. */
         if (kv_->ensure_from(pr.id, start + want, pr.n_computed) < 0) {
             plan_next_.reset();
-            return nullptr;
+            return refuse_ahead(AheadRefused::Kv);
         }
         /* A snapshot the store dropped since the hit was taken: step() gives the hit back and
          * prefills again, which only the step after the commit can do. */
         if (ps.ckpt_src >= 0 && !kv_->checkpoint_held(ps.ckpt_src)) {
             plan_next_.reset();
-            return nullptr;
+            return refuse_ahead(AheadRefused::Kv);
         }
         StepEntry n;
         n.req            = &pr;
@@ -3245,7 +3267,7 @@ const RadBatch* Scheduler::step_next_locked() {
         /* A wait is a refusal too (the prefill room gate, a recompute with no room): step() leaves
          * the waiter in the queue for the next attempt, so this step is not issued ahead with it,
          * and nothing of the attempt is undone -- a hit it took is kept, as step() keeps it. */
-        if (as != RAD_OK) { plan_next_.reset(); return nullptr; }
+        if (as != RAD_OK) { plan_next_.reset(); return refuse_ahead(AheadRefused::Waiting); }
 
         Request& r = *s.req;
         StepEntry n;
