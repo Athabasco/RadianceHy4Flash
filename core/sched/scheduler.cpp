@@ -1652,7 +1652,12 @@ void Scheduler::fill_group_step(StepPlan& p, bool ahead) {
         e.slot = slot;
         e.card = s.card;
         e.n_tokens = 1;
-        e.ctx_len = (int32_t)(r.n_computed + 1);
+        /* Planned the way a decode step plans its row: after the previous sub-step committed,
+         * n_computed is the last committed token and it is on the host, so the row is host-staged
+         * at that position. Issued ahead of that commit the token is not on the host yet, so the
+         * card owns the row (dev) exactly as a plain ahead decode row's, and ctx_len is only the
+         * position ceiling: ADV_TRUNK restages the token and its position from the StepSlot. */
+        e.ctx_len = (int32_t)(r.n_computed + (ahead ? 1 : 0));
         e.n_spec = 0;
         e.n_accepted = r.n_accepted + 1;
         e.conv_cursor = s.conv_cursor;
@@ -1660,7 +1665,8 @@ void Scheduler::fill_group_step(StepPlan& p, bool ahead) {
         e.n_draft = 0;
         e.is_prefill = false;
         e.produces_token = true;
-        e.dev_tok = e.ctx_len;
+        e.dev = ahead;
+        e.dev_tok = row;
         e.dev_out = row;
         e.dev_aux = 0;
         if (ahead) s.entry_next = (int32_t)p.e.size(); else s.entry = (int32_t)p.e.size();

@@ -10449,3 +10449,49 @@ TEST(a_decoder_that_finishes_inside_a_group_keeps_its_place_until_the_last_slice
     CHECK(f.sch.find(d) == nullptr);
     CHECK_EQ(f.sch.find(p)->output.size(), (size_t)1);
 }
+
+/* ------------------------------------------------------------------ what the group freezes */
+/* A group's decode rows are planned the way a decode step plans its row. After the previous
+ * sub-step committed, the decoder's token is the last committed one, on the host, at n_computed;
+ * while a sub-step is issued ahead of that commit it is not on the host yet, so the card owns the
+ * row (as a plain ahead decode row's) and ctx_len is only the position ceiling. One position too
+ * far reads token 0 - a token the sequence never held - and a position it never reached. */
+TEST(a_group_s_decoders_are_planned_at_the_token_they_committed) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/4);
+    CHECK_OK(f.start());
+    uint64_t d = 0, p = 0;
+    const RadBatch* b = slice_start(f, &d, &p);
+    REQUIRE(b != nullptr);
+
+    /* the mixed step's own plan: the committed token at its own position */
+    CHECK_EQ(f.sch.plan().e[0].ctx_len, 100);
+    CHECK(!f.sch.plan().e[0].dev);
+    CHECK_EQ(b->token_ids[0], 11);
+    CHECK_EQ(b->positions[0], 100);
+
+    /* the next sub-step, issued ahead of this one's commit: token and position are the card's
+     * (the plugin's advance restages both from the StepSlot), and dev_tok names its row */
+    const RadBatch* nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(f.sch.next_plan().slice_j, 1);
+    CHECK(f.sch.next_plan().e[0].dev);
+    CHECK_EQ(f.sch.next_plan().e[0].ctx_len, 101);
+    CHECK_EQ(f.sch.next_plan().e[0].dev_tok, 0);
+    f.commit_plain(20);
+    f.sch.promote_next();
+    f.commit_plain(21);
+
+    /* the sub-step after that, planned after the commit instead of ahead: the token it just
+     * committed, at the position it committed at, not one past either */
+    const RadBatch* b2 = f.sch.step();
+    REQUIRE(b2 != nullptr);
+    CHECK_EQ(f.sch.plan().slice_j, 2);
+    CHECK(!f.sch.plan().e[0].dev);
+    CHECK_EQ(f.sch.plan().e[0].ctx_len, 102);
+    CHECK_EQ(f.sch.plan().e[0].dev_tok, 0);
+    CHECK_EQ(b2->token_ids[0], 21);
+    CHECK_EQ(b2->positions[0], 102);
+    REQUIRE_EQ(f.sch.find(d)->output.size(), (size_t)3);
+    (void)p;
+}
