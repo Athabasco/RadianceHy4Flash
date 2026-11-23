@@ -1228,10 +1228,10 @@ void Engine::rank_loop(int index) {
 }
 
 /* ------------------------------------------------------------------ the scheduler thread */
-int Engine::prepare_release(const RadBatch* b) {
+int Engine::prepare_release(const RadBatch* b, bool ahead) {
     /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
      * parked, so the level can change and a recall can drain both streams. */
-    if (const int as = arena_step(b); as < 0) return as;
+    if (const int as = arena_step(b, ahead); as < 0) return as;
     /* Grow the followers' pools to match rank 0's before the step's block table is used:
      * admission grew rank 0's cache and the new ids are already in the table. Done here, not on
      * the 100 ms arbiter tick, because the step is about to run; safe because every rank thread is
@@ -1274,7 +1274,7 @@ int Engine::issue_ahead(const RadBatch** out) {
     /* Its rows' tokens, positions and slots, advanced on the card behind this step's acceptance
      * and drafts. */
     RAD_TRY(advance_all(ADV_TRUNK, 0, false));
-    RAD_TRY(prepare_release(nb));
+    RAD_TRY(prepare_release(nb, /*ahead=*/true));
     issue_what_.store(kIssueModel, std::memory_order_release);
     step_batch_.store(nb, std::memory_order_release);
     barrier_->arrive_and_wait();
@@ -1356,8 +1356,9 @@ int Engine::step_loop() {
         step_watch.progress();
         lora_epoch_.fetch_add(1, std::memory_order_acq_rel);
         phase_t_ = std::chrono::steady_clock::now();
-        /* Encode media for waiting requests while nothing is in flight. The scheduler issues no
-         * step ahead while a request waits, and a request with unencoded media waits. */
+        /* Encode media for waiting requests while nothing is in flight. A request with unencoded
+         * media keeps the scheduler from issuing a step ahead (step_next), so the encode runs
+         * before the step that admits it. */
         if (!ahead && sched_.encodes_pending()) {
             if (const int es = run_encodes(); es < 0) return fail_loop(es);
         }
@@ -2467,7 +2468,7 @@ void Engine::loan_tick(bool idle) {
  * in those slots revert to their host copies (an address change, not a copy) and both streams
  * that can read a slot are drained. A prefill pays this on its first chunk only, since the loan
  * does not regrow until steps have been small for a while (arena_tick). */
-int Engine::arena_step(const RadBatch* b) {
+int Engine::arena_step(const RadBatch* b, bool ahead) {
     if (arena_rows_.size() <= 1 || !b) return RAD_OK;
     /* An encoder pass needs the full plan: its activations are sized by the pass, and a plugin
      * declares them small under shape_probe. */
@@ -2477,10 +2478,10 @@ int Engine::arena_step(const RadBatch* b) {
     const uint64_t now = rad_mono_ns();
     arena_last_ = arena_rows_[(size_t)level];
     if (arena_last_ >= arena_floor_) { arena_floor_ = arena_last_; arena_floor_ns_ = now; }
-    /* Whether the next step continues a prompt, so the stager stages its first layers at this
-     * step's end. Never for a step issued ahead (a decode step whose plan the scheduler does not
-     * hold). */
-    const bool more = b->phase != RAD_PHASE_DECODE && sched_.prefill_continues();
+    /* Whether the step after this one continues a prompt, so the stager stages its first layers at
+     * this step's end. Released normally, that step is the plan the scheduler holds; issued ahead,
+     * `b` *is* that step, and its own plan (`plan_next_`) says whether it carries a chunk. */
+    const bool more = b->phase != RAD_PHASE_DECODE && sched_.prefill_continues(ahead);
     for (auto& r : ranks_) {
         const int64_t allow = r->arena_lent[(size_t)level];
         if (r->mover.loan(Mover::kLendArena) > allow ||

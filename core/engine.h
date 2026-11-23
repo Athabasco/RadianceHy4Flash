@@ -658,8 +658,10 @@ private:
     /* The next step's forward pass, issued before this one is read back; null when the scheduler
      * wants this step committed first. See Scheduler::step_next. */
     int  issue_ahead(const RadBatch** out);
-    /* The arena level and the followers' pools, before any release that runs a forward pass. */
-    int  prepare_release(const RadBatch* b);
+    /* The arena level and the followers' pools, before any release that runs a forward pass.
+     * `ahead` says the batch is a step issued ahead of its commit: the stager then reads whether
+     * *that* step continues a prompt (the scheduler's next plan), not the committed one. */
+    int  prepare_release(const RadBatch* b, bool ahead = false);
     /* Whether a step may be issued ahead: requires that the drafter, if any, runs on the card (the
      * prompt-lookup drafter reads the committed sequence). */
     bool pipelining_ = false;
@@ -862,7 +864,7 @@ private:
      * level k serves (level 0 is the full plan); empty when the arena lends nothing. The floor is
      * the largest recent step: the loan grows past it only after no step that large has run for a
      * while, so a run of prefill chunks does not refill and recall the slab between chunks. */
-    int  arena_step(const RadBatch* b);
+    int  arena_step(const RadBatch* b, bool ahead);
     void arena_tick(uint64_t now_ns);
     int  arena_level(int64_t rows) const;
     std::vector<int64_t> arena_rows_;
