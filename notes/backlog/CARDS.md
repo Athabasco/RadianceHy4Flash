@@ -211,7 +211,7 @@ picks how many candidates a step verifies, not the token the law emits.
 
 ### 1.3 X-01: the host KV tier on, in the served configs (local lane)
 
-The served configs carry `prefix-cache-mib: 16384` (`scripts/backlog/*.yaml`, as `README.md:48` does). The
+The served configs carry `prefix-cache-mib: 16384` (`scripts/backlog/*.yaml`, as `README.md:55` does). The
 item's claim is "640 units (3 points) per idle 65K session", its verify step "/stats VRAM units after
 idle". `idle` with `RAD_IDLE_CHARS=190000` sends one conversation of 58,903 tokens, lets it finish and
 idle, sends a decode-only request so the experts ask for VRAM, then the same prefix again and a cold
