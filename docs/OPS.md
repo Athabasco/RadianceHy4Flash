@@ -3769,8 +3769,8 @@ refuses the graph rather than resolving a similar op.
 | `mla_kv_split` | `M`(range) `heads` `k_dim` `v_dim` `rope_dim` `dtype` | `kvb`, `k_rope` → `k`, `v` |
 | `attn_kv_sink` | `M`(range) `N` `heads` `head_dim` `window` `scale`:f64 `dtype` | `q`, `k`, `v`, `cu_q`, `cu_k`, `sinks`w → `out` |
 | `gate_mul` | `M`(range) `n` `dtype` | `a`, `g` → `y` |
-| `idx_pool_gated` | `M`(range) `n` `ratio` `rotary_dim` `eps`:f64 `theta`:f64 `mode` `sections`/opt `block_size`/opt `dtype` | `k`, `wv`w, `wg`w, `ape`w, `gain`w, `pos`, `page`?, `cache`:inout? → `out`? |
-| `idx_pool_gated_fp8` | `M`(range) `n` `ratio` `rotary_dim` `eps`:f64 `theta`:f64 `mode` `sections`/opt `block_size`/opt `dtype` | `k`, `wv`w, `wg`w, `ape`w, `gain`w, `pos`, `page`?, `cache`:inout? → `q`?, `scale`? |
+| `idx_pool_gated` | `M`(range) `n` `ratio` `rotary_dim` `eps`:f64 `theta`:f64 `mode` `sections`/opt `block_size`/opt `norm_f32`/opt `dtype` | `k`, `wv`w, `wg`w, `ape`w, `gain`w, `pos`, `page`?, `cache`:inout? → `out`? |
+| `idx_pool_gated_fp8` | `M`(range) `n` `ratio` `rotary_dim` `eps`:f64 `theta`:f64 `mode` `sections`/opt `block_size`/opt `norm_f32`/opt `dtype` | `k`, `wv`w, `wg`w, `ape`w, `gain`w, `pos`, `page`?, `cache`:inout? → `q`?, `scale`? |
 | `idx_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` | `q`, `gate`, `k`, `bt`, `cu`, `nc` → `score` |
 | `engram_ids` | `M`(range) `heads` `ngram` `pad` `map_size` `image`/opt `video`/opt | `tok`, `state`:inout, `cu`, `pos`, `token_map`w, `mult`w, `vocab_sizes`w, `offsets`w, `num_accepted`?, `cache_idx`? → `ids`, `mask`, `ahead_ids`? |
 | `engram_norm` | `M`(range) `heads` `n` `eps`:f64 `dtype` | `e`, `gain`w → `y` |
@@ -3969,6 +3969,18 @@ pair `j` turns by the h position when `j % 3 == 1` and `j < 3h`, by the w positi
 and `j < 3w`, else by t; with equal components it is `gptj`). The result goes to
 `cache[page[w]]` (`[pages, 1, 4, n/4]`, a page's `n` elements contiguous, a page < 0 or out of
 range skipped, two groups naming one page `RAD_E_INVAL`) and/or `out[w]`.
+
+`norm_f32` (**opt-in, off by default**: the plugin sets it from `RADIANCE_HY4_IDX_POOL_F32=0..3`;
+backlog item F-17) moves the key's f64 arithmetic to f32, which RDNA4 issues at 1/16 rate, a half at
+a time: bit 0 the sum of `mean(y^2)` (same order, `n · 2^-24` rounding at worst, 7.6e-6 relative at
+`n` 128, halved by the `rsqrt`, against the bf16 step of 3.9e-3 the key is rounded to) and bit 1 the
+rotary's `theta^(-2i/rotary_dim)`, `cos` and `sin` (the `pow`'s own few ulp; the trig's phase,
+though, errs by the argument's own size, `|ang| · 2^-24`, which is nothing near the start of a
+sequence and a whole bf16 step for the fastest pair at the model's longest positions). It is lossy: the same law
+in a different precision, not the same numbers, and whoever measures that trade asks for it. The
+gate's `exp` is f64 in every form. libref has the f64 form only: it is the law, and `norm_f32`
+leaves it unchanged. libr4d and libavx both take the switch (libavx's `cos` and `sin` are f32 in
+either form, so there bit 1 is the `pow` alone).
 
 **`idx_score`**: `q [M, heads, n]` is already rotated at the query's position, `gate [M, heads]` is
 `index_head`'s output, `k` the indexer cache (`[pages, 1, 4, n/4]`, or flat `[G, n]`), `bt [seqs,
