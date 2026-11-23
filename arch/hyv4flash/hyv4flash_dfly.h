@@ -154,6 +154,11 @@ struct Dfly {
         if (s.world > 1 && s.sparse.heads % s.world)
             no("the draft's %lld attention heads do not split evenly over %d ranks",
                (long long)s.sparse.heads, s.world);
+        /* The correction's gate and up hold this rank's rows and its down this rank's columns, so
+         * the chain's width splits over the same ranks. */
+        if (s.world > 1 && s.n_embd % s.world)
+            no("the draft's %lld-wide correction does not split evenly over %d ranks",
+               (long long)s.n_embd, s.world);
         if (s.world > 1 && b && (!rad_op_declared(b, "all_gather") ||
                                  !rad_op_declared(b, "row_topk_merge")))
             no("tensor parallelism (%d ranks) needs all_gather and row_topk_merge for the draft "
@@ -285,7 +290,7 @@ struct Dfly {
     };
     Shape s{};
     Geom g{};
-    int64_t Md = 0, W = 0, R = 8, E = 0, H = 0, L = 0, RO = 0, N = 0, VD = 0, Q = 0, F = 0;
+    int64_t Md = 0, W = 0, R = 8, E = 0, Ew = 0, H = 0, L = 0, RO = 0, N = 0, VD = 0, Q = 0, F = 0;
     rad_kvgroup kvg = 0;
     rad_weight token = 0, head = 0, fusion = 0, f_enorm = 0, f_hnorm = 0, f_gate = 0, c_hnorm = 0,
                c_enorm = 0, c_gate = 0, c_up = 0, c_down = 0, out_norm = 0;
@@ -299,7 +304,7 @@ struct Dfly {
     /* --draft-coupling: the planes the engine binds by name (one draw a drafting row, one state a
      * (chain step, row)) */
     rad_buf couple_draws = 0, couple_state = 0;
-    rad_op op_ar_o = 0, op_ar_y = 0;   /* TP: the layers' two reductions; 0 at one rank */
+    rad_op op_ar_o = 0, op_ar_y = 0, op_ar_c = 0;   /* TP: the layers' two reductions and the chain's; 0 at one rank */
     rad_buf ident = 0;   /* taps: [max_seqs, P] the identity table */
     int64_t ident_w = 0;
     struct ChainCodes { int64_t k = 0, g8 = 0; rad_buf q8 = 0, s8 = 0; };
@@ -342,6 +347,7 @@ struct Dfly {
         s = shape;
         g = geom;
         E = s.n_embd;
+        Ew = E / s.world;
         const AttnGeom& a = s.sparse_r;   /* this rank's heads */
         H = a.heads;
         F = ff / s.world;                 /* this rank's MLP width (drafter() checked it divides) */
@@ -447,11 +453,12 @@ struct Dfly {
         ccat = bf("chain_in", { S, 2 * E });
         /* gate and up each into a buffer of its own, then copied into the halves silu_mul reads: a GEMM
          * output as a column half of one [S, 2E] buffer is strided once two sequences draft, and
-         * libr4d's GEMMs refuse a strided output (the copies are exact, so the bytes are unchanged). */
-        cg = bf("chain_gate", { S, E });
-        cup = bf("chain_up", { S, E });
-        cgu = bf("chain_gate_up", { S, 2 * E });
-        cff = bf("chain_act", { S, E });
+         * libr4d's GEMMs refuse a strided output (the copies are exact, so the bytes are unchanged).
+         * At TP each holds this rank's width: the gate's and the up's rows and the down's input. */
+        cg = bf("chain_gate", { S, Ew });
+        cup = bf("chain_up", { S, Ew });
+        cgu = bf("chain_gate_up", { S, 2 * Ew });
+        cff = bf("chain_act", { S, Ew });
         cd = bf("chain_delta", { S, E });
         zc = bf("corrected", { S, E });
         logits = decl_b(b, nm.f("dfly.logits"), RAD_F32, { S, Vr });
@@ -600,6 +607,8 @@ struct Dfly {
             RAD_ARCH_TRY(rc);
             op_ar_y = decl_all_reduce(b, g, E, y, &rc);
             RAD_ARCH_TRY(rc);
+            op_ar_c = decl_all_reduce(b, g, E, cd, &rc);
+            RAD_ARCH_TRY(rc);
         }
         /* C, D: the layers, each with its table. */
         const double scale = 1.0 / std::sqrt((double)Q);
@@ -727,10 +736,12 @@ struct Dfly {
 
         /* F: the chain, one step a proposal. */
         steps.assign((size_t)depth, Step{});
-        /* The correction's linears once, their ops issued by every step. */
-        RAD_ARCH_TRY(linear(c_g, "dfly.correct_gate", gtop, S, E, 2 * E, c_gate, ccat, cg, RAD_SHARD_NONE, {}, true));
-        RAD_ARCH_TRY(linear(c_u, "dfly.correct_up", gtop, S, E, 2 * E, c_up, ccat, cup, RAD_SHARD_NONE, {}, true));
-        RAD_ARCH_TRY(linear(c_d, "dfly.correct_down", gtop, S, E, E, c_down, cff, cd, RAD_SHARD_NONE, {}, true));
+        /* The correction's linears once, their ops issued by every step: gate and up by rows, down
+         * by columns, so each rank reads 1/world of each and the down's partial sum is reduced
+         * exactly once a step before the residual. */
+        RAD_ARCH_TRY(linear(c_g, "dfly.correct_gate", gtop, S, Ew, 2 * E, c_gate, ccat, cg, RAD_SHARD_ROW, {}, true));
+        RAD_ARCH_TRY(linear(c_u, "dfly.correct_up", gtop, S, Ew, 2 * E, c_up, ccat, cup, RAD_SHARD_ROW, {}, true));
+        RAD_ARCH_TRY(linear(c_d, "dfly.correct_down", gtop, S, E, Ew, c_down, cff, cd, RAD_SHARD_COL, {}, true));
         for (int64_t k = 0; k < depth; ++k) {
             Step& st = steps[(size_t)k];
             const int ki = (int)k;
@@ -747,9 +758,9 @@ struct Dfly {
                               { token }, { prev }, { pe });
             st.op_hn = decl_rmsnorm(b, S, E, s.eps, c_hnorm, zk, ccat);
             st.op_en = decl_rmsnorm(b, S, E, s.eps, c_enorm, pe, ccat);
-            st.op_gcp = decl_copy(b, S, E, RAD_BF16, cg, cgu);
-            st.op_ucp = decl_copy(b, S, E, RAD_BF16, cup, cgu);
-            st.op_silu = mk(b, "silu_mul", { RAD_RANGE("M", 1, S), RAD_INT("n", E), RAD_STR("dtype", "bf16") },
+            st.op_gcp = decl_copy(b, S, Ew, RAD_BF16, cg, cgu);
+            st.op_ucp = decl_copy(b, S, Ew, RAD_BF16, cup, cgu);
+            st.op_silu = mk(b, "silu_mul", { RAD_RANGE("M", 1, S), RAD_INT("n", Ew), RAD_STR("dtype", "bf16") },
                             {}, { cgu }, { cff });
             st.op_add = add(S, zk, cd, zc);
             RAD_ARCH_TRY(st.t_corr.declare(b, nm, S, "dfly.corrected", ki, RAD_BF16, E, zc));
@@ -1024,10 +1035,11 @@ struct Dfly {
             RAD_ISSUE_N(c, st.op_en, n, brows(pe, n), RAD_W(c_enorm), bcol(ccat, E, E, n));
             run(c, c_g, ccat, cg, n);
             run(c, c_u, ccat, cup, n);
-            RAD_ISSUE_N(c, st.op_gcp, n, brows(cg, n), bcol(cgu, 0, E, n));
-            RAD_ISSUE_N(c, st.op_ucp, n, brows(cup, n), bcol(cgu, E, E, n));
+            RAD_ISSUE_N(c, st.op_gcp, n, brows(cg, n), bcol(cgu, 0, Ew, n));
+            RAD_ISSUE_N(c, st.op_ucp, n, brows(cup, n), bcol(cgu, Ew, Ew, n));
             RAD_ISSUE_N(c, st.op_silu, n, brows(cgu, n), brows(cff, n));
             run(c, c_d, cff, cd, n);
+            issue_all_reduce(c, op_ar_c, cd, n, E);
             RAD_ISSUE_N(c, st.op_add, n, brows(zk, n), brows(cd, n), brows(zc, n));
             st.t_corr.step(c, brows(zc, n), n);
             RAD_ISSUE_N(c, st.op_head, n, brows(zc, n), RAD_W(head), brows(logits, n));
