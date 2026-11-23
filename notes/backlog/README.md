@@ -41,3 +41,8 @@ needed stays. Numbers, lanes and what a later card would need: `closed/S-01b.md`
 step of 1024 rows has no ring to copy into, so `min_rows` is not the lever, and where the floor binds (two 1024-row
 chunks a step) the step is 2048 rows and already staged: the lane measured the same `stage_layers`, the same h2d bytes
 and the same ms before and after rounding the floor up. Number, lane and runs: `closed/M-03a.md`.
+- **S-04 (interleave EMA at the stager floor):** closed without code. On the served lane the decode-only run after a big
+chunk does not lengthen (16 against 17.5 steps, medians over the two arrival windows) because since S-01 the samples
+that hold the mean down are 1984-row chunks that cost 0.010 s, which a floor on rows keeps; where the change does act
+it doubles the hold and costs the arrival's TTFT +0.29 s (1 decoder) and +0.92 s (4). Numbers, tables and commands:
+`closed/S-04.md`.
