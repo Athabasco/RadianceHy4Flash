@@ -50,8 +50,13 @@ def long_prompt(chars, seed, stamp=False):
     """A prompt of about `chars` characters of repository source. stamp=True makes it unique per call
     (a fresh arrival must not hit the prefix cache; probe.py uses it), off keeps it stable (bench.py)."""
     rnd = random.Random(seed)
+    # shuffle, not sample: the same seed then walks the corpus in the order the backlog's own
+    # probe.py and bench.py did, so pf6 / pf20 stay the 6.7K / 24.9K prompts their numbers were
+    # taken on (notes/backlog/refs/kernels/levers-general.md).
+    files = list(CORPUS)
+    rnd.shuffle(files)
     parts, n = [], 0
-    for f in rnd.sample(CORPUS, len(CORPUS)):
+    for f in files:
         t = open(f, errors="replace").read()[: max(0, chars - n)]
         parts.append(f"// ===== {os.path.relpath(f, SRC)} =====\n{t}")
         n += len(t)
