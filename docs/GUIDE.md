@@ -1288,6 +1288,27 @@ A longer chunk holds the device longer per step, but the prefill a decode step w
 sooner: four decoders with a long prompt beside them finished in 29.5 s at a 2048 chunk and 31.9 s at
 512.
 
+**An interval a quantum under the batch: one step an interval.** A chunk that shares its step with
+decoding sequences has to leave them their rows, so it is the batch less those rows -- a quantum
+short of the interval boundary when the interval is the batch itself (2032 of 2048 beside one
+decoder). The next step then takes the last rows up to the boundary, and on a hybrid model that
+short step carries the checkpoint and arms its own run of decode-only interleave steps: every
+interval runs two steps, and the arrival's time to first token pays for the interleave run, not for
+the short step's 40-65 ms. `checkpoint-interval: 1984` under `max-num-batched-tokens: 2048` puts the
+boundary a quantum lower, so the chunk is the whole interval and a quantum of the batch (64 rows;
+eight sequences at five drafts take 48) stays free for decode: `RADIANCE_LOG_STEPS=1` shows one step
+an interval where it showed two (2032 · 16 · 2032 · 16 · 1600 -> 1984 · 1984 · 1728 at a 5.7K
+arrival beside one decoder). On the served lane (TP2, u3, 210 W, `scripts/backlog/nospec.yaml`, a
+5.7K arrival three times) arrival TTFT fell from 2.96 to 2.43 s at one decoder (-18 %) and from 2.80
+to 2.44 s at four (-13 %), with the decoders' typical gap unchanged (13.7 / 18.3 ms) and a lone
+prefill unchanged (pf2 0.725 -> 0.747 s, pf20 7.080 -> 7.057 s on the iks-A lane). Set the interval
+to the batch less a quantum, not to some smaller number: what removes the remainder step is that the
+chunk still fills the batch. The chunks are a quantum shorter than 2048 rows, so a prompt's chunks
+are tiled differently than at 2048 and a served answer can differ the way it does between any two
+chunk sizes (a prompt that is one chunk either way comes out bit-identical, greedy with logprobs,
+and a 5.7K prompt's logprobs move as far as they do under `max-num-batched-tokens: 1984`); no dtype,
+kernel or accumulation width changes.
+
 **Decoders beside a chunk: `prefill-interleave: N`.** A step that carries a chunk takes the
 chunk's time, and every sequence decoding beside it waits that long for its next token. With
 `prefill-interleave: 2`, after a step that carried a chunk while other sequences were decoding,
@@ -2699,7 +2720,7 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 |---|---|---|
 | `placement: MODE` | auto | `all_vram`, `layer_offload`, `expert_tiered`, `auto` |
 | `deterministic: true` | off | pin placement to the loader's plan, so the resident set cannot change under the heat engine |
-| `checkpoint-interval: N` | 2048 | linear-attention state checkpoint interval, in tokens |
+| `checkpoint-interval: N` | 2048 | linear-attention state checkpoint interval, in tokens. It also caps a prompt's chunk (§4.5), so under a `max-num-batched-tokens: 2048` a chunk that shares its step with decoding sequences leaves a remainder step every interval; `1984` (a quantum less) keeps one step an interval with a quantum of the batch free for decode (-18 % arrival TTFT at one decoder, -13 % at four on the TP2 lane) |
 | `prefill-span: N` | 1 | checkpoint intervals one step may carry of a prefill alone in its step, from the prompt's second interval on (several prompts prefilling with nothing decoding take such steps one at a time, the fewest tokens left first); needs `max-num-batched-tokens` of N intervals. Every other step is planned at the budget less the extra intervals, and the checkpoints inside a span are not written (§4.5) |
 | `prefill-span-pass: MODE` | piece | the routed (MoE) block's pass of a spanned step: `piece`, a pass a checkpoint interval; `step`, one pass over the whole step where the model runs such a step serially (Flash-Next at one and two ranks), so each expert's weight is read once for all the step's rows. More arena (the expert planes are a step tall) and output that differs from piece passes at tie level; needs `prefill-span` above 1 (§4.5) |
 | `prefill-span-min: N` | auto | the shortest prompt, in tokens, a prefill spans for. `auto`: eight intervals where routed experts are staged from host memory, 0 elsewhere; `0` spans every lone prefill from its second interval on (§4.5) |
