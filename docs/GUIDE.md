@@ -908,7 +908,9 @@ larger prefill chunk costs resident experts (§4.5). While steps are small most 
 architecture plugin declares its activations again at smaller step sizes (the decode rows rounded up
 to a power of two, at least 256, then each level 4x the one below, up to the step budget), each packed
 into the bottom of the arena. While recent steps fit a smaller size, the top of the arena holds expert
-weights; the first larger step takes it back before it runs (an address change, not a copy). Startup
+weights (less the prefill stager's ring, which every level but the smallest keeps above its own
+buffers so such a step is still staged); the first larger step takes it back before it runs (an
+address change, not a copy). Startup
 prints what each size lends (`activation arena: lends ...`). A plugin opts in with
 `RadArchProbe::shape_probe_ok`; one that does not keeps its whole arena.
 
@@ -1613,9 +1615,13 @@ Measured on two R9700s (PCIe Gen5 x8, 265 W) over MXFP4 containers:
 chunk leaves room for one row plus the draft window per decode row behind it, and a share of the
 budget (an eighth, at least one quantum) for each prefill behind it and for the next request waiting
 to start, so a long prompt (a minute or more at 256K) does not starve decode rows or admission. The
-chunk never drops under the smallest step the prefill stager overlaps (one more than the largest
-arena level, named on the startup line `prefill staging: ...`); below that every routed layer reads
-its pooled experts synchronously and the prefill slows far more than sharing saves. Where holding a
+chunk never drops under the smallest step the prefill stager overlaps (one more than the smallest
+arena level, named on the startup line `prefill staging: ...`, rounded up to whole quanta: 320 with
+a 64-token quantum, where the levels are 256 and 1024 tokens); below that every routed layer reads
+its pooled experts synchronously and the prefill slows far more than sharing saves. A prefill step
+of any size above the smallest level is staged: every level above it keeps the stager's ring right
+above its own buffers, and only the smallest level (where decode steps land) lends it to the expert
+slab. Where holding a
 chunk back would leave a short remainder before the checkpoint boundary, the interval is split into
 two staged halves instead. Decode rows alone take only their few tokens: the chunk ends a quantum
 short of the boundary and the next step finishes it. A prompt with nothing beside it is unaffected.

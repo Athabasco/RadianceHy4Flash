@@ -2270,12 +2270,53 @@ TEST(a_step_runs_at_the_smallest_arena_level_that_holds_it) {
     CHECK_EQ(rad::arena_level_for({}, 1), 0);
 }
 
+/* Backlog M-03b. The stager arms for a prefill step of at least its floor's rows: 128 rows route
+ * 16 of 512 experts each, so an expert is routed with p = 98 % and the step reads nearly the whole
+ * pooled set either way. A decode step's rows are one per sequence and route a small share, and a
+ * draft pass has no trunk layer of its own to stage: neither is staged. */
+TEST(the_stager_arms_for_a_prefill_step_of_its_floor_and_no_other_pass) {
+    RadBatch b{};
+    b.n_tok = 127;
+    CHECK(!rad::stage_arms(&b, 128));
+    b.n_tok = 128;
+    CHECK(rad::stage_arms(&b, 128));
+    b.n_tok = 200;
+    CHECK(rad::stage_arms(&b, 128));
+    b.phase = RAD_PHASE_DECODE;
+    CHECK(!rad::stage_arms(&b, 128));               /* routes a small share of the pooled set */
+    b.phase = RAD_PHASE_MIXED;
+    CHECK(rad::stage_arms(&b, 128));                /* a chunk sharing its step counts */
+    b.phase = RAD_PHASE_PREFILL;
+    b.draft_pass = 1;
+    CHECK(!rad::stage_arms(&b, 128));               /* the trunk's pass staged the drafts' layers */
+    CHECK(!rad::stage_arms(nullptr, 128));
+    b.draft_pass = 0;
+    b.n_tok = 4096;
+    CHECK(rad::stage_arms(&b, 4096));
+    CHECK(!rad::stage_arms(&b, 8192));
+}
+
+/* A step the stager arms for copies through the ring, so the ring's place stays out of the expert
+ * slab's loan whatever arena level the step runs at: on the served shape a 200-token prefill step
+ * runs at the 256-token level, whose own step would lend the whole stretch above its buffers. */
+TEST(a_staged_step_keeps_the_ring_above_its_level) {
+    const int64_t smallest = 1216 << 20;   /* what the 256-token level lends with no ring kept */
+    const int64_t ring = 173 << 20;        /* what is above the ring, at every level that keeps it */
+    CHECK_EQ(rad::arena_step_lent(smallest, ring, true), ring);
+    CHECK_EQ(rad::arena_step_lent(smallest, ring, false), smallest);
+    CHECK_EQ(rad::arena_step_lent(ring, ring, true), ring);     /* the 1024-token level */
+    CHECK_EQ(rad::arena_step_lent(ring, ring, false), ring);    /* a decode step there */
+    CHECK_EQ(rad::arena_step_lent(0, ring, true), 0);           /* the full plan lends nothing */
+    CHECK_EQ(rad::arena_step_lent(0, ring, false), 0);
+    CHECK_EQ(rad::arena_step_lent(smallest, 0, true), 0);       /* the ring reaches the top */
+}
+
 /* Backlog M-03b. Every arena level but the smallest keeps the prefill stager's ring right above its
- * own buffers, so a prefill step of any size above the smallest level's rows is staged; the
- * smallest level is the one decode steps land on, and it lends the ring to the expert slab
- * instead. All the levels that keep it share the one place the stager has below its full-plan
- * ring, so that place is above the highest of them, and the smallest pass that finds a ring there
- * is one past the smallest level. The span's shared level keeps the ring wherever it sits. */
+ * own buffers for every step it holds; the smallest level is where decode steps land, and it
+ * lends the ring to the expert slab for residency instead -- a prefill step at it keeps the ring
+ * through arena_step_lent rather than through this table. All the levels that keep it share the
+ * one place the stager has below its full-plan ring, so that place is above the highest of them.
+ * The span's shared level keeps the ring wherever it sits. */
 TEST(the_stager_ring_sits_above_every_arena_level_but_the_smallest) {
     /* the served shape: 256 and 1024-token levels, no span */
     CHECK(!rad::arena_ring_level(256, 256, 0));
@@ -2288,9 +2329,9 @@ TEST(the_stager_ring_sits_above_every_arena_level_but_the_smallest) {
     CHECK_EQ(rad::arena_ring_above({ { 256, 186 << 20 }, { 512, 354 << 20 }, { 1024, 706 << 20 } },
                                    512),
              int64_t(706 << 20));
-    /* a span whose shared level is the smallest: it keeps the ring at its own place, and the
-     * smallest pass there is still one past it, so no step at that level arms; a level above it
-     * still keeps the ring above itself and the place moves up */
+    /* a span whose shared level is the smallest: it keeps the ring at its own place, above the
+     * level's buffers, and a level above it still keeps the ring above itself, so the place moves
+     * up */
     CHECK(rad::arena_ring_level(256, 256, 256));
     CHECK_EQ(rad::arena_ring_above({ { 256, 186 << 20 } }, 256), int64_t(186 << 20));
     CHECK_EQ(rad::arena_ring_above({ { 256, 186 << 20 }, { 1024, 706 << 20 } }, 256),

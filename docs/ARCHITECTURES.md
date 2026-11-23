@@ -3710,10 +3710,12 @@ step (MoeFP8's `rows` is `max-num-batched-tokens`), so a routed pass is `tokens 
 = 131072 under `max-num-batched-tokens: 8192` (`prefill-span: 4`, `prefill-span-pass: step`, `prefill-span-first: on`).
 libr4d's `swiglu_clamped_bf16` and the fused `swiglu_clamped_quant` once refused past 65535 rows and stopped the engine
 at a 19.5K-token prompt; they serve up to 2^31 - 1 rows now. Leave `busy-prefill-chunk` at its default (`auto`): on this
-model the prefill stager overlaps from a 4097-token step, `auto` never holds a chunk under it, and an explicit
-`busy-prefill-chunk: 1088` (Flash-Next's value) is under it, which the startup warns about and which cost -26 % prefill
-(every routed layer then reads its pooled experts synchronously). An explicit N must be at least the stager's step
-(startup line `prefill staging: ...`, the warning names it; 4160 with a 64-token quantum).
+model the arena's smaller levels run up to 4096 tokens, the prefill stager overlaps from a 257-token step (M-03b: every
+arena level but the 256-token one, where decode steps land, keeps the ring and is staged), and `auto` never holds a chunk
+under it; an explicit `busy-prefill-chunk` under it (Flash-Next's 1088 was, against the 4097-token step the stager used to
+need) is what the startup warns about, and it cost -26 % prefill (every routed layer then reads its pooled experts
+synchronously). An explicit N must be at least the stager's step (startup line `prefill staging: ...`, the warning names
+it; 320 with a 64-token quantum).
 
 **TP2 recipe (u3 container, two R9700, 210 W; measured 2026-11-22, `work/tp2t1`).** (1) `draft-depth-stop: 0.3`
 with `draft-depth: adaptive` (default 0.85 verifies too little for one client; the general-levers
@@ -3767,8 +3769,10 @@ the memlock limit above the extra pinned bytes.
 background streams, 90 s a level, arrivals 2K to 32K every 15 s; u3 coupled, T 0.9, 210 W, `max-num-batched-tokens: 2048`).**
 Default (`busy-prefill-chunk: auto`, `prefill-interleave: auto:1`): worst stall 0.76 s (2 streams) / 0.81 s (4), stall p99 0.71 s,
 whatever the arrival depth; background decode per stream falls to 47 % (33 vs 70 tok/s at two, 24 vs 48 at four) inside arrival
-windows; arrival TTFT at 16K 9.5 / 10.3 s against 3.4 s cold. On this container `auto` floors a shared chunk at 1024 tokens (the
-stager's smallest pass, startup line `prefill staging`), not 4097. Cold prefill is the same in every row (3.96K tok/s at 2K,
+windows; arrival TTFT at 16K 9.5 / 10.3 s against 3.4 s cold. On this container `auto` floors a shared chunk at 320 tokens with a
+64-token quantum (the stager's smallest pass, startup line `prefill staging`, one more than the 256-token level since M-03b put
+the ring above every level but that one; it floored at 1024 before, so the `auto` row below is the older floor). Cold prefill is
+the same in every row (3.96K tok/s at 2K,
 3.50K at 16K, 2.96K at 64K): the knobs act only while other sequences decode.
 
 | setting | worst stall 2 / 4 streams | stall p99 2 / 4 | bg tok/s per stream in window 2 / 4 | 16K arrival TTFT p50 2 / 4 |

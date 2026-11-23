@@ -545,10 +545,16 @@ public:
     int64_t bidi_fit(const Request& r, int64_t n_computed, int64_t n_target, int64_t want,
                      int64_t budget) const;
 
-    /* The smallest step the prefill stager overlaps, in tokens (0 = no stager), set once by the
-     * engine after init. --busy-prefill-chunk keeps a held-back chunk at or above it (busy_cap).
-     * Also logs the resolved policy at startup. */
+    /* The smallest step a held-back prefill chunk takes, in tokens (0 = no stager), set from the
+     * arena once by the engine after init: a level's pass, one past the largest level below the
+     * span's -- not the prefill stager's arm floor (kStageArmRows, 128 rows), which is a different
+     * quantity and why a level that keeps the ring lends it per step (arena.h).
+     * --busy-prefill-chunk keeps a held-back chunk at or above it (busy_cap). Also logs the
+     * resolved policy at startup. */
     void    set_stage_rows(int64_t rows);
+    /* The busy-chunk floor at chunk quantum `quantum`: a level's pass in whole quanta, rounded
+     * down, or one quantum when no stager is armed. */
+    int64_t stage_floor(int64_t quantum) const;
     /* The shortest prefill that spans, in tokens (0: every one alone in its step), set once by
      * the engine after init. Where routed experts are read from host memory, the arena a spanned
      * step takes is room the experts lose for it, which on a short prompt costs more than the span
@@ -558,8 +564,8 @@ public:
      * inside the step (RadArchProbe::ckpt_snap_ok) and the engine holds a stage for it. Set once
      * by the engine after init; false keeps every checkpoint at a chunk's end. */
     void    set_ckpt_inside(bool on) { ckpt_inside_ = on; builder_.set_ckpt_cut(on); }
-    /* Whether the step just planned leaves a prompt with at least the stager's smallest pass still
-     * to prefill, so the next step most likely carries a chunk the stager arms for -- and that next
+    /* Whether the step just planned leaves a prompt with at least the stager's arm floor still to
+     * prefill, so the next step most likely carries a chunk the stager arms for -- and that next
      * step is not a held one (--prefill-interleave), which would drop what was staged. With
      * `next_plan`, the step issued ahead (`plan_next_`) is the one being released; its hold is
      * counted from its own shape, since promote_next() arms it after the release. */
@@ -598,7 +604,7 @@ private:
     KVGeom        kvgeom_{};
     /* Does this model carry recurrent state a prefix hit would have to restore? See admit_one. */
     bool          has_linear_state_ = false;
-    /* set_stage_rows: the prefill stager's smallest pass, 0 when it is not armed. */
+    /* set_stage_rows: a level's pass, the smallest step a held-back chunk takes; 0 when no stager. */
     int64_t       stage_rows_ = 0;
     /* set_span_min: the shortest prefill a span is taken for, 0 for any. */
     int64_t       span_min_ = 0;

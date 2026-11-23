@@ -15,6 +15,17 @@
 
 namespace rad {
 
+/* Whether a pass is one a prefill stager arms for with `min_rows` as its floor: a trunk pass that
+ * carries a prompt chunk of at least that many rows (RAD_PHASE_PREFILL or RAD_PHASE_MIXED). A
+ * decode step's rows are one per sequence and route a small share of the pooled set, so reading
+ * them in place costs little; a draft pass reads none of the trunk's layers (place/stager.h,
+ * "trunk only"). The stager's begin_pass and the engine's arena_step both go through here: the
+ * step that is staged is the step whose ring the expert slab gives back. */
+inline bool stage_arms(const RadBatch* b, int64_t min_rows) {
+    return b != nullptr && b->draft_pass == 0 && b->phase != RAD_PHASE_DECODE &&
+           b->n_tok >= min_rows;
+}
+
 class OpStager {
 public:
     virtual ~OpStager() = default;

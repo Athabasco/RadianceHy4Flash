@@ -113,6 +113,11 @@ bool arena_ring_level(int64_t rows, int64_t smallest_rows, int64_t span_rows) {
     return rows > smallest_rows || (span_rows > 0 && rows == span_rows);
 }
 
+int64_t arena_step_lent(int64_t level_lent, int64_t ring_lent, bool staged) {
+    if (!staged || ring_lent >= level_lent) return level_lent;
+    return ring_lent;
+}
+
 int64_t arena_ring_above(const std::vector<ArenaStepLevel>& levels, int64_t span_rows) {
     if (levels.empty()) return -1;
     int64_t smallest = levels[0].rows;

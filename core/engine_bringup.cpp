@@ -1702,6 +1702,12 @@ int Engine::declare() {
  * the stager's ring: what a kernel writes past the rows it was given lands there rather than in
  * an expert's weights. */
 static constexpr int64_t kArenaGuard = 1ll << 20;
+/* The oldest step the prefill stager arms for, in rows (M-03b): 128 rows route 16 of 512 experts
+ * each, so an expert is routed with p = 98 % and such a step reads nearly the whole pooled set,
+ * synchronously and in place, unless it is staged. It is not an arena level's size: a step keeps
+ * the ring whatever level it lands on (arena_step_lent), and the scheduler's floor for a
+ * held-back chunk is a level's pass rather than this (Engine::bringup, set_stage_rows). */
+static constexpr int64_t kStageArmRows = 128;
 
 /* The activation arena's smaller levels, sized by the plugin itself.
  *
@@ -5081,30 +5087,45 @@ int Engine::start() {
          * static plan, which may still stage file-tier weights on demand. */
         RAD_TRY(r->mover.bind_compute_stream(r->ctx.stream()));
 
-        /* The prefill stager, where the budget made room. Only a step larger than every smaller
-         * arena level finds the region unlent, so that is the smallest pass it arms for. */
+        /* The prefill stager, where the budget made room. Every smaller arena level but the
+         * smallest keeps the ring right above its own buffers, so a step that lands on one finds
+         * it unlent; the smallest level is where decode steps land and it lends the ring to the
+         * slab for residency, so a prefill step that lands on it keeps the ring for its own step
+         * only (arena_step_lent). It arms from kStageArmRows rows: below that a step routes too
+         * few experts for the copies to pay, and a decode step is never staged (stager.h). */
         if (r->program.arena_stage_bytes > 0 && r->plan.dynamic && !r->arena_levels.empty()) {
-            /* The smallest pass is one past every level that lends the ring. The span's shared
-             * level does not: it keeps its own place for it, right above its buffers and the
-             * guard, wherever that is below the region at the top (stager.h). */
-            int64_t top_level = 0;
-            r->arena_low_off = -1;
+            std::vector<ArenaStepLevel> levels;
+            levels.reserve(r->arena_levels.size());
+            int64_t smallest = r->arena_levels[0].rows;
             for (const ArenaLevel& lv : r->arena_levels) {
-                if (lv.rows != arena_span_rows_) { top_level = std::max(top_level, lv.rows); continue; }
-                const int64_t off = (lv.end + kArenaGuard + RAD_ALIGN_UNIT - 1) /
-                                    RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
-                r->arena_low_off = std::min(off, r->program.arena_stage_off);
+                levels.push_back({ lv.rows, lv.end });
+                smallest = std::min(smallest, lv.rows);
             }
+            /* One place for every level that keeps the ring, above the highest of them and the
+             * guard, and never past the top of the full plan's own buffers. */
+            const int64_t above = arena_ring_above(levels, arena_span_rows_);
+            r->arena_low_off =
+                above < 0 ? -1
+                          : std::min((above + kArenaGuard + RAD_ALIGN_UNIT - 1) /
+                                         RAD_ALIGN_UNIT * RAD_ALIGN_UNIT,
+                                     r->program.arena_stage_off);
+            r->arena_min_rows = smallest;
+            /* A held-back chunk's floor is a level's pass: one past the largest level below the
+             * span's (0 when the span is the only one, which leaves the floor a quantum). */
+            int64_t largest = 0;
+            for (const ArenaLevel& lv : r->arena_levels)
+                if (lv.rows != arena_span_rows_) largest = std::max(largest, lv.rows);
+            r->arena_top_rows = largest;
             char* const base = (char*)r->ctx.arena_base();
             RAD_TRY(r->stager.init(r->program, r->plan, &r->mover,
                                    base + r->program.arena_stage_off,
                                    r->arena_low_off >= 0 ? base + r->arena_low_off : nullptr,
-                                   r->program.arena_stage_bytes, top_level + 1));
+                                   r->program.arena_stage_bytes, kStageArmRows));
             if (r->stager.enabled() && r->index == 0)
-                RAD_INFO("prefill staging: a %s ring at the top of the arena; a step of more "
-                         "than %lld tokens copies the pooled experts of %zu routed layers onto "
+                RAD_INFO("prefill staging: a %s ring; a prefill step of %lld tokens or more copies "
+                         "the pooled experts of %zu routed layers onto "
                          "the card up to %d layers ahead of the layers that read them",
-                         humanb(r->stager.ring_bytes()).c_str(), (long long)top_level,
+                         humanb(r->stager.ring_bytes()).c_str(), (long long)kStageArmRows,
                          r->stager.n_layers(), (int)PrefillStager::lead());
         }
         /* The file stager, wherever a routed expert is on the file tier (static or dynamic plan;
@@ -5248,18 +5269,24 @@ int Engine::start() {
         for (auto& r : ranks_) {
             RAD_TRY(rad_dev_set(r->device));
             r->arena_lent.assign(1, 0);
+            r->arena_ring_lent = 0;
             const Program& P = r->program;
             const int64_t top = P.arena_bytes;
             for (const ArenaLevel& lv : r->arena_levels) {
                 if (r->ctx.add_level(lv.rows, lv.offset, lv.decl) < 0) { ok = false; break; }
-                /* The span's shared level keeps the stager's ring above its buffers: it lends
-                 * what is above the ring. */
-                const bool ring = lv.rows == arena_span_rows_ && r->arena_low_off >= 0 &&
-                                  r->stager.enabled();
-                const int64_t edge = ring
-                    ? (r->arena_low_off + P.arena_stage_bytes + RAD_ALIGN_UNIT - 1) /
-                          RAD_ALIGN_UNIT * RAD_ALIGN_UNIT
-                    : (lv.end + kArenaGuard + RAD_ALIGN_UNIT - 1) / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
+                /* Every level but the smallest keeps the stager's ring above its buffers, and the
+                 * span's shared level does wherever it is: each lends what is above the ring. A
+                 * prefill step that lands on the smallest level keeps the ring for its own step
+                 * (arena_step_lent), which is the same amount: what is above the ring. */
+                const bool ring = r->arena_low_off >= 0 && r->stager.enabled() &&
+                                  arena_ring_level(lv.rows, r->arena_min_rows, arena_span_rows_);
+                const int64_t ring_edge =
+                    (r->arena_low_off + P.arena_stage_bytes + RAD_ALIGN_UNIT - 1) /
+                    RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
+                const int64_t edge =
+                    ring ? ring_edge
+                         : (lv.end + kArenaGuard + RAD_ALIGN_UNIT - 1) / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
+                if (ring) r->arena_ring_lent = top > ring_edge ? top - ring_edge : 0;
                 r->arena_lent.push_back(top > edge ? top - edge : 0);
             }
             if (!ok) break;
