@@ -1918,10 +1918,16 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
                 CHECK_EQ(pint(b.op_of(df.c_d.op), "N"), df.E);
                 CHECK_EQ(pint(b.op_of(df.c_d.op), "K"), df.E / world);
                 CHECK_EQ(pint(b.op_of(df.steps[0].op_silu), "n"), df.E / world);
-                CHECK_EQ(find_b(b, "chain_gate")->d.shape[1], df.E / world);
-                CHECK_EQ(find_b(b, "chain_up")->d.shape[1], df.E / world);
-                CHECK_EQ(find_b(b, "chain_gate_up")->d.shape[1], 2 * df.E / world);
-                CHECK_EQ(find_b(b, "chain_act")->d.shape[1], df.E / world);
+                /* The chain's buffers are this rank's slice too: gate and up rows, the down's K. */
+                const RecBuf* bg = find_b(b, "dfly.chain_gate");
+                const RecBuf* bu = find_b(b, "dfly.chain_up");
+                const RecBuf* bgu = find_b(b, "dfly.chain_gate_up");
+                const RecBuf* ba = find_b(b, "dfly.chain_act");
+                REQUIRE(bg && bu && bgu && ba);
+                CHECK_EQ(bg->d.shape[1], df.E / world);
+                CHECK_EQ(bu->d.shape[1], df.E / world);
+                CHECK_EQ(bgu->d.shape[1], 2 * df.E / world);
+                CHECK_EQ(ba->d.shape[1], df.E / world);
                 CHECK(df.op_ar_c != 0);
                 CHECK_EQ(pint(b.op_of(df.op_ar_c), "exact"), 1);
                 for (const auto& st : df.steps) CHECK(st.op_gather != 0 && st.op_merge != 0);
@@ -1944,12 +1950,13 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
                     const rad_op op = is[i].op;
                     if (op == df.op_ar_o || op == df.op_ar_y) ++ar;
                     if (op == df.op_ar_c) ++arc;
-                    if (op == df.c_d.op || op == df.op_ar_c || op == df.steps[0].op_add)
-                        chain.push_back(i);
+                    bool add = false;
                     for (const auto& st : df.steps) {
                         ga += op == st.op_gather;
                         me += op == st.op_merge;
+                        add = add || op == st.op_add;
                     }
+                    if (op == df.c_d.op || op == df.op_ar_c || add) chain.push_back(i);
                     if (op == df.steps[0].op_topk) ++tk;
                     if (op == L.p_out.op) i_out = i;
                     if (op == df.op_ar_o) i_ar = i;
@@ -1964,7 +1971,7 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
                 for (int r = 0; r < 5; ++r) {
                     CHECK_EQ(is[chain[3 * r]].op, df.c_d.op);
                     CHECK_EQ(is[chain[3 * r + 1]].op, df.op_ar_c);
-                    CHECK_EQ(is[chain[3 * r + 2]].op, df.steps[0].op_add);
+                    CHECK_EQ(is[chain[3 * r + 2]].op, df.steps[r].op_add);
                     CHECK_EQ(is[chain[3 * r + 1]].n, 2 * df.E);
                 }
                 CHECK_EQ(ga, 5);
