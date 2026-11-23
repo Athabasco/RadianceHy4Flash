@@ -220,6 +220,11 @@ struct MoeFP8 {
          * this block's Geom is the experts'). 0 means n_embd. With it the router reads
          * Wire::route. The sigmoid router only. */
         int64_t router_k = 0;
+        /* Read the router's projection weight as it is stored, bf16, rather than widened to f32 at
+         * load (GlmRouter::Config::weight_bf16; the projection widens it exactly in the kernel, so
+         * the logits are the f32 path's). It takes effect only when the weight's stored encoding
+         * is bf16, or unknown (a builder with no model behind it); a checkpoint that stores the
+         * router in f32 keeps the f32 weight and kernel path. The sigmoid router only. */
         bool router_weight_bf16 = false;
         /* The caller reduces the block's delta across ranks, because it applies more linear work
          * to it first (Nemotron-H's latent up-projection); no all-reduce is declared. */

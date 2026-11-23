@@ -28,7 +28,7 @@
 
    ---- what the launcher checks ---------------------------------------------------------------
 
-   The three operands present, x bf16, w f32 and y f32 (RAD_E_DTYPE), 1 <= N <= 512 and
+   The three operands present, x bf16, w f32 or bf16 and y f32 (RAD_E_DTYPE), 1 <= N <= 512 and
    1 <= K <= 16384, x, w and y rank 2 with x [M][K], w [N][K] and y [M][N] for x's own M
    (RAD_E_SHAPE), every row k-contiguous with a pitch of at least the row's width (the same
    RAD_E_SHAPE, as in libr4d), and M within the row-count grid, 1..65535. Nothing is staged in

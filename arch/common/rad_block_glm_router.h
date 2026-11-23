@@ -12,6 +12,8 @@ struct GlmRouter {
     struct Config {
         int64_t experts = 288, top_k = 8, rows = 32, groups = 1, topk_groups = 1;
         int norm = 1;
+        /* Declare the projection weight as stored bf16 (gemm_nt_f32's `weight_bf16`) when its
+         * stored encoding is bf16 or unknown; otherwise, or when false, it is declared f32. */
         bool weight_bf16 = false;
         double route_scale = 2.5;
     };

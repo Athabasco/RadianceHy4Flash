@@ -2097,7 +2097,8 @@ static const RadKernelInfo kKernels[] = {
 
 /* ------------------------------------------------------------------ r3d_gemm_nt_f32.hip
  *
- * The router's F32 projection: a bf16 activation against an f32 weight, f32 out, no narrowing.
+ * The router's F32 projection: a bf16 activation against an f32 weight or a stored bf16 one
+ * (widened exactly), f32 out, no narrowing.
  * One wave R rows by C columns, lane l folding k = l, l+32, ... with fmaf and the xor butterfly;
  * the tile form its rule picks for M, every form byte-identical.
  */

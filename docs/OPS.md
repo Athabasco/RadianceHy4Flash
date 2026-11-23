@@ -804,7 +804,7 @@ may not have arrived.
 | op | params | operands |
 |---|---|---|
 | `gemm_nt` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
-| `gemm_nt_f32` | `M`(range) `N` `K` `dtype` [`weight_bf16`] | `a`, `b`w → `y` |
+| `gemm_nt_f32` | `M`(range) `N` `K` `dtype` `weight_bf16`/opt | `a`, `b`w → `y` |
 | `gemm_nt_bias` | `M`(range) `N` `K` `dtype` `act`/opt | `a`, `b`w, `bias`w, `res`? → `y` |
 | `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt `w_rb`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
 | `gemm_nt_q_bias` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w, `bias`w → `y` |
@@ -883,10 +883,12 @@ what a separate tensor would hold, so the fused form equals the unfused chain bi
 may be `y` itself, the residual stream updated in place (the encoder towers' layers do this), so an
 implementation reads `res` before it stores the product over it.
 
-`gemm_nt_f32` is `y[M, N] = a[M, K] @ b[N, K]^T` with a bf16 activation, an f32 weight (stored bf16 and widened exactly when `weight_bf16=1`), f32
-accumulation and an f32 `y`; `dtype` (`bf16`) names the activation. It exists for the projections
-whose weights and results must not narrow to bf16: GLM's router logits and its indexer's signed
-head gates.
+`gemm_nt_f32` is `y[M, N] = a[M, K] @ b[N, K]^T` with a bf16 activation, an f32 weight, f32
+accumulation and an f32 `y`; `dtype` (`bf16`) names the activation. With `weight_bf16=1` the weight
+operand is the checkpoint's stored bf16 instead, widened exactly to f32 in the kernel, so `y` is
+byte for byte what the f32 copy of the same values gives. It exists for the projections whose
+weights and results must not narrow to bf16: GLM's router logits and its indexer's signed head
+gates.
 
 libr4d's `gemm_nt_f32_bf16` takes `N` up to 512, `K` up to 16384, `M` up to 65535 and pitched
 rows. A wave computes a tile of rows by columns, chosen by `M` and `N` (a single column per wave

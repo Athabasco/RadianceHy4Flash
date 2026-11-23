@@ -150,13 +150,15 @@ int main() {
     const Shape shapes[] = { { 1, 288, 512 },  { 2, 288, 129 },  { 3, 36, 129 },
                              { 8, 288, 129 },  { 33, 32, 512 },  { 70, 36, 129 },
                              { 70, 4, 512 },   { 7, 31, 129 },   { 65, 13, 130 },
-                             { 16, 288, 1056 }, { 24, 288, 1040 }, { 40, 36, 1024 } };
+                             { 16, 288, 1056 }, { 24, 288, 1040 }, { 40, 36, 1024 },
+                             { 1, 512, 3072 } };
     int fails = 0, cases = 0;
     for (const Shape& sh : shapes) {
         const int M = sh.M, N = sh.N, K = sh.K, xp = K + 5, yp = N + 3;
         std::vector<uint16_t> x((size_t)M * xp);
         std::vector<float> w((size_t)N * K);
         for (auto& v : x) v = f2b(nd(rng));
+        // The weight's values are bf16 values, so the stored-bf16 run below reads the same weight.
         std::vector<uint16_t> packed(w.size());
         for (size_t i = 0; i < w.size(); ++i) {
             packed[i] = f2b(nd(rng) * 0.03f);
@@ -207,6 +209,8 @@ int main() {
             }
             for (int c = N; c < yp; ++c) bad += y[(size_t)r * yp + c] != -7.25f;
         }
+        // The same weight stored as bf16 (`weight_bf16`): widened in the kernel, the output is the
+        // f32 weight's byte for byte, the pitch's fill included.
         std::vector<float> packed_y(y.size(), -7.25f);
         t[1].dtype = RAD_BF16;
         t[1].data = packed.data();
