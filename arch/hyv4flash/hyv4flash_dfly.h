@@ -129,7 +129,11 @@ struct Dfly {
         why.clear();
         auto no = [&](const char* fmt, auto... a) {
             if (why.empty()) {
+                /* Every caller passes a literal; a variadic lambda cannot say so to the compiler. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-security"
                 std::snprintf(buf, sizeof buf, fmt, a...);
+#pragma GCC diagnostic pop
                 why = buf;
             }
         };
