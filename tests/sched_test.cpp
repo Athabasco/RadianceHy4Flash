@@ -9179,9 +9179,11 @@ uint64_t ngram_cycle_request(Fixture& f) {
 }  // namespace
 
 namespace {
-/* A serial MTP head that drafts 3 rounds under a verify window of 8 rows (--draft-suffix on). */
-void suffix_setup(Fixture& f, int head = 3, int mx = 8, int min_match = 4, bool on = true) {
-    f.build(4096, 64);
+/* A serial MTP head that drafts 3 rounds under a verify window of 8 rows (--draft-suffix on), in
+ * a context of `max_ctx` tokens. */
+void suffix_setup(Fixture& f, int head = 3, int mx = 8, int min_match = 4, bool on = true,
+                  int64_t max_ctx = 4096) {
+    f.build(4096, 64, 512, max_ctx);
     f.cfg.n_spec = std::max(head, mx);
     f.cfg.n_spec_head = on ? head : 0;
     f.cfg.draft_suffix = on;
@@ -9227,6 +9229,60 @@ TEST(the_suffix_index_proposes_the_latest_recurrence_and_cuts_by_path_score) {
     CHECK(ow.n >= 3);
     CHECK_EQ(out[0], 8); CHECK_EQ(out[1], 9); CHECK_EQ(out[2], 40);
     CHECK_NEAR(ow.score, 1.0, 1e-4);   /* a pattern seen once, followed once: D = 1 */
+}
+
+TEST(the_suffix_index_advanced_by_chunk_proposes_what_one_build_proposes) {
+    using namespace rad;
+    /* A history full of recurrences: a 512-token passage over a 24-token alphabet, repeated 12
+     * times with one token of each repetition changed. Indexed in 64-token chunks as a prompt
+     * prefilling commits them, it must count and find what one pass over the whole history counts
+     * and finds, and the later proposal must add nothing: the work moves out of the first decode,
+     * not out of the index. */
+    std::vector<int32_t> v(6144);
+    uint32_t rng = 12345;
+    for (size_t i = 0; i < 512; ++i) {
+        rng = rng * 1664525u + 1013904223u;
+        v[i] = (int32_t)((rng >> 16) % 24u);
+    }
+    for (size_t b = 1; b < 12; ++b) {
+        for (size_t i = 0; i < 512; ++i) v[b * 512 + i] = v[i];
+        v[b * 512 + (b * 37) % 512] = (int32_t)(100 + b);
+    }
+    TokenSeq s;
+    s.a = v.data(); s.na = (int64_t)v.size();
+    int32_t want[16], got[16];
+    SuffixIndex cold;
+    const SuffixIndex::Out ow = cold.propose(s, 9, 4, 8, 0.3f, want);
+    REQUIRE(ow.n > 0);
+    CHECK_EQ(cold.indexed(), (int64_t)v.size());
+
+    SuffixIndex warm;
+    TokenSeq c;
+    c.a = v.data(); c.na = 0;
+    for (int64_t n = 64; n <= (int64_t)v.size(); n += 64) {
+        c.na = n;
+        warm.index(c, 9, 4, n);
+    }
+    CHECK_EQ(warm.indexed(), (int64_t)v.size());
+    const SuffixIndex::Out og = warm.propose(c, 9, 4, 8, 0.3f, got);
+    CHECK_EQ(og.n, ow.n);
+    CHECK_EQ(og.match, ow.match);
+    CHECK_NEAR(og.score, ow.score, 1e-6);
+    for (int j = 0; j < og.n; ++j) CHECK_EQ(got[j], want[j]);
+    /* the first decode's proposal indexes nothing: the history was indexed as it committed */
+    CHECK_EQ(warm.indexed(), (int64_t)v.size());
+    warm.propose(c, 9, 4, 8, 0.3f, got);
+    CHECK_EQ(warm.indexed(), (int64_t)v.size());
+
+    /* A history that shrank under the index (a request restarted) is rebuilt, not counted twice */
+    c.na = 3000;
+    const SuffixIndex::Out os = warm.propose(c, 9, 4, 8, 0.3f, got);
+    SuffixIndex fresh;
+    const SuffixIndex::Out of = fresh.propose(c, 9, 4, 8, 0.3f, want);
+    CHECK_EQ(os.n, of.n);
+    CHECK_EQ(os.match, of.match);
+    CHECK_NEAR(os.score, of.score, 1e-6);
+    for (int j = 0; j < os.n; ++j) CHECK_EQ(got[j], want[j]);
 }
 
 TEST(a_recurring_history_selects_a_suffix_step_in_place_of_the_heads_draft) {
@@ -9299,6 +9355,70 @@ TEST(without_a_recurrence_or_with_the_flag_off_the_heads_draft_is_verified_as_be
         CHECK_EQ(f.sch.metrics().suffix_steps, (int64_t)0);
         CHECK_EQ(f.sch.metrics().suffix_held_ahead, (int64_t)0);
     }
+}
+
+/* The prompt is indexed as its chunks commit, so nothing in the first decode's step pays for the
+ * whole prompt: the last prefill chunk's commit used to run the one index build over all of it, and
+ * this one indexes its own chunk (S-06). The chain it proposes there is still the chain a cold
+ * index over the same history proposes. */
+TEST(a_long_prompt_is_indexed_as_its_chunks_commit_and_not_at_the_first_decode) {
+    Fixture f;
+    suffix_setup(f, 3, 8, 4, /*on=*/true, /*max_ctx=*/65536);
+    CHECK_OK(f.start());
+    const int64_t N = 64000;
+    auto r = std::make_unique<Request>();
+    r->id = f.next_id++;
+    r->max_tokens = 256;
+    r->prompt.resize((size_t)N);
+    for (int64_t i = 0; i < N; ++i) r->prompt[(size_t)i] = 100 + (int32_t)(i % 64);
+    const uint64_t a = r->id;
+    CHECK(f.add(std::move(r)) == a);
+
+    int64_t chunks = 0;
+    double last_ms = 0.0;
+    for (;;) {
+        REQUIRE(f.sch.step() != nullptr);
+        const StepPlan& p = f.sch.plan();
+        REQUIRE_EQ(p.e.size(), (size_t)1);
+        const bool last = p.e[0].produces_token;
+        const auto c0 = std::chrono::steady_clock::now();
+        f.commit_plain(100);
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - c0).count();
+        ++chunks;
+        if (last) { last_ms = ms; break; }
+    }
+    CHECK(chunks > 200);   /* chunks of the checkpoint interval (256) over 64000 tokens */
+
+    /* What the first decode used to do: one index build over the whole prompt, here in the test. */
+    const Request* rq = f.sch.find(a);
+    REQUIRE(rq != nullptr);
+    TokenSeq ts;
+    ts.a = rq->prompt.data(); ts.na = (int64_t)rq->prompt.size();
+    ts.b = rq->output.data(); ts.nb = (int64_t)rq->output.size();
+    int32_t cold_out[16];
+    SuffixIndex cold;
+    const auto k0 = std::chrono::steady_clock::now();
+    const SuffixIndex::Out oc = cold.propose(ts, a, f.cfg.draft_suffix_min_match,
+                                             std::min(f.cfg.draft_suffix_max, (int)RAD_SCHED_MAX_SPEC),
+                                             f.cfg.draft_suffix_min_score, cold_out);
+    const double cold_ms = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - k0).count();
+    std::fprintf(stderr, "suffix index over %lld tokens: one build %.2f ms; the last prefill "
+                 "chunk's commit (chunk index + proposal) %.3f ms\n",
+                 (long long)N, cold_ms, last_ms);
+    /* The commit indexes its own chunk (256 tokens at this geometry) and proposes: eight times
+     * under the one build over all 64000 tokens that the first decode used to do. */
+    CHECK(last_ms * 8.0 < cold_ms);
+
+    /* And the chain at the first decode is the one the cold index proposes */
+    REQUIRE(f.sch.step() != nullptr);
+    rq = f.sch.find(a);
+    REQUIRE(rq != nullptr);
+    REQUIRE(oc.n > 0);
+    CHECK(rq->draft_suffix);
+    CHECK_EQ(rq->n_draft, oc.n);
+    for (int j = 0; j < oc.n; ++j) CHECK_EQ(rq->draft[j], cold_out[j]);
 }
 
 /* The head runs only its own 3 rounds after a suffix step, but its history pass covers every

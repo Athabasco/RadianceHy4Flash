@@ -694,6 +694,10 @@ private:
     /* --draft-suffix: the suffix proposal for `s`'s next step, over its committed history, into
      * `out` (RAD_SCHED_MAX_SPEC entries). Returns its length, 0 for none. */
     int suffix_propose(SchedReq& s, int32_t* out, int* match = nullptr);
+    /* --draft-suffix: indexes `r`'s committed history in `s`'s suffix index, proposing nothing.
+     * Called as each prefill chunk commits, so the first decode does not index the whole prompt
+     * (suffix.h). */
+    void suffix_index(SchedReq& s, const Request& r);
     /* Prompt lookup is the deployment's only drafter and --draft-window adaptive is on: its
      * proposals feed each sequence's estimate and are capped by its window, as a head's are. */
     bool lookup_adapt_ = false;

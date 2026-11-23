@@ -1165,6 +1165,18 @@ int Scheduler::suffix_propose(SchedReq& s, int32_t* out, int* match) {
     return o.n;
 }
 
+/* --draft-suffix: the same index brought up to `r`'s committed history without proposing. A chunk
+ * of a prompt is indexed as it commits, while the card runs the next one, so the first decode does
+ * not index the prompt (O(prompt) at 64K) inside the step that issues it (S-06). */
+void Scheduler::suffix_index(SchedReq& s, const Request& r) {
+    TokenSeq seq;
+    seq.a = r.prompt.data();
+    seq.na = (int64_t)r.prompt.size();
+    seq.b = r.output.data();
+    seq.nb = (int64_t)r.output.size();
+    s.suffix_ix.index(seq, r.id, cfg_.draft_suffix_min_match, r.n_computed);
+}
+
 /* ------------------------------------------------------------------ chunking */
 int64_t Scheduler::chunk_end(const Request& r, int64_t n_target) const {
     if (rswa_windows_.empty() || !kv_->has_runtime_window(r.id)) return n_target;
@@ -3175,6 +3187,9 @@ int Scheduler::commit(StepResult& res) {
                  * position, as in decode. */
                 s.conv_cursor = (int32_t)((s.conv_cursor + 1) % (W ? W : 1));
             }
+            /* --draft-suffix: index this chunk now, behind the token it just pushed, so the first
+             * decode does not index the whole prompt at once (suffix.h, S-06). */
+            if (cfg_.draft_suffix && r.may_speculate) suffix_index(s, r);
         } else {
             int32_t a = res.n_accepted ? res.n_accepted[i] : 0;
             if (a < 0) a = 0;
