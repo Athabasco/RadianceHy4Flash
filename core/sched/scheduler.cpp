@@ -4333,17 +4333,28 @@ SchedMetrics Scheduler::metrics() const {
 void Scheduler::publish(bool idle) {
     const int64_t now = mono_us();
     if (idle && now - pub_at_us_ < 20000) return;
+    /* The request table is the expensive half of the copy: a walk of reqs_ with a block-table
+     * lookup per group per request, a prefix-cache probe and a sort, under mu_. A busy step used
+     * to rebuild it every step, a few us at 8-16 requests (audit D-17), for observers that poll
+     * at dashboard rates: it is rebuilt at most every 20 ms now, while the metrics copy beside it,
+     * which is a handful of counters, still goes with every step. So /metrics' counters and the
+     * delta a phase's measurement takes never lose a step to a skipped publication. */
+    const bool table = now - pub_tbl_us_ >= 20000;
     {
         std::lock_guard<std::mutex> lk(mu_);
         scratch_m_ = metrics_locked();
-        scratch_reqs_.resize(reqs_.size());
-        scratch_reqs_.resize((size_t)requests_locked(scratch_reqs_.data(), (int)scratch_reqs_.size()));
+        if (table) {
+            scratch_reqs_.resize(reqs_.size());
+            scratch_reqs_.resize(
+                (size_t)requests_locked(scratch_reqs_.data(), (int)scratch_reqs_.size()));
+        }
     }
     if (!pub_mu_.try_lock()) return;
     pub_m_ = scratch_m_;
-    pub_reqs_.swap(scratch_reqs_);
+    if (table) pub_reqs_.swap(scratch_reqs_);
     pub_mu_.unlock();
     pub_at_us_ = now;
+    if (table) pub_tbl_us_ = now;
 }
 
 SchedMetrics Scheduler::observed_metrics() const {

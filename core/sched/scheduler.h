@@ -513,9 +513,11 @@ public:
 
     /* The observers' copy. Dashboards, scrapers and admin calls read what the engine thread last
      * published, never the scheduler's state behind the step lock, so an observer cannot slow
-     * the step. publish() runs on the engine thread once a step (at most every 20 ms while idle),
-     * builds the copy under mu_ and swaps it in only if no reader holds the copy's lock; a
-     * skipped swap happens at the next call. */
+     * the step. publish() runs on the engine thread once a step: the metrics copy is cheap and
+     * goes every call, the request table beside it is a walk of reqs_ with a block-table lookup
+     * per group, so it is rebuilt at most every 20 ms (idle or stepping, as it always was while
+     * idle). The copy is built under mu_ and swapped in only if no reader holds the copy's lock;
+     * a skipped swap happens at the next call. */
     void                 publish(bool idle);
     SchedMetrics         observed_metrics() const;
     int                  observed_requests(ReqStat* out, int max) const;
@@ -750,7 +752,8 @@ private:
     std::vector<ReqStat> pub_reqs_;
     SchedMetrics         scratch_m_;
     std::vector<ReqStat> scratch_reqs_;
-    int64_t              pub_at_us_ = 0;
+    int64_t              pub_at_us_ = 0;      /* the last publication */
+    int64_t              pub_tbl_us_ = 0;     /* the last request-table rebuild in one */
 
     /* The sinks a commit owes a wake: it pushes with the wake deferred (Sink::push) because it
      * holds mu_ while it pushes, and flush_wakes issues them once the lock is gone, so a woken
