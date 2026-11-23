@@ -7672,6 +7672,33 @@ static void iqr_gemm_case(const Plugin& pl, const IqrCase& f, int64_t M, int64_t
                                std::to_string(h_bf16(y[(size_t)first])) + " vs " +
                                std::to_string(h_bf16(yr[(size_t)first])) + ", rms " + std::to_string(rms)
                          : exact ? "the int8 row's bytes" : "the int8 row's to a rounding, rel_l2 " + std::to_string(rel));
+    /* The chained form (`chain` 1, and no engine record, so r4d_chain.h's wait returns at once):
+     * the launch issues its weight's first units before that wait and its activations after it, so
+     * its bytes are the plain launch's, bit for bit, on both kernels the IQR row picks from (the
+     * GEMV and the 16-token tile under 17 tokens, the 64-token tile above) and on the int8 tile
+     * beside it. A weight unit read before the wait that was not the block's own, or an activation
+     * that moved with it, would show here as differing bytes. */
+    {
+        auto form = [&](const RadKernelInfo* k, const std::vector<RadTensor>& ts, int pin) {
+            if (pin && pl.pin_split_waves) pl.pin_split_waves(512);
+            auto once = [&](long long chain) {
+                std::vector<RadParam> ps = gp;
+                if (chain) ps.push_back(PI("chain", 1));
+                std::vector<uint16_t> o;
+                if (launch(k, ts, ps) != RAD_OK) return o;
+                o.resize((size_t)(M * N));
+                st_memcpy(o.data(), ts[4].data, o.size() * 2, hipMemcpyDeviceToHost);
+                return o;
+            };
+            const std::vector<uint16_t> plain = once(0), chained = once(1);
+            if (pin && pl.pin_split_waves) pl.pin_split_waves(0);
+            return !plain.empty() && plain == chained;
+        };
+        ok((std::string(nm) + ": the chained form is the IQR launch's bytes").c_str(), form(r, tq, 0),
+           "the chained form's bytes differ");
+        ok((std::string(nm) + ": the chained form is the int8 launch's bytes").c_str(), form(ri, ti, 1),
+           "the chained form's bytes differ");
+    }
     dfree_all();
 }
 
