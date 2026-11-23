@@ -650,8 +650,13 @@ private:
     gen::ShapeDriver*                 shp_gen_ = nullptr;
     int  gen_loop();
     /* Zeroes the state slots the KV manager granted since the last step, on every rank's stream,
-     * before the step or pass that first reads them. */
+     * before the step or pass that first reads them: the loop clears for a step it releases
+     * itself, and issue_ahead for the step it releases ahead of its commit. */
     void clear_fresh_states();
+    /* Enqueues the recurrent half of a prefix hit (StepEntry::ckpt_restore) into the state slots
+     * the hit's admission took, on every rank's stream, before the pass that first reads them: the
+     * loop for a step it releases itself, issue_ahead for the step it releases ahead. */
+    int  restore_hits(const StepPlan& plan);
     bool serial_drafting() const;
     int  advance_all(int mode, int round, bool from_proposal, int rows = -1);
     int  issue_serial_drafter(int step, StepOut& so);

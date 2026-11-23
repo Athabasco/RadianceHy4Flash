@@ -1271,6 +1271,12 @@ int Engine::issue_ahead(const RadBatch** out) {
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
     kv_test_prepare(sched_.plan(), nb->step, ranks_);
 #endif
+    /* The two host duties of a step, both writing what its first read wants on the card: the
+     * state slots a fresh admission took are zeroed, and a prefix hit's recurrent half is copied
+     * in, before the pass below. The loop does the same for a step it releases itself; here they
+     * must be done now, because the loop reaches them only after this step has run. */
+    clear_fresh_states();
+    RAD_TRY(restore_hits(sched_.next_plan()));
     /* Its rows' tokens, positions and slots, advanced on the card behind this step's acceptance
      * and drafts. */
     RAD_TRY(advance_all(ADV_TRUNK, 0, false));
@@ -1412,7 +1418,9 @@ int Engine::step_loop() {
         idle = 0;
         if (t_on) phase_mark(PH_PLAN);
 
-        clear_fresh_states();
+        /* A step issued ahead cleared its fresh slots when it was issued: the loop reaches this
+         * point after that step's pass has run, and the clear would wipe the state it computed. */
+        if (!issued) clear_fresh_states();
 
         /* Entries that want logits rows, in BatchBuilder's out_ids order: those with
          * produces_token, 1 + n_spec rows each. Row and sequence indices differ (a mid-prompt
@@ -1503,45 +1511,11 @@ int Engine::step_loop() {
             RAD_INFO("%s", s.c_str());
         }
 
-        /* Restore the recurrent half of a prefix hit before the step that reads it (the adopted
-         * blocks carry the attention layers), copying from the snapshot's host slot. Enqueued on
-         * each rank's stream before the release, so no synchronisation is needed.
-         *
-         * Under the scheduler's lock, because an HTTP thread's cancel mutates the sequence table.
-         * Taken only when the step has a restore. */
-        bool any_restore = false;
-        for (const StepEntry& e : plan.e) if (e.ckpt_restore >= 0) { any_restore = true; break; }
-        if (any_restore) {
-            const int rs = sched_.locked([&]() -> int {
-                for (const StepEntry& e : plan.e) {
-                    if (e.ckpt_restore < 0) continue;
-                    if (!state_slots_of(e.seq, &ckpt_slots_)) continue;
-                    /* The window behind the hit, in the blocks admit_one seeded. */
-                    if (ranks_[0]->kv.has_window_snapshot() &&
-                        !ranks_[0]->kv.window_rows(e.seq, e.ctx_len, &ckpt_win_)) {
-                        RAD_ERR("sequence %llu: no window rows at %d to restore into",
-                                (unsigned long long)e.seq, (int)e.ctx_len);
-                        return RAD_E_STATE;
-                    }
-                    for (size_t ri = 0; ri < ranks_.size(); ++ri) {
-                        auto& rk = ranks_[ri];
-                        if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
-                        const int s = rk->kv.checkpoint_restore(ckpt_slots_.data(),
-                                                                (int)ckpt_slots_.size(),
-                                                                e.ckpt_restore, rk->ctx.stream(),
-                                                                &ckpt_win_);
-                        if (s < 0) {
-                            RAD_ERR("could not restore sequence %llu from checkpoint slot %d on "
-                                    "rank %d: %s", (unsigned long long)e.seq,
-                                    (int)e.ckpt_restore, (int)ri, rad_strerror(s));
-                            if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
-                            return s;
-                        }
-                    }
-                    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
-                }
-                return RAD_OK;
-            });
+        /* Restore the recurrent half of a prefix hit before the step that reads it. A step planned
+         * here restores here, before its release; a step issued ahead restored when it was issued
+         * (issue_ahead), since this point comes after the pass it released. */
+        if (!issued) {
+            const int rs = restore_hits(plan);
             if (rs < 0) return fail_loop(rs);
         }
 
@@ -2704,6 +2678,48 @@ void Engine::clear_fresh_states() {
         }
     }
     ranks_[0]->kv.clear_state_clears();
+}
+
+/* The recurrent half of a prefix hit: its attention layers are in the blocks the hit adopted,
+ * its state is in the snapshot's host slot, and the step that first reads it copies that in.
+ * Enqueued on each rank's stream before the release that runs the step, so no synchronisation is
+ * needed.
+ *
+ * Under the scheduler's lock, because an HTTP thread's cancel mutates the sequence table. */
+int Engine::restore_hits(const StepPlan& plan) {
+    bool any_restore = false;
+    for (const StepEntry& e : plan.e) if (e.ckpt_restore >= 0) { any_restore = true; break; }
+    if (!any_restore) return RAD_OK;
+    return sched_.locked([&]() -> int {
+        for (const StepEntry& e : plan.e) {
+            if (e.ckpt_restore < 0) continue;
+            if (!state_slots_of(e.seq, &ckpt_slots_)) continue;
+            /* The window behind the hit, in the blocks admit_one seeded. */
+            if (ranks_[0]->kv.has_window_snapshot() &&
+                !ranks_[0]->kv.window_rows(e.seq, e.ctx_len, &ckpt_win_)) {
+                RAD_ERR("sequence %llu: no window rows at %d to restore into",
+                        (unsigned long long)e.seq, (int)e.ctx_len);
+                return RAD_E_STATE;
+            }
+            for (size_t ri = 0; ri < ranks_.size(); ++ri) {
+                auto& rk = ranks_[ri];
+                if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
+                const int s = rk->kv.checkpoint_restore(ckpt_slots_.data(),
+                                                        (int)ckpt_slots_.size(),
+                                                        e.ckpt_restore, rk->ctx.stream(),
+                                                        &ckpt_win_);
+                if (s < 0) {
+                    RAD_ERR("could not restore sequence %llu from checkpoint slot %d on "
+                            "rank %d: %s", (unsigned long long)e.seq,
+                            (int)e.ckpt_restore, (int)ri, rad_strerror(s));
+                    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                    return s;
+                }
+            }
+            if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+        }
+        return RAD_OK;
+    });
 }
 
 int Engine::serve(std::unique_ptr<StallWatch> watch) {

@@ -503,6 +503,9 @@ public:
     void block_end();
 
     const StepPlan&      plan() const { return plan_; }
+    /* The step step_next() planned, from its return until promote_next() makes it plan(): the step
+     * released ahead of its commit, whose entries the engine must set up before that release. */
+    const StepPlan&      next_plan() const { return plan_next_; }
     const ChunkGeometry& geometry() const { return geo_; }
     DraftController&     draft() { return draft_; }
     LookupGate&          lookup_gate() { return lookup_; }
