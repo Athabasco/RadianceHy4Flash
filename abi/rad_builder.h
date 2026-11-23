@@ -291,6 +291,15 @@ typedef struct RadBuildCtx {
      * max_tok rows. 0, the zero-initialised default, keeps the interval-tall passes. A plugin
      * without such a pass ignores it. */
     int      span_pass_step;
+
+    /* ---- appended in ABI 44 (a chunk planned as layer-sliced sub-steps) */
+    /* The number of trunk layers, from the first, whose persistent state a pass can carry across
+     * a step boundary and pick up again at layer L: every state the layers [0, L) write is either
+     * declared as replicated persistent (the KV cache, an attention sink, a tap, a calibration
+     * table) or fully rewritten by the trunk of each pass. 0, the zero-initialised default, says
+     * the plugin declares no such set, and the scheduler never slices a chunk for it; the plugin
+     * reports the same fact in RadArchProbe::slice_layers_ok. */
+    int32_t  layer_slices;
 } RadBuildCtx;
 
 /* The most instances (engine ranks) one process holds at once; every slot is below it. */
@@ -1746,6 +1755,14 @@ typedef struct RadArchProbe {
      * rather than ending the chunk there and running the rows past it as a step of their own.
      * Zero keeps that step. */
     int32_t ckpt_snap_ok;
+
+    /* ---- appended in ABI 44 (a chunk planned as layer-sliced sub-steps) */
+    /* Nonzero when the plugin honours RadBatch::layer_lo/hi: it runs a step's trunk over that
+     * range only, and starts at layer_lo from the state the previous sub-step left (the replicated
+     * persistent state declared as RadBuildCtx::layer_slices, plus its transient buffers keyed by
+     * a pass's position in the chunk). Zero, the zero-initialised default, keeps every step whole:
+     * a plugin that runs a whole trunk whatever the range says must keep it zero. */
+    int32_t slice_layers_ok;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);
