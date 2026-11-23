@@ -2270,6 +2270,36 @@ TEST(a_step_runs_at_the_smallest_arena_level_that_holds_it) {
     CHECK_EQ(rad::arena_level_for({}, 1), 0);
 }
 
+/* Backlog M-03b. Every arena level but the smallest keeps the prefill stager's ring right above its
+ * own buffers, so a prefill step of any size above the smallest level's rows is staged; the
+ * smallest level is the one decode steps land on, and it lends the ring to the expert slab
+ * instead. All the levels that keep it share the one place the stager has below its full-plan
+ * ring, so that place is above the highest of them, and the smallest pass that finds a ring there
+ * is one past the smallest level. The span's shared level keeps the ring wherever it sits. */
+TEST(the_stager_ring_sits_above_every_arena_level_but_the_smallest) {
+    /* the served shape: 256 and 1024-token levels, no span */
+    CHECK(!rad::arena_ring_level(256, 256, 0));
+    CHECK(rad::arena_ring_level(1024, 256, 0));
+    CHECK_EQ(rad::arena_ring_above({ { 256, 186 << 20 }, { 1024, 706 << 20 } }, 0),
+             int64_t(706 << 20));
+    /* a span's shared level, between the two: it keeps the ring too, and the one place is above
+     * the highest level that keeps it */
+    CHECK(rad::arena_ring_level(512, 256, 512));
+    CHECK_EQ(rad::arena_ring_above({ { 256, 186 << 20 }, { 512, 354 << 20 }, { 1024, 706 << 20 } },
+                                   512),
+             int64_t(706 << 20));
+    /* a span whose shared level is the smallest: it keeps the ring at its own place, and the
+     * smallest pass there is still one past it, so no step at that level arms; a level above it
+     * still keeps the ring above itself and the place moves up */
+    CHECK(rad::arena_ring_level(256, 256, 256));
+    CHECK_EQ(rad::arena_ring_above({ { 256, 186 << 20 } }, 256), int64_t(186 << 20));
+    CHECK_EQ(rad::arena_ring_above({ { 256, 186 << 20 }, { 1024, 706 << 20 } }, 256),
+             int64_t(706 << 20));
+    /* one level only, and no level at all: no level above the smallest keeps a ring */
+    CHECK_EQ(rad::arena_ring_above({ { 256, 186 << 20 } }, 0), int64_t(-1));
+    CHECK_EQ(rad::arena_ring_above({}, 0), int64_t(-1));
+}
+
 /* ================================================================== the rank barrier */
 /* abort() releases ranks parked on the barrier and every later arrival returns at once, so a
  * fault on one rank cannot leave the others parked and the engine can exit. */

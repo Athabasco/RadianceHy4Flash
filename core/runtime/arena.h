@@ -78,4 +78,24 @@ int64_t arena_host_bytes(const Program& P);
  * full plan) when none does. `level_rows[k]` is the largest step level k serves; entry 0 is the
  * full plan and is never chosen by size. */
 int arena_level_for(const std::vector<int64_t>& level_rows, int64_t rows);
+
+/* A smaller arena level as the stager's ring arithmetic needs it: the step it holds, and the
+ * highest offset its own buffers reach (ArenaLevel::end). */
+struct ArenaStepLevel {
+    int64_t rows = 0;
+    int64_t end = 0;
+};
+
+/* Which arena levels keep the prefill stager's ring right above their own buffers (stager.h):
+ * every level but the smallest, and the span's shared level (`span_rows`, 0 without one) wherever
+ * it is. The smallest level is the one decode steps land on, and it lends the ring to the expert
+ * slab for residency instead; every level above it only ever holds a prefill step of more than its
+ * own rows, which routes nearly every pooled expert anyway. */
+bool arena_ring_level(int64_t rows, int64_t smallest_rows, int64_t span_rows);
+
+/* The offset, in bytes from the arena base, above the highest level that keeps a ring (-1 when no
+ * level keeps one). Every level that keeps it shares the one place the stager has below its
+ * full-plan ring, so the place is above the highest of them; the caller adds the guard and clamps
+ * it under the full plan's own region. */
+int64_t arena_ring_above(const std::vector<ArenaStepLevel>& levels, int64_t span_rows);
 }  /* namespace rad */
