@@ -1636,6 +1636,12 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve,
 
     if (!kv_->has_sequence(r.id)) RAD_TRY(kv_->add_sequence(r.id));
 
+    /* The whole prompt's length, before the first chunk: the cache recalls its loan for the prompt
+     * once here rather than for each chunk's shortfall as the chunks arrive, and keeps the reserve
+     * out of the arbiter's hands while the prompt still has blocks to take. A cache that keeps no
+     * reserve accepts it and does nothing. */
+    (void)kv_->reserve_ahead(r.id, s.seq_len());
+
     /* R-SWA: the visible set becomes [0, prompt) plus a ring of W once the prompt is placed. The
      * floor is this sequence's own prompt length (image tokens included, they are prompt rows),
      * and it is armed here rather than at the prefill's end so no checkpoint is reserved for the

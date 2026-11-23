@@ -490,6 +490,13 @@ public:
      * held blocks). Also decays the buffer's shortfall term, so call it once per arbiter tick. */
     int64_t spare_tokens();
 
+    /* The scheduler tells the cache how long a sequence will grow: the whole prompt, at admission,
+     * before its first chunk. That makes the recall in grow_for buy the prompt's blocks in one go
+     * instead of one chunk's shortfall at a time, and keeps spare_tokens from lending the reserve
+     * back between two chunks. A no-op for an unknown sequence; lowering it is a no-op too, since
+     * blocks already taken cannot be untaken. */
+    int     reserve_ahead(uint64_t seq, int64_t n_tokens);
+
     /* Lends `tokens` from the top, or takes back what a smaller number no longer covers. Lending
      * past a held block is refused (RAD_E_STATE). Taking back always succeeds here; the caller
      * must have moved the slab out of those blocks first. */
@@ -719,6 +726,11 @@ private:
     struct Seq {
         uint64_t id = 0;
         int64_t  n_tokens = 0;
+        /* How long the sequence said it would grow, in tokens: the scheduler's reserve_ahead at
+         * admission, 0 when it never said. The recall in grow_for covers the blocks still to come
+         * up to it, and spare_tokens keeps them from being lent back out between two chunks of the
+         * same prompt. Preemption clears it, as it clears the blocks. */
+        int64_t  n_target = 0;
         std::vector<std::vector<int32_t>> blocks;   /* per group */
         std::vector<int64_t> first_block_pos;       /* WINDOW: token pos of blocks[0] */
         std::vector<SeqWindow> win;                 /* per group: the runtime window, if any */
@@ -816,13 +828,17 @@ private:
     std::vector<std::vector<int32_t>> held_hist_;   /* per group, per bucket: held blocks */
 
     int64_t  buf_blocks(size_t i) const;
+    /* The blocks the sequences admitted with a length (reserve_ahead) still have to take in group
+     * i, over the lendable groups: the reserve spare_tokens will not lend back. */
+    int64_t  pending_blocks(size_t i) const;
     /* One past the highest held block, rounded up to a bucket. */
     int64_t  held_top(size_t i) const;
     /* The blocks a loan of `tokens` takes off the top of group i. */
     int64_t  lent_blocks(size_t i, int64_t tokens) const;
     /* Moves every lendable group's mark to a loan of `tokens`, unchecked (set_loan checks). */
     void     apply_loan(int64_t tokens);
-    int  grow_for(int32_t g, int64_t blocks, bool* waiting_for_fleet = nullptr);
+    int  grow_for(int32_t g, int64_t blocks, bool* waiting_for_fleet = nullptr,
+                  int64_t ahead = 0);
     void note_held(int32_t g, int32_t b, int delta);
     bool      configured_ = false;
     static const std::vector<int32_t> kNoBlocks;

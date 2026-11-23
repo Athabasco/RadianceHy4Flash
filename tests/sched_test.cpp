@@ -1659,6 +1659,25 @@ TEST(a_prompt_names_real_vocabulary_rows) {
     for (int i = 1; i < 5; ++i) CHECK_EQ(rc[i], RAD_E_INVAL);
 }
 
+/* The cache is told the whole prompt at admission, not one chunk of it: it can then recall the
+ * KV loan it lent the expert slab for the whole prompt in one go, instead of once per chunk's
+ * shortfall (a 60K prompt arrives as ~30 chunks of 1984 tokens). */
+TEST(admission_tells_the_cache_how_long_the_prompt_is) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    uint64_t a = f.submit(1000, 8);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.kv.reserved.count(a), 1);
+    CHECK_EQ(f.kv.reserved[a], 1000);
+
+    /* Once, at admission: a decode step grows the sequence too, and it must not restate the
+     * reserve (the cache keeps the largest, so a restated chunk would pin it). */
+    for (int i = 0; i < 4; ++i) CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.kv.reserved[a], 1000);
+    CHECK_EQ((int)f.kv.reserved.size(), 1);
+}
+
 TEST(a_prefix_hit_starts_the_request_at_the_last_usable_checkpoint) {
     Fixture f;
     f.build();

@@ -3906,6 +3906,66 @@ TEST(a_recall_the_slab_cannot_make_refuses_the_request) {
     CHECK_EQ((int64_t)e.kv.block_table(1, G_FULL).size(), 0);
 }
 
+/* A prompt arrives as chunks, and the arbiter (Engine::loan_tick) asks the cache what it can spare
+ * between two of them and lends it: recalling one chunk's shortfall while the arbiter hands the
+ * buffer straight back is a recall per chunk, and each one is a mover sync on both streams plus a
+ * walk of the whole pool. A 55K-token arrival measured 11 of them on the local lane. A sequence
+ * admitted with its whole length (reserve_ahead) recalls for the prompt once, and the arbiter
+ * cannot lend the reserve out again while the prompt still has blocks to take. */
+TEST(a_chunked_prefill_recalls_the_loan_once_not_once_a_chunk) {
+    Lender e;
+    CHECK_OK(e.build());
+    const int64_t all = e.kv.total_blocks(G_FULL);
+    CHECK_OK(e.kv.set_loan(e.kv.spare_tokens()));
+    const int64_t idle = e.kv.live_blocks(G_FULL);
+    int calls = 0;
+    e.kv.set_reclaim([&](int64_t) { ++calls; return (int)RAD_OK; });
+
+    /* Longer than the cache keeps, so all of it is recall, in five chunks of the group. */
+    const int64_t bs = e.bs();
+    const int64_t tokens = (idle + all) / 2 * bs;
+    const int64_t chunk = tokens / 5;
+    CHECK(chunk > bs);
+
+    CHECK_OK(e.kv.add_sequence(1));
+    e.kv.reserve_ahead(1, tokens);              /* admission knows the whole prompt */
+    for (int64_t n = chunk; n < tokens; n += chunk) {
+        CHECK_OK(e.kv.ensure(1, n));
+        /* The arbiter: the loan becomes what the cache says it can spare, when that is a chunk
+         * less than it lends now. */
+        const int64_t spare = e.kv.spare_tokens();
+        CHECK(spare <= e.kv.loan_tokens());     /* the reserve is not offered back */
+        CHECK_OK(e.kv.set_loan(spare));
+    }
+    CHECK_OK(e.kv.ensure(1, tokens));
+    CHECK_EQ(calls, 1);
+    CHECK_EQ(e.kv.loan_recalls(), 1);
+    CHECK_EQ((int64_t)e.kv.block_table(1, G_FULL).size(), (tokens + bs - 1) / bs);
+}
+
+/* The reserve ends with the prompt it was for. Two prompts in a row recall once each: a first that
+ * kept the loan down for its whole life must not pin it there, or the expert slab would never get
+ * the memory back (the idle handback X-01 depends on it). */
+TEST(a_second_prompt_recalls_for_itself_once_the_first_one_is_taken) {
+    Lender e;
+    CHECK_OK(e.build());
+    const int64_t all = e.kv.total_blocks(G_FULL);
+    const int64_t bs = e.bs();
+    int calls = 0;
+    e.kv.set_reclaim([&](int64_t) { ++calls; return (int)RAD_OK; });
+
+    const int64_t tokens = all / 4 * bs;   /* both prompts fit in the carve together */
+    for (uint64_t id = 1; id <= 2; ++id) {
+        CHECK_OK(e.kv.set_loan(e.kv.spare_tokens()));
+        CHECK_OK(e.kv.add_sequence(id));
+        e.kv.reserve_ahead(id, tokens);
+        for (int64_t n = tokens / 3; n < tokens; n += tokens / 3) CHECK_OK(e.kv.ensure(id, n));
+        CHECK_OK(e.kv.ensure(id, tokens));
+        CHECK_EQ(e.kv.loan_recalls(), (int64_t)id);   /* one more, for this prompt */
+    }
+    CHECK_EQ(calls, 2);
+}
+
 /* The kept buffer is one step's worth, so a chunked prefill recalls once per chunk rather than per
  * block. A bigger chunk means a bigger buffer, the operator's one lever on the derivation. */
 TEST(the_derived_buffer_is_one_chunk_of_the_group) {
