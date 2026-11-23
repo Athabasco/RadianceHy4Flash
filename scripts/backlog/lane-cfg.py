@@ -2,18 +2,20 @@
 """lane-cfg.py <cfg.yaml> <out.yaml>: a backlog config with the lane's settings put in.
 
 The configs in scripts/backlog/*.yaml are written for the served (local) lane. A lane run rewrites
-the four keys that differ per lane, from the environment lane.sh exports, and leaves every other
+the keys that differ per lane, from the environment lane.sh exports, and leaves every other
 line of the file alone, so a run's exact config sits next to its numbers:
 
-    RAD_PORT            server.port
-    RAD_MODEL           models.*.model
-    RAD_HOST_POOL_MIB   models.*.host-pool-mib  (empty: keep the file's)
-    RAD_NGRAM           models.*.ngram-placement (empty: keep the file's)
+    RAD_PORT               server.port
+    RAD_MODEL              models.*.model
+    RAD_HOST_POOL_MIB      models.*.host-pool-mib (empty: keep the file's)
+    RAD_NGRAM              models.*.ngram-placement (empty: keep the file's)
+    RAD_PREFIX_CACHE_MIB   models.*.prefix-cache-mib (empty: keep the file's)
 """
 import os, re, sys
 
 KEYS = {"port": "RAD_PORT", "model": "RAD_MODEL",
-        "host-pool-mib": "RAD_HOST_POOL_MIB", "ngram-placement": "RAD_NGRAM"}
+        "host-pool-mib": "RAD_HOST_POOL_MIB", "ngram-placement": "RAD_NGRAM",
+        "prefix-cache-mib": "RAD_PREFIX_CACHE_MIB"}
 
 
 def main():
