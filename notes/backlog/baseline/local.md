@@ -11,8 +11,8 @@ their median, and each section ends with the delta to §2.
 | model | `/srv/models/hy4-flash-iqr-v4/hy4-flash-iqr-v4-u3.rad` (read only) |
 | build | `cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ -DRAD_WITH_HIP=ON -DRAD_GPU_TARGETS=gfx1201 && cmake --build build --target radiance -j 32`; plugin targets `radiance_home/{kernels/libr4d.so,kernels/libavx.so,kernels/libref.so,kernels/spechub.so,quantizers/libquant.so,architectures/hyv4flash.so}` |
 | configs | `scripts/backlog/{nospec,nsv,coupled03,cpv,prof}.yaml` as committed; `lane.sh` only rewrites port, model path, host pool / ngram placement and checkpoint interval |
-| method | `scripts/backlog/lane.sh local "scripts/backlog/run.sh <tag> <cfg> <phases>"`, three tags `-r1..-r3`; stamps `RADIANCE_AQL_STAMP=7`, profile `RADIANCE_PROFILE_EVERY=1`; raw data in `runs/local/<tag>/` (not committed) |
-| phases | `c1` 73-token prompt decode, `c1b` same after a warm pass, `c8` eight streams, `pf6` 6681-token prefill, `pf20` 24856-token prefill, `pf2` 2385-token prompt, `tail400` 159-token prompt, `stall1`/`stall4` 1/4 background streams arriving at 1.5 s |
+| method | `scripts/backlog/lane.sh local "scripts/backlog/run.sh <tag> <cfg> <phases>"`, three tags `-r1..-r3` for §2 and `sm-r1..r3` for the small prompts (those on `ef147763`, which is notes only above the baseline commit); stamps `RADIANCE_AQL_STAMP=7`, profile `RADIANCE_PROFILE_EVERY=1`; raw data in `runs/local/<tag>/` (not committed) |
+| phases | `c1` 73-token prompt decode, `c1b` same after a warm pass, `c8` eight streams, `pf6` 6681-token prefill, `pf20` 24856-token prefill, `pf2` 2385-token prompt, `tail400` 159-token prompt, `stall1`/`stall4` 1/4 background streams arriving at 1.5 s; the small-prompt runs add `tail742` 256 and `tail2560` 723 tokens |
 
 `lane.sh` takes `gpu2` (both cards) through the card scheduler. No other GPU job of this
 worktree ran at the same time; other Moebius runs may have shared the host, which is what the
@@ -28,9 +28,9 @@ no stamps.
 | r1 | 13.710 ms / 71.6 tok/s | 13.844 ms / 70.8 | 13.363 ms / 73.3 |
 | r2 | 13.738 ms / 71.5 | 13.762 ms / 71.4 | 13.411 ms / 73.2 |
 | r3 | 13.704 ms / 71.6 | 13.773 ms / 71.4 | 13.403 ms / 73.2 |
-| **median** | **13.738 ms / 71.5** | **13.773 ms / 71.4** | **13.403 ms / 73.2** |
+| **median** | **13.710 ms / 71.6** | **13.773 ms / 71.4** | **13.403 ms / 73.2** |
 | §2 | 13.84 ms / 72.3 | 13.84 ms / 72.3 | 13.5-13.9 ms / 72-74 |
-| delta | -0.7 % / -1.1 % | -0.5 % / -1.3 % | below the range |
+| delta | -0.9 % / -1.0 % | -0.5 % / -1.3 % | below the range |
 
 The stamped per-pass figures for `c1` (`r1`, pass kind 1330): 36 passes, 1318 dispatches, wall
 13.742 ms, busy 13.500 ms, hit 0.984, 11 missed units a step. §2: 1330 dispatches, wall 13.5-13.9, busy
@@ -244,7 +244,7 @@ Unprofiled (`nsv`, debug logs, no stamps) and the §2 reference:
 
 | figure | local r1 / r2 / r3 | median | §2 | delta |
 |---|---|---|---|---|
-| one stream | 13.710 / 13.738 / 13.704 ms | 13.738 ms | 13.84 | -0.7 % |
+| one stream | 13.710 / 13.738 / 13.704 ms | 13.710 ms | 13.84 | -0.9 % |
 | one stream, summed | 73.8 / 73.2 / 73.2 tok/s | 73.2 | 72.3 | +1.2 % |
 | eight streams, agg | 310.1 / 309.1 / 305.7 | 309.1 | 306-317 | +1.1 % |
 | eight streams, summed | 322.2 / 320.8 / 317.4 | 320.8 | 315.7 | +1.6 % |
@@ -257,9 +257,29 @@ Unprofiled (`nsv`, debug logs, no stamps) and the §2 reference:
 | `stall1` arrival | 3.02 / 3.05 / 3.04 s | 3.04 | 3.08 | -1.3 % |
 | `stall4` arrival | 2.84 / 2.87 / 2.89 s | 2.87 | 2.82 | +1.8 % |
 
-The §2.6 717-token point was not re-run: the lane profile's small prompts are `tail400` (159
-tokens) and `pf2` (2385 tokens), which bracket it; neither is at 717 tokens, so §2.6's 255 ms
-is not confirmed here.
+Small prompts against §2.6 (`nsv`, tags `sm-r1..r3`, phases `c1,tail742,tail2560,tail2600`; the
+phases are all new prompts in a run, and `tail2600` shares 2560 characters of prefix with
+`tail2560` yet is no cheaper, so the prefix cache does not resume between phases here and each
+`tail` meets a cold prefix):
+
+| prompt tokens | local sm r1 / r2 / r3, TTFT | median | §2.6 | delta |
+|---|---|---|---|---|
+| 73 (`c1`) | 78 / 78 / 78 ms | 78 | 78-88 ms | at the low end |
+| 256 (`tail742`) | 152 / 149 / 151 ms | 151 | 223 ms | **-32 %** |
+| 723 (`tail2560`) | 269 / 264 / 269 ms | 269 | 255 ms (at 717) | +5.5 % |
+| 734 (`tail2600`) | 265 / 257 / 261 ms | 261 | — | |
+
+The 73-token figure is the `c1` phase's own TTFT: §2.6 lists that point but the tables above never
+reported it. The 723-token point is six tokens over §2.6's 717 (a `tail` cut lands on characters,
+not tokens); six rows of prefill are 1-2 ms, so the comparison holds, and `tail2600` (734 tokens,
+261 ms) shows the same slope from the other side.
+
+The local lane's small steps are cheaper than §2.6's at 73 and 256 rows (78 vs 78-88 ms, 151 vs
+223 ms) and dearer at 717 rows (269 vs 255 ms), so the gap is not one fixed cost. §2.6's 256-token
+row is described as a lone cold prefill as well, so the -32 % is a difference between the two
+measurements rather than a definition; `iks-B` reaches §2.6 here (228 ms), so the low figure is
+this lane's small-step path rather than a mistake in §2.6.
+The same three runs' `c1` gave 13.65 / 13.68 / 13.64 ms a step, within noise of the 13.710 ms above.
 
 Host phases from the debug `step decode:` lines (`nsv` r1, mean/128):
 
@@ -284,7 +304,8 @@ the arrival prefill, whose host side is 46.8 ms of plan/build/save for 5881 prom
 | 2.3 DFly2 one | 22.742 ms, 2.813 tok/step | +0.2 % ms |
 | 2.3 DFly2 eight | 425.3 summed | -4.0 % |
 | 2.4 third chunk | 568.1 ms | +0.6 % |
-| 2.5 one / eight unprofiled | 13.738 / 309.1 | -0.7 % / +1.1 % |
+| 2.5 one / eight unprofiled | 13.710 / 309.1 | -0.9 % / +1.1 % |
+| 2.5 small prompts, 73 / 256 / 723 tokens | 78 / 151 / 269 ms | at the range / -32 % / +5.5 % |
 | 2.5 `pf6` / `pf20` TTFT | 1968 / 7173 ms | +0.4 % / +2.0 % |
 | 2.5 stall1 / stall4 | 3.04 / 2.87 s | -1.3 % / +1.8 % |
 

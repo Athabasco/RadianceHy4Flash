@@ -12,8 +12,8 @@ other two (see "Lane noise" below), so the range is as important as the median.
 | model | `$RAD_MODELS/hy4-flash-iqr-v4/hy4-flash-iqr-v4-u3.rad` (`~/models/…` on iks, read only) |
 | build | iks toolchain via `"$RAD_CONFIGURE"` and `cmake --build build -j 48`, `gfx1201`, HIP on; same tree at the same commit as iks-A, `build/` reused |
 | configs | `scripts/backlog/{nospec,nsv,coupled03,cpv,prof}.yaml` as committed; `lane.sh` rewrites the port and model path and sets `host-pool-mib 16000` with Engram on disk (`~/ngram`) for this lane |
-| method | `RAD_IKS_NAME=RadianceHy4Flash-run-1654 scripts/backlog/lane.sh iks-B 'scripts/backlog/run.sh <tag> <cfg> <phases>'`, tags `-r1..-r3` (plus `ns-st-r4` to separate the cold first run); stamps `RADIANCE_AQL_STAMP=7`, profile `RADIANCE_PROFILE_EVERY=1`; raw data in `runs/iks-B/<tag>/` (copied back, not committed) |
-| phases | `c1`, `c1b`, `c8`, `pf6` 6681-token prefill, `pf20` 24856-token prefill, `pf2` 2385-token prompt, `tail400` 159-token prompt, `stall1`/`stall4` at 1.5 s |
+| method | `RAD_IKS_NAME=RadianceHy4Flash-run-1654 scripts/backlog/lane.sh iks-B 'scripts/backlog/run.sh <tag> <cfg> <phases>'`, tags `-r1..-r3` (plus `ns-st-r4` to separate the cold first run), plus `sm-r1..r3` and `smrev-r1..r2` for the small prompts on the next tree (`RAD_IKS_NAME=RadianceHy4Flash-run-1673`, `ef147763`, notes only above the baseline commit); stamps `RADIANCE_AQL_STAMP=7`, profile `RADIANCE_PROFILE_EVERY=1`; raw data in `runs/iks-B/<tag>/` (copied back, not committed) |
+| phases | `c1`, `c1b`, `c8`, `pf6` 6681-token prefill, `pf20` 24856-token prefill, `pf2` 2385-token prompt, `tail400` 159-token prompt, `stall1`/`stall4` at 1.5 s; the small-prompt runs add `tail742` 256 and `tail2560` 723 tokens |
 
 One lane only: `lane-pair.sh` (both iks lanes at once) exceeds the 112 GiB of the machine, because
 two 16 GiB host pools and the 60 GiB tmpfs Engram table do not fit together with the disk-backed
@@ -291,9 +291,29 @@ Unprofiled (`nsv`) and the §2 reference:
 | `stall1` arrival | 4.58 / 4.36 / 4.22 s | 4.36 | 3.08 | +41.6 % |
 | `stall4` arrival | 3.81 / 3.85 / 3.96 s | 3.85 | 2.82 | +36.5 % |
 
-The §2.6 717-token point was not re-run: the lane profile's small prompts are `tail400` (159
-tokens) and `pf2` (2385 tokens), which bracket it; neither is at 717 tokens, so §2.6's 255 ms
-is not confirmed here.
+Small prompts against §2.6 (`nsv`; tags `sm-r1..r3` for phases `c1,tail742,tail2560,tail2600` and
+`smrev-r1..r2` for `c1,tail2600,tail2560`, i.e. the same two big prompts in the other order):
+
+| prompt tokens | position in the run | iks-B TTFT | median | §2.6 | delta |
+|---|---|---|---|---|---|
+| 73 (`c1`) | first phase | 112 / 107 / 104 ms | 107 | 78-88 ms | +22 % over 88 |
+| 256 (`tail742`) | second phase | 232 / 228 / 221 ms | 228 | 223 ms | +2.2 % |
+| 723 (`tail2560`) / 734 (`tail2600`) | the first ~720-row prefill of a run | 425 / 441 / 413 ms (723) and 561 / 550 ms (734, `smrev`) | 441 | — | |
+| 723 / 734 | the next ~720-row prefill of the same run | 270 / 269 / 271 ms (734) and 266 / 263 ms (723, `smrev`) | 269 | 255 ms (at 717) | +5.5 % |
+
+The 73-token figure is the `c1` phase's own TTFT: §2.6 lists that point but the tables above never
+reported it. The 723-token point is six tokens over §2.6's 717 (a `tail` cut lands on characters,
+not tokens).
+
+The ~720-row prefill costs whatever position it is in, not whatever size it is: the prompt that
+follows `tail742` costs 413-441 ms when it is the 723-token one and 550-561 ms when it is the
+734-token one, and the prompt that follows *that* costs 263-271 ms either way. This lane reads its
+Engram table from disk (`~/ngram`), so the first big prefill of a run faults it in and the next one
+hits it; §2.6's 255 ms is the second, warm figure, which this lane reaches at 269 ms. It is the
+same effect that makes `pf6` 24 % slower here (see below). The `tail` phases' single decode step is
+also much cheaper on this lane (2.2-2.9 ms against 13.5-14 ms on the other two), which does not
+touch the TTFTs reported here. The same runs' `c1` gave 14.67 / 14.59 / 14.66 ms a step, next to the
+14.725 ms above.
 
 The prefill TTFT is the figure this lane cannot reproduce: the best runs are 2354-2473 ms
 (18-29 % above §2's 1.92-1.99 s), one of the three `nsv` runs and three of the four `ns-st`
@@ -326,6 +346,7 @@ gather, and it is the whole difference between B's 279-290 summed tok/s and the 
 | 2.3 DFly2 eight | 382.7 summed | -13.6 % |
 | 2.4 third chunk | 591.0 ms | +4.7 % |
 | 2.5 one / eight unprofiled | 14.725 / 274.7 | +6.4 % / -10.5 % |
+| 2.5 small prompts, 73 / 256 / ~720 warm | 107 / 228 / 269 ms | +22 % / +2.2 % / +5.5 % |
 | 2.5 `pf6` / `pf20` TTFT | 2473 / 7793 ms | +24 % / +10.9 % |
 | 2.5 stall1 / stall4 | 4.36 / 3.85 s | +41.6 % / +36.5 % |
 
@@ -334,6 +355,8 @@ eight, layer totals 289.2/259.1 us) and misses §2's end-to-end rates by 9-14 % 
 step waits on the disk-backed Engram table (3-4 ms a step on eight streams, 3.75 ms on a DFly2
 verify). Prefill TTFT and the stall probe are the worst affected. The lane is usable for
 kernel-time comparisons, but its e2e throughput is not a stable target until the Engram
-placement changes.
+placement changes. The small prompts show the same hand: the first ~720-row prefill of a run
+pays 413-561 ms to fault the table in, the second 263-271 ms, and only the second is within
+5.5 % of §2.6's 255 ms.
 
 End of the iks-B baseline.

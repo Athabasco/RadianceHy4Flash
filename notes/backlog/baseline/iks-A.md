@@ -11,8 +11,8 @@ their median, and each section ends with the delta to §2.
 | model | `$RAD_MODELS/hy4-flash-iqr-v4/hy4-flash-iqr-v4-u3.rad` (`~/models/…` on iks, read only) |
 | build | iks toolchain via `"$RAD_CONFIGURE"` and `cmake --build build -j 48`, `gfx1201`, HIP on; the tree is unpacked fresh from the same commit, `build/` survives between calls |
 | configs | `scripts/backlog/{nospec,nsv,coupled03,cpv,prof}.yaml` as committed; `lane.sh` rewrites the port and model path and sets `host-pool-mib 16000` with Engram in `/dev/shm/radiance-ngram` (ram) for this lane |
-| method | `RAD_IKS_NAME=RadianceHy4Flash-run-1654 scripts/backlog/lane.sh iks-A 'scripts/backlog/run.sh <tag> <cfg> <phases>'`, tags `-r1..-r3`; stamps `RADIANCE_AQL_STAMP=7`, profile `RADIANCE_PROFILE_EVERY=1`; raw data in `runs/iks-A/<tag>/` (copied back, not committed) |
-| phases | `c1`, `c1b`, `c8`, `pf6` 6681-token prefill, `pf20` 24856-token prefill, `pf2` 2385-token prompt, `tail400` 159-token prompt, `stall1`/`stall4` at 1.5 s |
+| method | `RAD_IKS_NAME=RadianceHy4Flash-run-1654 scripts/backlog/lane.sh iks-A 'scripts/backlog/run.sh <tag> <cfg> <phases>'`, tags `-r1..-r3`, plus `sm-r1..r3` for the small prompts on the next tree (`RAD_IKS_NAME=RadianceHy4Flash-run-1673`, `ef147763`, notes only above the baseline commit); stamps `RADIANCE_AQL_STAMP=7`, profile `RADIANCE_PROFILE_EVERY=1`; raw data in `runs/iks-A/<tag>/` (copied back, not committed) |
+| phases | `c1`, `c1b`, `c8`, `pf6` 6681-token prefill, `pf20` 24856-token prefill, `pf2` 2385-token prompt, `tail400` 159-token prompt, `stall1`/`stall4` at 1.5 s; the small-prompt runs add `tail742` 256 and `tail2560` 723 tokens |
 
 One lane only: `lane-pair.sh` (both iks lanes at once) exceeds the 112 GiB of the machine, because
 two 16 GiB host pools and the 60 GiB tmpfs Engram table do not fit together with the disk-backed
@@ -258,9 +258,27 @@ Unprofiled (`nsv`) and the §2 reference:
 | `stall1` arrival | 2.96 / 2.97 / 2.95 s | 2.96 | 3.08 | -3.9 % |
 | `stall4` arrival | 2.84 / 2.83 / 2.83 s | 2.83 | 2.82 | +0.4 % |
 
-The §2.6 717-token point was not re-run: the lane profile's small prompts are `tail400` (159
-tokens) and `pf2` (2385 tokens), which bracket it; neither is at 717 tokens, so §2.6's 255 ms
-is not confirmed here.
+Small prompts against §2.6 (`nsv`, tags `sm-r1..r3`, phases `c1,tail742,tail2560,tail2600`; the
+phases are all new prompts in a run, and `tail2600` shares 2560 characters of prefix with
+`tail2560` yet is no cheaper, so the prefix cache does not resume between phases here and each
+`tail` meets a cold prefix):
+
+| prompt tokens | iks-A sm r1 / r2 / r3, TTFT | median | §2.6 | delta |
+|---|---|---|---|---|
+| 73 (`c1`) | 74 / 74 / 74 ms | 74 | 78-88 ms | -5 % at the bottom |
+| 256 (`tail742`) | 135 / 136 / 135 ms | 135 | 223 ms | **-39 %** |
+| 723 (`tail2560`) | 242 / 244 / 243 ms | 243 | 255 ms (at 717) | -4.7 % |
+| 734 (`tail2600`) | 239 / 239 / 237 ms | 239 | — | |
+
+The 73-token figure is the `c1` phase's own TTFT: §2.6 lists that point but the tables above never
+reported it. The 723-token point is six tokens over §2.6's 717 (a `tail` cut lands on characters,
+not tokens); six rows of prefill are 1-2 ms, so the comparison holds, and `tail2600` (734 tokens,
+239 ms) shows the same slope from the other side. The same three runs' `c1` gave 13.51 / 13.51 /
+13.52 ms a step, next to the 13.583 ms above.
+
+As on `local`, the 256-token step is far cheaper than §2.6's 223 ms while the 73- and 723-token
+points agree within a few per cent, so the §2.6 row for 256 tokens is the outlier of the four;
+`iks-B` measures 228 ms at that point, so the two fast lanes are the difference, not §2.6.
 
 Host phases from the debug `step decode:` lines (`nsv` r1, mean/128):
 
@@ -287,12 +305,15 @@ the arrival prefill, 51.0 ms of host plan/build/save for 5881 prompt tokens (loc
 | 2.4 third chunk | 570.1 ms | +1.0 % |
 | 2.4 last chunk | 301.9 ms | -10.8 % |
 | 2.5 one / eight unprofiled | 13.583 / 311.6 | -1.9 % / +1.9 % |
+| 2.5 small prompts, 73 / 256 / 723 tokens | 74 / 135 / 243 ms | -5 % / -39 % / -4.7 % |
 | 2.5 `pf6` / `pf20` TTFT | 1926 / 7172 ms | -0.5 % / +2.0 % |
 | 2.5 stall1 / stall4 | 2.96 / 2.83 s | -3.9 % / +0.4 % |
 
 The lane reproduces §2 within a few percent. It is 1-3 % faster than local on decode and DFly2
 one stream, the prefill first three chunks are the same, and the 537-row last chunk is 10 %
 faster. The category split differs (junction +22-32 %, routed GEMMs and quantisers lower) at a
-total within 2-4 % of both §2 and local.
+total within 2-4 % of both §2 and local. The small-prompt steps are 5 % faster at 73 tokens and
+4.7 % faster at 723, but 39 % faster at 256, the same outlier `local` shows (`iks-B` measures
+228 ms there, so the outlier is the small-step path of these two lanes).
 
 End of the iks-A baseline.
