@@ -46,3 +46,8 @@ chunk does not lengthen (16 against 17.5 steps, medians over the two arrival win
 that hold the mean down are 1984-row chunks that cost 0.010 s, which a floor on rows keeps; where the change does act
 it doubles the hold and costs the arrival's TTFT +0.29 s (1 decoder) and +0.92 s (4). Numbers, tables and commands:
 `closed/S-04.md`.
+- **M-03b (stage prefill steps of ~128-1024 rows):** closed without code. Staging such a step does make its routed GEMM
+cheaper (30 % at 256 rows, 41 % at 723, 58 % on the 720-row tail chunk of a 6.7K prompt) and that is worth -77..-103 ms
+of TTFT on the 6.7K prompt, but at 250-380 rows an expert is routed with p ~ 98 %, so the ring copies 3.7-4 GiB a rank
+(~90 ms) before the step, which 23 ms of saved GEMM does not repay: every resumed turn loses 47-93 ms and a lone
+256-token prompt 89-93 ms, on both lanes, both runs each. Numbers, op table and commands: `closed/M-03b.md`.

@@ -2226,6 +2226,51 @@ TEST(prefix_cache_hits_the_shared_prefix_only) {
     CHECK_EQ(f.pc.lookup(p1, {}).n_attn_tokens, 48);
 }
 
+/* A request's chain, kept between calls (SchedReq::chain): the lookup that admits it and the
+ * publish that hands its blocks back walk the same prompt blocks, and a request that waits asks
+ * again on every scheduling round. Only blocks the kept chain does not cover are hashed. */
+TEST(a_kept_chain_hashes_only_the_blocks_past_what_it_covers) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/false));
+    auto prompt = tok_run(10, 1024);                     /* 64 blocks */
+    publish(f, 1, prompt, 1024);
+    CHECK_EQ(f.pc.stats().chain_blocks, 64ll);
+
+    /* Nobody kept the publish's chain: a lookup hashes the prompt's blocks again. */
+    const CacheHit cold = f.pc.lookup(prompt, {});
+    CHECK_EQ(f.pc.stats().chain_blocks, 128ll);
+
+    /* Handed a chain, a lookup hashes the prompt's blocks into it once; handed the same chain
+     * again, it hashes none, and the hit is the cold lookup's. */
+    PrefixChain chain;
+    const CacheHit first = f.pc.lookup(prompt, {}, nullptr, nullptr, 0, &chain);
+    CHECK_EQ(f.pc.stats().chain_blocks, 192ll);
+    const CacheHit kept = f.pc.lookup(prompt, {}, nullptr, nullptr, 0, &chain);
+    CHECK_EQ(f.pc.stats().chain_blocks, 192ll);
+    CHECK_EQ(kept.n_attn_tokens, cold.n_attn_tokens);
+    CHECK_EQ(kept.n_attn_tokens, first.n_attn_tokens);
+    CHECK_EQ(kept.n_linear_tokens, cold.n_linear_tokens);
+    CHECK_EQ(kept.branch_at, cold.branch_at);
+    CHECK(chain.hs == chain_of(prompt));
+
+    /* A publish goes on from there: the prompt's blocks are held, and only the two whole blocks
+     * of the reply are hashed. */
+    auto text = prompt;
+    for (int i = 0; i < 40; ++i) text.push_back(700 + i);        /* 1064 tokens, 66 blocks */
+    CHECK_OK(f.kv.add_sequence(2));
+    CHECK_OK(f.kv.ensure(2, (int64_t)text.size()));
+    std::vector<std::vector<int32_t>> bt;
+    for (int32_t g : f.pc.cached_groups()) bt.push_back(f.kv.block_table(2, g));
+    CHECK_OK(f.pc.insert(2, text, {}, bt, (int64_t)text.size(), "", -1, &chain));
+    CHECK_EQ(f.pc.stats().chain_blocks, 194ll);
+    CHECK(chain.hs == chain_of(text));
+
+    /* What it published under the kept chain is what a cold walk of the reply finds: its 66 whole
+     * blocks, which leave the last 8 tokens to compute from. */
+    CHECK_EQ(f.pc.lookup(text, {}).n_attn_tokens, 1056);
+    CHECK_EQ(f.pc.stats().chain_blocks, 260ll);
+}
+
 /* Where a hit ends at a head two cached prompts already left differently (CacheHit::branch_at):
  * the same instructions in front of different texts. One cached prompt past it is not enough, the
  * next prompt could be the same conversation going on; a prompt that follows one of them further, or
