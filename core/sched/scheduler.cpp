@@ -2961,9 +2961,6 @@ bool Scheduler::ends_every_request() const {
 
 const RadBatch* Scheduler::step_next_locked() {
     if (!step_open_ || next_open_ || plan_.e.empty()) return nullptr;
-    /* Once the hold is spent, the held chunk goes into the next full step rather than waiting
-     * behind decode steps issued ahead. */
-    if (held_prefill_ > 0 && interleave_left_ == 0) return nullptr;
     /* Before the loop below, which reserves the next step's KV. */
     if (ends_every_request()) return nullptr;
 
@@ -3004,7 +3001,37 @@ const RadBatch* Scheduler::step_next_locked() {
         if (++n_continuing > 1) return nullptr;
         continuing = &e;
     }
-    if (continuing && !prefill_ahead) return nullptr;
+    /* The step after the commit sees each request advanced by the row it carries here: a chunk that
+     * reaches the prompt's end leaves a decode row there, and counts as one for the shares below
+     * and for whether another prompt still wants a chunk (step() plans that step from that view). */
+    auto pf_after = [&](const SchedReq& sr) -> bool {
+        const Request& rr = *sr.req;
+        int64_t nc = rr.n_computed;
+        if (sr.entry >= 0 && (size_t)sr.entry < plan_.e.size() &&
+            plan_.e[(size_t)sr.entry].slot == sr.slot && plan_.e[(size_t)sr.entry].is_prefill)
+            nc += plan_.e[(size_t)sr.entry].n_tokens;
+        return nc < (int64_t)rr.prompt.size() || nc + 1 < sr.seq_len();
+    };
+    int32_t pf_slot = continuing ? continuing->slot : -1;
+    const int64_t pf_adv = continuing ? (int64_t)continuing->n_tokens : 0;
+    /* A chunk the hold left over goes into the step after the one that spends its last held step:
+     * step() takes it there, with the budget and the queue it finds then, so it is as planable
+     * ahead as a chunk this step's plan already carries. */
+    if (pf_slot < 0 && held_prefill_ > 0 && interleave_left_ == 0) {
+        for (int32_t slot : running_) {
+            if (!pf_after(*reqs_[(size_t)slot])) continue;
+            if (pf_slot >= 0) return nullptr;
+            pf_slot = slot;
+        }
+        if (pf_slot < 0) return nullptr;   /* the hold outlived the prompt it held */
+    }
+    if (pf_slot >= 0) {
+        if (!prefill_ahead) return nullptr;
+        /* One chunk and one admission: a second prompt that still wants a chunk shares that step's
+         * budget with the first, so the whole step is left to step(). */
+        for (int32_t slot : running_)
+            if (slot != pf_slot && pf_after(*reqs_[(size_t)slot])) return nullptr;
+    }
 
     for (const StepEntry& e : plan_.e) {
         if (!e.produces_token) continue;   /* a continuing chunk, planned below */
@@ -3082,20 +3109,7 @@ const RadBatch* Scheduler::step_next_locked() {
      * priority order. Walk that order to the chunk: what comes before it has its row in
      * plan_next_ already (it sampled a token, or was a last chunk) and takes its budget; what
      * comes after it is what busy_cap holds the chunk back for. */
-    if (continuing) {
-        const int32_t pf_slot = continuing->slot;
-        /* The step after the commit sees each request advanced by the row it carries here. A prompt
-         * chunk that reaches the prompt's end leaves a decode row there, and counts as one for the
-         * shares this step plans with (step() plans the next step from the committed view). */
-        auto pf_after = [&](const SchedReq& sr) -> bool {
-            const Request& rr = *sr.req;
-            int64_t nc = rr.n_computed;
-            if (sr.entry >= 0 && (size_t)sr.entry < plan_.e.size()) {
-                const StepEntry& ce = plan_.e[(size_t)sr.entry];
-                if (ce.is_prefill) nc += ce.n_tokens;
-            }
-            return nc < (int64_t)rr.prompt.size() || nc + 1 < sr.seq_len();
-        };
+    if (pf_slot >= 0) {
         int64_t budget_at_pf = budget0, behind_dec = 0, behind_pf = 0;
         if (share_step) {
             for (int32_t slot : running_) {
@@ -3114,7 +3128,7 @@ const RadBatch* Scheduler::step_next_locked() {
 
         SchedReq& ps = *reqs_[(size_t)pf_slot];
         const Request& pr = *ps.req;
-        const int64_t start  = pr.n_computed + continuing->n_tokens;
+        const int64_t start  = pr.n_computed + pf_adv;
         const int64_t target = ps.seq_len();
         const int64_t shares = share_step ? behind_pf + (admit_possible ? 1 : 0) : 0;
         const int64_t reserve = share_step ? behind_dec + share_tok * shares : 0;
@@ -3297,6 +3311,7 @@ void Scheduler::promote_next() {
                 if (held_prefill_ > 0) ++m_.steps_held;
             }
         } else {
+            held_prefill_ = 0;   /* the chunk this step carries is not one the hold left over */
             bool continues = false;
             int64_t n_dec = 0;
             for (const StepEntry& e : plan_.e) {

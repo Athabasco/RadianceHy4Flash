@@ -4134,7 +4134,7 @@ TEST(interleave_does_not_hold_after_a_prompts_last_chunk) {
 }
 
 /* A decode-only step of the hold may be issued ahead; it counts toward N and as a held step, and
- * once the hold is spent the next step is a full one that carries the chunk. */
+ * once the hold is spent the step that carries the chunk is issued ahead as well. */
 TEST(interleave_counts_steps_issued_ahead_and_then_serves_the_chunk) {
     Fixture f;
     f.build();
@@ -4155,13 +4155,14 @@ TEST(interleave_counts_steps_issued_ahead_and_then_serves_the_chunk) {
     f.commit_plain(12);
     f.sch.promote_next();
     CHECK_EQ(f.sch.metrics().steps_held, 2);
-    CHECK(f.sch.step_next() == nullptr);                /* the hold is spent */
+    CHECK(f.sch.step_next() != nullptr);                /* the hold is spent: the chunk's step, ahead */
     f.commit_plain(12);
+    f.sch.promote_next();
 
-    CHECK(f.sch.step() != nullptr);
     bool chunk = false;
     for (const StepEntry& e : f.sch.plan().e) if (e.seq == p && e.is_prefill) chunk = true;
     CHECK(chunk);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
 }
 
 /* The arithmetic at a real deployment's shape: a 2048-token step and interval, the stager arming
@@ -7155,6 +7156,7 @@ struct AheadRun {
     std::vector<int64_t> held;      /* paged blocks each sequence holds at the end */
     std::vector<int32_t> phases;    /* plan phase of each step, in order */
     int ahead = 0;                  /* steps that ran issued ahead */
+    int mixed_ahead = 0;            /* of those, the mixed ones (a chunk beside decode rows) */
     int64_t steps_ahead_counter = 0;/* the scheduler's own count of them */
     int card_host_disagree = 0;
 };
@@ -7300,6 +7302,7 @@ AheadRun ahead_pipelined(int n_spec, int steps, const AheadScript& sc = AheadScr
             f.sch.promote_next();
             b = nb;
             ++run.ahead;
+            if (nb->phase == RAD_PHASE_MIXED) ++run.mixed_ahead;
         } else {
             b = f.sch.step();
             if (!b) break;
@@ -7438,6 +7441,24 @@ TEST(a_queue_of_two_arrivals_is_admitted_after_the_commit) {
     const AheadRun b = ahead_pipelined(0, T, sc);
     CHECK(b.ahead > 0);
     CHECK(b.ahead < T);
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    for (size_t t = 0; t < a.steps.size(); ++t) CHECK(a.steps[t] == b.steps[t]);
+    CHECK(a.out == b.out);
+    CHECK(a.phases == b.phases);
+}
+
+/* A chunk the hold left over: the step that takes it after the hold's last held step carries a
+ * prefill row, so it is a mixed step and can be issued ahead like any other. */
+TEST(a_chunk_the_hold_left_over_is_issued_ahead) {
+    const int T = 20;
+    AheadScript sc;
+    sc.prompts = { 40, 900 };
+    sc.tweak = [](Fixture& f) {
+        f.cfg.prefill_interleave = 2;   /* two decode-only steps behind each chunk step */
+    };
+    const AheadRun a = ahead_reference(0, T, sc);
+    const AheadRun b = ahead_pipelined(0, T, sc);
+    CHECK(b.mixed_ahead > 0);       /* the chunk after the hold ran issued ahead */
     REQUIRE_EQ(a.steps.size(), b.steps.size());
     for (size_t t = 0; t < a.steps.size(); ++t) CHECK(a.steps[t] == b.steps[t]);
     CHECK(a.out == b.out);
