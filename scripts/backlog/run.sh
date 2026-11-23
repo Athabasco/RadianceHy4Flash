@@ -27,12 +27,12 @@ lane_render "$cfg" "$lanecfg" || exit 2
 echo "run $tag: $D"
 echo "cfg $lanecfg, phases $ph"
 
-X=(); xq=""
+X=(); args=""
 while [ $# -gt 0 ]; do
   if [ "$1" = "--" ]; then shift; X=("$@"); break; fi
-  export "$1"; shift
+  export "${1?}"; shift
 done
-for a in "${X[@]}"; do xq+="$(printf '%q' "$a") "; done
+for a in "${X[@]}"; do args+=" $(printf '%q' "$a")"; done
 if [ -n "$RADIANCE_AQL_STAMP" ]; then
   export RADIANCE_AQL_STAMP_OUT=${RADIANCE_AQL_STAMP_OUT:-$D/$tag.stamps.csv}
 fi
@@ -40,8 +40,8 @@ fi
 # The server and the probe run inside the lane's card reservation, so no other job takes the pair
 # between the probe's requests.
 inner=$(
-  printf '"$RAD_BIN" --config %q > %q 2>&1 &\nP=$!\n%s' \
-    "$lanecfg" "$D/server.log" "$xq"
+  printf '"$RAD_BIN" --config %q%s > %q 2>&1 &\nP=$!\n' \
+    "$lanecfg" "$args" "$D/server.log"
   cat <<'EOF'
 . "$RAD_REPO/scripts/backlog/lanes.sh"    # lane_health
 for i in $(seq 1 900); do

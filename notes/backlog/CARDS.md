@@ -54,7 +54,8 @@ scripts/backlog/lane.sh --env iks-A               # what a lane exports: port, m
   (`<cfg>.yaml` with the lane's port, model, host pool and `ngram-placement`), `server.log`, `run.out`, `<tag>.json`.
   `RADIANCE_AQL_STAMP=1` also leaves `<tag>.stamps.csv` there, the input of `layer.py` and `agg.py`. A lane whose
   `ngram-placement` is `ram=DIR` first clears that directory: the pinned copy belongs to one process and the one a
-  killed run leaves behind refuses the next start (§1.2).
+  killed run leaves behind refuses the next start (§1.2). The arguments after `--` go on the server's command line,
+  each one shell-quoted, so `-- --check` reaches radiance intact (radiance takes only `--config FILE [--check]`).
   ```sh
   scripts/backlog/lane.sh local 'scripts/backlog/run.sh c1 nospec.yaml c1,c8'
   scripts/backlog/lane.sh iks-A 'scripts/backlog/run.sh c1 nospec.yaml c1,c8'
