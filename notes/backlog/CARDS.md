@@ -181,6 +181,34 @@ What the lanes pinned down beyond the numbers:
 - iks has no `curl`, so `lane_health` asks `/health` with `python3`; and a measuring host whose `TEMP` is a
   directory is not a sampling temperature (`RAD_TEMP` is).
 
+**P-16, the load rule from one sequence, `local`, 2026-11-23.** `coupled03.yaml`, `cpv.yaml` and `cprof.yaml`
+now carry `draft-depth-load-from: 1`, the line the served `README.md` config already had, so the load-aware
+rule decides a step that drafts for a single sequence too: the server log prints "a step drafting for 1
+sequence(s) or more" where it printed "5", and `draft-depth-stop: 0.3` is not read. Three runs each way on
+`local`, interleaved before and after (`scripts/backlog/lane.sh local 'scripts/backlog/run.sh p16-b1
+coupled03.yaml c1,c4,think'`, and the same with `p16-a1` on a copy of the committed file with that one line
+added):
+
+| phase | rule from five sequences (before) | `draft-depth-load-from: 1` (after) |
+|---|---|---|
+| `c1` — 1 decoder, 256 code tokens | 123.2 tok/s, 2.81 tok/step, 21.9 ms/step (121.7 / 123.2 / 123.9) | **133.1 tok/s, 3.16 tok/step, 22.7 ms/step** (132.9 / 133.1 / 133.1) |
+| `c4` — 4 decoders, 256 tokens each | 281.0 tok/s agg, 11.38 tok/step (280.6 / 281.0 / 287.3) | **306.4 tok/s agg, 12.64 tok/step** (288.4 / 306.4 / 311.7) |
+| `think` — 1 decoder, 384 tokens, reasoning high | 108.0 tok/s, 2.27 tok/step, 20.3 ms/step (104.8 / 108.1 / 108.0) | **132.7 tok/s, 3.10 tok/step, 22.6 ms/step** (111.2 / 132.7 / 145.0) |
+
+So the item's "code ±0" does not hold on this lane, and its "thinking text +9 % at one client" is where this
+lane's slowest `think` run lands, not what it gives on average: code gains 8.0 % at `c1` and 9.0 % at `c4`,
+thinking text 22.9 % at the median.
+The step costs 3.7 % more at `c1` for 12.5 % more tokens a step (the round the rule now runs at one
+sequence, priced by its own tables). `think` is the one noisy number — 111.2 .. 145.0 tok/s after against
+104.8 .. 108.1 before — because the rule's online tables and the sampled text move the depth run to run,
+while the before runs are tight to the digit (2.27 tok/step three times: the 0.3 threshold prices the same
+chain whatever the text). The drafter table above (`c1` 110.3 tok/s, 2.81 tok/step) is the stop rule at one
+client — its tok/step is the "before" here to the digit — so read that row as the config before this line.
+Greedy text is unchanged, which is the merge bar's first clause: the three `GREEDY` prompts at temperature
+0 (256 tokens, `reasoning_effort: none`, `ignore_eos` off) come back 256 / 256 / 103 tokens and
+`9f77180a9ab097fb…` / `285d021c7e9a5bdf…` / `d3d2aa2a1091868e…` sha256, both configs, byte for byte — the rule
+picks how many candidates a step verifies, not the token the law emits.
+
 ### 1.3 X-01: the host KV tier on, in the served configs (local lane)
 
 The served configs carry `prefix-cache-mib: 16384` (`scripts/backlog/*.yaml`, as `README.md:48` does). The
