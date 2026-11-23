@@ -2724,7 +2724,9 @@ whole form elsewhere (the host mailbox included), which keeps every promise `sp`
 `logits_gemm` is separate from `gemm_nt` because `lm_head` is its own access class
 (`RAD_ACCESS_VOCAB`) and because the sampler fuses against it: under the distributed top-k a rank
 never materialises a full logits row (`spec.md` §9, §13). `M` is one row per sampled position,
-`gather_rows` having run first. A quantised head (codes and a scale plane: E4M3 or int8) reaches a
+`gather_rows` having run first — except when every row of the step is an output row (a plain
+decode/verify step), where the gather would copy the hidden rows onto themselves and the head reads
+`final_hidden` directly. A quantised head (codes and a scale plane: E4M3 or int8) reaches a
 host kernel joined (Weights of several planes, above).
 
 **`logits_gemm_vocab`** (device-only) is `logits_gemm` over a head stored as up to four width
