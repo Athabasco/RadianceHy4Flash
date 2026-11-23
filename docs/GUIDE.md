@@ -4571,6 +4571,19 @@ first such step and under a block drafter (DFly2), which never begins a serial c
 request is gone from the table; its totals are `draft_n`, `draft_n_accepted` and `draft_steps` in the
 response's `timings` (§5).
 
+**Steps not issued ahead** (`steps_ahead`, `steps_ahead_refused` on `/stats`): the engine builds the
+next step while this one runs, and `steps_ahead` counts the steps built that way. Each time it does
+not, `steps_ahead_refused` adds one under the reason of the scheduler's first refusal: `waiting` (the
+queue head cannot be admitted yet: a prefill room gate, no card or slot, an encode owed), `held`
+(`--prefill-interleave` or `--mixed-step-target` left the step to the commit, or the step's own
+shares held a chunk back), `mid_prompt` (a second prompt chunk wants the step, or the next step
+would carry a prefill row with no decode row beside it), `grammar` (a grammar that cannot rewind
+decides at the commit), `suffix_hot` (`--draft-suffix`: the history ended in a recurring pattern),
+`ends_every` (the step in flight likely ends every request it carries, or brings a scored row to its
+last token) and `kv` (the context limit, the KV pool, or a snapshot the store dropped). `steps_ahead`
+plus the seven is every step the engine offered to issue ahead, so a gap between `steps` and
+`steps_ahead` is explained here.
+
 ### 6.2 The JSON behind it
 
 ```sh
