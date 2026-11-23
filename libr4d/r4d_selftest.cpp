@@ -37116,7 +37116,8 @@ static void device_phase(const Plugin& pl) {
              * forms and the trellis under a per-row f32 scale. */
             const IqrCase fd[] = {
                 { 5, 5, 0, 12, 1, true, true },
-                { 2, 4, 0, 0, 1, false, true }, { 5, 4, 0, 12, 1, true, true },
+                /* zero is built on 6-bit codes only (R4D_IQR_FORMS), whatever the base row's list */
+                { 2, 6, 0, 0, 1, false, true }, { 5, 4, 0, 12, 1, true, true },
                 { 6, 4, 0, 16, 1, true, true }, { 6, 4, 0, 16, 1, false, true, true },
             };
             for (int64_t m = 1; m <= 16; ++m) iqr_dual_case(pl, fd[0], m, 1536, 3072);
