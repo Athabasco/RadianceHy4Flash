@@ -228,8 +228,12 @@ struct Indexer {
                                         s.q_lora, RAD_SHARD_NONE, grp, { qsrc }, act(qa), w.iqn));
         RAD_ARCH_TRY(query_rope.declare(b, nm, g, nm.f("blk.%d.index_query_rope", l), Hi * R,
                                         s.q_lora, RAD_SHARD_NONE, grp, { qsrc }, act(qa), w.iqr));
+        /* K-49: Hi heads of rope a row, so over a prefill chunk this is the other rope where the
+         * row form divides the `sincosf` by the head count. The drafter's own rope (dfly.h:634)
+         * is the same op over the draft block's rows -- min(max_tok, seqs * block), dfly.h:358 --
+         * and K-49 measured the trunk's and the indexer's, so it stays on `rope`. */
         op_q_rope = decl_rope_gptj(b, T, Hi, R, s.theta_sparse, w.iqr,
-                                   s.mrope ? s.mrope_sparse.c_str() : nullptr);
+                                   s.mrope ? s.mrope_sparse.c_str() : nullptr, "rope_rows");
         op_qn_copy = decl_copy(b, T, Hi * (D - R), RAD_BF16, w.iqn, w.iq);
         op_qr_copy = decl_copy(b, T, Hi * R, RAD_BF16, w.iqr, w.iq);
         HY4_NEED(op_q_rope && op_qn_copy && op_qr_copy, "rope / cast");

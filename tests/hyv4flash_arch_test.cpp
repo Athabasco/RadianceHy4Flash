@@ -401,6 +401,39 @@ TEST(the_pass_key_tells_a_selecting_step_from_a_dense_one) {
     CHECK_EQ(hyv4flash::pass_key(&pc, &pf->b, nullptr), (uint64_t)0);
 }
 
+/* K-49: the rotaries that turn over a whole prefill chunk are declared under the row-form name.
+ * `rope_rows` is the same op with the same parameters -- one thread per (token, pair) looping the
+ * heads, so one `sincosf` a (token, pair) instead of one a (token, head, pair) -- byte-identical,
+ * and libr4d's launch takes it at 64+ rows and 4+ heads (r4d_model_bf16.hip:1530-1541), so one
+ * declaration still runs the per-(head, pair) kernel at decode. What stays on `rope` is the key's
+ * rotary: one head a row, where the row form only cuts the thread count. The wide fixture is the
+ * one whose head counts reach the launch's bound; the mini's do not, and the declaration is the
+ * same either way. */
+TEST(the_rotaries_of_a_prefill_chunk_are_declared_under_the_row_form_name) {
+    for (const bool wide : { false, true }) {
+        Declared d(bf16_encs, 1, 0, wide);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        const RadBuilder& b = d.b;
+        /* The mini program, wide or not: a query rope and a key rope a layer (three layers), and
+         * the two sparse layers' indexer query rope. */
+        int rows_form = 0, per_pair = 0;
+        for (const auto& o : b.ops) {
+            if (o.op == "rope_rows") {
+                /* The query rotaries: the heads that share one position's angles. */
+                CHECK(pint(&o, "n_head") > 1);
+                CHECK_EQ(pint(&o, "n_head_kv"), 0);
+                CHECK(pflt(&o, "scale") > 0.0);
+                ++rows_form;
+            } else if (o.op == "rope") {
+                CHECK_EQ(pint(&o, "n_head"), 1);       /* the key part's rotary, alone */
+                ++per_pair;
+            }
+        }
+        CHECK_EQ(rows_form, 5);
+        CHECK_EQ(per_pair, 3);
+    }
+}
+
 /* The latent cache row's front (WP16.5): where a library declares mla_row_norm_rope_store the step
  * issues it once a layer instead of the row's norm, its rotary and the store; RADIANCE_HY4_CACHE_ROW=0,
  * the debug taps and a library without the op keep the three. Taps need the unfused ops (they
@@ -653,7 +686,7 @@ TEST(the_tower_and_the_three_component_positions) {
     CHECK_EQ(count_op(b, "conv2d_unfold"), 1);
     CHECK_EQ(count_op(b, "scatter_rows"), 1);
     for (const auto& o : b.ops)
-        if (o.op == "rope") {
+        if (o.op == "rope" || o.op == "rope_rows") {   /* both names of one op (K-49) */
             CHECK_EQ(pstr(&o, "mode"), std::string("imrope_gptj"));
             CHECK_EQ(pstr(&o, "sections"), std::string("2 1 1"));
         }
@@ -716,7 +749,8 @@ TEST(the_tower_and_the_three_component_positions) {
     REQUIRE_EQ(n.rc, RAD_OK);
     CHECK_EQ(n.b.encoder.out, (rad_buf)0);
     CHECK(find_w(n.b, "v.blk.0.attn_qkv.weight") != nullptr);
-    CHECK_EQ(pstr(find_op(n.b, "rope"), "mode"), std::string("gptj"));
+    CHECK_EQ(pstr(find_op(n.b, "rope"), "mode"), std::string("gptj"));       /* the key's */
+    CHECK_EQ(pstr(find_op(n.b, "rope_rows"), "mode"), std::string("gptj"));  /* the query's */
 }
 
 /* What this build does not serve is refused by name at declare: a quantised kv_b (DECISIONS U2),
