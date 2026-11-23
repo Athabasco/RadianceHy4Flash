@@ -107,8 +107,9 @@ scripts/backlog/lane.sh --env iks-A               # what a lane exports: port, m
   config (`prof.yaml`, `cprof.yaml`) compared op by op.
 - **`steps.py <server.log> [--tail=N]`** the `RADIANCE_LOG_STEPS=1` log as the backlog reads a step: every
   prefill-bearing step (`MIXED n_tok`, `prefill n_tok`) with the decode-only steps that ran before it, so one
-  interval beside decoders prints `MIXED 2057` with `decode-headroom` and `MIXED 2033 | 17 | MIXED 2033` without
-  it (S-01). It is a plain CPU tool over the text, so it runs on the lane or here over a copied-back log.
+  interval beside decoders prints `MIXED 1984` at the served `checkpoint-interval: 1984`, against `MIXED 2033 | 17 |
+  MIXED 2033` at the full 2048 batch before S-01 (the remainder step). It is a plain CPU tool over the text, so it runs
+  on the lane or here over a copied-back log.
 - The configs are the served (local) ones: `nospec.yaml` (no drafter), `coupled03.yaml` (DFly2 coupled, 5 proposals),
   `cpv.yaml` (the same with debug logging), `cprof.yaml` (DFly2 + `profile-ops`), `nsv.yaml` / `nsv1984.yaml`
   (debug logging, and a 1984-token checkpoint interval), `prof.yaml` (`profile-ops`). `lane.sh` rewrites only a

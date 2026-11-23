@@ -32,3 +32,8 @@ Since the backlog was written, these decisions were made:
 the engine refuses to serve under it (Incompatible) and its failure mode is a full card reset, so it buys the smallest
 of the three lossless memory levers at the highest price. Number, sources and the verify steps a lane would run:
 `closed/M-13.md`.
+- **S-01(b) (`--decode-headroom`, FP-3):** closed without code. S-01(a)'s `checkpoint-interval: 1984` already leaves no
+remainder step in the served schedule (three `MIXED` steps an arrival, both arms of every run), so at the served geometry
+the flag has no step to remove and only grows the arena (1.39 -> 1.43 GiB a rank, +43.34 MiB); at 2048 rows it reaches
+exactly the schedule (a) reaches, inside noise and with a larger arena. The cherry-pick is reverted, the harness it
+needed stays. Numbers, lanes and what a later card would need: `closed/S-01b.md`.
