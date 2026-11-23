@@ -421,8 +421,8 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
         card_copies_.push_back(base);
         table_shares_.push_back(s);
         RAD_INFO("placement: n-gram table in pinned memory the cards read, %s in shared file %s, "
-                 "%s in %.1f s", humanb(n).c_str(), s.path.c_str(),
-                 s.filler ? "filled" : "reused (probes match)", since());
+                 "%s in %.1f s%s", humanb(n).c_str(), s.path.c_str(),
+                 s.filler ? "filled" : "reused (probes match)", since(), at_now().c_str());
     } else if (card) {
         base = rad_dev_alloc(n, RAD_MEM_HOST_MAPPED);
         if (!base) {
@@ -435,16 +435,16 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
             return rc;
         }
         card_copies_.push_back(base);
-        RAD_INFO("placement: n-gram table copied into pinned memory the cards read, %s in %.1f s",
-                 humanb(n).c_str(), since());
+        RAD_INFO("placement: n-gram table copied into pinned memory the cards read, %s in %.1f s%s",
+                 humanb(n).c_str(), since(), at_now().c_str());
     } else {
         TableCopy tc;
         const int rc = table_copy_make(*file_, src, n, foff, &tc, why);
         if (rc != RAD_OK) return rc;
         table_copies_.push_back(tc);
         base = tc.base;
-        RAD_INFO("placement: n-gram table copied into locked memory, %s in %.1f s",
-                 humanb(n).c_str(), since());
+        RAD_INFO("placement: n-gram table copied into locked memory, %s in %.1f s%s",
+                 humanb(n).c_str(), since(), at_now().c_str());
     }
     table_copy_of_.push_back({ src, base });
     *out = base;
@@ -473,9 +473,10 @@ int Engine::table_file_map(const uint8_t* src, int64_t n, int64_t foff, void** o
     const int rc = table_file_open(*file_, src, n, foff, path, &c, &filled, why);
     if (rc != RAD_OK) return rc;
     table_files_.push_back(c);
-    RAD_INFO("placement: n-gram table read from %s (%s%s, %.1f s)", path.c_str(), humanb(n).c_str(),
+    RAD_INFO("placement: n-gram table read from %s (%s%s, %.1f s%s)", path.c_str(), humanb(n).c_str(),
              filled ? ", filled from the container" : "",
-             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+             at_now().c_str());
     *out = c.base;
     return RAD_OK;
 }
@@ -1694,7 +1695,9 @@ int Engine::declare() {
     } else if (cfg_.n_spec > 0) {
         RAD_INFO("speculation: prompt lookup only -- this container declares no draft head");
     }
+    const uint64_t t_lv = rad_mono_ns();
     probe_arena_levels();
+    phase_done("arena levels", t_lv);
     return RAD_OK;
 }
 
@@ -2263,6 +2266,9 @@ int Engine::plan() {
         }
     }
 
+    /* B-03: every rank's pinned host pool is allocated inside the configure below; the phase
+     * runs from the first rank's configure to the loop's end. */
+    const uint64_t t_pin = rad_mono_ns();
     for (size_t ri = 0; ri < ranks_.size(); ++ri) {
         auto& r = ranks_[ri];
         /* This rank's own split: cfg_ field for field unless the block above re-split it. */
@@ -2350,6 +2356,7 @@ int Engine::plan() {
                      "holds no weights; its %lld MiB (its share of --host-pool-mib) stay allocated, as on "
                      "every rank", r->index, (long long)cfg_.host_pool_mib);
     }
+    phase_done("host pool pin", t_pin);
     return RAD_OK;
 }
 
@@ -3294,7 +3301,8 @@ static SweepGate g_sweep_gate;
  * card. */
 static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
                            const std::vector<int>& devices, RelayoutPool* pool,
-                           int64_t* read_out, const std::function<int()>& before_writes = {}) {
+                           int64_t* read_out, const std::function<int()>& before_writes = {},
+                           uint64_t begin_ns = 0 /* B-03: the start stamp for the (at) suffix; 0 (a refill after bring-up) leaves it out */) {
     *read_out = 0;
     if (runs.empty()) return RAD_OK;
 
@@ -3709,9 +3717,10 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
         /* Wall time vs disk time: when they match, the sweep is at the drive's ceiling; the
          * difference is copies that did not overlap a read (host memcpys, the issue loop). */
         RAD_INFO("load: one pass over the container, %s read in %.1f s (%.1f GB/s) for %zu "
-                 "rank(s); %.1f s of that was the disk (%.1f GB/s)",
+                 "rank(s); %.1f s of that was the disk (%.1f GB/s)%s",
                  humanb(read_bytes).c_str(), s, read_bytes / (s > 0 ? s : 1) / 1e9, nr,
-                 read_s, read_bytes / (read_s > 0 ? read_s : 1) / 1e9);
+                 read_s, read_bytes / (read_s > 0 ? read_s : 1) / 1e9,
+                 startup_at(begin_ns, rad_mono_ns()).c_str());
         return RAD_OK;
     }();
 
@@ -4185,7 +4194,8 @@ int Engine::load_weights() {
     const auto rt0 = std::chrono::steady_clock::now();
     int sw_st = RAD_OK;
     if (file_) {
-        sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes);
+        sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes, {},
+                                startup_begin_ns_);
     } else {
         /* Every weight to the workers in declaration order, as the budget allows. */
         for (size_t k = 0; k < staged.size() && !pool.failed(); ++k) {
@@ -4850,6 +4860,13 @@ void Engine::seal_base_weights() {
         }
 }
 
+/* B-03: the bring-up's phase lines; startup_begin_ns_ is the `at` clock. */
+void Engine::phase_done(const char* what, uint64_t since_ns) const {
+    RAD_INFO("%s", startup_phase(what, since_ns, startup_begin_ns_, rad_mono_ns()).c_str());
+}
+
+std::string Engine::at_now() const { return startup_at(startup_begin_ns_, rad_mono_ns()); }
+
 int Engine::start() {
     EngineScope es(owner_, cfg_.served_model_name.c_str());
     std::unique_lock<std::mutex> bringup(g_bringup_mu);
@@ -5024,7 +5041,7 @@ int Engine::start() {
         }
     }
 
-    RAD_TRY(declare());
+    { const uint64_t t = rad_mono_ns(); RAD_TRY(declare()); phase_done("declare", t); }
 
     /* --debug-graph stops here: everything it prints is known after declare, and it must work on
      * a machine where the model does not fit. */
@@ -5053,10 +5070,12 @@ int Engine::start() {
                rows.empty() ? std::string() : "attention:\n" + rows);
     }
 
-    RAD_TRY(plan());
+    { const uint64_t t = rad_mono_ns(); RAD_TRY(plan()); phase_done("plan", t); }
     bringup.unlock();
-    RAD_TRY(load_weights());
-    RAD_TRY(configure_kv());
+    { const uint64_t t = rad_mono_ns(); RAD_TRY(load_weights()); phase_done("weights", t); }
+    { const uint64_t t = rad_mono_ns(); RAD_TRY(configure_kv()); phase_done("kv", t); }
+    /* B-03: the per-rank context init, the stagers, the lending and step_state_init below. */
+    const uint64_t t_ctx = rad_mono_ns();
 
     for (auto& r : ranks_) {
         LogRank lr(r->index);
@@ -5430,6 +5449,8 @@ int Engine::start() {
     const int64_t MiB = 1024 * 1024;
     const int64_t headroom = std::max<int64_t>(cfg_.gpu_headroom_mib, 0) * MiB;
     const int64_t allowance = Config{}.gpu_headroom_mib * MiB;
+    phase_done("contexts", t_ctx);
+    const uint64_t t_settle = rad_mono_ns();
     for (size_t ri = 0; ri < ranks_.size(); ++ri) {
         auto& r = ranks_[ri];
         LogRank lr(r->index);
@@ -5496,11 +5517,13 @@ int Engine::start() {
             RAD_INFO("card %d settled at %s free, against %s",
                      r->device, humanb(got).c_str(), asked.c_str());
     }
+    phase_done("settle", t_settle);
     seal_base_weights();
     /* Bringup done: everything this engine loads is loaded. From here the stuck-exit watchdog
      * treats a device that advances nothing as a hang; before here it treats it as a slow load
      * (device.h's dev_engine_ready). */
     dev_engine_ready.store(true, std::memory_order_release);
+    phase_done("ready", startup_begin_ns_);
     return RAD_OK;
 }
 

@@ -247,6 +247,10 @@ private:
     /* rad_mono_ns at the top of start(), so serve() can report how long bringup took. The same
      * span the startup watch covers (main.cpp creates it here and ends it at the listen). */
     uint64_t              startup_begin_ns_ = 0;
+    /* B-03: logs startup_phase(what, since_ns, startup_begin_ns_, now) at info level. */
+    void phase_done(const char* what, uint64_t since_ns) const;
+    /* B-03: " (at y.y s)" since the start, for the lines that give their own duration. */
+    std::string at_now() const;
     std::vector<std::thread>           rank_threads_;
 
     Config cfg_;
