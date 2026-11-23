@@ -7465,6 +7465,21 @@ TEST(a_chunk_the_hold_left_over_is_issued_ahead) {
     CHECK(a.phases == b.phases);
 }
 
+/* The rows keep step()'s order: the decode rows first, then the prompt chunk, so a chunk whose
+ * sequence was admitted before a decoder's still follows that decoder's row. */
+TEST(a_chunk_issued_ahead_keeps_the_order_of_the_sequences) {
+    const int T = 12;
+    AheadScript sc;
+    sc.prompts = { 900, 40 };   /* the prompt that continues has the lower slot */
+    const AheadRun a = ahead_reference(0, T, sc);
+    const AheadRun b = ahead_pipelined(0, T, sc);
+    CHECK(b.ahead > 0);
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    for (size_t t = 0; t < a.steps.size(); ++t) CHECK(a.steps[t] == b.steps[t]);
+    CHECK(a.out == b.out);
+    CHECK(a.phases == b.phases);
+}
+
 /* ================================================================== a block drafter on the card */
 namespace {
 /* Every pass of a block drafter's run: each step's trunk batch, then its context and query

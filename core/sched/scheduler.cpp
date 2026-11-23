@@ -3033,10 +3033,14 @@ const RadBatch* Scheduler::step_next_locked() {
             if (slot != pf_slot && pf_after(*reqs_[(size_t)slot])) return nullptr;
     }
 
-    for (const StepEntry& e : plan_.e) {
-        if (!e.produces_token) continue;   /* a continuing chunk, planned below */
-        if (e.slot < 0 || (size_t)e.slot >= reqs_.size()) return nullptr;
-        SchedReq& s = *reqs_[(size_t)e.slot];
+    /* The rows of this step that produce a token, in the sequences' order -- which is the order
+     * step() sorts the decode half into, and is not the plan's order: a last chunk sits in the
+     * prefill half there and its sequence may still precede a decoder's. */
+    for (int32_t slot : running_) {
+        SchedReq& s = *reqs_[(size_t)slot];
+        if (s.entry < 0 || (size_t)s.entry >= plan_.e.size()) continue;
+        const StepEntry& e = plan_.e[(size_t)s.entry];
+        if (!e.produces_token || e.slot != slot) continue;   /* a continuing chunk, planned below */
         if (!s.req || s.req->state != ReqState::Running || !s.running) return nullptr;
         Request& r = *s.req;
         /* A grammar that cannot rewind decides at commit whether the next step may speculate; one
@@ -3183,6 +3187,8 @@ const RadBatch* Scheduler::step_next_locked() {
         ps.sched_tokens  = (int32_t)want;
         if (ps.req) { ps.req->n_draft = 0; ps.req->draft = nullptr; ps.req->draft_parent = nullptr; }
         if (ckpt > 0) reserve_ckpt(n, pr, ckpt, (int32_t)(ckpt - start - 1));
+        /* step() plans the decode rows before the prompt chunks, so this row follows the decode
+         * rows planned above (an admission, which the full step also places last, follows it). */
         plan_next_.e.push_back(n);
         plan_next_.n_tok += want;
     }

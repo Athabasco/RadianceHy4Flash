@@ -389,10 +389,11 @@ public:
      *               than the rounds that ran).
      *   step_next      plans and builds that step: every row of this one that produces a token, as
      *               a device row, at the furthest context it can reach, plus the head waiter's
-     *               admission and at most one continuing prompt chunk. Null (step() runs after the
-     *               commit instead) when only committed state can decide: media still encoding, a
-     *               grammar, the context's end, a pool that cannot grow, a held-back chunk, or
-     *               more than one prompt chunk to place.
+     *               admission and at most one prompt chunk -- the one this step continues, or the
+     *               one a spent hold left over. Null (step() runs after the commit instead) when
+     *               only committed state can decide: media still encoding, a grammar, the
+     *               context's end, a pool that cannot grow, a chunk the step's own shares hold
+     *               back, or more than one prompt chunk to place.
      *   promote_next   once this step has committed: the next step becomes the open one.
      *
      * While the next step is open, commit() leaves continuing requests' blocks in place, and a
