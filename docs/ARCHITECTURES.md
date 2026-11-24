@@ -3556,6 +3556,23 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   The drafter is declined, not refused, in the cases of [DFly2](#dfly2-the-hy4-flash-drafter): the
   container still loads and speculation falls back to prompt lookup.
 
+- **A sliced pass** (S-02). The step runs the trunk over `RadBatch::layer_lo` .. `layer_hi` and
+  stops between two layers: the plugin reports `slice_layers_ok` = 1 (the probe says 0 with the
+  debug taps on, which read the trunk between every two ops) and, when the engine asks
+  (`RadBuildCtx::layer_slices`), declares as persistent what a sub-step resumes from — `streams`,
+  `block_in`, `hc_post` and the int8 linears' codes pairs, none of which the arena may reuse
+  between two sub-steps. `hc_x`, `block_out` and `embed` stay transient. The decode rows (the batch's
+  first `n_tok_decode`, always at the front) are planned as a decode step plans them and run every
+  layer, so a layer outside the slice runs that band alone, under a decode plan (`T = DT`, `S = D`,
+  `P = 0`); a prefill-only sub-step without decode rows issues nothing for them. The step head
+  (embed, the streams) runs the whole step on the first slice and the decode band after it, and the
+  head after the trunk (the collapse, the output norm, the gather and `logits_gemm`) runs the extent
+  the trunk's last layer ran: the chunk's rows on the slice that ran its end, the decode band's
+  alone before that, since the engine hands a sub-step the out rows its entries own. The compact
+  pass and the trunk's checkpoint are the last sub-step's. The pipeline is never taken for a
+  sub-step. `--chunk-slices-prefill m` is the test hook: a prefill-only step cut into m, so that a
+  single greedy run serves a prompt sliced and unsliced.
+
 ### Tensor parallelism
 
 `--tp 2` or `--tp 4` (PLAN §1.5):
@@ -3622,8 +3639,10 @@ trunk step with media rows: embed_lookup, the encoder's rows over their placehol
   and TP2, 136 comparisons each, 0 fail. `data/kernels_hy4.rkb` carries the vision rows.
 
 Tests: `hyv4flash_arch_test` (the declared graph of the `mini` geometry, each step kind lint clean,
-the taps, the refusals; at two and four ranks every weight covered exactly once, each rank's heads,
-experts and vocabulary, two exact reductions a layer, every step kind lint clean on every rank)
+the taps, the refusals, a sliced sub-step: its layer range only, the decode band on every layer, the
+state it resumes declared persistent; at two and four ranks every weight covered exactly once, each
+rank's heads, experts and vocabulary, two exact reductions a layer, every step kind lint clean on
+every rank)
 and, against transformers, the harness of the plugin's work directory (`ref/run_rad.py --preset
 mini`, `--tp 2` on fake host ranks; `--preset mini4`, twice mini's heads and experts, at `--tp 4`).
 
