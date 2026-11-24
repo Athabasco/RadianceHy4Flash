@@ -37656,6 +37656,12 @@ static void device_phase(const Plugin& pl) {
             iqr_dual_case(pl, fd[0], 1, 3072, 1024, 1536);
             iqr_dual_case(pl, fd[1], 1, 6144, 2048, 3072);
             iqr_dual_case(pl, fd[1], 1, 2048, 6144, 3072);   /* the roles the other way round */
+            /* K-03's pair: q_a's 1024 (eight waves a tile) in front of the gate's 4096 / 8192
+             * (four), at the attention input's K -- both kinds of layer's gate width, and the
+             * pair under the trellis's other code. */
+            iqr_dual_case(pl, fd[0], 1, 1024, 4096, 3072);
+            iqr_dual_case(pl, fd[0], 1, 1024, 8192, 3072);
+            iqr_dual_case(pl, fd[1], 1, 1024, 4096, 3072);
             iqr_dual_case(pl, fd[0], 2, 6144, 2048, 3072, /* refuse */ true);
             for (size_t i = 2; i < sizeof fd / sizeof fd[0]; ++i) {
                 iqr_dual_case(pl, fd[i], 1, 3072, 1024, 1024);
