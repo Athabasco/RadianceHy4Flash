@@ -11981,8 +11981,11 @@ extern "C" int rad_kernel_concurrent(int i) {
  *
  * They answer 2: every chained form here ends its wait in r4d_chain_acquire, which empties the
  * scalar data cache behind the fence, so the engine may issue their packets without the packet
- * processor's acquire. A form that waited without it would have to keep this at 1 for the whole
- * library: one row's 1 keeps the fences on every chained packet of the engine. */
+ * processor's acquire. One form takes rad_abi.h's other way to 2: the head's matvec at M <= 2
+ * (r4dchain_mvm) waits with r4d_chain_wait_vec, and behind its acquire it has no scalar load from
+ * anything but its argument segment -- every operand it reads is a lane-varying one
+ * (tests/chain_scalar_audit.py). A form that waited with neither would have to keep this at 1 for
+ * the whole library: one row's 1 keeps the fences on every chained packet of the engine. */
 extern "C" int rad_kernel_chain(int i) {
     const RadKernelInfo* k = rad_kernel_at(i);
     if (!k) return 0;
@@ -12029,8 +12032,8 @@ extern "C" int rad_kernel_chain(int i) {
         /* the two-rank one-shot at a decode-sized message, and the rotated wire's row for the
          * messages under its size floor, which the exact kernel carries */
         "ar_oneshot_2rank_exact", "ar_oneshot_2rank_wht6",
-        /* the decode tail: the embedding, the sampled rows' gather, the lm_head's WMMA pass (the
-         * matvec below three rows stays plain) and the soft-cap */
+        /* the decode tail: the embedding, the sampled rows' gather, the lm_head's WMMA and matvec
+         * passes (the matvec is chained at M <= 2; the IQR head's stays plain) and the soft-cap */
         "embed_lookup_bf16", "gather_rows_bf16", "logits_gemm_i8",
         "logit_softcap_bf16", "logit_softcap_f32",
         /* the vocab-parallel sampler's candidate chain (temperature, top-k, the gathered sets'
