@@ -79,13 +79,25 @@ The Engram placement is the key here that decides what a start costs. `ram` read
 private pinned copy at every start: four tables one after the other at 1.4 GB/s, about 42 s of a
 66 s startup. `ram=DIR` keeps that copy as a file, `DIR/ngram-<id>.tab`, in a tmpfs, so a start that
 finds it complete checks samples of it against the container and pins it where it lies instead of
-reading the table again, which is 15-25 s off that start. The last engine to leave deletes the file,
-so what a file saves is a start after a crash, or after a stop that killed the engine before it
-cleaned up, rather than a planned restart; and a file left behind is 60 GiB of tmpfs that the next
-start counts against the free memory it checks before it pins anything. So it pays where the host
-has the room to leave it in place, and where two engines on separate card sets hold one table in
-host memory instead of two. Mount the directory's tmpfs with huge pages, since a tmpfs takes them
-only where `shmem_enabled` allows them and that defaults to `never`:
+reading the table again. Measured on two R9700 at TP2 with this recipe (u3 container, 210 W, the
+engine answering `/health`):
+
+| Engram placement | starts, seconds to `/health` |
+|---|---|
+| `ram` | 31.1, 53.4, 36.0 |
+| `ram=DIR`, tmpfs mounted the default way: the fill, then three reuses | 58.9, then 35.8, 36.7, 36.6 |
+| `ram=DIR` on a `huge=always` tmpfs: the fill, then three reuses | 32.1, then 22.2, 22.5, 22.5 |
+
+The reused file takes 13.5 s off a 36 s start, and it does that only on huge pages: on a tmpfs
+mounted the default way a reuse lands back at the `ram` time and the fill costs 23 s on top, so the
+mount is part of the recipe and not a tuning detail. The answer and the rate were unchanged by it
+(greedy text identical in every start, 69 tok/s decoding 64 tokens). The last engine to leave
+deletes the file, so what a file saves is a start after a crash, or after a stop that killed the
+engine before it cleaned up, rather than a planned restart; and a file left behind is 60.24 GiB of
+tmpfs that the next start counts against the free memory it checks before it pins anything. So it
+pays where the host has the room to leave it in place, and where two engines on separate card sets
+hold one table in host memory instead of two. Mount the directory's tmpfs with huge pages, since a
+tmpfs takes them only where `shmem_enabled` allows them and that defaults to `never`:
 
 ```sh
 sudo mkdir -p /dev/shm/radiance-ngram

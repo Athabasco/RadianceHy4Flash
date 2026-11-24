@@ -1010,7 +1010,9 @@ A tmpfs holds the file on huge pages only where `shmem_enabled` allows them
 leaves the table on 4 KiB pages: mount the directory's tmpfs with `huge=always`, or set
 `shmem_enabled=advise`. The gather reads 96-byte rows at random, so the page size is a cost of the
 cards' TLB and the driver's mapping rather than of the bandwidth; what the pages buy is startup,
-where the file is filled and pinned a whole range at a time. A container cannot ask for them itself
+where the file is filled and pinned a whole range at a time -- on two R9700 at TP2 a reused file on a
+huge-page tmpfs answered in 22.5 s against 36 s for `ram`, while the same reuse on a 4 KiB tmpfs
+answered in 36.7 s, the same as `ram`. A container cannot ask for them itself
 (`docker run --tmpfs` refuses `huge=`, `--shm-size` sets a size and no page size, and the sysfs
 knob is the host's), so the mount belongs on the host and the directory is passed in from there.
 
