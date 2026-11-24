@@ -15,8 +15,9 @@ read these before working:
 2. Open a PR whose title or body contains a closing keyword for the item's issue
    (`Fixes #N` / `Closes #N`). Without the keyword, the follow does not bind your PR to the
    issue and nobody reviews it (`#172` was missed exactly that way).
-3. Title the PR `[needs lane] <item>: <subject>`: the code was checked without GPU; a lane
-   measures it later and merges by §2.
+3. Title the PR `[measured] <item>: <subject>` when you measured the item's whole merge bar
+   yourself (see below), `[needs lane] <item>: <subject>` when you could not; a lane then
+   measures it and merges by §2.
 
 ## What a change carries
 
@@ -34,9 +35,16 @@ reference paths, `tests/chain_scalar_audit.py`, the plugin lints (`hyv4flash_arc
 scheduler tests (`sched_test`), every ctest that runs without a card. Run the touched ones;
 paste nothing you did not run.
 
-Do **not** claim measured GPU numbers — you have no lane. Instead, list inside the PR body
-the item's "Verify" GPU checks and the `stamps` / `kbench` rows its merge bar wants; a lane
-run here measures the PR (before / after on one lane) and merges or closes it by §2.
+With a GPU, measure the change yourself (CARDS.md §6 step 3): before (merge base) and after
+(PR head) on the same machine, at least three runs each, the stamps / `rad-kbench` /
+`profile-ops` rows the item's merge bar names plus output parity. Put them in the PR body under
+`## Measurement` with both commit ids, your GPUs, power cap, ROCm version, container and
+`ngram-placement`, and the raw output. Any placement, `ram` included, is fine on your machine.
+Never compare your numbers with a lane's baseline.
+
+What you could not measure, list in the PR body: the item's "Verify" GPU checks and the
+`stamps` / `kbench` rows still owed. A lane here measures only that part. Never claim numbers
+you did not run.
 
 ## How the review works here
 
