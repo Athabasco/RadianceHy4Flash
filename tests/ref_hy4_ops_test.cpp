@@ -656,6 +656,51 @@ TEST(k15_the_fused_sink_and_expand_is_the_pair_it_replaces_on_the_host) {
     CHECK(ld_dt(RAD_BF16, y.t.data, 0) != 0.0f);
 }
 
+TEST(k15_the_fused_op_serves_the_sliding_geometry_and_is_the_pair_there_too) {
+    /* The geometry the plugin declares it at (Hy4-flash at TP2: 32 heads sparse, 16 sliding), with the
+     * group the codes are read at and the token heights a decode step has. */
+    const int64_t M = 4, H = 16, L = 512, R = 64, kd = 192, vd = 256, group = 128, n = H * vd, bs = 4;
+    const int64_t pages = (M + bs - 1) / bs;
+    T q(RAD_BF16, {M, H, L}), qr(RAD_BF16, {M, H, R}), kv(RAD_BF16, {pages, 1, bs, L + R}),
+      bt(RAD_I32, {1, pages}), su(RAD_I32, {1}), cu(RAD_I32, {2}), sinks(RAD_F32, {H}),
+      lat(RAD_BF16, {M, H, L}), lat2(RAD_BF16, {M, H, L}), w(RAD_BF16, {H * (kd + vd), L}),
+      gg(RAD_BF16, {M, n}), q8(RAD_I8, {M, n}), q82(RAD_I8, {M, n}), sc(RAD_F32, {M, n / group}),
+      sc2(RAD_F32, {M, n / group});
+    for (int64_t i = 0; i < M * H * L; ++i) st_dt(RAD_BF16, q.t.data, i, 0.1f * (float)((i * 13) % 29) - 1.4f);
+    for (int64_t i = 0; i < M * H * R; ++i) st_dt(RAD_BF16, qr.t.data, i, 0.2f * (float)((i * 7) % 19) - 1.9f);
+    for (int64_t i = 0; i < pages * bs * (L + R); ++i) st_dt(RAD_BF16, kv.t.data, i, 0.05f * (float)((i * 17) % 23) - 0.5f);
+    for (int64_t i = 0; i < H * (kd + vd) * L; ++i) st_dt(RAD_BF16, w.t.data, i, 0.01f * (float)((i * 37) % 41) - 0.2f);
+    for (int64_t i = 0; i < M * n; ++i) st_dt(RAD_BF16, gg.t.data, i, 0.1f * (float)((i * 11) % 17) - 0.8f);
+    for (int64_t i = 0; i < H; ++i) st_dt(RAD_F32, sinks.t.data, i, 0.5f - 0.1f * (float)i);
+    bt.n({0}); su.n({M}); cu.n({0, M});
+    const double scale = std::pow((double)(L + R), -0.5);
+    A sink; sink.t(q).t(qr).t(kv).t(bt).t(su).t(cu).t(sinks).t(lat).i("M", M).i("heads", H)
+        .i("latent_dim", L).i("rope_dim", R).i("block_size", bs).i("window", 0).d("scale", scale)
+        .s("dtype", "bf16");
+    REQUIRE_EQ(run("mla_attn_paged_sink", sink), (int)RAD_OK);
+    A ex; ex.t(lat).t(w).t(gg).t(q8).t(sc).tnull().i("M", M).i("heads", H).i("k_dim", kd)
+        .i("v_dim", vd).i("latent_dim", L).i("group", group).s("dtype", "bf16");
+    REQUIRE_EQ(run("mla_expand_gate_had_quant_i8g", ex), (int)RAD_OK);
+    A one; one.t(q).t(qr).t(kv).t(bt).t(su).t(cu).t(sinks).t(lat2).t(w).t(gg).t(q82).t(sc2).tnull()
+        .i("M", M).i("heads", H).i("latent_dim", L).i("rope_dim", R).i("block_size", bs).i("window", 0)
+        .d("scale", scale).s("dtype", "bf16").i("stable", 1).i("k_dim", kd).i("v_dim", vd)
+        .i("group", group);
+    REQUIRE_EQ(run("mla_attn_paged_sink_expand_i8g", one), (int)RAD_OK);
+    int bad = 0;
+    for (int64_t i = 0; i < M * H * L && bad < 3; ++i)
+        if (ld_dt(RAD_BF16, lat.t.data, i) != ld_dt(RAD_BF16, lat2.t.data, i)) {
+            CHECK_EQ(ld_dt(RAD_BF16, lat2.t.data, i), ld_dt(RAD_BF16, lat.t.data, i)); ++bad;
+        }
+    for (int64_t i = 0; i < M * n && bad < 3; ++i)
+        if (ld_int(RAD_I8, q8.t.data, i) != ld_int(RAD_I8, q82.t.data, i)) {
+            CHECK_EQ(ld_int(RAD_I8, q82.t.data, i), ld_int(RAD_I8, q8.t.data, i)); ++bad;
+        }
+    for (int64_t i = 0; i < M * n / group && bad < 3; ++i)
+        if (ld_dt(RAD_F32, sc.t.data, i) != ld_dt(RAD_F32, sc2.t.data, i)) {
+            CHECK_EQ(ld_dt(RAD_F32, sc2.t.data, i), ld_dt(RAD_F32, sc.t.data, i)); ++bad;
+        }
+}
+
 TEST(the_absorbed_path_equals_the_non_absorbed_path_on_the_same_inputs) {
     const int64_t H = 3, kd = 6, vd = 8, L = 16, R = 4, m = 5, N = 14, W = 6, bs = 4;
     const double scale = std::pow((double)(kd + R), -0.5);
