@@ -3470,6 +3470,17 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   `RADIANCE_HY4_SHARE_CODES`, `RADIANCE_HY4_FUSED_QUANT`, `RADIANCE_HY4_ROUTER_FUSE`,
   `RADIANCE_HY4_CHAIN_Q8`. Not fused: the attention norm and the feed-forward norm are the
   junction's (`rmsnorm_ihc_junction`), and o_proj's input comes out of `mla_expand_gate`.
+- **The shared expert beside the routed GEMMs** (P-01). The shared expert is the plugin's own gated
+  MLP (MoeFP8 runs with no shared arm), so MoeFP8's interleave never reached it and its gate and down
+  projection were ordered launches behind `latent_out`. `MoeFP8::step` takes a `side` (SideOps) and
+  asks for its three stages where it issues its own shared arm's: gate_up behind the routed gate_up
+  (behind the router from `kSharedFirstRows` routed rows on a trellis gate_up), the gate behind the
+  routed quantiser, down behind the routed down. A recorded pass then leaves each unordered beside
+  the routed launch in front of it. The arm's buffers are `rad_buf_concurrent`. Taken where neither
+  shared linear quantises for itself (its codes fed, or bf16), which is the device configuration;
+  the pipelined prefill's pieces keep the old order. Byte-identical: the same launches on the same
+  operands, and the junction's add is unchanged. `RADIANCE_HY4_SHARED_SIDE=0` restores the old
+  order (default on).
 - **The Engram table on disk** (`ngram-placement: disk`). The ids and the gathered rows are
   host-domain buffers (as `rad_block_ple.h`'s), so libavx's host gather reads and writes them in the
   host arena; a device gather (vram, ram) reads and writes them over the link. A prefill chunk's
