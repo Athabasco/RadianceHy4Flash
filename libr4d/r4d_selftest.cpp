@@ -34441,13 +34441,19 @@ static void ar_ihc_junction_case(const Plugin& pl, const std::vector<int>& devs,
     if (!ar_peer_path_ok(devs, world)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     const bool host = std::strstr(name, "_host") != nullptr;
     std::vector<IjCase> cs;
-    auto C = [&](int64_t M, int64_t n, bool add, bool ys, bool xs, bool tail, bool head) {
-        IjCase c; c.M = M; c.n = n; c.hc = 4; c.add = add; c.ys = ys; c.xs = xs; c.tail = tail; c.head = head;
+    auto C = [&](int64_t M, int64_t n, bool add, bool ys, bool xs, bool tail, bool head, int64_t hc = 4) {
+        IjCase c; c.M = M; c.n = n; c.hc = hc; c.add = add; c.ys = ys; c.xs = xs; c.tail = tail; c.head = head;
         cs.push_back(c);
     };
     C(1, 3072, false, false, false, true, false); C(1, 3072, true, true, true, true, false);
     C(6, 3072, true, false, false, true, false);  C(17, 512, false, true, false, true, true);
     C(3, 512, true, false, false, false, false);
+    /* K-13: a row is split over several blocks at decode heights (four up to six rows, two at
+     * eight), so these are the split's own bytes: the two-block count, the widest form (hc 8, so
+     * 17 sums a wave), and a narrow row whose last blocks own no words and no pieces. */
+    C(8, 3072, true, true, true, true, false);
+    C(2, 3072, false, false, false, true, false, 8);
+    C(4, 512, false, false, false, false, false, 2);
     /* 256 rows: 256 blocks of 16 waves would sit on the full-card cliff, so the launch takes 255 */
     if (world == 2) { C(192, 3072, true, false, false, true, false); C(96, 3072, false, true, true, true, false);
                       C(256, 3072, false, false, false, true, false); }
