@@ -1544,9 +1544,10 @@ void int8_trunk_encs_host(RadBuilder* b) {
 /* K-19: the gather writes the routed sum's rotated int8 codes and scales in the launch that sums
  * it (`moe_gather_inv_i8g`), so `ffn_latent_out` declares no `had_quant_act_i8g` of its own -- one
  * launch fewer on every MoE layer, the same codes. It needs the slot table, no shared arm in the
- * gather, the sixteen-slot selection and a latent the weight's scale group divides; where any of
- * those fails the plain gather serves and the linear quantises for itself (and the codes' pair is
- * only declared, never written, when the switch is off). */
+ * gather, `top_k` 16 (the codes' 256-column wave is written from the sixteen-slot selection), a
+ * latent that is a whole number of those waves and one the weight's scale group divides; where any
+ * of those fails the plain gather serves and the linear quantises for itself (and the codes' pair
+ * is only declared, never written, when the switch is off). */
 TEST(the_moe_gather_writes_the_routed_sums_codes) {
     struct Run {
         const char* what;
@@ -1559,6 +1560,7 @@ TEST(the_moe_gather_writes_the_routed_sums_codes) {
         { "latent 256, sixteen slots", false, 256, 16, 2, 8 - 2 },
         { "the switch off", true, 256, 16, 0, 8 },
         { "a latent the group does not divide", false, 128, 16, 0, 8 },
+        { "eight slots, not the sixteen the codes need", false, 256, 8, 0, 8 },
     };
     for (const Run& r : runs) {
         fprintf(stderr, "run %s\n", r.what);
