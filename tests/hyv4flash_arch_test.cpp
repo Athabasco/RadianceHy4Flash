@@ -604,6 +604,99 @@ TEST(a_tail_without_every_decode_row_in_place_runs_the_full_pass) {
     }
 }
 
+/* K-26: the decode query's rotary is applied inside the sinks' stable instances (`rope_pos`), so
+ * a step with no prefill rows needs no `rope` over its query rows. Where the rotation happens is
+ * the whole of it: a decode row rotated in the sink and again by a launch is a different
+ * attention, and so is one rotated nowhere, while the rest of the step is identical. So the
+ * choice is held here. Decode only: no `rope` launch a layer, and both sinks carry the step's own
+ * rotary positions, one a row -- the two sparse layers attend through the selection at this
+ * context, the sliding layer through the paged instance. Mixed, or RADIANCE_HY4_FOLD_QROPE=0: the
+ * launch runs over every query row the layer keeps (the fast instances and the non-absorbed path
+ * read the rotated buffer) and the sinks carry no positions. */
+TEST(a_decode_only_step_folds_the_query_rotary_into_the_sinks) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const auto& m = *hyv4flash::models[0];
+    /* The per-layer ops the choice sits between: the query's rotary launch, and the two stable
+     * sinks it can fold into. */
+    auto rope_op = [&](rad_op op) {
+        for (const auto& l : m.layers)
+            if (l.attn.op_q_rope == op) return true;
+        return false;
+    };
+    auto sink_op = [&](rad_op op, bool& through_sel) {
+        for (const auto& l : m.layers)
+            if (l.attn.op_sel == op || l.attn.op_paged == op) {
+                through_sel = l.attn.op_sel == op;
+                return true;
+            }
+        return false;
+    };
+    struct Got {
+        int launches = 0, sinks = 0, positioned = 0, bare = 0, through_sel = 0, through_paged = 0;
+        int64_t rows = 0, pos_rows = 0;
+    };
+    /* fold: "1", "0", or nullptr for the shipped default. */
+    auto run = [&](const char* fold, const std::vector<int>& dq, const std::vector<int>& pq) {
+        if (fold) setenv("RADIANCE_HY4_FOLD_QROPE", fold, 1);
+        auto k = kit(d.b, dq, pq);
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        unsetenv("RADIANCE_HY4_FOLD_QROPE");
+        CHECK_LINT(d.b, &c);
+        CHECK(c.step_fail.empty());
+        CHECK(k->b.phase == (pq.empty() ? RAD_PHASE_DECODE : RAD_PHASE_MIXED));
+        Got g;
+        for (const auto& issue : c.issues) {
+            if (rope_op(issue.op)) {
+                ++g.launches;
+                g.rows += issue.n;
+                continue;
+            }
+            bool sel_op = false;
+            if (!sink_op(issue.op, sel_op)) continue;
+            ++g.sinks;
+            (sel_op ? g.through_sel : g.through_paged) += 1;
+            const RadOperand& rp = issue.opd.back();
+            if (rp.kind == RAD_OPK_NONE) {
+                ++g.bare;
+                CHECK(rp.raw == nullptr);
+            } else {
+                ++g.positioned;
+                g.pos_rows += rp.rows;
+                /* the step's own rotary positions, one a row it folds */
+                CHECK(rp.raw == (const void*)k->b.positions);
+                CHECK_EQ(rp.rows, issue.n);
+            }
+        }
+        return g;
+    };
+
+    const Got fold = run(nullptr, { 1, 1 }, {});
+    CHECK_EQ(fold.launches, 0);
+    CHECK_EQ(fold.sinks, 3);
+    CHECK_EQ(fold.through_sel, 2);
+    CHECK_EQ(fold.through_paged, 1);
+    CHECK_EQ(fold.positioned, 3);
+    CHECK_EQ(fold.bare, 0);
+    CHECK_EQ(fold.pos_rows, 6);
+
+    const Got off = run("0", { 1, 1 }, {});
+    CHECK_EQ(off.launches, 3);
+    CHECK_EQ(off.rows, 6);
+    CHECK_EQ(off.sinks, 3);
+    CHECK_EQ(off.positioned, 0);
+    CHECK_EQ(off.bare, 3);
+
+    /* One decode row and four prompt rows: the launch carries all five of them, a layer. */
+    const Got mixed = run(nullptr, { 1 }, { 4 });
+    CHECK_EQ(mixed.launches, 3);
+    CHECK_EQ(mixed.rows, 15);
+    CHECK_EQ(mixed.sinks, 3);
+    CHECK_EQ(mixed.positioned, 0);
+    CHECK_EQ(mixed.bare, 3);
+}
+
 /* #74 review, point 1: the tail's capacity counts the three rotary planes exactly when the
  * derivation writes them, which is when the step carries rope_pos: the core hands it to a program
  * that declares an encoder (batch.cpp, mm_on_). Served tower: an encoder, five planes; declared

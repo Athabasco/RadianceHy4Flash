@@ -100,6 +100,15 @@ inline rad_op mk(RadBuilder* b, const char* name, std::initializer_list<RadParam
                                  ws.size() ? ws.begin() : nullptr, (int)ws.size());
     return rw(b, h, reads, writes);
 }
+/* mk with the params assembled at run time: an op whose optional parameters exist only on some of
+ * its instances (the latent sinks' folded rotary) cannot write them in an initializer list. */
+inline rad_op mk_list(RadBuilder* b, const char* name, const std::vector<RadParam>& ps,
+                      std::initializer_list<rad_weight> ws, std::initializer_list<rad_buf> reads,
+                      std::initializer_list<rad_buf> writes) {
+    const rad_op h = rad_decl_op(b, name, ps.data(), (int)ps.size(),
+                                 ws.size() ? ws.begin() : nullptr, (int)ws.size());
+    return rw(b, h, reads, writes);
+}
 
 /* An op that must resolve: a graph with a hole would look servable. */
 #define HY4_NEED(h, what)                                                                      \

@@ -3390,7 +3390,9 @@ per layer
   ihc_pre (hc_attn), rmsnorm (attn_norm)
   q_a, rmsnorm, q_nope / q_rope; kv_a, rmsnorm on the latent, rope (gptj) on q_rope -- under
   `rope_rows`, its row-form name -- and on the key,
-  kv_store of the row [latent | key] as one KV head of (512 + 64) / 2; attn_gate
+  kv_store of the row [latent | key] as one KV head of (512 + 64) / 2; attn_gate (a decode step's
+  query rotary is folded into the sink instead: its stable instance's optional `rope_pos`, one
+  launch a layer less; `RADIANCE_HY4_FOLD_QROPE=0` issues the `rope_rows` launch as well)
   [sparse] index_key, rmsnorm, qsa_work, idx_pool_gated into the indexer cache, qsa_tail_store;
            selecting: index_query_nope / _rope, rope_rows, index_head, idx_score,
            qsa_select(own 1)
