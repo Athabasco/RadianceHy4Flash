@@ -3428,9 +3428,15 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   LDS holding a head's folded rows) instead of a launch of its own and the latent's round trip. The
   bytes are `merge_sink`'s, so the latent and everything past it are unchanged;
   `RADIANCE_HY4_SINK_FOLD=0` keeps the two launches, which is the A/B switch. It is issued at one to
-  four rows only: the fold's partials pass through the expansion's workgroups (`heads * ceil(rows / 16)`
-  of them), so at those heights it is a win of a few microseconds a layer and from six rows on a loss of
-  more than `merge_sink`'s launch costs.
+  four rows where the sink splits a row 20 ways (no window) and one to eight where it splits 8 (a
+  window): the fold's partials pass through the expansion's workgroups (`heads * ceil(rows / 16)` of
+  them), so at those heights it is a win of up to three microseconds a layer (15 % at one to two rows
+  where the sink splits 20 ways, 2-6 % at three to four, 4-17 % at one to eight where it splits 8) and
+  above them a loss of more than `merge_sink`'s launch costs (5.5-9 % at six rows, 16-17 % at eight and
+  24-67 % from sixteen to seventeen at the 20-split law, 15 % at sixteen rows at the 8-split one).
+  Served on the local lane at TP2 (`nospec.yaml`, phases c1, c8, pf6, three arms a side) the fold
+  is inside the noise of its own switch: 69.9 -> 70.3 tok/s at c1 (14.07 -> 13.97 ms a step, the
+  same arm repeating within 3 %), 295 -> 304 tok/s at c8, pf6 TTFT 1.908 -> 1.910 s.
 - **The caches.** The sliding layers' latent rows in a `RAD_KV_WINDOW` group (block 16, window
   `sliding_window` = 512 keys with the own one), the sparse layers' in a full group of block 4, so
   a page is an indexer group and `qsa_select`'s table is the attention's; the indexer's pooled keys

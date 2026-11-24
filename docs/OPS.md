@@ -3874,11 +3874,15 @@ libavx run the pair itself; `tests/r4d_emu/test_mla_kv.cpp` runs the fold itself
 `merge_sink` and to the expansion on the folded latent byte for byte; and libr4d's row declares the
 pair's chain as its `replaces` (`mla_attn_paged_sink`, then `mla_expand_gate_had_quant_i8g` over the
 latent it wrote, `r4d_fuse.cpp`), which rad-kbench's fusion oracle runs. A call whose sink form is one
-pass, or a step whose expansion is not fused, keeps the two launches. The plugin also keeps them above
-four rows: the fold reads the partials through `heads * ceil(rows / 16)` workgroups, which off the small
-step cannot fill the memory system, and rad-kbench measures the fused launch 4-16 % of the pair faster at
-one to four rows, level at eight where the sink splits 8 ways, and 16-58 % slower from six rows on where
-it splits 20 (`data/kernels_hy4.py k15`).
+pass (no split to fold: the sink wrote the latent itself) runs the pair's two kernels inside the one
+call, the second the plain expansion; a step whose expansion is not fused keeps the two calls. The
+plugin issues the one call for a whole-step paged decode up to a row bound that follows the sink's split
+law -- four rows where it splits 20 ways (no window), eight where it splits 8 (a window): the fold reads
+the partials through `heads * ceil(rows / 16)` workgroups, which off the small step cannot fill the
+memory system, and rad-kbench at 16 heads measures the fused launch 15 % of the pair faster at one to
+two rows at the first law and 2-6 % at three to four, 5.5-9 % slower at six, 16-17 % at eight and
+24-67 % from sixteen to seventeen, and 4-17 % faster at one to eight rows at the second, 15 % slower
+at sixteen (`data/kernels_hy4.py k15`).
 
 `mla_expand_gate_had_quant_i8g` (G-3c, levers-general L3) is `mla_expand_gate` followed by
 `had_quant_act_i8g` over its `[M, heads * v_dim]` product (`group` 128): `q` int8 `[M, heads * v_dim]`,

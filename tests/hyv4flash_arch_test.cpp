@@ -2467,6 +2467,12 @@ TEST(the_four_rank_junction_twin_takes_the_launch_bound_heights) {
  * back, which is the A/B the lane measures. A decode step of three sequences: two contexts select,
  * so their layers keep the selection and issue the fused expansion, the third holds the paged sink. */
 TEST(k15_the_paged_sink_and_the_fused_expansion_are_one_launch_pair) {
+    /* the height bound follows the sink's split law, which the layer's window sets: four rows at
+     * the 20-slot law (no window), eight where the window splits 8 ways. */
+    CHECK_EQ(hyv4flash::sink_fold_rows(0), 4);
+    CHECK_EQ(hyv4flash::sink_fold_rows(8), 8);
+    CHECK_EQ(hyv4flash::sink_fold_rows(512), 8);
+    CHECK_EQ(hyv4flash::sink_fold_rows(2048), 4);
     g3_fusions = true;
     Declared on(int8_attn_encs);
     REQUIRE_EQ(on.rc, RAD_OK);
@@ -2479,14 +2485,28 @@ TEST(k15_the_paged_sink_and_the_fused_expansion_are_one_launch_pair) {
     CHECK_EQ(count_issued(on.b, c, "mla_attn_paged_sink_expand_i8g"), 1);
     CHECK_EQ(count_issued(on.b, c, "mla_attn_paged_sink"), 0);
     CHECK_EQ(count_issued(on.b, c, "mla_expand_gate_had_quant_i8g"), 0);
-    /* above kFoldRows the fold's bytes cost more than merge_sink's launch saves, so the pair is
-     * back and the expansion is still the fused one. */
+    /* the declared height bound is the layer's own law: the fused row is declared by the sliding
+     * layer alone here (its reader takes the rotated int8 codes), so eight rows for its window. */
+    CHECK_EQ(count_op(on.b, "mla_attn_paged_sink_expand_i8g"), 1);
+    CHECK_EQ(pint(find_op(on.b, "mla_attn_paged_sink_expand_i8g", 0), "window"), 8);
+    CHECK_EQ(param(find_op(on.b, "mla_attn_paged_sink_expand_i8g", 0), "M")->ihi, 8);
+    /* five rows is inside the window's law, so the fused call is still the one issued, and neither
+     * the sink nor the expansion runs on its own. */
     auto k5 = kit(on.b, { 1, 1, 1, 1, 1 }, {}, 0);
     RadCtx c5{ .b = &on.b, .batch = &k5->b };
     hyv4flash::step(&c5, &k5->b);
     CHECK(c5.step_fail.empty());
-    CHECK_EQ(count_issued(on.b, c5, "mla_attn_paged_sink_expand_i8g"), 0);
-    CHECK_EQ(count_issued(on.b, c5, "mla_attn_paged_sink"), 1);
+    CHECK_EQ(count_issued(on.b, c5, "mla_attn_paged_sink_expand_i8g"), 1);
+    CHECK_EQ(count_issued(on.b, c5, "mla_attn_paged_sink"), 0);
+    /* above the bound the fold's bytes cost more than merge_sink's launch saves, so the pair is
+     * back and the expansion is still the fused one. */
+    auto k9 = kit(on.b, { 1, 1, 1, 1, 1, 1, 1, 1, 1 }, {}, 0);
+    RadCtx c9{ .b = &on.b, .batch = &k9->b };
+    hyv4flash::step(&c9, &k9->b);
+    CHECK(c9.step_fail.empty());
+    CHECK_EQ(count_issued(on.b, c9, "mla_attn_paged_sink_expand_i8g"), 0);
+    CHECK_EQ(count_issued(on.b, c9, "mla_attn_paged_sink"), 1);
+    CHECK_EQ(count_issued(on.b, c9, "mla_expand_gate_had_quant_i8g"), 1);
     setenv("RADIANCE_HY4_SINK_FOLD", "0", 1);
     Declared off(int8_attn_encs);
     unsetenv("RADIANCE_HY4_SINK_FOLD");

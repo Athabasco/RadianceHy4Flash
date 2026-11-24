@@ -24,20 +24,20 @@
  * attention.
  *
  * Where the whole step is the paged decode, the expansion is fused (G-3c) and the step is at most
- * kFoldRows rows, the layer issues mla_attn_paged_sink_expand_i8g, which is the sink and that
- * expansion over its latent in one call: the sink's partials are folded in the expansion's
+ * sink_fold_rows(window) rows, the layer issues mla_attn_paged_sink_expand_i8g, which is the sink
+ * and that expansion over its latent in one call: the sink's partials are folded in the expansion's
  * workgroup, so merge_sink's launch and the latent's round trip go and every byte past the fold is
  * unchanged (K-15). RADIANCE_HY4_SINK_FOLD=0 keeps the two launches.
  *
  * The row bound is the fold's price. The partials a workgroup folds are rows x splits x 516 floats
- * read cold through heads x ceil(rows / 16) workgroups, and at the decode heights the sink splits
- * 20 ways (window 0) or 8 (a window) those few workgroups cannot fill the memory system: measured
- * on one card at 16 heads, the fused launch is 4-16 % of the pair faster at one to four rows (three
- * to four us a layer), level at eight in the 8-split law, and 16-58 % slower from six rows on in the
- * 20-split one. Four rows is where every law still wins.
- *
- * The sparse layers' indexer (hyv4flash_indexer.h) runs between the cache store and the
- * attention.
+ * read cold through heads x ceil(rows / 16) workgroups, so the last height the fold wins at follows
+ * the sink's split law: 20 ways with no window, one a 64-key super-chunk of it otherwise (8 at this
+ * model's 512). Measured on one card at 16 heads, the fused launch against the pair's two rows from
+ * the same pass: the 20-split law is 15 % faster at one to two rows (3.1-3.4 us a layer) and 2-6 %
+ * at three to four (0.5-1.2 us, the four-row row's own spread 5 %), 5.5-9 % slower at six, 16-17 %
+ * at eight and 24-67 % from sixteen to seventeen; the 8-split law is 4-17 % faster at one to eight
+ * rows (0.8-3.7 us) and 15 % slower at sixteen. Hence four rows at the first and eight at the
+ * second.
  *
  * Streamed KV (docs/KV-STREAMING.md, --kv-resident): the sparse latent group may stream, as GLM's
  * MLA does (rad_block_glm_mla.h). Its store writes the host mirror always and the ring slot where
@@ -137,6 +137,17 @@ struct AttnWire {
 
 struct Indexer;   /* hyv4flash_indexer.h */
 
+/* K-15's height bound for a layer: the sink's split law (libr4d's sink_law -- kMaxSplits with no
+ * window, one a super-chunk of the window otherwise) sets how many partials the fold reads, and the
+ * measurement in the header above says where that stops paying. */
+constexpr int64_t kFoldRowsFull = 4, kFoldRowsWindow = 8, kFoldSuperChunk = 64, kFoldSplitsMax = 20;
+inline int64_t sink_fold_rows(int64_t window) {
+    const int64_t splits = window > 0
+        ? std::min<int64_t>(kFoldSplitsMax, (window + kFoldSuperChunk - 1) / kFoldSuperChunk)
+        : kFoldSplitsMax;
+    return splits > kFoldRowsWindow ? kFoldRowsFull : kFoldRowsWindow;
+}
+
 struct Attn {
     Shape s{};
     AttnGeom a{};
@@ -170,11 +181,10 @@ struct Attn {
     rad_op op_expand_quant = 0;
     /* K-15: the paged sink and the fused expansion in one launch pair, the sink's partials folded in
      * the expansion's workgroup (RADIANCE_HY4_SINK_FOLD=0 keeps them apart, the A/B switch); only
-     * where the whole step is the paged decode, since the row covers op_paged's rows alone. */
+     * where the whole step is the paged decode and inside the layer's sink_fold_rows bound, since the
+     * row covers op_paged's rows alone. */
     rad_op op_sink_q = 0;
     static constexpr int64_t kFuseRows = 64;
-    /* K-15's row bound: above it the fold's bytes cost more than merge_sink's launch saves. */
-    static constexpr int64_t kFoldRows = 4;
     Tap t_in_norm{}, t_q_resid{}, t_kv_latent{}, t_kv_rope{}, t_gate{}, t_o_proj{}, t_out{};
 
     /* G-3b: maps the three linears that read the attention norm's output (q_a, kv_a, the gate) and
@@ -516,7 +526,7 @@ struct Attn {
             if (op_expand_quant && fuse_on("RADIANCE_HY4_SINK_FOLD") &&
                 rad_op_declared(b, "mla_attn_paged_sink_expand_i8g")) {
                 op_sink_q = mk(b, "mla_attn_paged_sink_expand_i8g",
-                               { RAD_RANGE("M", 1, std::min<int64_t>(T, kFoldRows)),
+                               { RAD_RANGE("M", 1, std::min<int64_t>(T, sink_fold_rows(window))),
                                  RAD_INT("heads", H), RAD_INT("latent_dim", L),
                                  RAD_INT("rope_dim", R), RAD_INT("block_size", bs),
                                  RAD_INT("window", window), RAD_F64("scale", scale),
@@ -736,8 +746,8 @@ struct Attn {
         const bool fused_q = op_expand_quant && abs_rows == T && T > 0 && T <= kFuseRows;
         /* K-15: the sink, whose rows are the whole step's, and that same expansion in one pair -- at
          * the heights the fold pays at (see the header). */
-        const bool fused_sink = fused_q && op_sink_q && !selecting && T > 0 && T <= kFoldRows &&
-                                p.D > 0 && p.DT == T;
+        const bool fused_sink = fused_q && op_sink_q && !selecting && T > 0 &&
+                                T <= sink_fold_rows(window) && p.D > 0 && p.DT == T;
         if (abs_rows > 0) {
             RAD_ISSUE_N(c, op_absorb, abs_rows, brows(w.q_nope, abs_rows), RAD_W(kv_b),
                         brows(w.q_lat, abs_rows));
