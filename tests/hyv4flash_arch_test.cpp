@@ -1686,6 +1686,90 @@ TEST(the_fold_follows_the_gate_ups_own_row_share) {
     }
 }
 
+/* The handle a declared buffer was given, for a check on which of two pairs an op took: a rad_buf
+ * is the buffer's index in RadBuilder::bufs, from 1. */
+static rad_buf buf_handle(const RadBuilder& b, const std::string& name) {
+    for (size_t k = 0; k < b.bufs.size(); ++k)
+        if (b.bufs[k].name == name) return (rad_buf)(k + 1);
+    return 0;
+}
+
+/* K-23 where the gate_up's input codes are fed: a recipe whose latent linear is rotated int8 opens
+ * the MoE layer's input, so the trunk's junction quantises the feed-forward's input once (G-3b) and
+ * the shared expert's gate_up reads that pair (Lin::feed) with no quantiser of its own -- the shape
+ * a served u3/IQR build takes, layer 0's dense MLP being the only gate_up with nothing in front of
+ * it. The fold reads the pair the layer was given, and nothing writes that pair a second time. */
+void iqr_fed_ffn_encs(RadBuilder* b) {
+    iqr_ffn_encs(b);
+    b->encs.insert(b->encs.begin(), { { "ffn_latent_in", enc_i8(true) } });
+}
+TEST(the_gate_fold_reads_the_codes_a_fed_gate_up_is_given) {
+    MetaKV mk = mini_meta(false, 128, 256);
+    RadBuilder b;
+    iqr_fed_ffn_encs(&b);
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(hyv4flash::declare(&b, mk.meta(), &ctx), RAD_OK);
+    CHECK_EQ(count_op(b, "gemm_nt_q_gated"), 3);
+    CHECK_EQ(count_op(b, "gated_had_quant_i8g"), 3);        /* the pair, for the rows past 16 */
+    /* Layer 0's dense MLP quantises its own input into the untagged trunk pair; the MoE layers'
+     * feed-forward input is the junction's pair, which their latent linear and shared gate_up share. */
+    const rad_buf own = buf_handle(b, "trunk_codes.256.128.q8");
+    const rad_buf own_s = buf_handle(b, "trunk_codes.256.128.s8");
+    const rad_buf fed = buf_handle(b, "trunk_codes.junc_ffn_in.256.128.q8");
+    const rad_buf fed_s = buf_handle(b, "trunk_codes.junc_ffn_in.256.128.s8");
+    REQUIRE(own != 0);
+    REQUIRE(own_s != 0);
+    REQUIRE(fed != 0);
+    REQUIRE(fed_s != 0);
+    for (int i = 0; i < 3; ++i) {
+        const RecOp* f = find_op(b, "gemm_nt_q_gated", i);
+        REQUIRE(f != nullptr);
+        REQUIRE_EQ(f->reads.size(), (size_t)2);
+        REQUIRE_EQ(f->writes.size(), (size_t)2);
+        CHECK_EQ(pstr(f, "dtype"), std::string("i8a8h"));
+        /* the pair writes the same two code buffers the fold does */
+        const RecOp* a = find_op(b, "gated_had_quant_i8g", i);
+        REQUIRE(a != nullptr);
+        CHECK(a->writes == f->writes);
+        /* layer 0's fold reads the codes its own quantiser writes; a shared expert's fold reads the
+         * fed pair, and neither of the two ever reads the other's. */
+        CHECK_EQ(f->reads[0], i == 0 ? own : fed);
+        CHECK_EQ(f->reads[1], i == 0 ? own_s : fed_s);
+        CHECK(!in(f->reads, i == 0 ? fed : own));
+    }
+    /* The fed pair's writers are the trunk's junction quantisers, one a MoE layer: no gate_up
+     * quantises it a second time for the fold to read instead. */
+    int writers = 0;
+    for (const auto& o : b.ops)
+        if (in(o.writes, fed)) { ++writers; CHECK_EQ(o.op, std::string("rmsnorm_ihc_junction")); }
+    CHECK_EQ(writers, 2);
+    CHECK_EQ(count_op(b, "had_quant_act_i8g"), 1);          /* layer 0's gate_up, the only one */
+    every_weight_read(b);
+    steps_clean_at(b, 0, 1);
+    /* A decode-class step issues the fold and no pair, and the only input quantiser it issues is
+     * layer 0's gate_up: a fed gate_up leaves the codes to the trunk. */
+    for (int rows : { 1, 16 }) {
+        std::unique_ptr<Kit> k = kit(b, { rows }, {});
+        k->b.positions_h = k->pos.data();
+        RadCtx c{ .b = &b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_EQ(count_issued(b, c, "gemm_nt_q_gated"), 3);
+        CHECK_EQ(count_issued(b, c, "gated_had_quant_i8g"), 0);
+        CHECK_EQ(count_issued(b, c, "had_quant_act_i8g"), 1);
+    }
+    /* Past the rows the fold serves, the pair runs and writes the same codes. */
+    std::unique_ptr<Kit> pf = kit(b, {}, { 17 });
+    pf->b.positions_h = pf->pos.data();
+    RadCtx pc{ .b = &b, .batch = &pf->b };
+    hyv4flash::step(&pc, &pf->b);
+    CHECK(pc.step_fail.empty());
+    CHECK_EQ(count_issued(b, pc, "gemm_nt_q_gated"), 0);
+    CHECK_EQ(count_issued(b, pc, "gated_had_quant_i8g"), 3);
+    every_weight_read(b);
+    steps_clean_at(b, 0, 1);
+}
+
 /* q_nope and q_rope rotated int8 of one form at a q_lora of whole 128 groups: the q residual's norm
  * writes their codes in its pass (rmsnorm_had_quant_i8g) from q_a's raw output, so neither has a
  * quantiser; on a CPU engine q_nope quantises the normed residual once and q_rope reads its codes. */
