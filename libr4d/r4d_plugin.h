@@ -911,8 +911,6 @@ int64_t r4d_rad_mla_attn_paged_sink_scratch(const RadArgs*);
 int64_t r4d_rad_mla_attn_sel_sink_scratch(const RadArgs*);
 int r4d_shape_mla_attn_paged_sink(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_mla_attn_sel_sink(const RadParam*, int, int, RadOpdDesc*);
-int r4d_rad_mla_attn_paged_sink_expand_i8g(const RadArgs*, RadStream);
-int r4d_shape_mla_attn_paged_sink_expand_i8g(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_router_sigmoid_topk(const RadArgs*, RadStream);
 int r4d_rad_router_sigmoid_group_topk(const RadArgs*, RadStream);
 int r4d_shape_router_sigmoid_group_topk(const RadParam*, int, int, RadOpdDesc*);
@@ -1138,7 +1136,6 @@ int r4d_fuse_qkv_norm_rope_kv_store(const RadParam*, int, uint64_t, int, RadFuse
 int r4d_fuse_add_rmsnorm(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_mla_expand_gate(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_mla_expand_gate_had_quant_i8g(const RadParam*, int, uint64_t, int, RadFuseStep*);
-int r4d_fuse_mla_attn_paged_sink_expand_i8g(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_qk_norm_rope_gate_kv_store_streamed(const RadParam*, int, uint64_t, int,
                                                  RadFuseStep*);
 int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam*, int, uint64_t, int, RadFuseStep*);

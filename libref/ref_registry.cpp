@@ -241,13 +241,6 @@ static const RadParamSpec pMlaAttnPagedSink[] = { P_INT("M"), P_INT("heads"), P_
     P_INTO("stable") };
 static const RadOperandSpec oMlaAttnPagedSink[] = { OPD("q"), OPD("q_rope"), OPD("kv"),
     OPD("block_table"), OPD("seqused"), OPD("cu_seqlens"), WGT("sinks"), OUT("out") };
-/* mla_attn_paged_sink_expand_i8g (K-15): mla_attn_paged_sink's parameters and the expand's. */
-static const RadParamSpec pMlaAttnPagedSinkX[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
-    P_INT("rope_dim"), P_INT("block_size"), P_INT("window"), P_F64("scale"), P_STR("dtype"),
-    P_INTO("stable"), P_INT("k_dim"), P_INT("v_dim"), P_INT("group") };
-static const RadOperandSpec oMlaAttnPagedSinkX[] = { OPD("q"), OPD("q_rope"), OPD("kv"),
-    OPD("block_table"), OPD("seqused"), OPD("cu_seqlens"), WGT("sinks"), OUT("out"), WGT("w"),
-    OPD("g"), OUT("q8"), OUT("scale"), OUT_O("out_bf16") };
 static const RadParamSpec pMlaAttnSelSink[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
     P_INT("rope_dim"), P_INT("blocks"), P_INT("block_size"), P_F64("scale"), P_STR("dtype"),
     P_INTO("stable") };
@@ -1485,11 +1478,6 @@ static const RadOpSchema kSchemas[] = {
   "softmax once and carries no value. No visible key gives zero. `stable` 1 (optional, default 0) "
   "asks that a row's bytes not depend on the launch (M, its other rows); a row-independent "
   "kernel ignores it." },
-{ "mla_attn_paged_sink_expand_i8g", ARR(pMlaAttnPagedSinkX), ARR(oMlaAttnPagedSinkX),
-  "mla_attn_paged_sink and mla_expand_gate_had_quant_i8g on its latent, in one op (K-15). The "
-  "latent (`out`) is mla_attn_paged_sink's: the sink's slots fold in ascending order and the sink "
-  "joins once, whether merge_sink does it or the expand's workgroup folds it into its LDS. The "
-  "codes, the scale and `out_bf16` are the expand's. Byte-identical to the two ops." },
 { "mla_attn_sel_sink", ARR(pMlaAttnSelSink), ARR(oMlaAttnSelSink),
   "mla_attn's per-query page table and visible length with a rotary part and a sink: tokens "
   "[0, length[r]) of table row bt[r]. The score, the sink and `stable` are "
@@ -2642,9 +2630,6 @@ SIMPLE("ref_mla_project_kv", "mla_project_kv", "attn", "absorbed MLA projections
        DT_FLOAT, ref_mla_project_kv),
 SIMPLE("ref_mla_attn_paged_sink", "mla_attn_paged_sink", "attn",
        "paged latent attention with a window and a sink", DT_FLOAT, ref_mla_attn_paged_sink),
-SIMPLE("ref_mla_attn_paged_sink_expand_i8g", "mla_attn_paged_sink_expand_i8g", "attn",
-       "the sink's attention and its rows' expand, gate and rotated int8 quantiser", DT_FLOAT,
-       ref_mla_attn_paged_sink_expand_i8g),
 SIMPLE("ref_mla_attn_sel_sink", "mla_attn_sel_sink", "attn",
        "selected-page latent attention with a rotary part and a sink", DT_FLOAT,
        ref_mla_attn_sel_sink),

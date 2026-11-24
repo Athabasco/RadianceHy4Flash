@@ -199,8 +199,7 @@ struct Uniform {
 /* ================================================================== schemas */
 TEST(every_hy4_op_has_a_schema_with_f64_floats_and_str_enums_and_a_shape_description) {
     const char* ops[] = { "ihc_pre", "ihc_post", "mla_project_kv", "mla_attn_paged_sink",
-        "mla_attn_sel_sink", "mla_attn_paged_sink_expand_i8g", "mla_kv_split", "attn_kv_sink", "gate_mul",
-        "idx_pool_gated", "idx_pool_gated_fp8", "idx_pool_gated_i8",
+        "mla_attn_sel_sink", "mla_kv_split", "attn_kv_sink", "gate_mul", "idx_pool_gated", "idx_pool_gated_fp8", "idx_pool_gated_i8",
         "idx_score", "engram_ids", "engram_norm", "engram_gate", "dfly_sel" };
     const char* f64[] = { "eps", "hc_eps", "post_mag", "scale", "theta" };
     const char* str[] = { "dtype", "mode", "sections" };
@@ -237,10 +236,6 @@ TEST(every_hy4_op_describes_all_its_operands_at_a_typical_geometry) {
                               RAD_INT("latent_dim", 64), S("mode", "absorb"), S("dtype", "bf16") } },
         { "mla_attn_paged_sink", { RAD_INT("M", 5), RAD_INT("heads", 4), RAD_INT("latent_dim", 64),
                               RAD_INT("rope_dim", 8), RAD_INT("block_size", 16), RAD_INT("window", 8), S("dtype", "bf16") } },
-        { "mla_attn_paged_sink_expand_i8g", { RAD_INT("M", 5), RAD_INT("heads", 4), RAD_INT("latent_dim", 64),
-                              RAD_INT("rope_dim", 8), RAD_INT("block_size", 16), RAD_INT("window", 8),
-                              RAD_INT("k_dim", 24), RAD_INT("v_dim", 32), RAD_INT("group", 8),
-                              S("dtype", "bf16") } },
         { "mla_attn_sel_sink", { RAD_INT("M", 5), RAD_INT("heads", 4), RAD_INT("latent_dim", 64),
                               RAD_INT("rope_dim", 8), RAD_INT("blocks", 6), RAD_INT("block_size", 4), S("dtype", "bf16") } },
         { "mla_kv_split", { RAD_INT("M", 5), RAD_INT("heads", 4), RAD_INT("k_dim", 24), RAD_INT("v_dim", 32),
@@ -594,111 +589,6 @@ TEST(mla_attn_paged_sink_matches_hf_eager_attention_on_the_latent_at_both_window
         .i("rope_dim", 4).i("blocks", 3).i("block_size", 4).d("scale", std::pow(256.0, -0.5)).s("dtype", "f32");
     REQUIRE_EQ(run("mla_attn_sel_sink", a), (int)RAD_OK);
     CHECK(worst(out, mla_out_w0, 2 * 2 * 16, 2e-5, 2e-6) <= 1.0);
-}
-
-TEST(k15_the_fused_sink_and_expand_is_the_pair_it_replaces_on_the_host) {
-    /* mla_attn_paged_sink_expand_i8g is the sink and the G-3c expansion over its latent: run the pair on
-     * the host and the fused op beside it on the same bytes, and every byte the pair wrote has to come
-     * back. This is the composition libr4d's fold is held to (the emu runs the kernel against this pair). */
-    MlaGolden g;
-    const int64_t H = 2, L = 16, kd = 4, vd = 8, m = 2, group = 8, n = H * vd;
-    const double scale = std::pow(256.0, -0.5);
-    T lat(RAD_BF16, {m, H, L}), lat2(RAD_BF16, {m, H, L}), w(RAD_BF16, {H * (kd + vd), L}),
-      gg(RAD_BF16, {m, n}), y(RAD_BF16, {m, n}), y2(RAD_BF16, {m, n}), q8(RAD_I8, {m, n}),
-      q82(RAD_I8, {m, n}), sc(RAD_F32, {m, n / group}), sc2(RAD_F32, {m, n / group});
-    for (int64_t i = 0; i < H * (kd + vd) * L; ++i) st_dt(RAD_BF16, w.t.data, i, 0.05f * (float)((i * 37) % 23) - 0.5f);
-    for (int64_t i = 0; i < m * n; ++i) st_dt(RAD_BF16, gg.t.data, i, 0.1f * (float)((i * 11) % 17) - 0.8f);
-    A sink; sink.t(g.q).t(g.qr).t(g.kv).t(g.bt).t(g.su).t(g.cu).t(g.sinks).t(lat).i("M", m)
-        .i("heads", H).i("latent_dim", L).i("rope_dim", 4).i("block_size", 4).i("window", 0)
-        .d("scale", scale).s("dtype", "bf16");
-    REQUIRE_EQ(run("mla_attn_paged_sink", sink), (int)RAD_OK);
-    A ex; ex.t(lat).t(w).t(gg).t(q8).t(sc).tnull().i("M", m).i("heads", H).i("k_dim", kd)
-        .i("v_dim", vd).i("latent_dim", L).i("group", group).s("dtype", "bf16");
-    REQUIRE_EQ(run("mla_expand_gate_had_quant_i8g", ex), (int)RAD_OK);
-
-    A one; one.t(g.q).t(g.qr).t(g.kv).t(g.bt).t(g.su).t(g.cu).t(g.sinks).t(lat2).t(w).t(gg).t(q82)
-        .t(sc2).tnull().i("M", m).i("heads", H).i("latent_dim", L).i("rope_dim", 4)
-        .i("block_size", 4).i("window", 0).d("scale", scale).s("dtype", "bf16").i("stable", 1)
-        .i("k_dim", kd).i("v_dim", vd).i("group", group);
-    REQUIRE_EQ(run("mla_attn_paged_sink_expand_i8g", one), (int)RAD_OK);
-    /* The latent, the codes and the scales: byte for byte, and a value that says the pair wrote them. */
-    int bad = 0;
-    for (int64_t i = 0; i < m * H * L && bad < 3; ++i)
-        if (ld_dt(RAD_BF16, lat.t.data, i) != ld_dt(RAD_BF16, lat2.t.data, i)) {
-            CHECK_EQ(ld_dt(RAD_BF16, lat2.t.data, i), ld_dt(RAD_BF16, lat.t.data, i)); ++bad;
-        }
-    CHECK(m * H * L > 0 && ld_dt(RAD_BF16, lat.t.data, 0) != 0.0f);
-    bad = 0;
-    for (int64_t i = 0; i < m * n && bad < 3; ++i)
-        if (ld_int(RAD_I8, q8.t.data, i) != ld_int(RAD_I8, q82.t.data, i)) {
-            CHECK_EQ(ld_int(RAD_I8, q82.t.data, i), ld_int(RAD_I8, q8.t.data, i)); ++bad;
-        }
-    CHECK(ld_int(RAD_I8, q8.t.data, 0) != 0);
-    bad = 0;
-    for (int64_t i = 0; i < m * n / group && bad < 3; ++i)
-        if (ld_dt(RAD_F32, sc.t.data, i) != ld_dt(RAD_F32, sc2.t.data, i)) {
-            CHECK_EQ(ld_dt(RAD_F32, sc2.t.data, i), ld_dt(RAD_F32, sc.t.data, i)); ++bad;
-        }
-    /* The plane, where a caller asks for it, is the pair's bf16 product too. */
-    A ex2; ex2.t(lat).t(w).t(gg).t(q8).t(sc).t(y).i("M", m).i("heads", H).i("k_dim", kd)
-        .i("v_dim", vd).i("latent_dim", L).i("group", group).s("dtype", "bf16");
-    REQUIRE_EQ(run("mla_expand_gate_had_quant_i8g", ex2), (int)RAD_OK);
-    A one2; one2.t(g.q).t(g.qr).t(g.kv).t(g.bt).t(g.su).t(g.cu).t(g.sinks).t(lat2).t(w).t(gg).t(q82)
-        .t(sc2).t(y2).i("M", m).i("heads", H).i("latent_dim", L).i("rope_dim", 4)
-        .i("block_size", 4).i("window", 0).d("scale", scale).s("dtype", "bf16").i("stable", 1)
-        .i("k_dim", kd).i("v_dim", vd).i("group", group);
-    REQUIRE_EQ(run("mla_attn_paged_sink_expand_i8g", one2), (int)RAD_OK);
-    bad = 0;
-    for (int64_t i = 0; i < m * n && bad < 3; ++i)
-        if (ld_dt(RAD_BF16, y.t.data, i) != ld_dt(RAD_BF16, y2.t.data, i)) {
-            CHECK_EQ(ld_dt(RAD_BF16, y2.t.data, i), ld_dt(RAD_BF16, y.t.data, i)); ++bad;
-        }
-    CHECK(ld_dt(RAD_BF16, y.t.data, 0) != 0.0f);
-}
-
-TEST(k15_the_fused_op_serves_the_sliding_geometry_and_is_the_pair_there_too) {
-    /* The geometry the plugin declares it at (Hy4-flash at TP2: 32 heads sparse, 16 sliding), with the
-     * group the codes are read at and the token heights a decode step has. */
-    const int64_t M = 4, H = 16, L = 512, R = 64, kd = 192, vd = 256, group = 128, n = H * vd, bs = 4;
-    const int64_t pages = (M + bs - 1) / bs;
-    T q(RAD_BF16, {M, H, L}), qr(RAD_BF16, {M, H, R}), kv(RAD_BF16, {pages, 1, bs, L + R}),
-      bt(RAD_I32, {1, pages}), su(RAD_I32, {1}), cu(RAD_I32, {2}), sinks(RAD_F32, {H}),
-      lat(RAD_BF16, {M, H, L}), lat2(RAD_BF16, {M, H, L}), w(RAD_BF16, {H * (kd + vd), L}),
-      gg(RAD_BF16, {M, n}), q8(RAD_I8, {M, n}), q82(RAD_I8, {M, n}), sc(RAD_F32, {M, n / group}),
-      sc2(RAD_F32, {M, n / group});
-    for (int64_t i = 0; i < M * H * L; ++i) st_dt(RAD_BF16, q.t.data, i, 0.1f * (float)((i * 13) % 29) - 1.4f);
-    for (int64_t i = 0; i < M * H * R; ++i) st_dt(RAD_BF16, qr.t.data, i, 0.2f * (float)((i * 7) % 19) - 1.9f);
-    for (int64_t i = 0; i < pages * bs * (L + R); ++i) st_dt(RAD_BF16, kv.t.data, i, 0.05f * (float)((i * 17) % 23) - 0.5f);
-    for (int64_t i = 0; i < H * (kd + vd) * L; ++i) st_dt(RAD_BF16, w.t.data, i, 0.01f * (float)((i * 37) % 41) - 0.2f);
-    for (int64_t i = 0; i < M * n; ++i) st_dt(RAD_BF16, gg.t.data, i, 0.1f * (float)((i * 11) % 17) - 0.8f);
-    for (int64_t i = 0; i < H; ++i) st_dt(RAD_F32, sinks.t.data, i, 0.5f - 0.1f * (float)i);
-    bt.n({0}); su.n({M}); cu.n({0, M});
-    const double scale = std::pow((double)(L + R), -0.5);
-    A sink; sink.t(q).t(qr).t(kv).t(bt).t(su).t(cu).t(sinks).t(lat).i("M", M).i("heads", H)
-        .i("latent_dim", L).i("rope_dim", R).i("block_size", bs).i("window", 0).d("scale", scale)
-        .s("dtype", "bf16");
-    REQUIRE_EQ(run("mla_attn_paged_sink", sink), (int)RAD_OK);
-    A ex; ex.t(lat).t(w).t(gg).t(q8).t(sc).tnull().i("M", M).i("heads", H).i("k_dim", kd)
-        .i("v_dim", vd).i("latent_dim", L).i("group", group).s("dtype", "bf16");
-    REQUIRE_EQ(run("mla_expand_gate_had_quant_i8g", ex), (int)RAD_OK);
-    A one; one.t(q).t(qr).t(kv).t(bt).t(su).t(cu).t(sinks).t(lat2).t(w).t(gg).t(q82).t(sc2).tnull()
-        .i("M", M).i("heads", H).i("latent_dim", L).i("rope_dim", R).i("block_size", bs).i("window", 0)
-        .d("scale", scale).s("dtype", "bf16").i("stable", 1).i("k_dim", kd).i("v_dim", vd)
-        .i("group", group);
-    REQUIRE_EQ(run("mla_attn_paged_sink_expand_i8g", one), (int)RAD_OK);
-    int bad = 0;
-    for (int64_t i = 0; i < M * H * L && bad < 3; ++i)
-        if (ld_dt(RAD_BF16, lat.t.data, i) != ld_dt(RAD_BF16, lat2.t.data, i)) {
-            CHECK_EQ(ld_dt(RAD_BF16, lat2.t.data, i), ld_dt(RAD_BF16, lat.t.data, i)); ++bad;
-        }
-    for (int64_t i = 0; i < M * n && bad < 3; ++i)
-        if (ld_int(RAD_I8, q8.t.data, i) != ld_int(RAD_I8, q82.t.data, i)) {
-            CHECK_EQ(ld_int(RAD_I8, q82.t.data, i), ld_int(RAD_I8, q8.t.data, i)); ++bad;
-        }
-    for (int64_t i = 0; i < M * n / group && bad < 3; ++i)
-        if (ld_dt(RAD_F32, sc.t.data, i) != ld_dt(RAD_F32, sc2.t.data, i)) {
-            CHECK_EQ(ld_dt(RAD_F32, sc2.t.data, i), ld_dt(RAD_F32, sc.t.data, i)); ++bad;
-        }
 }
 
 TEST(the_absorbed_path_equals_the_non_absorbed_path_on_the_same_inputs) {

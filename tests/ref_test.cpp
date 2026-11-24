@@ -1261,7 +1261,7 @@ TEST(op_vocabulary) {
         "swiglu_step", "router_sigmoid_group_topk", "mla_attn_paged",
         /* Hy4-flash: independent hyper-connections, sink attention, the compressed indexer, Engram. */
         "ihc_pre", "ihc_post", "mla_project_kv", "mla_attn_paged_sink", "mla_attn_sel_sink",
-        "mla_kv_split", "attn_kv_sink", "gate_mul", "mla_attn_paged_sink_expand_i8g", "mla_expand_gate", "swiglu_clamped_had_quant_i8g", "mla_expand_gate_had_quant_i8g", "idx_pool_gated", "idx_score", "engram_ids",
+        "mla_kv_split", "attn_kv_sink", "gate_mul", "mla_expand_gate", "swiglu_clamped_had_quant_i8g", "mla_expand_gate_had_quant_i8g", "idx_pool_gated", "idx_score", "engram_ids",
         "engram_norm", "engram_gate", "idx_pool_gated_fp8", "idx_pool_gated_i8", "dsa_query_i8", "dfly_sel", "rmsnorm_ihc_junction",
         "kda_update", "ssd_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
@@ -10837,10 +10837,6 @@ std::vector<Geo> geometries() {
         G("mla_attn_paged_sink", "M", 3, a.i("M", R).i("heads", 2).i("latent_dim", 8).i("rope_dim", 4)
                                             .i("block_size", 4).i("window", 3).d("scale", 0.25)
                                             .i("ctx", 6).s("dtype", "f32")),
-        G("mla_attn_paged_sink_expand_i8g", "M", 3,
-          a.i("M", R).i("heads", 2).i("latent_dim", 8).i("rope_dim", 4).i("block_size", 4)
-           .i("window", 3).d("scale", 0.25).i("ctx", 6).i("k_dim", 4).i("v_dim", 16)
-           .i("group", 16).s("dtype", "f32")),
         G("mla_attn_sel_sink", "M", 3, a.i("M", R).i("heads", 2).i("latent_dim", 8).i("rope_dim", 4)
                                           .i("blocks", 2).i("block_size", 4).d("scale", 0.25)
                                           .s("dtype", "f32")),

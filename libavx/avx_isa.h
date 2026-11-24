@@ -85,7 +85,6 @@ int         avx_par_force(int threads);
     X(mla_attn)                                                                                   \
     X(ihc_pre)              X(ihc_post)             X(mla_project_kv)       X(mla_kv_split)       \
     X(rmsnorm_ihc_junction)                                                                       \
-    X(mla_attn_paged_sink_expand_i8g)                                                     \
     X(mla_attn_paged_sink)  X(mla_attn_sel_sink)    X(attn_kv_sink)         X(gate_mul)           \
     X(idx_pool_gated)       X(idx_score)            X(engram_ids)           X(engram_norm)        \
     X(engram_gate)          X(idx_pool_gated_fp8)   X(mla_expand_gate)      X(dfly_sel)           \

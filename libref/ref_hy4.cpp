@@ -628,28 +628,6 @@ int ref_mla_expand_gate_had_quant_i8g(const RadArgs* a, RadStream s) {
     return ref_had_quant_act_i8g(&q, s);
 }
 
-/* mla_attn_paged_sink_expand_i8g (K-15): mla_attn_paged_sink and then mla_expand_gate_had_quant_i8g
- * on the latent it wrote, which is the fused op's contract and its bytes: the kernel's fold applies
- * merge_sink's per-column rule to the same partials, so the latent and everything after it agree bit
- * for bit. Operands: q, q_rope, kv, block_table, seqused, cu_seqlens, sinks, out (the latent), then
- * the expand's x (that same out), w, g, q8, scale, out_bf16?. */
-int ref_mla_attn_paged_sink_expand_i8g(const RadArgs* a, RadStream s) {
-    if (!a || a->n_t < 12) return RAD_E_INVAL;
-    RadTensor st[8] = { a->t[0], a->t[1], a->t[2], a->t[3],
-                        a->t[4], a->t[5], a->t[6], a->t[7] };
-    RadArgs sink = *a;
-    sink.t = st;
-    sink.n_t = 8;
-    const int rc = ref_mla_attn_paged_sink(&sink, s);
-    if (rc != RAD_OK) return rc;
-    const bool y = a->n_t > 12 && a->t[12].data != nullptr;
-    RadTensor et[6] = { a->t[7], a->t[8], a->t[9], a->t[10], a->t[11], y ? a->t[12] : RadTensor{} };
-    RadArgs ex = *a;
-    ex.t = et;
-    ex.n_t = 6;   /* the absent plane is a null tensor, not a shorter array (abi rule) */
-    return ref_mla_expand_gate_had_quant_i8g(&ex, s);
-}
-
 /* ================================================================== the compressed indexer */
 
 namespace {

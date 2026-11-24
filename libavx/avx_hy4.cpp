@@ -735,27 +735,6 @@ AVX_KERNEL(mla_expand_gate_had_quant_i8g) {
     return AVX_FN(avx_had_quant_act_i8g)(&q, stream);
 }
 
-/* mla_attn_paged_sink_expand_i8g (K-15): mla_attn_paged_sink and then mla_expand_gate_had_quant_i8g
- * on the latent it wrote -- the fused op's contract and, since the kernel's fold is merge_sink's rule
- * per column, its bytes. Operands: the sink's eight, then the expand's x (that same `out`), w, g,
- * q8, scale, out_bf16?. */
-AVX_KERNEL(mla_attn_paged_sink_expand_i8g) {
-    if (!rad_args_have(a, 11)) return RAD_E_INVAL;
-    RadTensor st[8] = { a->t[0], a->t[1], a->t[2], a->t[3],
-                        a->t[4], a->t[5], a->t[6], a->t[7] };
-    RadArgs sink = *a;
-    sink.t = st;
-    sink.n_t = 8;
-    int rc = AVX_FN(avx_mla_attn_paged_sink)(&sink, stream);
-    if (rc != RAD_OK) return rc;
-    const bool y = a->n_t > 12 && a->t[12].data != nullptr;
-    RadTensor et[6] = { a->t[7], a->t[8], a->t[9], a->t[10], a->t[11], y ? a->t[12] : RadTensor{} };
-    RadArgs ex = *a;
-    ex.t = et;
-    ex.n_t = 6;   /* the absent plane is a null tensor, not a shorter array (abi rule) */
-    return AVX_FN(avx_mla_expand_gate_had_quant_i8g)(&ex, stream);
-}
-
 /* ================================================================== the compressed indexer */
 
 namespace {

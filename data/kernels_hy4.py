@@ -301,12 +301,6 @@ def dfly(base, rec, out):
 #   python3 data/kernels_hy4.py g3 raw_g3.rkb
 #   rad-kbench --fixture raw_g3.rkb --kernels libref --rerecord g3.rkb
 #   python3 data/kernels_hy4.py append data/kernels_hy4.rkb g3.rkb data/kernels_hy4.rkb
-#   python3 data/kernels_hy4.py k15 k15.rkb
-#   # K-15: record it (a card: the ref runs the composition) and bench the fused row against the pair
-#   ./build/bin/rad-kbench --home build/radiance_home --kernels libref --fixture k15.rkb --rerecord k15r.rkb
-#   ./build/bin/rad-kbench --home build/radiance_home --bench --kernels libr4d:libref \
-#       --fixture k15r.rkb --report k15.md
-#   python3 data/kernels_hy4.py append data/kernels_hy4.rkb k15r.rkb data/kernels_hy4.rkb
 BF16, F32, I32, I8 = 3, 1, 11, 8
 IN_, OUT_, W_ = 0, 1, 3
 PINT, PSTR, PF64 = 1, 2, 4
@@ -350,59 +344,6 @@ def g3c_cases(base):
                 out.append(mkcase('mla_expand_gate_had_quant_i8g', M, p, ops,
                                   f"g3c mla_expand_gate_had_quant_i8g M={M} H={H}{' +plane' if plane else ''}", salt)); salt += 1
     return out
-def k15_cases(base):
-    """mla_attn_paged_sink_expand_i8g beside the two launches it replaces (K-15), at the TP2 / TP4 head
-    shares, the decode-class heights and both slot counts (window 0 is the 20-slot law, 512 the 8-slot
-    one): the fused row, then mla_attn_paged_sink and mla_expand_gate_had_quant_i8g at the same M and H
-    as its baseline. One sequence, its page table (block 4), with and without the bf16 plane. The heights
-    straddle both of the plugin's row bounds (`sink_fold_rows`: four rows at the 20-slot law, eight at the
-    8-slot one -- where the fold stops paying), and the baseline rows are the pair the fused row replaces:
-    sum the sink and the expand of the same M and H."""
-    out, salt = [], base
-    for H in (16, 8, 32):
-        for M in (1, 2, 3, 4, 6, 8, 16, 17, 64):
-            if H != 16 and M not in (1, 17, 64): continue
-            pages = (M + 3) // 4
-            ng = H * 256 // 128
-            head_p = [('heads', H), ('latent_dim', 512), ('rope_dim', 64), ('block_size', 4)]
-            tail_p = [('scale', 0.0625), ('dtype', 'bf16')]
-            sink_ops = [(IN_, BF16, (M, H, 512)), (IN_, BF16, (M, H, 64)),
-                        (IN_, BF16, (pages, 1, 4, 576)), (IN_, I32, (1, pages)),
-                        (IN_, I32, (1,)), (IN_, I32, (2,)), (W_, F32, (H,)),
-                        (OUT_, BF16, (M, H, 512))]
-            # The index operands draw as their op describes them: a page id below `pages`, the row count
-            # as a constant, and cu_seqlens cumulative (flags 1 = an index, | 4 = the cumulative form).
-            idx = ((3, dict(idx_max=pages, idx_const=-1, flags=1)),
-                   (4, dict(idx_max=0, idx_const=M, flags=1)),
-                   (5, dict(idx_max=M, idx_const=-1, flags=5)))
-            plane_op = (OUT_, BF16, (M, H * 256), 'plane')
-            for plane in (False, True):
-                ex = mkcase('mla_expand_gate_had_quant_i8g', M,
-                            [('M', M), ('heads', H), ('k_dim', 192), ('v_dim', 256), ('latent_dim', 512),
-                             ('group', 128), ('dtype', 'bf16')],
-                            [(IN_, BF16, (M, H, 512)), (W_, BF16, (H * 448, 512)),
-                             (IN_, BF16, (M, H * 256)), (OUT_, I8, (M, H * 256)), (OUT_, F32, (M, ng))],
-                            f"k15 mla_expand_gate_had_quant_i8g M={M} H={H}{' +plane' if plane else ''}", salt)
-                ex['opd'].append(dict(role=OUT_, dtype=BF16, shape=[M, H * 256], absent=0 if plane else 1,
-                                      fill=0, flags=0, idx_max=0, idx_const=-1, fill_chunk=0, has_enc=0))
-                out.append(ex); salt += 1
-                for window in (0, 512):
-                    par = [('M', M)] + head_p + [('window', window)] + tail_p
-                    c = mkcase('mla_attn_paged_sink_expand_i8g', M,
-                               par + [('k_dim', 192), ('v_dim', 256), ('group', 128)],
-                               sink_ops + [(W_, BF16, (H * 448, 512)),
-                                           (IN_, BF16, (M, H * 256)), (OUT_, I8, (M, H * 256)),
-                                           (OUT_, F32, (M, ng)), plane_op],
-                               f"k15 mla_attn_paged_sink_expand_i8g M={M} H={H} w{window}"
-                               f"{' +plane' if plane else ''}", salt)
-                    for i, kv in idx: c['opd'][i].update(kv)
-                    c['opd'][-1]['absent'] = 0 if plane else 1
-                    out.append(c); salt += 1
-                    s1 = mkcase('mla_attn_paged_sink', M, par, sink_ops,
-                                f"k15 mla_attn_paged_sink M={M} H={H} w{window}", salt)
-                    for i, kv in idx: s1['opd'][i].update(kv)
-                    out.append(s1); salt += 1
-    return out
 def g3b_cases(src, base):
     """rmsnorm_ihc_junction with the next norm's rotated int8 codes (`group` 128, xq / xs operands): the recorded
     tail junction points (gpu-mini n 512, the n 3072 clones) at M 1, 6, 8, 16, 64, with and without the addend."""
@@ -420,11 +361,6 @@ def g3b_cases(src, base):
         d['band'] = c['band'] + ' +codes'
         out.append(d)
     return out
-def k15(out):
-    cases = k15_cases(0x91500000)
-    fx = dict(version=6, samples=1024, source='hy4-flash K-15, merge_sink folded into the expand', oracle='libref',
-              recorded='2026-11-24', cases=cases)
-    save(fx, out); print(len(cases), 'cases ->', out)
 def g3(out, src='data/kernels_hy4.rkb'):
     cases = g3a_cases(0x93a00000) + g3b_cases(src, 0x93b00000) + g3c_cases(0x93c00000)
     fx = dict(version=6, samples=1024, source='hy4-flash G-3 fused launches (levers-general L3)', oracle='libref',
@@ -432,4 +368,4 @@ def g3(out, src='data/kernels_hy4.rkb'):
     save(fx, out); print(len(cases), 'cases ->', out)
 
 if __name__ == '__main__':
-    {'raw': raw, 'merge': merge, 'vis': vis, 'wp163': wp163, 'junction': junction, 'append': append, 'dfly': dfly, 'g3': g3, 'k15': k15}[sys.argv[1]](*sys.argv[2:])
+    {'raw': raw, 'merge': merge, 'vis': vis, 'wp163': wp163, 'junction': junction, 'append': append, 'dfly': dfly, 'g3': g3}[sys.argv[1]](*sys.argv[2:])

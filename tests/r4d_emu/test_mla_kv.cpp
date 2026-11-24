@@ -15,7 +15,6 @@
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
-#include "r4d_mla_sink_fold.h"
 #include "ref_host.h"
 #include <cmath>
 #include <cstdint>
@@ -54,7 +53,6 @@ struct Rng {
 
 static RadParam pi(const char* k, long long v) { RadParam p{}; p.key = k; p.kind = RAD_P_INT; p.ival = v; return p; }
 static RadParam ps(const char* k, const char* v) { RadParam p{}; p.key = k; p.kind = RAD_P_STR; p.sval = v; return p; }
-static RadParam pf(const char* k, double v) { RadParam p{}; p.key = k; p.kind = RAD_P_F64; p.dval = v; return p; }
 
 static int g_fails = 0, g_cases = 0;
 static void ok(bool good, const std::string& what) {
@@ -193,152 +191,6 @@ static bool vs_libref(const Draw& d, bool absorb, const std::vector<uint16_t>& g
     return bad == 0;
 }
 
-/* ---- K-15: the sink's slots folded into the expansion's workgroup -------------------------- */
-
-/* A host buffer whose first byte is 16-byte aligned, as the ops' checks require. */
-struct Buf {
-    std::vector<char> mem;
-    char* base = nullptr;
-    void alloc(size_t bytes) {
-        mem.assign(bytes + 64, 0);
-        base = mem.data() + ((16 - ((uintptr_t)mem.data() & 15)) & 15);
-    }
-    template <class T> T* as() { return (T*)base; }
-};
-
-static RadTensor bt_tensor(Buf& b, uint32_t dt, std::vector<int64_t> shape, int64_t elem) {
-    RadTensor t{};
-    t.data = b.base;
-    t.dtype = dt;
-    t.rank = (uint32_t)shape.size();
-    int64_t st = 1;
-    for (int i = (int)shape.size() - 1; i >= 0; --i) {
-        t.shape[i] = shape[i];
-        t.stride[i] = st;
-        st *= shape[i];
-    }
-    (void)elem;
-    return t;
-}
-
-/* `run` with the op's own scratch: the sink writes its partials there and the fused op folds them. */
-static int run_scratch(RadLaunchFn fn, int64_t (*scratch)(const RadArgs*), std::vector<RadTensor> t,
-                       std::vector<RadParam> p, MlaSinkForm* form = nullptr) {
-    RadArgs a{};
-    a.t = t.data(); a.n_t = (int)t.size(); a.p = p.data(); a.n_p = (int)p.size(); a.world_size = 1;
-    const int64_t need = scratch ? scratch(&a) : 0;
-    Buf mem;
-    mem.alloc((size_t)std::max<int64_t>(need, 0));
-    a.scratch = mem.base;
-    a.scratch_bytes = need > 0 ? need : 0;
-    if (!form) return fn(&a, nullptr);
-    return mla_sink_launch(&a, nullptr, form);
-}
-
-/* mla_attn_paged_sink_expand_i8g against the ops it replaces, bit for bit: the sink splits at
- * window 0, so the expansion's workgroup folds its head's partials into LDS (merge_sink's rule a
- * column at a time), and nothing of the latent, the codes, the scales or the gated product may
- * move. Two sequences, 8 and 32 heads (the sink's workgroup and four tiles), at both windows, and
- * the latent as a shape hook describes it ([rows, heads, latent], `lat_rank` 3) or as the plugin
- * hands it ([rows, heads * latent], 2) -- the fold writes a head's slice of a row either way. */
-static void sink_expand_fold_case(int64_t H, int64_t rows_per_seq, int64_t ctx_len, int64_t bs,
-                                  int window, uint32_t seed, int lat_rank = 3) {
-    const int64_t S = 2, M = rows_per_seq * S;
-    const int64_t blocks = (ctx_len + bs - 1) / bs, pages = S * blocks + 2;
-    const int64_t nv = H * kVd, ng = nv / 128;
-    Rng rng(seed);
-    Buf q, qr, kv, w, g, sinks, lat_a, lat_b, q8a, q8b, s8a, s8b, ya, yb, tbl, used, cu;
-    q.alloc((size_t)(M * H * kL * 2));      qr.alloc((size_t)(M * H * 64 * 2));
-    kv.alloc((size_t)(pages * bs * (kL + 64) * 2));
-    w.alloc((size_t)(H * (kKd + kVd) * kL * 2));  g.alloc((size_t)(M * nv * 2));
-    sinks.alloc((size_t)(H * 4));
-    lat_a.alloc((size_t)(M * H * kL * 2));  lat_b.alloc((size_t)(M * H * kL * 2));
-    q8a.alloc((size_t)(M * nv));            q8b.alloc((size_t)(M * nv));
-    s8a.alloc((size_t)(M * ng * 4));        s8b.alloc((size_t)(M * ng * 4));
-    ya.alloc((size_t)(M * nv * 2));         yb.alloc((size_t)(M * nv * 2));
-    tbl.alloc((size_t)(S * blocks * 4));    used.alloc((size_t)(S * 4));
-    cu.alloc((size_t)((S + 1) * 4));
-    for (int64_t i = 0; i < M * H * kL; ++i) q.as<uint16_t>()[i] = f2b(0.4f * rng.n());
-    for (int64_t i = 0; i < M * H * 64; ++i) qr.as<uint16_t>()[i] = f2b(0.4f * rng.n());
-    for (int64_t i = 0; i < pages * bs * (kL + 64); ++i) kv.as<uint16_t>()[i] = f2b(rng.n());
-    for (int64_t i = 0; i < H * (kKd + kVd) * kL; ++i) w.as<uint16_t>()[i] = f2b(0.05f * rng.n());
-    for (int64_t i = 0; i < M * nv; ++i) g.as<uint16_t>()[i] = f2b(3.0f * rng.n());
-    for (int64_t h = 0; h < H; ++h) sinks.as<float>()[h] = 0.5f + 0.25f * (float)h;
-    for (int64_t s = 0; s < S; ++s) {
-        used.as<int32_t>()[s] = (int32_t)ctx_len;
-        cu.as<int32_t>()[s] = (int32_t)(s * rows_per_seq);
-        for (int64_t b = 0; b < blocks; ++b) tbl.as<int32_t>()[s * blocks + b] = (int32_t)(s * blocks + b);
-    }
-    cu.as<int32_t>()[S] = (int32_t)M;
-    const double scale = 1.0 / std::sqrt((double)(kL + 64));
-    std::vector<RadParam> sp = { pi("M", M), pi("heads", H), pi("latent_dim", kL),
-                                 pi("rope_dim", 64), pi("block_size", bs), pi("window", window),
-                                 pf("scale", scale), ps("dtype", "bf16"),
-                                 pi("stable", 1) };
-    std::vector<RadParam> ep = { pi("M", M), pi("heads", H), pi("k_dim", kKd), pi("v_dim", kVd),
-                                 pi("latent_dim", kL), pi("group", 128), ps("dtype", "bf16") };
-    std::vector<RadParam> fp = sp;
-    for (const RadParam& e : ep) {
-        bool have = false;
-        for (const RadParam& f : fp) have = have || !std::strcmp(f.key, e.key);
-        if (!have) fp.push_back(e);
-    }
-    const RadTensor tq = bt_tensor(q, RAD_BF16, { M, H, kL }, 2),
-                    tqr = bt_tensor(qr, RAD_BF16, { M, H, 64 }, 2),
-                    tkv = bt_tensor(kv, RAD_BF16, { pages, 1, bs, kL + 64 }, 2),
-                    ttbl = bt_tensor(tbl, RAD_I32, { S, blocks }, 4),
-                    tused = bt_tensor(used, RAD_I32, { S }, 4),
-                    tcu = bt_tensor(cu, RAD_I32, { S + 1 }, 4),
-                    tsk = bt_tensor(sinks, RAD_F32, { H }, 4),
-                    tla = bt_tensor(lat_a, RAD_BF16,
-                                    lat_rank >= 3 ? std::vector<int64_t>{ M, H, kL }
-                                                  : std::vector<int64_t>{ M, H * kL }, 2),
-                    tlb = bt_tensor(lat_b, RAD_BF16,
-                                    lat_rank >= 3 ? std::vector<int64_t>{ M, H, kL }
-                                                  : std::vector<int64_t>{ M, H * kL }, 2),
-                    tw = bt_tensor(w, RAD_BF16, { H * (kKd + kVd), kL }, 2),
-                    tg = bt_tensor(g, RAD_BF16, { M, nv }, 2),
-                    tq8a = bt_tensor(q8a, RAD_I8, { M, nv }, 1),
-                    tq8b = bt_tensor(q8b, RAD_I8, { M, nv }, 1),
-                    ts8a = bt_tensor(s8a, RAD_F32, { M, ng }, 4),
-                    ts8b = bt_tensor(s8b, RAD_F32, { M, ng }, 4),
-                    tya = bt_tensor(ya, RAD_BF16, { M, nv }, 2),
-                    tyb = bt_tensor(yb, RAD_BF16, { M, nv }, 2);
-    char what[220];
-    /* the form the sink resolves to: the fold runs only where it splits and has not fused the row */
-    std::vector<RadTensor> sink_t = { tq, tqr, tkv, ttbl, tused, tcu, tsk, tla };
-    MlaSinkForm form{};
-    const int rc_form = run_scratch(nullptr, r4d_rad_mla_attn_paged_sink_scratch, sink_t, sp, &form);
-    std::snprintf(what, sizeof what,
-                  "K-15 heads %lld rank %d: the sink splits (%d slots a row, %d rows) and leaves the merge",
-                  (long long)H, lat_rank, form.splits, form.rows);
-    ok(rc_form == RAD_OK && form.splits > 1 && !form.fused && form.rows == M, what);
-    /* the three ops, in the plugin's order */
-    const int rc1 = run_scratch(r4d_rad_mla_attn_paged_sink, r4d_rad_mla_attn_paged_sink_scratch,
-                                sink_t, sp);
-    std::vector<RadTensor> exp_t = { tla, tw, tg, tq8a, ts8a, tya };
-    const int rc2 = run(r4d_rad_mla_expand_gate_had_quant_i8g, exp_t, ep);
-    std::vector<RadTensor> fuse_t = { tq, tqr, tkv, ttbl, tused, tcu, tsk, tlb, tw, tg, tq8b, ts8b, tyb };
-    const int rc3 = run_scratch(r4d_rad_mla_attn_paged_sink_expand_i8g,
-                                r4d_rad_mla_attn_paged_sink_scratch, fuse_t, fp);
-    std::snprintf(what, sizeof what, "K-15 heads %lld rank %d: the three ops and the fused one launch",
-                  (long long)H, lat_rank);
-    ok(rc1 == RAD_OK && rc2 == RAD_OK && rc3 == RAD_OK, what);
-    std::snprintf(what, sizeof what,
-                  "K-15 heads %lld rank %d: the fused op's latent is merge_sink's, bit for bit", (long long)H, lat_rank);
-    ok(std::memcmp(tla.data, tlb.data, (size_t)(M * H * kL * 2)) == 0, what);
-    std::snprintf(what, sizeof what,
-                  "K-15 heads %lld rank %d: the fused op's int8 codes and scales are the expansion's",
-                  (long long)H, lat_rank);
-    ok(std::memcmp(tq8a.data, tq8b.data, (size_t)(M * nv)) == 0 &&
-           std::memcmp(ts8a.data, ts8b.data, (size_t)(M * ng * 4)) == 0,
-       what);
-    std::snprintf(what, sizeof what,
-                  "K-15 heads %lld rank %d: the fused op's gated product is the expansion's",
-                  (long long)H, lat_rank);
-    ok(std::memcmp(tya.data, tyb.data, (size_t)(M * nv * 2)) == 0, what);
-}
-
 int main() {
     struct G { int64_t H, M; };
     for (const bool absorb : { true, false })
@@ -391,10 +243,6 @@ int main() {
                 ok(rc == RAD_OK && std::equal(tail.begin(), tail.end(), alone.begin() + 5 * yw), w);
             }
         }
-    for (const int64_t H : { (int64_t)8, (int64_t)32 })
-        for (const int window : { 0, 512 })
-            for (const int lat_rank : { 3, 2 })
-                sink_expand_fold_case(H, 2, 9, 4, window, (uint32_t)(H * 7 + window), lat_rank);
     std::printf("%d case(s), %d failure(s)\n", g_cases, g_fails);
     return g_fails ? 1 : 0;
 }

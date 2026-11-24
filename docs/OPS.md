@@ -3765,7 +3765,6 @@ refuses the graph rather than resolving a similar op.
 | `mla_project_kv` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `mode` `dtype` | `a`, `b`w → `y` |
 | `mla_expand_gate` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `dtype` | `x`, `w`w, `g` → `y` |
 | `mla_expand_gate_had_quant_i8g` | `M`(range) `heads` `k_dim` `v_dim` `latent_dim` `group` `dtype` | `x`, `w`w, `g` → `q`, `scale`, `out_bf16`? |
-| `mla_attn_paged_sink_expand_i8g` | `M`(range) `heads` `latent_dim` `rope_dim` `block_size` `window` `scale`:f64 `dtype` `stable`/opt `k_dim` `v_dim` `group` | `q`, `q_rope`, `kv`, `block_table`, `seqused`, `cu_seqlens`, `sinks`w, `out`, `w`w, `g` → `q8`, `scale`, `out_bf16`? |
 | `mla_attn_paged_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `block_size` `window` `scale`:f64 `dtype` `stable`/opt `row0`/opt | `q`, `q_rope`, `kv`, `block_table`, `seqused`, `cu_seqlens`, `sinks`w → `out` |
 | `mla_attn_sel_sink` | `M`(range) `heads` `latent_dim` `rope_dim` `blocks` `block_size` `scale`:f64 `dtype` `stable`/opt | `q`, `q_rope`, `kv`, `bt`, `length`, `sinks`w → `out` |
 | `mla_row_norm_rope_store` | `M`(range) `latent` `rope_dim` `eps`:f64 `theta`:f64 `scale`:f64/opt `mode`/opt `sections`/opt `block_size` `dtype` | `row`:inout, `w`w, `positions`, `slot_mapping`, `kv_cache`:inout |
@@ -3864,25 +3863,6 @@ bf16 before the product, as the pair stores and reads it. libref and libavx run 
 (their `mla_project_kv` expand, then their `gate_mul` in place); libr4d's fused row is held to its
 own pair byte for byte (rad-kbench's fusion oracle, `r4d_fuse.cpp`). A graph whose libraries lack
 the op issues the pair (`arch/hyv4flash`, `rad_op_declared`).
-
-`mla_attn_paged_sink_expand_i8g` (K-15) is `mla_attn_paged_sink` and `mla_expand_gate_had_quant_i8g`
-over its latent, in one call: the same operands in the same order, `out` the latent the expansion reads
-and, past it, `w`, `g` and the expansion's three outputs. Where the sink splits a row (its scratch form)
-the expansion's workgroup folds the row's partials with `merge_sink`'s rule before it multiplies, so the
-merge and the latent's round trip go and `out` holds exactly the bytes `merge_sink` writes: libref and
-libavx run the pair itself; `tests/r4d_emu/test_mla_kv.cpp` runs the fold itself and holds it to
-`merge_sink` and to the expansion on the folded latent byte for byte; and libr4d's row declares the
-pair's chain as its `replaces` (`mla_attn_paged_sink`, then `mla_expand_gate_had_quant_i8g` over the
-latent it wrote, `r4d_fuse.cpp`), which rad-kbench's fusion oracle runs. A call whose sink form is one
-pass (no split to fold: the sink wrote the latent itself) runs the pair's two kernels inside the one
-call, the second the plain expansion; a step whose expansion is not fused keeps the two calls. The
-plugin issues the one call for a whole-step paged decode up to a row bound that follows the sink's split
-law -- four rows where it splits 20 ways (no window), eight where it splits 8 (a window): the fold reads
-the partials through `heads * ceil(rows / 16)` workgroups, which off the small step cannot fill the
-memory system, and rad-kbench at 16 heads measures the fused launch 15 % of the pair faster at one to
-two rows at the first law and 2-6 % at three to four, 5.5-9 % slower at six, 16-17 % at eight and
-24-67 % from sixteen to seventeen, and 4-17 % faster at one to eight rows at the second, 15 % slower
-at sixteen (`data/kernels_hy4.py k15`).
 
 `mla_expand_gate_had_quant_i8g` (G-3c, levers-general L3) is `mla_expand_gate` followed by
 `had_quant_act_i8g` over its `[M, heads * v_dim]` product (`group` 128): `q` int8 `[M, heads * v_dim]`,
