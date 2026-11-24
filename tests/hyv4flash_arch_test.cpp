@@ -210,6 +210,42 @@ TEST(the_probe_reports_a_resumable_layer_range) {
 
 void int8_trunk_encs(RadBuilder* b);   /* defined with the quantised recipes below */
 
+/* S-02: a graph that reads the trunk between two ops is refused, not run on the wrong rows: the
+ * debug taps, a calibration window and a calibration directory each declare their own ops there.
+ * The same context without layer_slices declares, so the refusal is the engine's question, not the
+ * context. */
+TEST(a_sliced_declare_is_refused_where_the_trunk_is_read_between_layers) {
+    for (int which = 0; which < 3; ++which) {
+        /* A calibration directory that exists, so the unsliced control gets past opening it. */
+        char tmp[] = "/tmp/hyv4-slice-XXXXXX";
+        const char* dir = which == 2 ? mkdtemp(tmp) : nullptr;
+        REQUIRE(which != 2 || dir != nullptr);
+        RadBuilder b;
+        bf16_encs(&b);
+        RadBuildCtx ctx = build_ctx();
+        RadBuilder b0;                     /* the same context, unsliced */
+        bf16_encs(&b0);
+        RadBuildCtx ctx0 = build_ctx();
+        if (which == 0) setenv("RADIANCE_HY4_TAPS", "1", 1);
+        if (which == 1) ctx.calib_layer_hi = ctx0.calib_layer_hi = 2;
+        if (which == 2) ctx.calib_dir = ctx0.calib_dir = dir;
+        ctx.calib_tokens = ctx0.calib_tokens = which == 2 ? 100 : 0;
+        ctx.layer_slices = 4;
+        int rc = 0, rc0 = 0;
+        std::string err;
+        {
+            G3Env g3env;
+            err = stderr_of([&] { rc = hyv4flash::declare(&b, mini_meta().meta(), &ctx); });
+            (void)stderr_of([&] { rc0 = hyv4flash::declare(&b0, mini_meta().meta(), &ctx0); });
+        }
+        unsetenv("RADIANCE_HY4_TAPS");
+        CHECK(rc != RAD_OK);
+        CHECK(err.find("layer slicing") != std::string::npos);
+        CHECK_EQ(rc0, RAD_OK);
+        if (dir) rmdir(dir);
+    }
+}
+
 /* S-02b: the graph the engine asks to slice (RadBuildCtx::layer_slices) declares the state a
  * sub-step resumes from as persistent (design §3): the chunk's streams, the block input a junction
  * left open and its post gates, and the int8 codes pairs a slice's junction wrote for the next
