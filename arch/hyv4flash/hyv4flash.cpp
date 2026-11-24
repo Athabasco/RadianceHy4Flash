@@ -1546,20 +1546,22 @@ static void step(RadCtx* c, const RadBatch* batch) {
         l.t_resid.step(c, brows(m.tr.h, rows.n), rows.n);
         entered = je && l.j_end.tail;
     }
-    /* S-02: `rows.n` is the extent of the layer the loop ended on, so a sub-step that ran the
-     * trunk's end heads the chunk's rows with the unsliced result, and one that stopped between two
-     * layers heads the decode band's alone (the chunk's final_hidden waits for the last sub-step).
-     * A sliced prefill's middle sub-step has no rows here and issues nothing. */
-    if (rows.n) {
-        if (!entered) m.hc_head.pre(c, m.tr.h, m.tr.x, 0, rows.n);
-        m.t_hc_head.step(c, brows(m.tr.x, rows.n), rows.n);
+    /* S-02: the head runs the chunk's rows only on the sub-step that ran the trunk's end; one that
+     * stopped between two layers heads the decode band's rows alone, whose streams are complete and
+     * whose token the sampler takes this step, and leaves the chunk's final_hidden for the last
+     * sub-step. `rows.n` is the extent of the layer the loop ended on, which in the slice is the
+     * whole step: hence the cap, not the extent. */
+    const int64_t hn = hi >= last ? rows.n : std::min<int64_t>(rows.n, p.DT);
+    if (hn) {
+        if (!entered) m.hc_head.pre(c, m.tr.h, m.tr.x, 0, hn);
+        m.t_hc_head.step(c, brows(m.tr.x, hn), hn);
         if (!entered)
-            RAD_ISSUE_N(c, m.op_norm, rows.n, brows(m.tr.x, rows.n), RAD_W(m.final_gain),
-                        brows(m.final_hidden, rows.n));
-        m.t_final.step(c, brows(m.final_hidden, rows.n), rows.n);
+            RAD_ISSUE_N(c, m.op_norm, hn, brows(m.tr.x, hn), RAD_W(m.final_gain),
+                        brows(m.final_hidden, hn));
+        m.t_final.step(c, brows(m.final_hidden, hn), hn);
         if (rows.ids) {
             /* The sampler and the next draft pass both address the original trunk rows. */
-            for (int64_t end = rows.n; end > 0;) {
+            for (int64_t end = hn; end > 0;) {
                 int64_t start = end - 1;
                 while (start && rows.ids[start - 1] + 1 == rows.ids[start]) --start;
                 move_rows(c, m.unpack_hidden, m.final_hidden, E, start, rows.ids[start], end - start);

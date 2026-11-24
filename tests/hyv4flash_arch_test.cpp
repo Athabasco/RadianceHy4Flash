@@ -333,6 +333,59 @@ TEST(a_layer_slice_runs_the_layers_in_its_range_only) {
     CHECK_EQ(full_head, T);
 }
 
+/* S-02b: the head's rows are the decode band's until the sub-step that ran the trunk's end. The
+ * layer the loop ended on is not the extent to head: inside the slice it ran the whole step, so a
+ * sub-step that stopped between two layers would head the chunk's rows off a half-built trunk.
+ * With the junction chain off (RADIANCE_HY4_JUNCTION=0) the head's own norm writes final_hidden,
+ * so what it heads is its own and not the last junction's. */
+TEST(a_slice_heads_the_rows_its_own_trunk_ran) {
+    struct JOff {                        /* declared and stepped with the chain off */
+        std::string prev;
+        bool had = false;
+        JOff() {
+            const char* e = std::getenv("RADIANCE_HY4_JUNCTION");
+            if (e) had = true, prev = e;
+            setenv("RADIANCE_HY4_JUNCTION", "0", 1);
+        }
+        ~JOff() {
+            if (had) setenv("RADIANCE_HY4_JUNCTION", prev.c_str(), 1);
+            else unsetenv("RADIANCE_HY4_JUNCTION");
+        }
+    };
+    JOff joff;
+    Declared d(bf16_encs, 1, 0, false, 128, 4);
+    REQUIRE_EQ(d.rc, RAD_OK);
+    RadBuilder& b = d.b;
+    /* A prefill-only step (no decode band: nothing to head before the trunk's end) and a mixed one
+     * (one decode row, which is headed on every sub-step). */
+    for (int mixed = 0; mixed < 2; ++mixed) {
+        const int64_t T = 10, DT = mixed ? 1 : 0;
+        for (int32_t j = 0; j < 3; ++j) {
+            auto k = mixed ? kit(b, { (int)DT }, { (int)(T - DT) }) : kit(b, {}, { (int)T });
+            k->b.layer_lo = j;
+            k->b.layer_hi = j + 1;
+            if (j != 2) {                 /* a chunk finishing no sequence puts out no row */
+                k->b.n_out = (int32_t)DT;
+                static int32_t dec_out[] = { 0 };
+                k->b.out_ids = DT ? dec_out : nullptr;
+            }
+            RadCtx c{ .b = &b, .batch = &k->b };
+            hyv4flash::step(&c, &k->b);
+            CHECK(c.step_fail.empty());
+            CHECK_LINT(b, &c);
+            int64_t head = 0;
+            for (const auto& is : c.issues) {
+                const RecOp* o = b.op_of(is.op);
+                if (!o) continue;
+                for (rad_buf w : o->writes)
+                    if (w == hyv4flash::models[0]->final_hidden) head += is.n;
+            }
+            CHECK_EQ(head, j == 2 ? T : DT);
+            CHECK_EQ(count_issued(b, c, "logits_gemm"), (j == 2 || DT) ? 1 : 0);
+        }
+    }
+}
+
 /* S-02b: the decode band runs every layer of every sub-step, the chunk's rows only the layers of the
  * slice, and the head every sub-step over the extent the trunk's last layer ran (design §2.3): the
  * decode rows still produce a token each, and the chunk's final_hidden is written once, on the
