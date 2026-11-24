@@ -85,21 +85,14 @@ static const Flag g_flags[] = {
                                         "the decode rows between them: off (default), auto (m from\n"
                                         "--chunk-slice-target-ms and -cost-pct), or m itself (1-8).\n"
                                         "Only a model whose plugin reports it can run the trunk over\n"
-                                        "a layer range (RadArchProbe::slice_layers_ok) is sliced, and\n"
-                                        "never with the debug taps or a calibration window, which\n"
-                                        "read the trunk between two layers, so it is a no-op until\n"
-                                        "a plugin reports it" },
+                                        "a layer range (RadArchProbe::slice_layers_ok) is sliced, so\n"
+                                        "it is a no-op until a plugin reports it" },
     { "--chunk-slice-target-ms", "N",   "the duration a sub-step targets, in milliseconds; m follows\n"
                                         "from it and the learned chunk and decode step times\n"
                                         "(default 150)" },
     { "--chunk-slice-cost-pct", "N",    "the share of a chunk step's time the decode waits between\n"
                                         "two slices may pay, in percent (default 10); 0 caps m at 1\n"
                                         "and turns slicing off" },
-    { "--chunk-slices-prefill", "N",   "a test hook, not a lever: cut a prefill-only step (no\n"
-                                        "decode row) into m layer-sliced sub-steps, so a single-\n"
-                                        "stream greedy run serves a prompt both ways and the two\n"
-                                        "results must be identical. It pays the slice overhead and\n"
-                                        "gains nothing; off (the default) and 1 leave the step whole" },
     { "--prefill-room-gate",  "MODE",   "on: a fresh prefill starts only when its whole prompt plus one\n"
                                         "decode position fits beside every runner; off (the default)\n"
                                         "admits a prompt when its first chunk fits" },
@@ -761,10 +754,6 @@ int config_parse(int argc, char** argv, Config* c) {
             if      (!std::strcmp(v, "off"))  c->chunk_slices = 0;
             else if (!std::strcmp(v, "auto")) c->chunk_slices = -1;
             else if (!parse_int(a.c_str(), v, 1, 8, &c->chunk_slices)) return RAD_E_INVAL;
-        }
-        else if (S("--chunk-slices-prefill")) {
-            if (!(v = need(i))) return RAD_E_INVAL;
-            if (!parse_int(a.c_str(), v, 0, 8, &c->chunk_slices_prefill)) return RAD_E_INVAL;
         }
         else if (S("--chunk-slice-target-ms")) { if (!num(1, 60000, &c->chunk_slice_target_ms)) return RAD_E_INVAL; }
         else if (S("--chunk-slice-cost-pct"))  { if (!num(0, 100, &c->chunk_slice_cost_pct)) return RAD_E_INVAL; }
@@ -1799,8 +1788,6 @@ const ShowRow kShow[] = {
     { "--chunk-slices", [](const Config& c) {
           return c.chunk_slices < 0 ? std::string("auto")
                : c.chunk_slices == 0 ? std::string("off") : num(c.chunk_slices); } },
-    { "--chunk-slices-prefill", [](const Config& c) {
-          return c.chunk_slices_prefill > 1 ? num(c.chunk_slices_prefill) : std::string("off"); } },
     { "--chunk-slice-target-ms", [](const Config& c) { return num(c.chunk_slice_target_ms); } },
     { "--chunk-slice-cost-pct",  [](const Config& c) { return num(c.chunk_slice_cost_pct); } },
     { "--prefill-room-gate", [](const Config& c) {

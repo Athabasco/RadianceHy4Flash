@@ -1677,14 +1677,8 @@ chunk step's time the decodes may wait between two slices); `N` (1-8) sets m its
 trunk's layers and at a chunk of at least 128 rows. A sliced pass runs whole and serial, with the
 same KV bytes and the same `final_hidden` row as the unsliced one; a checkpoint is taken only at
 the group's last sub-step. Only a model whose plugin reports it can run its trunk over a layer
-range (`RadArchProbe::slice_layers_ok`) is sliced, so the flag is a no-op on a model that cannot;
-the scheduler logs which of the two applied. `hyv4flash` reports 1: its step declares the state a
-sub-step resumes from as persistent, and a sub-step re-runs only the decode rows outside its
-layer range. A serve that turns the debug taps on, or that records a calibration window
-(`--calib-dir`/`--calib-layers`), is never sliced: both read the trunk between two layers, which is
-where a slice stops and resumes, so the plugin reports 0 for the taps and an exported window and the
-engine withdraws the report for the CLI's, and the scheduler logs that it did.
-`radiance:engine_steps_sliced_total` counts
+range (`RadArchProbe::slice_layers_ok`) is sliced, so the flag is a no-op until a plugin reports
+that; the scheduler logs which of the two applied. `radiance:engine_steps_sliced_total` counts
 sliced chunks and `radiance:engine_substeps_total` the sub-steps they issued.
 
 ### 4.6 Speculative decoding
@@ -2718,10 +2712,9 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `prefill-room-gate: MODE` | off | `on`: a fresh prompt is admitted only when the whole prompt and one decode position fit the KV cache beside every running sequence and every prompt admitted ahead of it, and the requests behind it wait with it; a prompt that cannot fit even with nothing running fails (`idle_admission`) instead of waiting; long prompts then run one after another. `off`: a prompt is admitted when its first chunk fits, so a long one may fill the cache mid-prompt and be preempted, recomputing from its start |
 | `prefill-interleave: N` | auto:1 (0 under `deterministic: true`, KL mode, generators) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64; `auto` fits them in a quarter of the chunk step's measured time, `auto:SHARE` in SHARE of it (0 < SHARE <= 4); `0` lets every step carry a chunk |
 | `mixed-step-target-ms: N` | 0 (off) | soft completed-service-time target for mixed prefill/decode steps; learns one aggregate prefill cap while decoders are active and leaves uncontended prefill unchanged (§4.5) |
-| `chunk-slices: MODE` | off | `auto`: plan one prefill chunk as m layer-sliced sub-steps with the decoding rows between them, m from the measured chunk and decode step times against `chunk-slice-target-ms` and `chunk-slice-cost-pct`; `N` (1-8): m itself, capped at the trunk's layers and at a chunk of at least 128 rows. Only a model whose plugin reports it can run the trunk over a layer range (`RadArchProbe::slice_layers_ok`) is sliced, and never with the debug taps on or a calibration window recording (`--calib-dir`/`--calib-layers`), which read the trunk between two layers; on any other a chunk keeps one step and the scheduler logs why (§4.5) |
+| `chunk-slices: MODE` | off | `auto`: plan one prefill chunk as m layer-sliced sub-steps with the decoding rows between them, m from the measured chunk and decode step times against `chunk-slice-target-ms` and `chunk-slice-cost-pct`; `N` (1-8): m itself, capped at the trunk's layers and at a chunk of at least 128 rows. Only a model whose plugin reports it can run the trunk over a layer range (`RadArchProbe::slice_layers_ok`) is sliced; on any other a chunk keeps one step and the scheduler logs it (§4.5) |
 | `chunk-slice-target-ms: N` | 150 | the duration one layer-sliced sub-step targets, in milliseconds; `chunk-slices: auto` sizes m from it (§4.5) |
 | `chunk-slice-cost-pct: N` | 10 | the share of a chunk step's time the decodes may wait between two slices, in percent; with `chunk-slices: auto`, `0` makes the budget reject every split and keeps m at 1 (§4.5) |
-| `chunk-slices-prefill: N` | off | a test hook, not a lever: cut a prefill-only step (no decode row) into N layer-sliced sub-steps, so a single-stream greedy run serves a prompt both ways and the two results must be identical (§4.5); `scripts/backlog/s02_slice.py` compares the two runs, text and dumped buffers. It adds the slice overhead and gains nothing |
 | `preempt-wait-ms: N` | 5000 | how long a preempted prefill may wait for its whole-recompute gate before reclaiming cache blocks and preempting lowest-priority running requests until one overdue request can prefill; `0` falls back on the next step. A preempted request publishes what it computed to the prefix cache, as a finished one does, so its recompute adopts its prompt instead of computing it again; under pressure the cache gives those blocks back, the newest last, before another request is preempted |
 | `busy-prefill-chunk: MODE` | auto | a prefill chunk's share of a step that has other work: `auto` leaves decode rows and waiting requests their room (§4.5), `off` takes the whole step, `N` holds it to N tokens |
 | `max-num-seqs: N` | 256 | largest number of sequences one step may carry |

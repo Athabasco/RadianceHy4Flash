@@ -1031,14 +1031,11 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
      * (kvstream_op_gated). */
     bc.kv_stream_ok = arch_probe_.kv_stream_ok;
     /* S-02: the trunk layers, from the first, whose persistent state a chunk's sub-step carries to
-     * the next — the whole trunk when a sliced pass can happen at all (--chunk-slices asks, or the
-     * --chunk-slices-prefill test hook cuts a prefill-only step itself, and the plugin reports it
-     * can run the trunk over a layer range). 0 says the builder declares no such set, so a slice
-     * has nothing to resume from and no chunk is sliced on this model. The scheduler plans its
-     * slices by the same predicate (declared_layer_slices, sched/scheduler.h), so the declaration
-     * and the plan cannot disagree — a slice planned over transient state would read memory the
-     * next engine step resets. */
-    bc.layer_slices = declared_layer_slices(cfg_, (int32_t) meta_.n_layers);
+     * the next — the whole trunk when a sliced pass can happen at all (--chunk-slices asks and the
+     * plugin reports it can run the trunk over a layer range). 0 says the builder declares no such
+     * set, so a slice has nothing to resume from and no chunk is sliced on this model. */
+    bc.layer_slices = cfg_.chunk_slices != 0 && cfg_.slice_layers_ok
+                          ? (int32_t) meta_.n_layers : 0;
     /* The control vector, when one is loaded: this rank's view, or null. A plugin reads it at
      * declare only (the direction table never changes); the per-request switch rides the derived
      * mask, not this struct. */
@@ -1060,11 +1057,10 @@ int Engine::declare() {
     }
     /* S-02: the plugin reports whether its step's trunk can be stopped between two layers and
      * resumed from a persistent set (RadArchProbe::slice_layers_ok). --chunk-slices asks for
-     * slicing (and --chunk-slices-prefill's test hook cuts a prefill-only step itself); the report
-     * is what decides it, so it lands in the scheduler's cfg (the flow RadArchProbe::ckpt_snap_ok
-     * takes), and the builder is told to declare the set (RadBuildCtx::layer_slices, build_ctx)
-     * only when a sliced pass can happen. A model that does not report it plans m = 1 and the
-     * scheduler says why. */
+     * slicing; the report is what decides it, so it lands in the scheduler's cfg (the flow
+     * RadArchProbe::ckpt_snap_ok takes), and the builder is told to declare the set
+     * (RadBuildCtx::layer_slices, build_ctx) only when a sliced pass can happen. A model that does
+     * not report it plans m = 1 and the scheduler says why. */
     cfg_.slice_layers_ok = arch_probe_.slice_layers_ok != 0;
     RAD_TRY(lora_targets());
     /* KL mode measures the trunk (core/kld.h): a drafter writes no scored rows and a prefix hit
