@@ -531,7 +531,6 @@ struct Attn {
             v.x = x;
             return v;
         };
-        const RadOperand pos = praw(batch->positions, RAD_I32, T);
         t_in_norm.step(c, brows(xa, T), T);
         const int64_t M = rows.n;
         /* kv_a can reuse the codes q_a normally makes. Produce their full plane even
