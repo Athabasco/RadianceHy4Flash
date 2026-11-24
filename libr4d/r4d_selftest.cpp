@@ -16779,6 +16779,263 @@ static void fused_quant_fp8_numeric(const Plugin& pl) {
     }
 }
 
+/* K-22: a quantiser row at a width, a pitch, a scale group and a padded launch ---------------
+ *
+ * quant_act_fp8's launcher pads the row count with r4d_cliff_rows, so that a launch whose
+ * wavefront count lands on a multiple of the card's 2048 (r4d_common.h) carries a few extra rows
+ * that the kernel returns from at once. That may not move a byte, so every case runs the row
+ * through the fused kernel and through the unfused chain it replaces, on the same input, and
+ * compares the bf16 output, the codes and the scales byte for byte; the row is then quantised
+ * once more at the pitch, against the contiguous quantisation of the same values.
+ *
+ * The shapes are the ones the launchers' own rules pick, not round numbers. 73 rows is past every
+ * crossover of r4d_act_threads (72 for a 3072-wide row, 120 from 4096 up), so the norm's
+ * workgroup is the 256-lane one; 8 rows widens it to 1024, where lanes_sumsq reads the row back.
+ * K 3072 is the 24-group row this plugin runs, which a block of eight waves runs three groups at
+ * a time; K 3328 is 26 groups, so its last wave carries two. A block a row is eight wavefronts,
+ * so 253 rows is the first count inside the slow window (2024 of 2048) and is launched as 257
+ * rows, four of them idle; 256 rows lands on the multiple itself and takes one idle row; 84 and
+ * 300 rows are clear of it. `pad` widens the pitch past n: at pad 2 row r starts 4 * r bytes into
+ * an 8-byte boundary, so the rows alternate between the load forms the compiler picks inside one
+ * launch, and both are compared. The pads hold 0x7f7f, a bf16 NaN pattern no arithmetic above
+ * survives, so a row read at the wrong pitch cannot pass by rounding.
+ */
+static void quant_row_width_case(const RadKernelInfo* nrm, const RadKernelInfo* qz,
+                                 const RadKernelInfo* fz, uint32_t code_dt, int64_t M, int64_t K,
+                                 int64_t group, int64_t pad, const std::string& what) {
+    const int64_t nkb = (K + group - 1) / group, ld = K + pad;
+    std::vector<uint16_t> hx((size_t)M * ld), hxc((size_t)M * K), hw((size_t)K);
+    for (int64_t r = 0; r < M; ++r)
+        for (int64_t c = 0; c < ld; ++c) {
+            if (c >= K) { hx[(size_t)r * ld + c] = 0x7f7fu; continue; }
+            /* Per-group magnitudes an order of magnitude apart, so one group's amax cannot stand
+               in for its neighbour's, and one channel per row far above the rest. */
+            const float m = std::ldexp(1.0f, (int)(c / 128) - 2);
+            const float v = m * (0.037f * (float)((r * 29 + c * 13) % 71) - 1.3f);
+            const uint16_t h = h_to_bf16(c == (r * 37) % K ? v * 19.0f : v);
+            hx[(size_t)r * ld + c]  = h;
+            hxc[(size_t)r * K + c]  = h;
+        }
+    for (int64_t c = 0; c < K; ++c) hw[(size_t)c] = 0.004f * (float)((c * 19) % 51) - 0.1f;
+
+    void* d_x   = dalloc((size_t)M * ld * 2);
+    void* d_xc  = dalloc((size_t)M * K * 2);
+    void* d_w   = dalloc((size_t)K * 4);
+    void* d_y[2] = { dalloc((size_t)M * K * 2), dalloc((size_t)M * K * 2) };
+    void* d_q[2] = { dalloc((size_t)M * K), dalloc((size_t)M * K) };
+    void* d_s[2] = { dalloc((size_t)M * nkb * 4), dalloc((size_t)M * nkb * 4) };
+    if (!d_x || !d_xc || !d_w || !d_y[1] || !d_q[1] || !d_s[1]) {
+        ok((what + " alloc").c_str(), false, "hipMalloc failed");
+        return;
+    }
+    st_memcpy(d_x,  hx.data(),  hx.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_xc, hxc.data(), hxc.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w,  hw.data(),  hw.size() * 4, hipMemcpyHostToDevice);
+
+    auto cmp = [&](const std::string& tag) {
+        std::vector<uint16_t> y0((size_t)M * K), y1((size_t)M * K);
+        std::vector<uint8_t>  q0((size_t)M * K), q1((size_t)M * K);
+        std::vector<float>    s0((size_t)M * nkb), s1((size_t)M * nkb);
+        st_memcpy(y0.data(), d_y[0], y0.size() * 2, hipMemcpyDeviceToHost);
+        st_memcpy(y1.data(), d_y[1], y1.size() * 2, hipMemcpyDeviceToHost);
+        st_memcpy(q0.data(), d_q[0], q0.size(), hipMemcpyDeviceToHost);
+        st_memcpy(q1.data(), d_q[1], q1.size(), hipMemcpyDeviceToHost);
+        st_memcpy(s0.data(), d_s[0], s0.size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(s1.data(), d_s[1], s1.size() * 4, hipMemcpyDeviceToHost);
+        int64_t dy = 0, dq = 0, ds = 0, nz = 0;
+        for (size_t i = 0; i < y0.size(); ++i) dy += y0[i] != y1[i];
+        for (size_t i = 0; i < q0.size(); ++i) dq += q0[i] != q1[i];
+        for (size_t i = 0; i < s0.size(); ++i) ds += std::memcmp(&s0[i], &s1[i], 4) != 0;
+        for (size_t i = 0; i < q1.size(); ++i) nz += q1[i] != 0;
+        ok((what + ": " + tag).c_str(), dy == 0 && dq == 0 && ds == 0 && nz > (int64_t)q1.size() / 2,
+           "bf16 differs " + std::to_string(dy) + ", codes " + std::to_string(dq) +
+           ", scales " + std::to_string(ds) + ", nonzero codes " + std::to_string(nz));
+    };
+
+    /* The unfused pair on the contiguous rows, then the fused row at the pitch. The pitch rides on
+     * the tensor's leading stride: every one of these rows reads its n from the shape's last axis
+     * and its row pitch from stride[0], so a row of n columns that starts n + pad elements after the
+     * last is the engine's strided form (r4d_row_pitch). */
+    RadTensor t_x  = T(d_x, RAD_BF16, { M, K });
+    t_x.stride[0]  = ld;
+    RadTensor t_xc = T(d_xc, RAD_BF16, { M, K });
+    RadTensor t_w  = T(d_w, RAD_F32, { K });
+    RadTensor t_y0 = T(d_y[0], RAD_BF16, { M, K }), t_y1 = T(d_y[1], RAD_BF16, { M, K });
+    RadTensor t_q0 = T(d_q[0], code_dt, { M, K }), t_q1 = T(d_q[1], code_dt, { M, K });
+    RadTensor t_s0 = T(d_s[0], RAD_F32, { M, nkb }), t_s1 = T(d_s[1], RAD_F32, { M, nkb });
+    int rc = launch_row(nrm, { t_xc, t_w, t_y0 },
+                        { PI("M", M), PI("n", K), PF("eps", 1e-6), PS("dtype", "bf16"),
+                          PF("wadd", 1.0) });
+    if (rc == RAD_OK)
+        rc = launch_row(qz, { t_y0, t_q0, t_s0 },
+                        { PI("M", M), PI("n", K), PI("group", group), PS("dtype", "bf16") });
+    if (rc == RAD_OK)
+        rc = launch_row(fz, { t_x, T(nullptr, RAD_BF16, {}), t_w, t_q1, t_s1, t_y1 },
+                        { PI("M", M), PI("n", K), PF("eps", 1e-6), PI("group", group),
+                          PS("dtype", "bf16"), PF("wadd", 1.0) });
+    if (rc != RAD_OK) {
+        ok((what + " vs the unfused pair").c_str(), false, "rc=" + std::to_string(rc));
+        return;
+    }
+    cmp("the fused row at pitch " + std::to_string(ld));
+
+    /* The quantiser alone, on the same row at the pitch, against the contiguous quantisation of the
+     * same values: the standalone row's own two load paths, without the norm in front of it. */
+    {
+        std::vector<uint16_t> y0((size_t)M * K), yp((size_t)M * ld, 0x7f7fu);
+        st_memcpy(y0.data(), d_y[0], y0.size() * 2, hipMemcpyDeviceToHost);
+        for (int64_t r = 0; r < M; ++r)
+            std::copy(y0.begin() + (size_t)r * K, y0.begin() + (size_t)r * K + K,
+                      yp.begin() + (size_t)r * ld);
+        void* d_yp = dalloc((size_t)M * ld * 2);
+        if (!d_yp) { ok((what + " quant at a pitch alloc").c_str(), false, "hipMalloc failed"); return; }
+        st_memcpy(d_yp, yp.data(), yp.size() * 2, hipMemcpyHostToDevice);
+        RadTensor t_yp = T(d_yp, RAD_BF16, { M, K });
+        t_yp.stride[0] = ld;
+        rc = launch_row(qz, { t_yp, t_q1, t_s1 },
+                        { PI("M", M), PI("n", K), PI("group", group), PS("dtype", "bf16") });
+        if (rc != RAD_OK) { ok((what + " quant at a pitch").c_str(), false, "rc=" + std::to_string(rc)); return; }
+        cmp("the standalone quantiser at pitch " + std::to_string(ld));
+    }
+}
+
+static void quantizer_row_shape(const Plugin& pl) {
+    const RadKernelInfo* nrm = find(pl, "rmsnorm_bf16");
+    const RadKernelInfo* smu = find(pl, "silu_mul_bf16");
+    const RadKernelInfo* sg  = find(pl, "sigmoid_bf16");
+    const RadKernelInfo* ml  = find(pl, "mul_bf16");
+    const RadKernelInfo* qz  = find(pl, "quant_act_fp8");
+    const RadKernelInfo* rq  = find(pl, "rmsnorm_quant_fp8");
+    const RadKernelInfo* gq  = find(pl, "gated_quant_fp8");
+    const RadKernelInfo* tq  = find(pl, "gate_quant_fp8");
+    const RadKernelInfo* qh  = find(pl, "had_quant_act_i8g");
+    const RadKernelInfo* rh  = find(pl, "rmsnorm_had_quant_i8g");
+    if (!nrm || !smu || !sg || !ml || !qz || !rq || !gq || !tq || !qh || !rh) {
+        ok("quantiser rows at a width, a pitch and a group", false, "rows absent");
+        return;
+    }
+    quant_row_width_case(nrm, qz, rq, RAD_F8E4M3, 73, 3072, 128, 0,
+                         "rmsnorm_quant_fp8 M=73 K=3072 (256-lane block)");
+    quant_row_width_case(nrm, qz, rq, RAD_F8E4M3, 73, 3072, 128, 2,
+                         "rmsnorm_quant_fp8 M=73 K=3072 pitch 3074");
+    quant_row_width_case(nrm, qz, rq, RAD_F8E4M3, 73, 3328, 128, 0,
+                         "rmsnorm_quant_fp8 M=73 K=3328 (26 groups)");
+    quant_row_width_case(nrm, qz, rq, RAD_F8E4M3, 84, 3072, 128, 0,
+                         "rmsnorm_quant_fp8 M=84 K=3072 (three groups a wave)");
+    quant_row_width_case(nrm, qz, rq, RAD_F8E4M3, 253, 3072, 128, 0,
+                         "rmsnorm_quant_fp8 M=253 K=3072 (in the window, four idle rows)");
+    quant_row_width_case(nrm, qz, rq, RAD_F8E4M3, 300, 3072, 128, 0,
+                         "rmsnorm_quant_fp8 M=300 K=3072 (clear of the window)");
+    quant_row_width_case(nrm, qz, rq, RAD_F8E4M3, 256, 3072, 128, 2,
+                         "rmsnorm_quant_fp8 M=256 K=3072 pitch 3074 (one idle row)");
+    quant_row_width_case(nrm, qz, rq, RAD_F8E4M3, 8, 3072, 128, 2,
+                         "rmsnorm_quant_fp8 M=8 K=3072 pitch 3074 (1024-lane block)");
+    quant_row_width_case(nrm, qh, rh, RAD_I8, 73, 3072, 128, 2,
+                         "rmsnorm_had_quant_i8g M=73 K=3072 pitch 3074");
+    quant_row_width_case(nrm, qh, rh, RAD_I8, 253, 3072, 128, 0,
+                         "rmsnorm_had_quant_i8g M=253 K=3072 (in the window, four idle rows)");
+    quant_row_width_case(nrm, qh, rh, RAD_I8, 8, 3072, 256, 0,
+                         "rmsnorm_had_quant_i8g M=8 K=3072 group 256");
+    /* The gate rows read two sources a lane, so they have two pointers to test; both are pitched
+     * here (the [gate|up] plane's rows are 2K + 2 long, the gate row's own K + 2), which sends the
+     * second row of each down the four-load path. */
+    {
+        const int64_t M = 73, K = 3072, nkb = K / 128, ld = 2 * K + 2, xd = K + 2;
+        std::vector<uint16_t> hgu((size_t)M * ld, 0x7f7fu), hgc((size_t)M * 2 * K);
+        std::vector<uint16_t> hx((size_t)M * xd, 0x7f7fu), hxc((size_t)M * K);
+        for (int64_t r = 0; r < M; ++r)
+            for (int64_t c = 0; c < K; ++c) {
+                const float m = std::ldexp(1.0f, (int)(c / 128) - 2);
+                const float v = m * (0.037f * (float)((r * 29 + c * 13) % 71) - 1.3f);
+                const uint16_t g = h_to_bf16(v * 0.75f);
+                const uint16_t u = h_to_bf16(m * (0.011f * (float)((r + c * 7) % 43) - 0.2f));
+                const uint16_t xv = h_to_bf16(v);
+                hgu[(size_t)r * ld + c]         = g;
+                hgu[(size_t)r * ld + K + c]     = u;
+                hgc[(size_t)r * 2 * K + c]      = g;
+                hgc[(size_t)r * 2 * K + K + c]  = u;
+                hx[(size_t)r * xd + c]          = xv;
+                hxc[(size_t)r * K + c]          = xv;
+            }
+        void* d_gu[2] = { dalloc((size_t)M * ld * 2), dalloc((size_t)M * 2 * K * 2) };
+        void* d_g[2]  = { dalloc((size_t)M * xd * 2),  dalloc((size_t)M * K * 2) };
+        void* d_x[2]  = { dalloc((size_t)M * xd * 2),  dalloc((size_t)M * K * 2) };
+        void* d_y[2]  = { dalloc((size_t)M * K * 2),   dalloc((size_t)M * K * 2) };
+        void* d_q[2]  = { dalloc((size_t)M * K),       dalloc((size_t)M * K) };
+        void* d_s[2]  = { dalloc((size_t)M * nkb * 4), dalloc((size_t)M * nkb * 4) };
+        if (!d_gu[1] || !d_g[1] || !d_x[1] || !d_y[1] || !d_q[1] || !d_s[1]) {
+            ok("the gate rows at a pitch alloc", false, "hipMalloc failed");
+            return;
+        }
+        st_memcpy(d_gu[0], hgu.data(), hgu.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_gu[1], hgc.data(), hgc.size() * 2, hipMemcpyHostToDevice);
+        /* The gate row's gate: the first half of the [gate|up] plane, at its own pitch. */
+        for (int64_t r = 0; r < M; ++r) {
+            st_memcpy((uint16_t*)d_g[0] + (size_t)r * xd, hx.data() + (size_t)r * xd, (size_t)xd * 2,
+                      hipMemcpyHostToDevice);
+            st_memcpy((uint16_t*)d_g[1] + (size_t)r * K, hxc.data() + (size_t)r * K, (size_t)K * 2,
+                      hipMemcpyHostToDevice);
+        }
+        st_memcpy(d_x[0], hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_x[1], hxc.data(), hxc.size() * 2, hipMemcpyHostToDevice);
+        auto cmp = [&](const std::string& what, int rc) {
+            if (rc != RAD_OK) { ok(what.c_str(), false, "rc=" + std::to_string(rc)); return; }
+            std::vector<uint16_t> y0((size_t)M * K), y1((size_t)M * K);
+            std::vector<uint8_t>  q0((size_t)M * K), q1((size_t)M * K);
+            std::vector<float>    s0((size_t)M * nkb), s1((size_t)M * nkb);
+            st_memcpy(y0.data(), d_y[0], y0.size() * 2, hipMemcpyDeviceToHost);
+            st_memcpy(y1.data(), d_y[1], y1.size() * 2, hipMemcpyDeviceToHost);
+            st_memcpy(q0.data(), d_q[0], q0.size(), hipMemcpyDeviceToHost);
+            st_memcpy(q1.data(), d_q[1], q1.size(), hipMemcpyDeviceToHost);
+            st_memcpy(s0.data(), d_s[0], s0.size() * 4, hipMemcpyDeviceToHost);
+            st_memcpy(s1.data(), d_s[1], s1.size() * 4, hipMemcpyDeviceToHost);
+            int64_t dy = 0, dq = 0, ds = 0, nz = 0;
+            for (size_t i = 0; i < y0.size(); ++i) dy += y0[i] != y1[i];
+            for (size_t i = 0; i < q0.size(); ++i) dq += q0[i] != q1[i];
+            for (size_t i = 0; i < s0.size(); ++i) ds += std::memcmp(&s0[i], &s1[i], 4) != 0;
+            for (size_t i = 0; i < q1.size(); ++i) nz += q1[i] != 0;
+            ok(what.c_str(), dy == 0 && dq == 0 && ds == 0 && nz > (int64_t)q1.size() / 2,
+               "bf16 differs " + std::to_string(dy) + ", codes " + std::to_string(dq) +
+               ", scales " + std::to_string(ds) + ", nonzero codes " + std::to_string(nz));
+        };
+        RadTensor t_gu = T(d_gu[0], RAD_BF16, { M, 2 * K }), t_guc = T(d_gu[1], RAD_BF16, { M, 2 * K });
+        t_gu.stride[0] = ld;
+        RadTensor t_g[2] = { T(d_g[0], RAD_BF16, { M, K }), T(d_g[1], RAD_BF16, { M, K }) };
+        t_g[0].stride[0] = xd;
+        RadTensor t_x[2] = { T(d_x[0], RAD_BF16, { M, K }), T(d_x[1], RAD_BF16, { M, K }) };
+        t_x[0].stride[0] = xd;
+        RadTensor t_y[2] = { T(d_y[0], RAD_BF16, { M, K }), T(d_y[1], RAD_BF16, { M, K }) };
+        RadTensor t_q[2] = { T(d_q[0], RAD_F8E4M3, { M, K }), T(d_q[1], RAD_F8E4M3, { M, K }) };
+        RadTensor t_s[2] = { T(d_s[0], RAD_F32, { M, nkb }), T(d_s[1], RAD_F32, { M, nkb }) };
+        int rc = launch_row(smu, { t_guc, t_y[0] },
+                            { PI("M", M), PI("n", K), PS("dtype", "bf16") });
+        if (rc == RAD_OK)
+            rc = launch_row(qz, { t_y[0], t_q[0], t_s[0] },
+                            { PI("M", M), PI("n", K), PI("group", 128), PS("dtype", "bf16") });
+        if (rc == RAD_OK)
+            rc = launch_row(gq, { t_gu, t_q[1], t_s[1], t_y[1] },
+                            { PI("M", M), PI("n", K), PI("group", 128), PS("dtype", "bf16"),
+                              PS("act", "silu") });
+        cmp("gated_quant_fp8 M=73 K=3072 pitch 6146", rc);
+
+        /* The gate half of the same plane, sigmoid and mul folded in, its own pitch for each
+         * operand. */
+        rc = launch_row(sg, { t_g[1], t_y[0] },
+                        { PI("M", M), PI("n", K), PS("dtype", "bf16") });
+        if (rc == RAD_OK)
+            rc = launch_row(ml, { t_y[0], t_x[1], t_y[0] },
+                            { PI("M", M), PI("n", K), PS("dtype", "bf16") });
+        if (rc == RAD_OK)
+            rc = launch_row(qz, { t_y[0], t_q[0], t_s[0] },
+                            { PI("M", M), PI("n", K), PI("group", 128), PS("dtype", "bf16") });
+        if (rc == RAD_OK)
+            rc = launch_row(tq, { t_g[0], t_x[0], t_q[1], t_s[1], t_y[1] },
+                            { PI("M", M), PI("n", K), PI("group", 128), PS("dtype", "bf16"),
+                              PS("act", "sigmoid") });
+        cmp("gate_quant_fp8 M=73 K=3072 pitch 3074", rc);
+    }
+}
+
 /* ---- gelu_mul_quant_i8, against gelu_mul + quant_act_i8 -------------------------------------
  * Gemma 4 31B's per-rank feed-forward width (10752 of 21504 at two ranks), both batch widths.
  * `grp`: gelu_mul_quant_i8g against gelu_mul + quant_act_i8g, a scale per (row, 128), and a
@@ -38595,6 +38852,8 @@ static void device_phase(const Plugin& pl) {
         sel("gated_had_quant_i8g") || sel("swiglu_clamped_had_quant_i8g")) {
         if (!g_case) std::printf("\nthe fp8 fusions, against the pair each one replaces\n");
         fused_quant_fp8_numeric(pl);
+        if (!g_case) std::printf("\nthe quantiser rows at a width, a pitch and a scale group\n");
+        quantizer_row_shape(pl);
     }
     if (sel("gelu_mul_quant_i8")) {
         if (!g_case) std::printf("\ngelu_mul_quant_i8, against the pair it replaces\n");
