@@ -128,10 +128,11 @@ struct Declared {
     RadBuildCtx ctx = build_ctx();
     int rc = 0;
     explicit Declared(void (*encs)(RadBuilder*) = bf16_encs, int world = 1, int rank = 0,
-                      bool wide = false, int64_t ff_exp = 128)
+                      bool wide = false, int64_t ff_exp = 128, int layer_slices = 0)
         : mk(mini_meta(wide, ff_exp)) {
         encs(&b);
         ctx = build_ctx(rank, world);
+        ctx.layer_slices = layer_slices;
         G3Env g3env;
         std::string err;
         err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
@@ -186,13 +187,169 @@ TEST(the_replicated_kv_groups_and_the_chain_request) {
 }
 
 /* S-02: the plugin reports whether its step's trunk can be stopped between two layers and resumed
- * from a persistent set. This step still runs the whole trunk and declares no persistent set, so a
- * --chunk-slices request must not slice a chunk on it: the report is 0, and the core keeps m = 1.
- * S-02b declares the set and reports 1 here when the trunk can stop between two layers. */
-TEST(the_probe_reports_no_resumable_layer_range_on_the_trunk_step) {
+ * from a persistent set. S-02b declares that set (hyv4flash.cpp's Model::sliced, from
+ * RadBuildCtx::layer_slices), so the report is 1 and the core may slice a chunk on it — except where
+ * the trunk cannot stop: the debug taps read the trunk between every two ops (RADIANCE_HY4_TAPS). */
+TEST(the_probe_reports_a_resumable_layer_range) {
     RadArchProbe p{};
     CHECK_OK(hyv4flash::probe(mini_meta().meta(), &p));
-    CHECK_EQ(p.slice_layers_ok, 0);
+    CHECK_EQ(p.slice_layers_ok, 1);
+    /* The same trunk with the debug taps on: the ops the taps declare read the trunk between two
+     * layers, so a slice may not stop there and the plugin says 0. */
+    struct Taps {
+        Taps() { setenv("RADIANCE_HY4_TAPS", "1", 1); }
+        ~Taps() { unsetenv("RADIANCE_HY4_TAPS"); }
+    };
+    RadArchProbe t{};
+    {
+        Taps taps;
+        CHECK_OK(hyv4flash::probe(mini_meta().meta(), &t));
+    }
+    CHECK_EQ(t.slice_layers_ok, 0);
+}
+
+void int8_trunk_encs(RadBuilder* b);   /* defined with the quantised recipes below */
+
+/* S-02b: the graph the engine asks to slice (RadBuildCtx::layer_slices) declares the state a
+ * sub-step resumes from as persistent (design §3): the chunk's streams, the block input a junction
+ * left open and its post gates, and the int8 codes pairs a slice's junction wrote for the next
+ * slice's block to read. Without slicing they stay transient, so a deployment that does not slice
+ * pays nothing for them. */
+TEST(a_sliced_trunk_declares_the_state_a_sub_step_resumes) {
+    MetaKV mk = mini_meta();
+    for (int slices : { 0, 4 }) {
+        RadBuilder b;
+        int8_trunk_encs(&b);   /* a recipe with the int8 trunk linears, so there is a codes pair */
+        RadBuildCtx ctx = build_ctx();
+        ctx.layer_slices = slices;
+        G3Env g3env;
+        int rc = 0;
+        const std::string err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
+        if (rc != RAD_OK) fputs(err.c_str(), stderr);
+        REQUIRE_EQ(rc, RAD_OK);
+        const int want = slices > 0 ? (int)RAD_BUF_PERSIST : (int)RAD_BUF_TRANSIENT;
+        for (const char* n : { "streams", "block_in", "hc_post", "trunk_codes.128.128.q8",
+                              "trunk_codes.128.128.s8" }) {
+            const RecBuf* x = find_b(b, n);
+            REQUIRE(x != nullptr);
+            CHECK_EQ(x->d.kind, want);
+        }
+    }
+}
+
+/* S-02b: a sub-step runs the layers of its range over the chunk's rows and nothing over the rest
+ * (design §2.2, §2.4). Three slices of a prefill-only chunk cover the trunk exactly once: every
+ * layer's attention runs in the slice that owns it, and only the last slice heads the chunk, over
+ * its whole height. The embed is the step head's and runs on the first slice alone. */
+TEST(a_layer_slice_runs_the_layers_in_its_range_only) {
+    Declared d(bf16_encs, 1, 0, false, 128, 4);   /* a graph the engine asked to slice */
+    REQUIRE_EQ(d.rc, RAD_OK);
+    RadBuilder& b = d.b;
+    const auto& L = hyv4flash::models[0]->layers;
+    REQUIRE_EQ(L.size(), (size_t)3);
+    /* The rows an op handle was issued over: one issue a layer, over the layer's extent. */
+    auto rows_of = [](const RadCtx& c, rad_op op) {
+        int64_t n = 0;
+        for (const auto& is : c.issues)
+            if (is.op == op) n += is.n;
+        return n;
+    };
+    /* The rows the head wrote final_hidden over: the final norm when the trunk ended open, the last
+     * layer's junction tail when it ended a chain. */
+    auto head_rows = [&](const RadCtx& c) {
+        int64_t n = 0;
+        for (const auto& is : c.issues) {
+            const RecOp* o = b.op_of(is.op);
+            if (!o) continue;
+            for (rad_buf w : o->writes)
+                if (w == hyv4flash::models[0]->final_hidden) n += is.n;
+        }
+        return n;
+    };
+    int64_t full_embed = 0, full_head = 0;
+    const int64_t T = 10;
+    for (int32_t j = 0; j < 3; ++j) {
+        auto k = kit(b, {}, { (int)T });
+        k->b.layer_lo = j;
+        k->b.layer_hi = j + 1;
+        /* The out rows the plan's entries carry (StepEntry::dev_out): a chunk that has not run
+         * every layer yet puts out none, so this sub-step heads nothing. */
+        if (j != 2) { k->b.n_out = 0; k->b.out_ids = nullptr; }
+        RadCtx c{ .b = &b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(b, &c);
+        /* Layer j ran the chunk's rows; the others ran none (a prefill-only step has no decode
+         * band to run, so the layers outside the slice issue nothing at all). */
+        for (size_t i = 0; i < L.size(); ++i)
+            CHECK_EQ(rows_of(c, L[i].attn.op_absorb), (int64_t)i == (int64_t)j ? T : 0);
+        /* The chunk's head norm and logits once, on the slice that ran the trunk's end. */
+        const int64_t head = head_rows(c);
+        CHECK_EQ(head, j == 2 ? T : 0);
+        CHECK_EQ(count_issued(b, c, "logits_gemm"), j == 2 ? 1 : 0);
+        /* The embed is the step head's: the whole chunk on the first slice only. */
+        const int64_t embed = rows_of(c, hyv4flash::models[0]->embed);
+        CHECK_EQ(embed, j == 0 ? T : 0);
+        full_embed += embed;
+        full_head += head;
+    }
+    CHECK_EQ(full_embed, T);
+    CHECK_EQ(full_head, T);
+}
+
+/* S-02b: the decode band runs every layer of every sub-step, the chunk's rows only the layers of the
+ * slice, and the head every sub-step over the extent the trunk's last layer ran (design §2.3): the
+ * decode rows still produce a token each, and the chunk's final_hidden is written once, on the
+ * sub-step that ran the trunk's end. */
+TEST(the_decode_band_runs_every_layer_of_a_sub_step) {
+    Declared d(bf16_encs, 1, 0, false, 128, 4);
+    REQUIRE_EQ(d.rc, RAD_OK);
+    RadBuilder& b = d.b;
+    const auto& L = hyv4flash::models[0]->layers;
+    REQUIRE_EQ(L.size(), (size_t)3);
+    auto rows_of = [](const RadCtx& c, rad_op op) {
+        int64_t n = 0;
+        for (const auto& is : c.issues)
+            if (is.op == op) n += is.n;
+        return n;
+    };
+    auto head_rows = [&](const RadCtx& c) {
+        int64_t n = 0;
+        for (const auto& is : c.issues) {
+            const RecOp* o = b.op_of(is.op);
+            if (!o) continue;
+            for (rad_buf w : o->writes)
+                if (w == hyv4flash::models[0]->final_hidden) n += is.n;
+        }
+        return n;
+    };
+    const int64_t T = 11, DT = 1;   /* one decode row and a 10-row chunk */
+    const int64_t want_embed[] = { T, DT, DT };      /* the whole step on the first slice, the band after */
+    const int64_t want_head[]  = { DT, DT, T };      /* the band, the band, then the chunk */
+    const int64_t want_rows[][3] = { { T, DT, DT }, { DT, T, DT }, { DT, DT, T } };
+    const int64_t want_out[]   = { DT, DT, DT + 1 }; /* the decode row's token, then the chunk's too */
+    for (int32_t j = 0; j < 3; ++j) {
+        auto k = kit(b, { 1 }, { (int)(T - DT) });
+        REQUIRE(k->b.n_tok == T);
+        k->b.layer_lo = j;
+        k->b.layer_hi = j + 1;
+        /* The out rows the plan's entries carry (StepEntry::dev_out): the decode rows' on every
+         * sub-step, the chunk's last row's once it has run every layer. */
+        k->b.n_out = want_out[j];
+        RadCtx c{ .b = &b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(b, &c);
+        /* Every layer runs (the decode band), in the extent the slice gives it. */
+        for (size_t i = 0; i < L.size(); ++i)
+            CHECK_EQ(rows_of(c, L[i].attn.op_absorb), want_rows[j][i]);
+        CHECK_EQ(rows_of(c, hyv4flash::models[0]->embed), want_embed[j]);
+        CHECK_EQ(head_rows(c), want_head[j]);
+        CHECK_EQ(count_issued(b, c, "logits_gemm"), 1);
+        const RecIssue* h = issue_of(b, c, "logits_gemm");
+        REQUIRE(h != nullptr);
+        CHECK_EQ(h->n, want_out[j]);
+    }
 }
 
 /* Every layer kind's ops, once each where the plan says so: the connections, both MLA forms on

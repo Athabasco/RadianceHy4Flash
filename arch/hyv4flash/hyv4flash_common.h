@@ -242,6 +242,10 @@ struct Codes {
     RadBuilder* b = nullptr;
     Names* nm = nullptr;
     int64_t rows = 0;
+    /* S-02: the pairs are persistent, so a slice boundary may fall where a junction wrote the next
+     * block's input codes and the next block reads them (RadBuildCtx::layer_slices). Declared
+     * transient otherwise, which is every deployment that does not slice. */
+    bool persist = false;
     struct Pair { int64_t k = 0, g8 = 0; std::string tag; rad_buf q8 = 0, s8 = 0; };
     std::vector<Pair> pairs;
     int n_linear = 0;              /* int8 linears reading a pair */
@@ -258,10 +262,11 @@ struct Codes {
         p.g8 = g8;
         p.tag = tag;
         const char* sep = *tag ? "." : "";
+        const int kind = persist ? RAD_BUF_PERSIST : RAD_BUF_TRANSIENT;
         p.q8 = decl_b(b, nm->f("trunk_codes%s%s.%lld.%lld.q8", sep, tag, (long long)k, (long long)g8),
-                      RAD_I8, { rows, k });
+                      RAD_I8, { rows, k }, kind);
         p.s8 = decl_b(b, nm->f("trunk_codes%s%s.%lld.%lld.s8", sep, tag, (long long)k, (long long)g8),
-                      RAD_F32, { rows, (k + g8 - 1) / g8 });
+                      RAD_F32, { rows, (k + g8 - 1) / g8 }, kind);
         if (!p.q8 || !p.s8) return nullptr;
         pairs.push_back(p);
         return &pairs.back();

@@ -156,6 +156,10 @@ struct Model {
     Geom g{};
     int64_t n_weights = 0;
     Trunk tr{};
+    /* S-02: this graph declares the persistent set a sliced trunk needs
+     * (RadBuildCtx::layer_slices > 0), so a sub-step may stop between two layers and the next one
+     * resume from it: the chunk's streams, its block input and post gates, and the codes pairs. */
+    bool sliced = false;
     AttnWire aw_sparse{}, aw_sliding{};
     /* P-04: the prefill sequences' bounds rebased to 0, once a step (op_rebase, issued before the
      * layers and declared there too: declaration order is liveness), read by both wires. */
@@ -696,10 +700,15 @@ static int buffers(RadBuilder* b, Model& m) {
     auto bf = [&](const char* n, std::initializer_list<int64_t> shape) {
         return decl_b(b, nm.f("%s", n), RAD_BF16, shape);
     };
-    m.tr.h = bf("streams", { T, s.hc * E });
+    /* S-02: under layer_slices the trunk's carried state outlives a sub-step, so a slice may stop
+     * between two layers: the streams, the block input (the normed residual the next layer reads
+     * when a junction left the chain open) and the post gates are persistent. Transient otherwise,
+     * which is every graph that does not slice. */
+    const int carried = m.sliced ? RAD_BUF_PERSIST : RAD_BUF_TRANSIENT;
+    m.tr.h = decl_b(b, nm.f("streams"), RAD_BF16, { T, s.hc * E }, carried);
     m.tr.x = bf("hc_x", { T, E });
-    m.tr.post = decl_b(b, nm.f("hc_post"), RAD_F32, { T, s.hc });
-    m.tr.xn = bf("block_in", { T, E });
+    m.tr.post = decl_b(b, nm.f("hc_post"), RAD_F32, { T, s.hc }, carried);
+    m.tr.xn = decl_b(b, nm.f("block_in"), RAD_BF16, { T, E }, carried);
     m.tr.y = bf("block_out", { T, E });
     m.x0 = bf("embed", { T, E });
     m.final_hidden = decl_b(b, nm.f("final_hidden"), RAD_BF16, { T, E }, RAD_BUF_PERSIST);
@@ -965,6 +974,16 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.codes.b = b;
     m.codes.nm = &nm;
     m.codes.rows = g.max_tok;
+    /* S-02: a sliced trunk stops between two layers and resumes from the persistent set. Refuse a
+     * graph the engine asks to slice where the plugin cannot: debug taps and a calibration run read
+     * the trunk between every two ops, and the model has to say so rather than run on the wrong
+     * rows. (The probe reports slice_layers_ok 0 for them; this is the backstop.) */
+    m.sliced = ctx->layer_slices > 0;
+    if (m.sliced && (taps_on() || s.calib_lo > 0 || s.calib_hi > 0 ||
+                     (ctx->calib_dir && *ctx->calib_dir)))
+        return refuse("layer slicing reads the trunk between two layers; run without "
+                      "--chunk-slices, --calib-dir and the debug taps");
+    m.codes.persist = m.sliced;
     const CodesScope codes_scope(&m.codes);
     {
         const char* e = std::getenv("RADIANCE_HY4_PREFILL");
@@ -1317,23 +1336,50 @@ static void step(RadCtx* c, const RadBatch* batch) {
         return;
     }
     const StepPlan p = plan(m, batch);
+    /* S-02: the sub-step's layer range. The chunk's rows [n_tok_decode, T) run the layers
+     * [layer_lo, layer_hi) of the trunk and then wait, persisted, for the next sub-step; the decode
+     * rows [0, n_tok_decode) are planned exactly as a decode step plans them and run every layer, so
+     * a layer outside the slice runs the decode band alone. `bd` is that band's view: the batch's
+     * first n_tok_decode rows (the batch orders them first) as a decode pass, which is what a layer
+     * outside the slice, and a step head that does not run the chunk's rows, hand to the ops. */
+    const int64_t last = s.n_layer;
+    const int64_t lo = std::min<int64_t>(std::max<int64_t>(batch->layer_lo, 0), last);
+    const int64_t hi = batch->layer_hi > 0 ? std::min<int64_t>(batch->layer_hi, last) : last;
+    const bool sliced = lo > 0 || hi < last;
+    RadBatch dec{};
+    if (sliced) {
+        dec = *batch;
+        dec.phase = RAD_PHASE_DECODE;
+        dec.n_seq = (int32_t)p.D;
+        dec.n_tok = (int32_t)p.DT;
+        dec.n_out = 0;
+    }
+    const RadBatch* bd = sliced ? &dec : batch;
     /* The step half of the pipeline gate: one sequence (the pieces are one chunk's rows), no media
      * rows (their reduction would have to pick a lane too), and both pieces above the band floor so
-     * each one's kernels are the ones the whole step's shape would have picked. */
+     * each one's kernels are the ones the whole step's shape would have picked. A sub-step's rows are
+     * a layer range, not a chunk, so it never pipelines (the pieces would run the same layers). */
     const int64_t n0 = pipe_rows(T), n1 = T - n0;
-    const bool pipe = m.pipe_on && nmm == 0 && batch->n_seq == 1 && n0 >= pipe_min_rows() && n1 > 0;
-    RAD_ISSUE_N(c, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.x0, T));
-    if (nmm > 0) {
-        /* Rank 0 holds the rows, the others zeros: the exact sum gives every rank the rows. */
-        RAD_ISSUE_N(c, m.op_mm_copy, nmm, praw2(batch->mm_embd, RAD_BF16, nmm, E),
-                    brows(m.mm_rows, nmm));
-        issue_all_reduce(c, m.op_mm_reduce, m.mm_rows, nmm, E);
-        RAD_ISSUE_N(c, m.op_mm_scatter, nmm, brows(m.mm_rows, nmm),
-                    praw(batch->mm_rows, RAD_I32, nmm), brows(m.x0, T));
+    const bool pipe = m.pipe_on && nmm == 0 && batch->n_seq == 1 && n0 >= pipe_min_rows() && n1 > 0 &&
+                      !sliced;
+    /* The step head: the whole step's rows on the first slice, the decode band's on a later one (a
+     * middle sub-step's chunk rows in tr.h are the previous slice's, and must survive it). */
+    const int64_t nh = lo == 0 ? T : p.DT;
+    if (nh > 0) {
+        RAD_ISSUE_N(c, m.embed, nh, praw(batch->token_ids, RAD_I32, nh), RAD_W(m.token),
+                    brows(m.x0, nh));
+        if (nmm > 0) {
+            /* Rank 0 holds the rows, the others zeros: the exact sum gives every rank the rows. */
+            RAD_ISSUE_N(c, m.op_mm_copy, nmm, praw2(batch->mm_embd, RAD_BF16, nmm, E),
+                        brows(m.mm_rows, nmm));
+            issue_all_reduce(c, m.op_mm_reduce, m.mm_rows, nmm, E);
+            RAD_ISSUE_N(c, m.op_mm_scatter, nmm, brows(m.mm_rows, nmm),
+                        praw(batch->mm_rows, RAD_I32, nmm), brows(m.x0, T));
+        }
+        m.t_embed.step(c, brows(m.x0, nh), nh);
+        for (int64_t j = 0; j < s.hc; ++j)
+            RAD_ISSUE_N(c, m.op_stream, nh, brows(m.x0, nh), bcol(m.tr.h, j * E, E, nh));
     }
-    m.t_embed.step(c, brows(m.x0, T), T);
-    for (int64_t j = 0; j < s.hc; ++j)
-        RAD_ISSUE_N(c, m.op_stream, T, brows(m.x0, T), bcol(m.tr.h, j * E, E, T));
 
     /* P-04: the prefill sequences' bounds rebased to 0, once for every layer (both geometries'
      * absorbed prefill instance and the non-absorbed attention read m.cu_prefill). */
@@ -1351,20 +1397,45 @@ static void step(RadCtx* c, const RadBatch* batch) {
     bool entered = false;   /* the previous junction ran this layer's connection and input norm */
     for (size_t i = 0; i < m.layers.size(); ++i) {
         const Layer& l = m.layers[i];
-        if (l.engram >= 0) {
-            if (!m.engrams[(size_t)l.engram].step(c, batch)) return;
-            m.calib.after_engram(c, (int)i, T);
+        /* S-02: this layer's rows — the whole step inside the slice, the decode band alone outside
+         * it, and none at all for a sliced prefill (the test hook's middle sub-steps), which issues
+         * nothing. `entered` follows the chain and not the rows: a junction's `tail` is the layer's
+         * own, so the next layer is told the same either way. */
+        const bool in = (int64_t)i >= lo && (int64_t)i < hi;
+        const int64_t nr = in ? T : p.DT;
+        if (!nr) {
+            entered = (bool)l.j_end && l.j_end.tail;
+            continue;
         }
-        l.t_stream_in.step(c, brows(m.tr.h, T), T);
-        if (!entered) l.hc_attn.pre(c, m.tr.h, m.tr.x, m.tr.post, T);
-        l.t_attn_x.step(c, brows(m.tr.x, T), T);
-        l.t_attn_post.step(c, brows(m.tr.post, T), T);
+        const RadBatch* lb = in ? batch : bd;
+        rows.n = nr;
+        if (l.engram >= 0) {
+            /* Once a step, in the sub-step that runs its layer, over the rows that are here: the
+             * hash history advances once over the step's rows, not once a slice. */
+            if (!m.engrams[(size_t)l.engram].step(c, lb)) return;
+            m.calib.after_engram(c, (int)i, nr);
+        }
+        l.t_stream_in.step(c, brows(m.tr.h, nr), nr);
+        if (!entered) l.hc_attn.pre(c, m.tr.h, m.tr.x, m.tr.post, nr);
+        l.t_attn_x.step(c, brows(m.tr.x, nr), nr);
+        l.t_attn_post.step(c, brows(m.tr.post, nr), nr);
         if (!entered)
-            RAD_ISSUE_N(c, l.op_attn_norm, T, brows(m.tr.x, T), RAD_W(l.attn_gain), brows(m.tr.xn, T));
+            RAD_ISSUE_N(c, l.op_attn_norm, nr, brows(m.tr.x, nr), RAD_W(l.attn_gain), brows(m.tr.xn, nr));
         StepPlan lp = p;
+        if (!in) {
+            /* The decode band alone: a decode plan over the rows that are here. The chunk rows'
+             * selection, keys and queries for this layer were the sub-step that ran them. */
+            lp.T = p.DT;
+            lp.DT = p.DT;
+            lp.S = p.D;
+            lp.P = 0;
+            lp.nonabs = false;
+        }
         const int32_t* meta = batch->prefill_tail_h;
         const TailLayout tl(p.S, p.P, meta ? meta[0] : 0, batch->rope_pos != nullptr);
-        if (i + 1 == m.layers.size() && m.tail_meta && meta && p.P && meta[0] < T &&
+        /* The compact pass drops rows a sampler will not read: only once the chunk's rows have run
+         * every layer (the last sub-step), where the whole chunk is present. */
+        if (hi >= last && i + 1 == m.layers.size() && m.tail_meta && meta && p.P && meta[0] < T &&
             tail_keeps_decode(meta, tl, p.DT)) {
             lp.T = meta[0];
             rows.n = lp.T;
@@ -1390,21 +1461,24 @@ static void step(RadCtx* c, const RadBatch* batch) {
                 queries = &compact;
             }
         }
-        if (!l.attn.front(c, batch, queries, rows)) return;
-        m.calib.after_front(c, (int)i, l.attn, T);
+        /* The batch whose rows the layer's ops read: the whole step inside the slice, the compact
+         * view on the last layer, the decode band outside the slice. */
+        const RadBatch* lq = in ? queries : bd;
+        if (!l.attn.front(c, lb, lq, rows)) return;
+        m.calib.after_front(c, (int)i, l.attn, nr);
         /* A pass on a streamed group's ring attends through the selection at every context
          * (hyv4flash_attn.h); every sparse layer of a pass agrees, the view being the pass's. */
-        if (!l.sliding && !lp.select && l.attn.ring_bound(c, batch)) lp.select = true;
-        if (!l.sliding && !l.ix.step(c, batch, lp, queries, rows)) return;
+        if (!l.sliding && !lp.select && l.attn.ring_bound(c, lb)) lp.select = true;
+        if (!l.sliding && !l.ix.step(c, lb, lp, lq, rows)) return;
         if (!rows.n) {
-            const auto* kb = kv_batch(batch, l.attn.kv);
+            const auto* kb = kv_batch(lb, l.attn.kv);
             if (!l.j_mid && kb && kb->stream) kv_stage_next(c, l.attn.kv, l.attn.layer);
             return;
         }
         if (!l.sliding) m.df.snap_step(c, (int)i, m.iw, lp.select, rows);
         const bool jm = (bool)l.j_mid;
         const bool je = (bool)l.j_end;
-        l.attn.core(c, batch, lp, m.iw.sel, m.iw.len, m.iw.nsel, jm, queries, rows);
+        l.attn.core(c, lb, lp, m.iw.sel, m.iw.len, m.iw.nsel, jm, lq, rows);
         if (rows.ids)
             rows.spans([&](int64_t src, int64_t dst, int64_t n) {
                 move_rows(c, m.pack_h, m.tr.h, s.hc * E, src, dst, n);
@@ -1462,7 +1536,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
             entered = je && l.j_end.tail;
             continue;
         }
-        if (!l.ffn.step(c, queries, je)) return;
+        if (!l.ffn.step(c, lq, je)) return;
         if (je) {
             junction(l.j_end);
             l.ffn.tail_taps(c, rows.n);
@@ -1472,32 +1546,39 @@ static void step(RadCtx* c, const RadBatch* batch) {
         l.t_resid.step(c, brows(m.tr.h, rows.n), rows.n);
         entered = je && l.j_end.tail;
     }
-    if (!entered) m.hc_head.pre(c, m.tr.h, m.tr.x, 0, rows.n);
-    m.t_hc_head.step(c, brows(m.tr.x, rows.n), rows.n);
-    if (!entered)
-        RAD_ISSUE_N(c, m.op_norm, rows.n, brows(m.tr.x, rows.n), RAD_W(m.final_gain), brows(m.final_hidden, rows.n));
-    m.t_final.step(c, brows(m.final_hidden, rows.n), rows.n);
-    if (rows.ids) {
-        /* The sampler and the next draft pass both address the original trunk rows. */
-        for (int64_t end = rows.n; end > 0;) {
-            int64_t start = end - 1;
-            while (start && rows.ids[start - 1] + 1 == rows.ids[start]) --start;
-            move_rows(c, m.unpack_hidden, m.final_hidden, E, start, rows.ids[start], end - start);
-            end = start;
+    /* S-02: `rows.n` is the extent of the layer the loop ended on, so a sub-step that ran the
+     * trunk's end heads the chunk's rows with the unsliced result, and one that stopped between two
+     * layers heads the decode band's alone (the chunk's final_hidden waits for the last sub-step).
+     * A sliced prefill's middle sub-step has no rows here and issues nothing. */
+    if (rows.n) {
+        if (!entered) m.hc_head.pre(c, m.tr.h, m.tr.x, 0, rows.n);
+        m.t_hc_head.step(c, brows(m.tr.x, rows.n), rows.n);
+        if (!entered)
+            RAD_ISSUE_N(c, m.op_norm, rows.n, brows(m.tr.x, rows.n), RAD_W(m.final_gain),
+                        brows(m.final_hidden, rows.n));
+        m.t_final.step(c, brows(m.final_hidden, rows.n), rows.n);
+        if (rows.ids) {
+            /* The sampler and the next draft pass both address the original trunk rows. */
+            for (int64_t end = rows.n; end > 0;) {
+                int64_t start = end - 1;
+                while (start && rows.ids[start - 1] + 1 == rows.ids[start]) --start;
+                move_rows(c, m.unpack_hidden, m.final_hidden, E, start, rows.ids[start], end - start);
+                end = start;
+            }
         }
-    }
-    if (batch->n_out > 0) {
-        if (head_reads_all_rows(batch, p)) {
-            /* P-08: every row outputs, so out_ids is 0..T-1 and the gather would copy
-             * final_hidden onto itself; the head reads final_hidden directly. */
-            RAD_ISSUE_N(c, m.op_head, batch->n_out, brows(m.final_hidden, T), RAD_W(m.head),
-                        brows(m.logits, batch->n_out));
-        } else {
-            RAD_ISSUE_N(c, m.op_gather, batch->n_out, brows(m.final_hidden, T),
-                        praw(batch->out_ids, RAD_I32, batch->n_out),
-                        brows(m.logit_input, batch->n_out));
-            RAD_ISSUE_N(c, m.op_head, batch->n_out, brows(m.logit_input, batch->n_out), RAD_W(m.head),
-                        brows(m.logits, batch->n_out));
+        if (batch->n_out > 0) {
+            if (head_reads_all_rows(batch, p)) {
+                /* P-08: every row outputs, so out_ids is 0..T-1 and the gather would copy
+                 * final_hidden onto itself; the head reads final_hidden directly. */
+                RAD_ISSUE_N(c, m.op_head, batch->n_out, brows(m.final_hidden, T), RAD_W(m.head),
+                            brows(m.logits, batch->n_out));
+            } else {
+                RAD_ISSUE_N(c, m.op_gather, batch->n_out, brows(m.final_hidden, T),
+                            praw(batch->out_ids, RAD_I32, batch->n_out),
+                            brows(m.logit_input, batch->n_out));
+                RAD_ISSUE_N(c, m.op_head, batch->n_out, brows(m.logit_input, batch->n_out),
+                            RAD_W(m.head), brows(m.logits, batch->n_out));
+            }
         }
     }
     m.calib.after_step(c, T);
@@ -1523,11 +1604,11 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     out->chain_pays = RAD_CHAIN_ALWAYS;
     out->kv_stream_ok = 1;
     /* S-02: whether this step can run the trunk over a layer range and resume the next sub-step
-     * from a persistent set. S-02a only wires the report: the step still runs the whole trunk and
-     * declares no such set (RadBuildCtx::layer_slices), so it must say 0 and a --chunk-slices
-     * request keeps m = 1. S-02b declares the set and reports 1 here when the trunk can stop
-     * between two layers (no taps, no calibration window). */
-    out->slice_layers_ok = 0;
+     * from a persistent set (declared under RadBuildCtx::layer_slices), then report the chunk's
+     * token when its rows have run every layer. The persistent set is declared when the engine asks
+     * (S-02b); the debug taps and a calibration run read the trunk between every two ops, so a graph
+     * running them says 0 and a --chunk-slices request keeps m = 1. */
+    out->slice_layers_ok = taps_on() ? 0 : 1;
     /* declare() honours RadBuildCtx::shape_probe (probe_model above): the core sizes the arena's
      * levels, lends their tops to the expert slab and arms the prefill stager. */
     {   /* RADIANCE_HY4_SHAPE_PROBE=0: no sizing declares (an A/B switch, hy4-perf). */
@@ -1552,9 +1633,12 @@ static uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t*) {
     if (batch->draft_pass) return batch->draft_pass > 0 ? 9u : 17u;
     if (batch->phase != RAD_PHASE_DECODE) return 0;
     const StepPlan p = plan(*models[rad_slot(c)], batch);
-    /* The gather-or-direct head choice (P-08) changes what the step issues; the key separates it. */
+    /* The gather-or-direct head choice (P-08) changes what the step issues; the key separates it.
+     * A sub-step of a chunk group issues the layers of its range only, so the key carries it too
+     * (inert for every graph that does not slice: layer_lo and layer_hi are 0). */
     return 1u | (p.select ? 2u : 0u) | (p.nonabs ? 4u : 0u) |
-           (head_reads_all_rows(batch, p) ? 8u : 0u);
+           (head_reads_all_rows(batch, p) ? 8u : 0u) |
+           ((batch->layer_lo || batch->layer_hi) ? 16u : 0u);
 }
 } // namespace hyv4flash
 
