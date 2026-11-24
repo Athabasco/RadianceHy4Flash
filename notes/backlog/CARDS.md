@@ -366,22 +366,26 @@ A worker without access to the lanes can still do a card, and measures it as far
    - the plugin lints (`hyv4flash_arch_test`)
    - the scheduler tests (`sched_test`)
    - every ctest that runs without a card
-3. With a GPU, measure the change yourself: before (the PR's merge base) and after (the PR's head) on the same machine,
-   same settings, at least three runs each, interleaved. Take the rows the item's merge bar (§2) names: the stamps,
-   `rad-kbench` or `profile-ops` rows of the targeted kernel, op or step, and the output parity (§2.1). Put them in the PR
-   body under `## Measurement`, with:
-   - the commit ids of before and after,
-   - the GPUs (model, count, TP), power cap, ROCm / driver version,
+3. With a GPU, measure the change yourself: before (the PR's merge base) and after (your code commit) on the same
+   machine, same settings, at least three runs each, interleaved. Take the rows the item's merge bar (§2) names: the
+   stamps, `rad-kbench` or `profile-ops` rows of the targeted kernel, op or step, and the output parity (§2.1). Write
+   them to `notes/backlog/measurements/<item>.md` (for example `K-47.md`) and commit that file to the PR, with:
+   - the commit ids of before and after (after is the commit of the code you measured; the commit that adds this file
+     comes on top of it and changes nothing else),
+   - who measured, the GPUs (model, count, TP), power cap, ROCm / driver version,
    - the container and the `ngram-placement` you ran with (any placement is fine on your machine),
-   - the raw output of each run (in a `<details>` block), not only a summary.
-   Numbers from your machine are compared with each other only, never with a lane's baseline.
-4. Push a branch and open a PR. Title it `[measured] <item>: <subject>` when step 3 covers the item's whole merge bar,
-   `[needs testing] <item>: <subject>` when it does not (no GPU). A `[needs testing]` PR lists the GPU checks from the
-   item's "Verify" part and the rows still owed.
-5. The review checks the measurement: the commit ids match the PR's base and head, before and after come from one
-   machine, the rows are the ones §2 asks for, the raw output carries the numbers. When it holds, the review records
-   `MEASURED: contributor (<who>, <GPUs>): <numbers>` and the PR merges by §2.
-6. When the review approves the code but no measurement holds, the issue gets the label `ready-for-testing`.
+   - the raw lines of each run for the rows the bar names (not only a summary). Keep the file under 40 KB: the
+     review reads the PR as text and refuses larger files.
+   Numbers from your machine are compared with each other only, never with another machine's.
+4. Push a branch and open a PR whose title or body holds `Fixes #<issue>`. Title it `[measured] <item>: <subject>`
+   when the file covers the item's whole merge bar, `[needs testing] <item>: <subject>` when it does not (no GPU).
+5. **Write `/done` as a comment on the item's issue** (not on the PR): only that starts the review, and only the PR's
+   author can. After every push you want reviewed, write `/done` again. A PR gets at most three review rounds, so
+   push your fixes and the measurement together where you can.
+6. The review reads the PR's diff and files and the issue's title and body, nothing else. It checks the code and the
+   measurement file: the rows are the ones §2 asks for, before and after come from one machine, the raw lines carry
+   the numbers. When both hold it approves and the PR merges at once. When only the measurement is missing, the issue
+   gets the label `ready-for-testing` (§6.1).
 
 ### 6.1 Testing a `ready-for-testing` issue
 
@@ -392,7 +396,9 @@ No lane on the Moebius server measures anything. Anyone with a free GPU can meas
 2. Measure both as step 3 above says.
 3. Post the result as a comment on the issue, starting with a `## Measurement` heading.
 
-Within the hour the board picks it up: the Reviewer checks the numbers and the change merges, or the issue gets an
-answer saying what is missing, and the label stays.
+For an own card, the board picks it up within the hour: the Reviewer checks it, and the change merges, or the issue is
+told what is missing. For a PR from outside, the PR's author commits the posted measurement as
+`notes/backlog/measurements/<item>.md` and writes `/done`; the board reminds them on the issue.
+
 Items whose whole value is a measurement (marked "lane required" in their issue) need a lane from the start. Lossy items
 keep §3.
