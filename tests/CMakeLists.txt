@@ -330,11 +330,11 @@ set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
 # ================================================================== the device tests on a card
 #
 # The unit entries run on the host backend. These run the tests whose code differs on a card (the
-# AQL backend, the driver's elastic commit, the mover's copies, libquant's trellis GPTQ) on the
-# card, one at a time: a test that commits device memory fails beside another holding it, or beside
-# a server.
+# AQL backend, the driver's elastic commit, the mover's copies, libquant's trellis GPTQ, and the
+# n-gram table a --ngram-placement ram=DIR engine pins in a shared file) on the card, one at a
+# time: a test that commits device memory fails beside another holding it, or beside a server.
 if(RAD_HIP_FOUND)
-  foreach(n device_test mem_test place_test runtime_test quant_tcq_gpu_test)
+  foreach(n device_test mem_test place_test runtime_test quant_tcq_gpu_test table_fill_test)
     add_test(NAME ${n}_card COMMAND ${n} -perf_)
     set_tests_properties(${n}_card PROPERTIES
       LABELS gpu

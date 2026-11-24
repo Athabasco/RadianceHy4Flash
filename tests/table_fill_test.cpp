@@ -3,14 +3,22 @@
  * copy_table reserves and publishes a table's memory as the load's walk meets its weight, starts
  * the read, and join_table_fills waits for every table it started once the container pass has run
  * beside them. These tests drive the same reserve/start/join/release path a --ngram-placement ram
- * server drives for the tables it reads for the cards, on the host backend's memory: the locked
- * copy (a host gather) and the pinned one (a card's gather), without a card.
+ * server drives for the tables it reads for the cards: the locked copy (a host gather) and the
+ * pinned one (a card's gather) on the host backend's memory, and the shared file (ram=DIR) the
+ * engines on separate cards pin in place, which only a card's backend can map.
  */
 #include "rad_test.h"
 #include "engine_priv.h"
+#include "device/device.h"
 #include "format/radfile.h"
 #include "format/table_copy.h"
+#include "format/table_share.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -29,6 +37,7 @@ struct TableFillTestAccess {
     static size_t pending(Engine& e) { return e.pending_tables_.size(); }
     static size_t locked(Engine& e) { return e.table_copies_.size(); }
     static size_t pinned(Engine& e) { return e.card_copies_.size(); }
+    static size_t shared(Engine& e) { return e.table_shares_.size(); }
 };
 }  // namespace rad
 
@@ -106,6 +115,11 @@ bool write_tables(const std::string& path, int64_t nc, int64_t na, int64_t nb, T
 
 bool same_as(const void* got, const uint8_t* want, int64_t n) {
     return got && std::memcmp(got, want, (size_t)n) == 0;
+}
+
+/* Whether the shared file DIR/ngram-<id>.tab is there, whatever it holds. */
+bool share_file_exists(const std::string& dir, const std::string& id) {
+    return ::access((dir + "/ngram-" + id + ".tab").c_str(), F_OK) == 0;
 }
 
 }  // namespace
@@ -202,6 +216,138 @@ TEST(a_cards_tables_read_before_the_join_and_are_published_after_it) {
     CHECK_EQ(rad::TableFillTestAccess::locked(engine), size_t(0));
     CHECK(same_as(outa, src[1], n[1]));
     CHECK(same_as(outb, src[2], n[2]));
+}
+
+/* --ngram-placement ram=DIR (the third way a table is held): the file is filled by the engine that
+ * finds it unready and marked ready at the join, checked and pinned without a read by the next
+ * engine on it, and given back — mapping and file both — when the fill that wrote it failed. A
+ * table under kTableShareMin keeps its private pinned copy even under ram=DIR. */
+TEST(a_shared_table_is_filled_once_and_pinned_by_the_next_engine) {
+    /* A file is pinned where it lies (rad_dev_map_file), which only a card's backend can do: the
+     * unit entry runs this binary on the host backend and skips here, the _card entry runs it. */
+    if (rad::device_is_host())
+        SKIP("the shared placement pins a file in place, which the host backend cannot do");
+
+    TempContainer tmp{radtest::tmp_path("table-fill-shared.rad")};
+    /* c and a are at the share minimum, so ram=DIR shares them; b is under it. c comes first, so
+     * the 16-byte shift the failure case reads stays inside the container. */
+    const int64_t nc = rad::kTableShareMin, na = rad::kTableShareMin, nb = 64ll << 10;
+    Tables t;
+    REQUIRE(write_tables(tmp.path, nc, na, nb, &t));
+    REQUIRE_EQ(t.open(), 0);
+    const uint8_t* const* src = t.src;
+    const int64_t* n = t.n;
+    const int64_t* off = t.off;
+
+    const std::string dir = radtest::tmp_path("ngram-share");
+    REQUIRE(::mkdir(dir.c_str(), 0777) == 0);   /* an empty DIR is the placement's own */
+    const std::string ida = rad::table_share_id(tmp.path, off[1], n[1]);
+    /* Table 0 read 16 bytes late: a wrong read is what the check has to catch, and the share's id
+     * names the range that was read, so the file the fill makes carries the shifted offset. */
+    const int64_t bad_off = off[0] + 16;
+    const std::string idc = rad::table_share_id(tmp.path, bad_off, n[0]);
+    const std::string idb = rad::table_share_id(tmp.path, off[2], n[2]);
+    REQUIRE(!ida.empty() && !idc.empty() && !idb.empty() && ida != idc);
+
+    rad::Config config;
+    config.ngram_share_dir = dir;
+    rad::Engine engine(config);
+    rad::EngineScope owner(engine.owner(), "table-fill-shared-test");
+    rad::TableFillTestAccess::hold(engine, std::move(t.file));
+
+    void* outa = nullptr;
+    void* outb = nullptr;
+    std::string why;
+    const int rc = rad::TableFillTestAccess::copy(engine, src[1], n[1], off[1], true, &outa, &why);
+    /* A card whose locked-memory limit is under the table is the machine's setting, not a defect. */
+    if (rc == RAD_E_NOMEM && why.find("locking piece") != std::string::npos) SKIP("%s", why.c_str());
+    REQUIRE_EQ(rc, RAD_OK);
+    CHECK(outa != nullptr && outa != (const void*)src[1]);
+    CHECK_EQ(rad::TableFillTestAccess::pending(engine), size_t(1));
+    CHECK_EQ(rad::TableFillTestAccess::pinned(engine), size_t(0));
+    /* The file is this engine's to fill: it is not a table another engine may reuse yet. */
+    CHECK(!rad::table_share_is_ready(dir, ida, n[1]));
+    CHECK(share_file_exists(dir, ida));
+
+    /* Under kTableShareMin: the private pinned copy, and no file in DIR. */
+    REQUIRE_EQ(rad::TableFillTestAccess::copy(engine, src[2], n[2], off[2], true, &outb, &why),
+               RAD_OK);
+    CHECK_EQ(rad::TableFillTestAccess::pending(engine), size_t(2));
+    CHECK(!share_file_exists(dir, idb));
+
+    REQUIRE_EQ(rad::TableFillTestAccess::join(engine), RAD_OK);
+    CHECK_EQ(rad::TableFillTestAccess::pending(engine), size_t(0));
+    CHECK_EQ(rad::TableFillTestAccess::pinned(engine), size_t(2));
+    CHECK_EQ(rad::TableFillTestAccess::shared(engine), size_t(1));
+    CHECK(same_as(outa, src[1], n[1]));
+    CHECK(same_as(outb, src[2], n[2]));
+    /* The join is what marks the file ready, for the engines that come after this one. */
+    CHECK(rad::table_share_is_ready(dir, ida, n[1]));
+
+    /* The next engine on the same container and DIR checks the file's samples and pins it, with
+     * nothing to read: the copy is its own the moment it is made. */
+    {
+        Tables next;
+        next.path = tmp.path;
+        REQUIRE_EQ(next.open(), 0);
+        rad::Engine engine2(config);
+        rad::EngineScope owner2(engine2.owner(), "table-fill-shared-test-reuse");
+        rad::TableFillTestAccess::hold(engine2, std::move(next.file));
+        void* again = nullptr;
+        REQUIRE_EQ(rad::TableFillTestAccess::copy(engine2, next.src[1], next.n[1], next.off[1], true,
+                                                 &again, &why),
+                   RAD_OK);
+        CHECK_EQ(rad::TableFillTestAccess::pending(engine2), size_t(0));
+        CHECK_EQ(rad::TableFillTestAccess::pinned(engine2), size_t(1));
+        CHECK_EQ(rad::TableFillTestAccess::shared(engine2), size_t(1));
+        CHECK(again != nullptr && again != (const void*)next.src[1]);
+        CHECK(same_as(again, next.src[1], next.n[1]));
+    }
+
+    /* A ready file whose table no longer matches the container (a filler killed mid-write after
+     * it was marked ready, or a corrupted tmpfs) is not read: the engine lets go of its mapping
+     * and its lock and fails, and the file stays for the holder that filled it. */
+    {
+        const int fd = ::open((dir + "/ngram-" + ida + ".tab").c_str(), O_RDWR | O_CLOEXEC);
+        REQUIRE(fd >= 0);
+        uint8_t wrong = 0;
+        REQUIRE_EQ(::pread(fd, &wrong, 1, rad::kTableShareHeader), (ssize_t)1);
+        wrong = (uint8_t)(wrong ^ 0xff);
+        REQUIRE_EQ(::pwrite(fd, &wrong, 1, rad::kTableShareHeader), (ssize_t)1);
+        ::close(fd);
+
+        Tables t3;
+        t3.path = tmp.path;
+        REQUIRE_EQ(t3.open(), 0);
+        rad::Engine engine3(config);
+        rad::EngineScope owner3(engine3.owner(), "table-fill-shared-test-mismatch");
+        rad::TableFillTestAccess::hold(engine3, std::move(t3.file));
+        void* stale = nullptr;
+        why.clear();
+        CHECK_EQ(rad::TableFillTestAccess::copy(engine3, t3.src[1], t3.n[1], t3.off[1], true, &stale,
+                                                &why),
+                 (int)RAD_E_IO);
+        CHECK(why.find("does not match") != std::string::npos);
+        CHECK_EQ(rad::TableFillTestAccess::pending(engine3), size_t(0));
+        CHECK_EQ(rad::TableFillTestAccess::pinned(engine3), size_t(0));
+        CHECK_EQ(rad::TableFillTestAccess::shared(engine3), size_t(0));
+        CHECK(share_file_exists(dir, ida));
+    }
+
+    /* A fill that read the wrong bytes releases its mapping and the file: nothing half-filled is
+     * left for the engine that comes next, and the load fails. */
+    void* bad = nullptr;
+    REQUIRE_EQ(rad::TableFillTestAccess::copy(engine, src[0], n[0], bad_off, true, &bad, &why),
+               RAD_OK);
+    CHECK_EQ(rad::TableFillTestAccess::pending(engine), size_t(1));
+    CHECK(share_file_exists(dir, idc));
+    CHECK_EQ(rad::TableFillTestAccess::join(engine), (int)RAD_E_IO);
+    CHECK_EQ(rad::TableFillTestAccess::pending(engine), size_t(0));
+    CHECK_EQ(rad::TableFillTestAccess::shared(engine), size_t(1));   /* the failed one is not */
+    CHECK(!rad::table_share_is_ready(dir, idc, n[0]));
+    CHECK(!share_file_exists(dir, idc));
+    /* Joined and cleared: a second join is nothing left to do. */
+    CHECK_EQ(rad::TableFillTestAccess::join(engine), RAD_OK);
 }
 
 RAD_TEST_MAIN()
