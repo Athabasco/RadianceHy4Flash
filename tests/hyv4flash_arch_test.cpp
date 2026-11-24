@@ -2479,6 +2479,14 @@ TEST(k15_the_paged_sink_and_the_fused_expansion_are_one_launch_pair) {
     CHECK_EQ(count_issued(on.b, c, "mla_attn_paged_sink_expand_i8g"), 1);
     CHECK_EQ(count_issued(on.b, c, "mla_attn_paged_sink"), 0);
     CHECK_EQ(count_issued(on.b, c, "mla_expand_gate_had_quant_i8g"), 0);
+    /* above kFoldRows the fold's bytes cost more than merge_sink's launch saves, so the pair is
+     * back and the expansion is still the fused one. */
+    auto k5 = kit(on.b, { 1, 1, 1, 1, 1 }, {}, 0);
+    RadCtx c5{ .b = &on.b, .batch = &k5->b };
+    hyv4flash::step(&c5, &k5->b);
+    CHECK(c5.step_fail.empty());
+    CHECK_EQ(count_issued(on.b, c5, "mla_attn_paged_sink_expand_i8g"), 0);
+    CHECK_EQ(count_issued(on.b, c5, "mla_attn_paged_sink"), 1);
     setenv("RADIANCE_HY4_SINK_FOLD", "0", 1);
     Declared off(int8_attn_encs);
     unsetenv("RADIANCE_HY4_SINK_FOLD");

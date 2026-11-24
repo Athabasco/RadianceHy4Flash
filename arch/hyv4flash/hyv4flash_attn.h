@@ -23,11 +23,18 @@
  * The sparse layers' indexer (hyv4flash_indexer.h) runs between the cache store and the
  * attention.
  *
- * Where the whole step is the paged decode and the expansion is fused (G-3c), the sliding layers
- * issue mla_attn_paged_sink_expand_i8g, which is the sink and that expansion over its latent in one
- * call: the sink's partials are folded in the expansion's workgroup, so merge_sink's launch and the
- * latent's round trip go and every byte past the fold is unchanged (K-15).
- * RADIANCE_HY4_SINK_FOLD=0 keeps the two launches.
+ * Where the whole step is the paged decode, the expansion is fused (G-3c) and the step is at most
+ * kFoldRows rows, the layer issues mla_attn_paged_sink_expand_i8g, which is the sink and that
+ * expansion over its latent in one call: the sink's partials are folded in the expansion's
+ * workgroup, so merge_sink's launch and the latent's round trip go and every byte past the fold is
+ * unchanged (K-15). RADIANCE_HY4_SINK_FOLD=0 keeps the two launches.
+ *
+ * The row bound is the fold's price. The partials a workgroup folds are rows x splits x 516 floats
+ * read cold through heads x ceil(rows / 16) workgroups, and at the decode heights the sink splits
+ * 20 ways (window 0) or 8 (a window) those few workgroups cannot fill the memory system: measured
+ * on one card at 16 heads, the fused launch is 4-16 % of the pair faster at one to four rows (three
+ * to four us a layer), level at eight in the 8-split law, and 16-58 % slower from six rows on in the
+ * 20-split one. Four rows is where every law still wins.
  *
  * The sparse layers' indexer (hyv4flash_indexer.h) runs between the cache store and the
  * attention.
@@ -166,6 +173,8 @@ struct Attn {
      * where the whole step is the paged decode, since the row covers op_paged's rows alone. */
     rad_op op_sink_q = 0;
     static constexpr int64_t kFuseRows = 64;
+    /* K-15's row bound: above it the fold's bytes cost more than merge_sink's launch saves. */
+    static constexpr int64_t kFoldRows = 4;
     Tap t_in_norm{}, t_q_resid{}, t_kv_latent{}, t_kv_rope{}, t_gate{}, t_o_proj{}, t_out{};
 
     /* G-3b: maps the three linears that read the attention norm's output (q_a, kv_a, the gate) and
@@ -507,7 +516,7 @@ struct Attn {
             if (op_expand_quant && fuse_on("RADIANCE_HY4_SINK_FOLD") &&
                 rad_op_declared(b, "mla_attn_paged_sink_expand_i8g")) {
                 op_sink_q = mk(b, "mla_attn_paged_sink_expand_i8g",
-                               { RAD_RANGE("M", 1, std::min<int64_t>(T, kFuseRows)),
+                               { RAD_RANGE("M", 1, std::min<int64_t>(T, kFoldRows)),
                                  RAD_INT("heads", H), RAD_INT("latent_dim", L),
                                  RAD_INT("rope_dim", R), RAD_INT("block_size", bs),
                                  RAD_INT("window", window), RAD_F64("scale", scale),
@@ -725,9 +734,10 @@ struct Attn {
         const int64_t abs_rows = selecting ? T : p.nonabs ? p.DT : T;
         /* G-3c: every row of a small step is absorbed, so one launch gives o_proj its codes. */
         const bool fused_q = op_expand_quant && abs_rows == T && T > 0 && T <= kFuseRows;
-        /* K-15: the sink, whose rows are the whole step's, and that same expansion in one pair. */
-        const bool fused_sink = fused_q && op_sink_q && !selecting && T > 0 && p.D > 0 &&
-                                p.DT == T;
+        /* K-15: the sink, whose rows are the whole step's, and that same expansion in one pair -- at
+         * the heights the fold pays at (see the header). */
+        const bool fused_sink = fused_q && op_sink_q && !selecting && T > 0 && T <= kFoldRows &&
+                                p.D > 0 && p.DT == T;
         if (abs_rows > 0) {
             RAD_ISSUE_N(c, op_absorb, abs_rows, brows(w.q_nope, abs_rows), RAD_W(kv_b),
                         brows(w.q_lat, abs_rows));
