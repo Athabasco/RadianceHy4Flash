@@ -1600,7 +1600,7 @@ extern "C" int r4d_shape_ar_rmsnorm_had_quant_i8g(const RadParam* p, int n_p, in
 
 extern "C" int r4d_shape_gemm_nt_f32(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
-    const RadOpdDesc l[] = { opd((uint32_t)RAD_BF16, M, K), opd((uint32_t)RAD_F32, N, K),
+    const RadOpdDesc l[] = { opd((uint32_t)RAD_BF16, M, K), opd(pi(p, n_p, "weight_bf16", 0) ? RAD_BF16 : RAD_F32, N, K),
                              opd((uint32_t)RAD_F32, M, N) };
     R4D_PICK(l);
 }
