@@ -355,7 +355,7 @@ design agent: Opus 5.5, thinking medium.
 
 ## 6. Working from outside (no lane)
 
-A worker without access to the lanes can still do a card:
+A worker without access to the lanes can still do a card, and measures it as far as their own hardware allows:
 
 1. Write the change and its tests.
 2. Run what needs no GPU:
@@ -366,8 +366,22 @@ A worker without access to the lanes can still do a card:
    - the plugin lints (`hyv4flash_arch_test`)
    - the scheduler tests (`sched_test`)
    - every ctest that runs without a card
-3. Push a branch and open a PR titled `[needs lane]`. List in it the GPU checks from the item's "Verify" part, and the stamps
-   or kbench rows that the merge bar needs.
-4. A lane run here measures the PR (before / after on one lane) and merges or closes it by §2.
+3. With a GPU, measure the change yourself: before (the PR's merge base) and after (the PR's head) on the same machine,
+   same settings, at least three runs each, interleaved. Take the rows the item's merge bar (§2) names: the stamps,
+   `rad-kbench` or `profile-ops` rows of the targeted kernel, op or step, and the output parity (§2.1). Put them in the PR
+   body under `## Measurement`, with:
+   - the commit ids of before and after,
+   - the GPUs (model, count, TP), power cap, ROCm / driver version,
+   - the container and the `ngram-placement` you ran with (any placement is fine on your machine),
+   - the raw output of each run (in a `<details>` block), not only a summary.
+   Numbers from your machine are compared with each other only, never with a lane's baseline.
+4. Push a branch and open a PR. Title it `[measured] <item>: <subject>` when step 3 covers the item's whole merge bar,
+   `[needs lane] <item>: <subject>` when it does not (no GPU, or the bar needs the u3 served A/B you cannot run). A
+   `[needs lane]` PR lists the GPU checks from the item's "Verify" part and the rows still owed.
+5. The review checks the measurement: the commit ids match the PR's base and head, before and after come from one
+   machine, the rows are the ones §2 asks for, the raw output carries the numbers. When it holds, the review records
+   `MEASURED: contributor (<GPUs>): <numbers>` and the PR merges by §2 without a lane. Otherwise the review asks for the
+   missing rows, or records `MEASURED: owed` and a lane measures the PR here.
 
-Items whose whole value is a measurement (marked "lane required" in their issue) need a lane from the start.
+Items whose whole value is a measurement (marked "lane required" in their issue) need a lane from the start. Lossy items
+keep §3.
