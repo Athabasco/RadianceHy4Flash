@@ -1254,6 +1254,12 @@ static StepPlan plan(const Model& m, const RadBatch* batch) {
     return p;
 }
 
+/* P-08: a step whose every row is an output row. The scheduler appends out_ids per entry from that
+ * entry's own rows only, so n_out == T forces every entry to contribute all of its rows, in entry
+ * order = 0..T-1. With no prefill entries (D == S, DT == T) this is a plain decode/verify step and
+ * the gather before the head is an identity copy; the head can read final_hidden directly. */
+static bool head_reads_all_rows(const RadBatch* batch, const StepPlan& p) {
+    return batch->n_out == p.T && p.D == p.S && p.DT == p.T;
 /* The compact pass reads its rows [0, DT) as the batch's decode rows: paged() hands them the
  * batch's block table, seqused and decode bounds, and the stable instance. The derivation keeps
  * every decode row (d_prefill_tail); a tail whose kept rows do not start with exactly those runs
@@ -1479,10 +1485,18 @@ static void step(RadCtx* c, const RadBatch* batch) {
         }
     }
     if (batch->n_out > 0) {
-        RAD_ISSUE_N(c, m.op_gather, batch->n_out, brows(m.final_hidden, T),
-                    praw(batch->out_ids, RAD_I32, batch->n_out), brows(m.logit_input, batch->n_out));
-        RAD_ISSUE_N(c, m.op_head, batch->n_out, brows(m.logit_input, batch->n_out), RAD_W(m.head),
-                    brows(m.logits, batch->n_out));
+        if (head_reads_all_rows(batch, p)) {
+            /* P-08: every row outputs, so out_ids is 0..T-1 and the gather would copy
+             * final_hidden onto itself; the head reads final_hidden directly. */
+            RAD_ISSUE_N(c, m.op_head, batch->n_out, brows(m.final_hidden, T), RAD_W(m.head),
+                        brows(m.logits, batch->n_out));
+        } else {
+            RAD_ISSUE_N(c, m.op_gather, batch->n_out, brows(m.final_hidden, T),
+                        praw(batch->out_ids, RAD_I32, batch->n_out),
+                        brows(m.logit_input, batch->n_out));
+            RAD_ISSUE_N(c, m.op_head, batch->n_out, brows(m.logit_input, batch->n_out), RAD_W(m.head),
+                        brows(m.logits, batch->n_out));
+        }
     }
     m.calib.after_step(c, T);
 }
@@ -1530,7 +1544,9 @@ static uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t*) {
     if (batch->draft_pass) return batch->draft_pass > 0 ? 9u : 17u;
     if (batch->phase != RAD_PHASE_DECODE) return 0;
     const StepPlan p = plan(*models[rad_slot(c)], batch);
-    return 1u | (p.select ? 2u : 0u) | (p.nonabs ? 4u : 0u);
+    /* The gather-or-direct head choice (P-08) changes what the step issues; the key separates it. */
+    return 1u | (p.select ? 2u : 0u) | (p.nonabs ? 4u : 0u) |
+           (head_reads_all_rows(batch, p) ? 8u : 0u);
 }
 } // namespace hyv4flash
 

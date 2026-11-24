@@ -604,6 +604,65 @@ TEST(the_pass_key_tells_a_selecting_step_from_a_dense_one) {
     CHECK_EQ(hyv4flash::pass_key(&pc, &pf->b, nullptr), (uint64_t)0);
 }
 
+/* P-08: a decode step whose every row is an output row skips the gather and reads the head off
+ * final_hidden; the choice changes what the step issues, so the pass key carries it. Two batches
+ * with the same choice (one verify row per sequence or per step, whatever the split) share a key;
+ * a step with a row that does not output differs from one where every row does. */
+TEST(the_pass_key_tells_a_direct_head_step_from_a_gathered_one) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    auto full = kit(d.b, { 6 }, {});
+    full->b.positions_h = full->pos.data();
+    RadCtx fc{ .b = &d.b, .batch = &full->b };
+    const uint64_t k_full = hyv4flash::pass_key(&fc, &full->b, nullptr);
+    CHECK(k_full != 0);
+    CHECK((k_full & 8u) != 0);
+    /* the same choice in another shape (two verifies): the same key */
+    auto split = kit(d.b, { 3, 3 }, {});
+    split->b.positions_h = split->pos.data();
+    RadCtx sc{ .b = &d.b, .batch = &split->b };
+    CHECK_EQ(hyv4flash::pass_key(&sc, &split->b, nullptr), k_full);
+    /* one row of the step is not an output row: the gather runs, another key */
+    auto part = kit(d.b, { 6 }, {});
+    part->b.positions_h = part->pos.data();
+    part->b.n_out = part->b.n_tok - 1;
+    RadCtx pc{ .b = &d.b, .batch = &part->b };
+    const uint64_t k_part = hyv4flash::pass_key(&pc, &part->b, nullptr);
+    CHECK_EQ(k_full ^ k_part, (uint64_t)8u);      /* the choice bit only */
+}
+
+/* P-08: on those steps the head reads final_hidden directly, one launch and the T x E round trip
+ * a step gone; a step with a row that does not output (or a prefill entry) keeps the gather. */
+TEST(the_head_reads_final_hidden_when_every_row_outputs) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    auto full = kit(d.b, { 6 }, {});
+    full->b.positions_h = full->pos.data();
+    RadCtx fc{ .b = &d.b, .batch = &full->b };
+    hyv4flash::step(&fc, &full->b);
+    CHECK(fc.step_fail.empty());
+    CHECK_LINT(d.b, &fc);
+    CHECK_EQ(count_issued(d.b, fc, "logits_gemm"), 1);
+    CHECK_EQ(count_issued(d.b, fc, "gather_rows"), 0);
+    /* a decode step with a row that does not output keeps the gather */
+    auto part = kit(d.b, { 6 }, {});
+    part->b.positions_h = part->pos.data();
+    part->b.n_out = part->b.n_tok - 1;
+    RadCtx pc{ .b = &d.b, .batch = &part->b };
+    hyv4flash::step(&pc, &part->b);
+    CHECK(pc.step_fail.empty());
+    CHECK_LINT(d.b, &pc);
+    CHECK_EQ(count_issued(d.b, pc, "gather_rows"), 1);
+    CHECK_EQ(count_issued(d.b, pc, "logits_gemm"), 1);
+    /* a mixed step: the prefill rows are not all outputs, the gather stays */
+    auto mix = kit(d.b, { 1 }, { 6 });
+    mix->b.positions_h = mix->pos.data();
+    RadCtx mc{ .b = &d.b, .batch = &mix->b };
+    hyv4flash::step(&mc, &mix->b);
+    CHECK(mc.step_fail.empty());
+    CHECK_LINT(d.b, &mc);
+    CHECK_EQ(count_issued(d.b, mc, "gather_rows"), 1);
+    CHECK_EQ(count_issued(d.b, mc, "logits_gemm"), 1);
 /* K-49: the rotaries that turn over a whole prefill chunk are declared under the row-form name.
  * `rope_rows` is the same op with the same parameters -- one thread per (token, pair) looping the
  * heads, so one `sincosf` a (token, pair) instead of one a (token, head, pair) -- byte-identical,
