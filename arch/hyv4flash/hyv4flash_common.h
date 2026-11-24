@@ -399,16 +399,10 @@ struct Lin : LinearFP8 {
     /* The heights a pair's launch serves: the GEMV's, one token a step. The pair is two launches'
      * launch and ramp cost, which only the GEMV pays; a wider pass keeps both Lins' launches. */
     static constexpr int64_t kDualMaxM = 1;
-    /* This Lin's weight encoding spelled (rad_enc_format): a pair's launch reads one form's codes
-     * for both weights, so the two must be the same encoding, not merely the same code view. */
-    char enc_text[256] = {};
-    /* A trellis on a grid of `w_rb` rows a scale (libquant's tcq_rb), as LinearFP8 declares it: a
-     * pair's launch folds with the one Lin's value, so the two must agree. */
-    int64_t w_rb = 0;
-    /* The trellis's run in rows (libquant's tcq_rows, the plane's block[0]): the form's wave count
-     * off N is one thing, but the fold's run is what K-01's two weights differed in, and neither
-     * `enc_text` nor `w_rb` spells it -- so a pair compares it as its own field. */
-    int64_t w_run = 0;
+    /* This Lin's weight encoding as LinearFP8 read it: a pair's launch reads one form's codes for
+     * both weights, so the two must be one encoding -- its planes' runs and row-blocks included,
+     * which is what rad_enc_equal sees and what the fold needs to agree on. */
+    RadEncoding wenc{};
     ActFP8 with_codes(const ActFP8& a) const {
         ActFP8 r = a;
         if (q8 && !r.q8) {
@@ -451,12 +445,7 @@ struct Lin : LinearFP8 {
                 return RAD_E_DTYPE;
             }
             form = code_form(b, wn);
-            rad_enc_format(&e, enc_text, sizeof enc_text);
-            {
-                const RadEncPlane* tpl = rad_enc_plane(&e, "trellis");
-                w_rb = tpl && tpl->block[1] > 1 ? tpl->block[1] : 0;
-                w_run = tpl ? tpl->block[0] : 0;
-            }
+            wenc = e;
             Codes* c = codes_of(b);
             if (!c) return RAD_E_INVAL;
             if (fed_codes && fed_codes->q8 && fed_codes->s8 && fed_codes->g8 == form.g8 &&
@@ -498,8 +487,8 @@ struct Lin : LinearFP8 {
         if (!iqr || !mate.iqr || !form.rot) return RAD_OK;
         if (!mate.fed || mate.q8 != q8 || mate.s8 != s8 || mate.g8 != g8) return RAD_OK;
         if (mate.K != K || !form.same(mate.form)) return RAD_OK;
-        if (mate.w_rb != w_rb || mate.w_run != w_run) return RAD_OK;
-        if (std::strcmp(enc_text, mate.enc_text) || !rad_op_declared(b, "gemm_nt_q_dual")) return RAD_OK;
+        if (!rad_enc_equal(&wenc, &mate.wenc)) return RAD_OK;
+        if (!rad_op_declared(b, "gemm_nt_q_dual")) return RAD_OK;
         /* Each part's blocks cover its own tiles: two 16-row tiles where its own launch takes four
          * waves a tile (4096 columns and up), one where it takes eight. The row refuses a part whose
          * N is not a whole number of them, so the pair is not declared here either. */
