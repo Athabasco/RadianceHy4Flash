@@ -559,6 +559,174 @@ void gather_sixteen_cases(std::mt19937& rng, int& cases, int& fails) {
     }
 }
 
+/* moe_gather_inv_i8g's quantising sixteen-slot form (gather_kernel16_q8, libr4d/r4d_moe_gather.h):
+ * the same sums and the same `y` store as the plain sixteen-slot form, and the rotated int8 codes and
+ * their scales of the row it sums -- the quantiser the layer used to launch after it. The codes are
+ * checked against that quantiser's arithmetic written out here on the host (had_quant_act_i8g's:
+ * the 128-wide unnormalised rotation, the amax of the scale group, its scale, round to nearest into
+ * -127..127), at both scale groups: 128 for the int8 trunk and 256 for an IQ8R one, whose two
+ * rotation blocks share a scale. Codes and scales run at padded pitches with the poison after the
+ * last row, so an overrun shows, and the slices drop slots as on the card. */
+void host_quant_i8g(const std::vector<uint16_t>& y, int M, int n, int y_ld, int g8,
+                    std::vector<uint8_t>& q, std::vector<float>& s) {
+    const int nkb = n / g8;
+    q.assign((size_t)M * n, 0);
+    s.assign((size_t)M * nkb, 0.0f);
+    std::vector<float> v((size_t)n);
+    for (int r = 0; r < M; ++r) {
+        for (int i = 0; i < n; ++i) v[(size_t)i] = b2f(y[(size_t)r * y_ld + i]);
+        for (int g = 0; g < n / 128; ++g) {          /* the rotation, a 128-wide block at a time */
+            float* w = v.data() + g * 128;
+            for (int h = 1; h < 128; h <<= 1)
+                for (int i = 0; i < 128; ++i)
+                    if ((i & h) == 0) {
+                        const float a = w[i], b = w[i + h];
+                        w[i] = a + b;
+                        w[i + h] = a - b;
+                    }
+        }
+        for (int g = 0; g < nkb; ++g) {
+            float am = 0.0f;
+            for (int i = g * g8; i < (g + 1) * g8; ++i) am = std::fmax(am, std::fabs(v[(size_t)i]));
+            const float sc = am > 0.0f ? am * (1.0f / 127.0f) : 1.0f;
+            const float inv = 1.0f / sc;
+            s[(size_t)r * nkb + g] = sc;
+            for (int i = g * g8; i < (g + 1) * g8; ++i)
+                q[(size_t)r * n + i] = (uint8_t)(int8_t)std::rint(
+                    std::fmin(std::fmax(v[(size_t)i] * inv, -127.0f), 127.0f));
+        }
+    }
+}
+
+void gather_quant_cases(std::mt19937& rng, int& cases, int& fails) {
+    struct Q8Shape {
+        int M, n, nl, base, g8;
+        bool f32w;
+    };
+    const Q8Shape shapes[] = {
+        { 1, 2560, 288, 0, 128, true }, { 8, 1536, 288, 0, 128, true },
+        { 32, 512, 288, 0, 256, true }, { 33, 768, 144, 0, 128, false },
+        { 48, 256, 96, 96, 256, true }, { 40, 1024, 288, 0, 256, false },
+    };
+    const int k = 16, ne = 288;
+    const float s_poison = -1234.5f;
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (const Q8Shape& sh : shapes) {
+        const int M = sh.M, n = sh.n, T = M * k, nl = sh.nl, g8 = sh.g8, nkb = n / g8;
+        std::vector<int32_t> ids((size_t)T);
+        for (int r = 0; r < M; ++r) {
+            std::vector<int32_t> pool(ne);
+            for (int e = 0; e < ne; ++e) pool[(size_t)e] = e;
+            std::shuffle(pool.begin(), pool.end(), rng);
+            for (int j = 0; j < k; ++j) ids[(size_t)(r * k + j)] = pool[(size_t)j];
+        }
+        Scatter inv = scatter_kernel(ids, nl, sh.base, nullptr, true);
+        ++cases;
+        if (inv.rc != RAD_OK) {
+            std::printf("FAIL moe_gather_inv_i8g: the inverse at M=%d slice %d+%d\n", M, sh.base, nl);
+            ++fails;
+            continue;
+        }
+        const int ye_ld = n + 8, ew_ld = k + 2, y_ld = n + 8, q_ld = n + 8, s_ld = nkb + 2;
+        std::vector<uint16_t> ye((size_t)T * ye_ld);
+        std::vector<float> ewf((size_t)M * ew_ld);
+        std::vector<uint16_t> ewb((size_t)M * ew_ld);
+        if (((uintptr_t)ye.data() | (uintptr_t)ewf.data()) % 16 != 0) {
+            std::printf("FAIL moe_gather_inv_i8g: unaligned buffers at M=%d\n", M);
+            ++fails;
+            continue;
+        }
+        for (auto& v : ye) v = f2b(nd(rng));
+        for (size_t i = 0; i < ewf.size(); ++i) {
+            ewf[i] = std::fabs(nd(rng)) * 0.3f;
+            ewb[i] = f2b(ewf[i]);
+        }
+        const void* ew = sh.f32w ? (const void*)ewf.data() : (const void*)ewb.data();
+        const dim3 grid((unsigned)M,
+                        (unsigned)((n + 256 * (int)r4d_moegather::kGatherCols - 1) /
+                                   (256 * (int)r4d_moegather::kGatherCols)));
+        std::vector<uint16_t> y_ref((size_t)M * y_ld, kGatePoison);
+        std::vector<uint8_t> q_ref, q((size_t)M * q_ld + 16, 0x5a);
+        std::vector<float> s_ref, s((size_t)M * s_ld + 4, s_poison);
+        /* The plain form first: the sums the quantiser is fed in the layer. */
+        if (sh.f32w)
+            R4D_EMIT(nullptr, (r4d_moegather::gather_kernel16<256, true>), grid, dim3(256), 0,
+                     ye.data(), ew, inv.inv.data(), y_ref.data(), (uint32_t)M, (uint32_t)n,
+                     (uint32_t)k, (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld, nullptr,
+                     (uint32_t)T, nullptr, nullptr, 0, 0, 0);
+        else
+            R4D_EMIT(nullptr, (r4d_moegather::gather_kernel16<256, false>), grid, dim3(256), 0,
+                     ye.data(), ew, inv.inv.data(), y_ref.data(), (uint32_t)M, (uint32_t)n,
+                     (uint32_t)k, (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld, nullptr,
+                     (uint32_t)T, nullptr, nullptr, 0, 0, 0);
+        std::vector<uint16_t> y((size_t)M * y_ld, kGatePoison);
+        if (sh.f32w)
+            R4D_EMIT(nullptr, (r4d_moegather::gather_kernel16_q8<256, true>), grid, dim3(256), 0,
+                     ye.data(), ew, inv.inv.data(), y.data(), (uint32_t)M, (uint32_t)n, (uint32_t)k,
+                     (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld, nullptr, (uint32_t)T, nullptr,
+                     nullptr, 0, 0, 0, q.data(), s.data(), (uint32_t)q_ld, (uint32_t)s_ld,
+                     (uint32_t)g8);
+        else
+            R4D_EMIT(nullptr, (r4d_moegather::gather_kernel16_q8<256, false>), grid, dim3(256), 0,
+                     ye.data(), ew, inv.inv.data(), y.data(), (uint32_t)M, (uint32_t)n, (uint32_t)k,
+                     (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld, nullptr, (uint32_t)T, nullptr,
+                     nullptr, 0, 0, 0, q.data(), s.data(), (uint32_t)q_ld, (uint32_t)s_ld,
+                     (uint32_t)g8);
+        ++cases;
+        if (y != y_ref) {
+            size_t first = 0;
+            while (first < y.size() && y[first] == y_ref[first]) ++first;
+            std::printf("FAIL moe_gather_inv_i8g's sums at M=%d n=%d slice %d+%d %s weights: first "
+                        "difference at %zu\n", M, n, sh.base, nl, sh.f32w ? "f32" : "bf16", first);
+            ++fails;
+            continue;
+        }
+        host_quant_i8g(y_ref, M, n, y_ld, g8, q_ref, s_ref);
+        bool bad = false;
+        for (int r = 0; r < M && !bad; ++r) {
+            const uint8_t* qr = q.data() + (size_t)r * q_ld;
+            for (int i = 0; i < n && !bad; ++i)
+                if (qr[i] != q_ref[(size_t)r * n + i]) {
+                    std::printf("FAIL moe_gather_inv_i8g's codes at M=%d n=%d g8=%d %s weights, row "
+                                "%d column %d: %d, the quantiser's %d\n", M, n, g8,
+                                sh.f32w ? "f32" : "bf16", r, i, (int)qr[i],
+                                (int)q_ref[(size_t)r * n + i]);
+                    bad = true;
+                }
+            for (int g = 0; g < nkb && !bad; ++g)
+                if (std::memcmp(&s[(size_t)r * s_ld + g], &s_ref[(size_t)r * nkb + g],
+                                sizeof(float)) != 0) {
+                    std::printf("FAIL moe_gather_inv_i8g's scales at M=%d n=%d g8=%d %s weights, "
+                                "row %d group %d: %.9g, the quantiser's %.9g\n", M, n, g8,
+                                sh.f32w ? "f32" : "bf16", r, g, (double)s[(size_t)r * s_ld + g],
+                                (double)s_ref[(size_t)r * nkb + g]);
+                    bad = true;
+                }
+        }
+        ++cases;
+        if (bad) ++fails;
+        /* Past the live columns of every row, past the last group and past the last row nothing was
+         * written: the padding and the guards still hold the poison. */
+        bool over = false;
+        for (int r = 0; r < M; ++r) {
+            for (int i = n; i < q_ld; ++i)
+                if (q[(size_t)r * q_ld + i] != 0x5a) over = true;
+            for (int g = nkb; g < s_ld; ++g)
+                if (std::memcmp(&s[(size_t)r * s_ld + g], &s_poison, sizeof(float)) != 0) over = true;
+        }
+        for (int i = 0; i < 16; ++i)
+            if (q[(size_t)M * q_ld + i] != 0x5a) over = true;
+        for (int i = 0; i < 4; ++i)
+            if (std::memcmp(&s[(size_t)M * s_ld + i], &s_poison, sizeof(float)) != 0) over = true;
+        ++cases;
+        if (over) {
+            std::printf("FAIL moe_gather_inv_i8g wrote past its codes or scales at M=%d n=%d g8=%d\n",
+                        M, n, g8);
+            ++fails;
+        }
+    }
+}
+
 }   // namespace
 
 int main() {
@@ -567,6 +735,7 @@ int main() {
     router_scatter_cases(rng, cases, fails);
     gather_inverse_cases(rng, cases, fails);
     gather_sixteen_cases(rng, cases, fails);
+    gather_quant_cases(rng, cases, fails);
     std::printf("%d case(s), %d failure(s)\n", cases, fails);
     return fails ? 1 : 0;
 }
