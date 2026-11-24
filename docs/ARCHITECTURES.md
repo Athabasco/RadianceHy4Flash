@@ -3492,8 +3492,11 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   projection were ordered launches behind `latent_out`. `MoeFP8::step` takes a `side` (SideOps) and
   asks for its three stages where it issues its own shared arm's: gate_up behind the routed gate_up
   (behind the router from `kSharedFirstRows` routed rows on a trellis gate_up), the gate behind the
-  routed quantiser, down behind the routed down. A recorded pass then leaves each unordered beside
-  the routed launch in front of it. The arm's buffers are `rad_buf_concurrent`. Taken where neither
+  routed quantiser, down behind the routed down. Where the gated fold (K-23, `gemm_nt_q_gated`)
+  serves the step's rows, the first stage is the fold and the second issues nothing: two launches
+  where the pair's arm is three. A recorded pass then leaves each unordered beside the routed launch
+  in front of it. The arm's buffers are `rad_buf_concurrent`, the code pair the gate (or the fold)
+  writes included. Taken where neither
   shared linear quantises for itself (its codes fed, or bf16), which is the device configuration;
   the pipelined prefill's pieces keep the old order. Byte-identical: the same launches on the same
   operands, and the junction's add is unchanged. `RADIANCE_HY4_SHARED_SIDE=0` restores the old

@@ -1769,7 +1769,9 @@ bool has_buf(const std::vector<rad_buf>& v, rad_buf h) {
 }
 
 /* Where one MoE layer's launches sit in a pass: the routed gate_up, its quantiser, the routed
- * down, the gather, latent_out, and the shared arm's gate_up, gate and down. -1 when absent. */
+ * down, the gather, latent_out, and the shared arm's gate_up (or the fold, which names the same
+ * weight), gate and down. -1 when absent: no gate behind the fold (K-23), which writes the codes
+ * down reads and no gate_up product. */
 struct MoeOrder {
     int rgu = -1, rq = -1, rdn = -1, gather = -1, lat_out = -1, sgu = -1, sact = -1, sdn = -1;
 };
@@ -1801,6 +1803,24 @@ MoeOrder moe_order(const RadBuilder& b, const RadCtx& c, int l) {
         if (m.lat_out >= 0 && m.sdn >= 0) break;
     }
     return m;
+}
+
+/* The side's places in one MoE layer's pass (SharedSide): stage 0 -- the fold where it serves the
+ * rows, gate_up otherwise -- behind the routed gate_up (in front of it where MoeFP8 puts its own
+ * first stage, `first`); the gate behind the routed quantiser, none after the fold (stage 1 then
+ * issues nothing); down behind the routed down; all before the gather. */
+void side_order(const MoeOrder& m, bool fold, bool first = false) {
+    REQUIRE(m.rgu >= 0 && m.rq > m.rgu && m.rdn > m.rq && m.gather > m.rdn);
+    REQUIRE(m.sgu >= 0 && m.sdn > m.sgu);
+    if (first) CHECK(m.sgu < m.rgu);
+    else CHECK(m.sgu > m.rgu && m.sgu < m.rq);
+    if (fold) {
+        CHECK_EQ(m.sact, -1);
+    } else {
+        REQUIRE(m.sact > m.sgu && m.sdn > m.sact);
+        CHECK(m.sact > m.rq && m.sact < m.rdn);
+    }
+    CHECK(m.sdn > m.rdn && m.sdn < m.gather);
 }
 
 /* One launch as its op, rows, lane and operands (names, offsets, extents): two steps issuing the
@@ -1874,13 +1894,8 @@ TEST(the_shared_expert_rides_the_routed_pass) {
                         REQUIRE(m.rgu >= 0 && m.rq > m.rgu && m.rdn > m.rq && m.gather > m.rdn &&
                                 m.lat_out > m.gather);
                         REQUIRE(m.sgu >= 0 && m.sact > m.sgu && m.sdn > m.sact);
-                        if (r.on) {
-                            CHECK(m.sgu > m.rgu && m.sgu < m.rq);
-                            CHECK(m.sact > m.rq && m.sact < m.rdn);
-                            CHECK(m.sdn > m.rdn && m.sdn < m.gather);
-                        } else {
-                            CHECK(m.sgu > m.lat_out);
-                        }
+                        if (r.on) side_order(m, false);
+                        else CHECK(m.sgu > m.lat_out);
                     }
                 }
             }
@@ -1940,14 +1955,89 @@ TEST(the_shared_sides_first_stage_moves_with_moefp8s_own) {
         REQUIRE(!v.empty());
         for (int l : { 1, 2 }) {
             const MoeOrder m = moe_order(d.b, *v[0], l);
-            REQUIRE(m.rgu >= 0 && m.rq > m.rgu && m.rdn > m.rq && m.gather > m.rdn);
-            REQUIRE(m.sgu >= 0 && m.sact > m.sgu && m.sdn > m.sact);
-            if (rows * 2 >= 100) CHECK(m.sgu < m.rgu);
-            else CHECK(m.sgu > m.rgu && m.sgu < m.rq);
-            CHECK(m.sact > m.rq && m.sact < m.rdn);
-            CHECK(m.sdn > m.rdn && m.sdn < m.gather);
+            side_order(m, false, rows * 2 >= 100);
         }
     }
+}
+
+/* K-23 under the side: where the shared gate_up is an IQR trellis fed by the latent linear's
+ * rotated int8 codes and its down is rotated int8, the arm's gate_up and gate are one launch for
+ * the rows the fold serves (M <= 16): the side's stage 0 issues the fold, stage 1 nothing, stage 2
+ * down -- two launches where the pair's arm is three. The fold writes the gate's code pair (concurrent with
+ * the rest of the arm's buffers) and quantises nothing (its input codes are fed), so the arm still
+ * writes only its own buffers and rides the pass. Past 16 rows the pair runs as three stages. On
+ * and off (RADIANCE_HY4_SHARED_SIDE=0) issue the same launches with the same operands, in another
+ * order, at decode, verify and prefill heights, and every step kind is lint clean. */
+void iqr_side_encs(RadBuilder* b) {
+    iqr_ffn_encs(b);
+    b->encs.insert(b->encs.begin(), { { "ffn_latent_in", enc_i8(true) } });
+}
+TEST(the_shared_side_issues_the_fold_as_its_first_stage) {
+    struct Case { std::vector<int> dq, pq; int32_t ctx; bool fold; };
+    /* three decode rows; one decode beside a 10-row verify; a 12-row prefill; 40 rows (the pair). */
+    const Case cases[] = { { { 1 }, {}, 0, true }, { { 1, 1, 1 }, {}, 0, true },
+                           { { 1 }, { 10 }, 0, true }, { {}, { 12 }, 0, true },
+                           { {}, { 16 }, 16, true }, { {}, { 40 }, 0, false } };
+    struct Got { std::vector<std::vector<std::string>> sorted, order; };
+    /* REQUIRE returns from the lambda: it fills `g` rather than returning it. */
+    auto run = [&](bool side, Got& g) {
+        MetaKV mk = mini_meta(false, 128, 256);
+        RadBuilder b;
+        iqr_side_encs(&b);
+        RadBuildCtx ctx = build_ctx();
+        G3Env g3env;
+        if (!side) setenv("RADIANCE_HY4_SHARED_SIDE", "0", 1);
+        const int rc = hyv4flash::declare(&b, mk.meta(), &ctx);
+        unsetenv("RADIANCE_HY4_SHARED_SIDE");
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK_EQ(count_op(b, "gemm_nt_q_gated"), 3);   /* layer 0's MLP and two shared experts */
+        const rad_buf sgu = buf_h(b, "moe.shared_gate_up");
+        REQUIRE(sgu != 0);
+        CHECK_EQ(has_buf(b.concurrent, sgu), side);
+        /* The shared experts' folds (layers 1 and 2) write only buffers the side marked. */
+        for (int i = 1; side && i < 3; ++i) {
+            const RecOp* f = find_op(b, "gemm_nt_q_gated", i);
+            REQUIRE(f != nullptr);
+            for (rad_buf w : f->writes) CHECK(has_buf(b.concurrent, w));
+        }
+        for (const Case& cs : cases) {
+            auto k = kit(b, cs.dq, cs.pq, cs.ctx);
+            k->b.positions_h = k->pos.data();
+            auto v = run_passes(b, hyv4flash::step, { k.get() }, 0, 1);
+            CHECK_PASSES(b, v);
+            REQUIRE(!v.empty());
+            const RadCtx& c = *v[0];
+            if (cs.fold) {
+                CHECK_EQ(count_issued(b, c, "gemm_nt_q_gated"), 3);
+                CHECK_EQ(count_issued(b, c, "gated_had_quant_i8g"), 0);
+            }
+            for (int l : { 1, 2 }) {
+                const MoeOrder m = moe_order(b, c, l);
+                REQUIRE(m.sgu >= 0);
+                const RecOp* o = b.op_of(c.issues[(size_t)m.sgu].op);
+                REQUIRE(o != nullptr);
+                CHECK_EQ(o->op == "gemm_nt_q_gated", cs.fold);
+                if (side) side_order(m, cs.fold);
+                else CHECK(m.sgu > m.lat_out);
+            }
+            for (const auto& p : v) {
+                g.sorted.push_back(launches(b, *p));
+                g.order.push_back(issued_ops(b, *p));
+            }
+        }
+        every_weight_read(b);
+        steps_clean_at(b, 0, 1);
+    };
+    Got on, off;
+    run(true, on);
+    run(false, off);
+    REQUIRE_EQ(on.sorted.size(), off.sorted.size());
+    int moved = 0;
+    for (size_t p = 0; p < on.sorted.size(); ++p) {
+        CHECK(on.sorted[p] == off.sorted[p]);
+        moved += on.order[p] != off.order[p];
+    }
+    CHECK_EQ(moved, (int)(sizeof cases / sizeof cases[0]));
 }
 
 /* K-02 (P-14's switch): q_nope and q_rope read one q residual's codes, so where both are one IQR
