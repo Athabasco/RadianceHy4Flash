@@ -3422,6 +3422,12 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   the host libraries run the pair under the one op. `RADIANCE_HY4_EXPAND_GATE=0` issues the pair. libr4d's `mla_project_kv` sums on WMMA
   (WP16.3), in a different order from libref but row by row: a token's bytes are the same at any
   M, so verify rows still equal decode rows.
+- **The sink and the expansion, one launch pair (K-15).** Where the step is the paged decode and
+  `mla_expand_gate_had_quant_i8g` is fused, the layer issues `mla_attn_paged_sink_expand_i8g`: the
+  sink's rows, then the expansion, with `merge_sink`'s fold in the expansion's workgroup (16 KB of
+  LDS holding a head's folded rows) instead of a launch of its own and the latent's round trip. The
+  bytes are `merge_sink`'s, so the latent and everything past it are unchanged;
+  `RADIANCE_HY4_SINK_FOLD=0` keeps the two launches, which is the A/B switch.
 - **The caches.** The sliding layers' latent rows in a `RAD_KV_WINDOW` group (block 16, window
   `sliding_window` = 512 keys with the own one), the sparse layers' in a full group of block 4, so
   a page is an indexer group and `qsa_select`'s table is the attention's; the indexer's pooled keys

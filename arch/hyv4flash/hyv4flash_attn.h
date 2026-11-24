@@ -23,6 +23,15 @@
  * The sparse layers' indexer (hyv4flash_indexer.h) runs between the cache store and the
  * attention.
  *
+ * Where the whole step is the paged decode and the expansion is fused (G-3c), the sliding layers
+ * issue mla_attn_paged_sink_expand_i8g, which is the sink and that expansion over its latent in one
+ * call: the sink's partials are folded in the expansion's workgroup, so merge_sink's launch and the
+ * latent's round trip go and every byte past the fold is unchanged (K-15).
+ * RADIANCE_HY4_SINK_FOLD=0 keeps the two launches.
+ *
+ * The sparse layers' indexer (hyv4flash_indexer.h) runs between the cache store and the
+ * attention.
+ *
  * Streamed KV (docs/KV-STREAMING.md, --kv-resident): the sparse latent group may stream, as GLM's
  * MLA does (rad_block_glm_mla.h). Its store writes the host mirror always and the ring slot where
  * the block is resident (kv_store_streamed), and on a pass bound to the ring (a decode or verify
@@ -152,6 +161,10 @@ struct Attn {
     /* G-3c: the expansion, the gate and the rotated int8 codes attn_output reads, in one launch, for
      * decode-class steps (at most kFuseRows rows, every row absorbed); `out` then issues no quantiser. */
     rad_op op_expand_quant = 0;
+    /* K-15: the paged sink and the fused expansion in one launch pair, the sink's partials folded in
+     * the expansion's workgroup (RADIANCE_HY4_SINK_FOLD=0 keeps them apart, the A/B switch); only
+     * where the whole step is the paged decode, since the row covers op_paged's rows alone. */
+    rad_op op_sink_q = 0;
     static constexpr int64_t kFuseRows = 64;
     Tap t_in_norm{}, t_q_resid{}, t_kv_latent{}, t_kv_rope{}, t_gate{}, t_o_proj{}, t_out{};
 
@@ -489,6 +502,22 @@ struct Attn {
                      RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "bf16") },
                    { kv_b }, { w.lat, w.gate }, { out.q8, out.s8 });
             if (op_expand_quant && !rad_op_resolved(b, op_expand_quant)) op_expand_quant = 0;
+            /* K-15: the same expansion with the sink's attention in front of it, its partials folded
+             * into the expansion's LDS, so merge_sink's launch and the latent's round trip go. */
+            if (op_expand_quant && fuse_on("RADIANCE_HY4_SINK_FOLD") &&
+                rad_op_declared(b, "mla_attn_paged_sink_expand_i8g")) {
+                op_sink_q = mk(b, "mla_attn_paged_sink_expand_i8g",
+                               { RAD_RANGE("M", 1, std::min<int64_t>(T, kFuseRows)),
+                                 RAD_INT("heads", H), RAD_INT("latent_dim", L),
+                                 RAD_INT("rope_dim", R), RAD_INT("block_size", bs),
+                                 RAD_INT("window", window), RAD_F64("scale", scale),
+                                 RAD_STR("dtype", "bf16"), RAD_INT("stable", 1),
+                                 RAD_INT("k_dim", N), RAD_INT("v_dim", a.v),
+                                 RAD_INT("group", RAD_FP8_BLOCK) },
+                               { sinks, kv_b }, { w.q_lat, w.q_rope, w.gate },
+                               { w.lat, out.q8, out.s8 });
+                if (op_sink_q && !rad_op_resolved(b, op_sink_q)) op_sink_q = 0;
+            }
         }
         int rc = RAD_OK;
         op_ar = decl_all_reduce(b, g, s.n_embd, w.o, &rc);
@@ -592,11 +621,19 @@ struct Attn {
      * by the trunk: Model::op_rebase; on the last layer's compact pass, the retained queries'
      * bounds: query_cu). */
     void paged(RadCtx* c, const RadBatch* batch, const StepPlan& p, bool prefill,
-               const QueryRows& rows) const {
+               const QueryRows& rows, bool fused_q = false) const {
         const auto* kb = kv_batch(batch, kv);
         const int64_t pitch = kb->block_table_pitch, D = p.D, DT = p.DT, L = s.kv_lora,
                       R = a.qk_rope, H = a.heads;
-        if (D > 0 && DT > 0)
+        if (D > 0 && DT > 0 && fused_q)
+            /* K-15: the sink and the expansion of these rows in one launch pair (`fused_q` only
+             * where they are the step's whole, see core()). */
+            RAD_ISSUE_N(c, op_sink_q, DT, brows(w.q_lat, DT), brows(w.q_rope, DT),
+                        kv_cache(kv, layer), praw2(kb->block_table, RAD_I32, D, pitch),
+                        praw(kb->seqused, RAD_I32, D), praw(batch->cu_seqlens, RAD_I32, D + 1),
+                        RAD_W(sinks), brows(w.lat, DT), RAD_W(kv_b), brows(w.gate, DT),
+                        brows(out.q8, DT), brows(out.s8, DT));
+        else if (D > 0 && DT > 0)
             RAD_ISSUE_N(c, op_paged, DT, brows(w.q_lat, DT), brows(w.q_rope, DT),
                         kv_cache(kv, layer), praw2(kb->block_table, RAD_I32, D, pitch),
                         praw(kb->seqused, RAD_I32, D), praw(batch->cu_seqlens, RAD_I32, D + 1),
@@ -688,6 +725,9 @@ struct Attn {
         const int64_t abs_rows = selecting ? T : p.nonabs ? p.DT : T;
         /* G-3c: every row of a small step is absorbed, so one launch gives o_proj its codes. */
         const bool fused_q = op_expand_quant && abs_rows == T && T > 0 && T <= kFuseRows;
+        /* K-15: the sink, whose rows are the whole step's, and that same expansion in one pair. */
+        const bool fused_sink = fused_q && op_sink_q && !selecting && T > 0 && p.D > 0 &&
+                                p.DT == T;
         if (abs_rows > 0) {
             RAD_ISSUE_N(c, op_absorb, abs_rows, brows(w.q_nope, abs_rows), RAD_W(kv_b),
                         brows(w.q_lat, abs_rows));
@@ -705,16 +745,18 @@ struct Attn {
             if (selecting)
                 selected(c, p, sel, len);
             else
-                paged(c, queries, p, !p.nonabs, rows);
-            if (fused_q)
-                RAD_ISSUE_N(c, op_expand_quant, T, brows(w.lat, T), RAD_W(kv_b), brows(w.gate, T),
-                            brows(out.q8, T), brows(out.s8, T));
-            else if (op_expand_gate)
-                RAD_ISSUE_N(c, op_expand_gate, abs_rows, brows(w.lat, abs_rows), RAD_W(kv_b),
-                            brows(w.gate, abs_rows), brows(w.ag, abs_rows));
-            else
-                RAD_ISSUE_N(c, op_expand, abs_rows, brows(w.lat, abs_rows), RAD_W(kv_b),
-                            brows(w.ao, abs_rows));
+                paged(c, queries, p, !p.nonabs, rows, fused_sink);
+            if (!fused_sink) {
+                if (fused_q)
+                    RAD_ISSUE_N(c, op_expand_quant, T, brows(w.lat, T), RAD_W(kv_b),
+                                brows(w.gate, T), brows(out.q8, T), brows(out.s8, T));
+                else if (op_expand_gate)
+                    RAD_ISSUE_N(c, op_expand_gate, abs_rows, brows(w.lat, abs_rows), RAD_W(kv_b),
+                                brows(w.gate, abs_rows), brows(w.ag, abs_rows));
+                else
+                    RAD_ISSUE_N(c, op_expand, abs_rows, brows(w.lat, abs_rows), RAD_W(kv_b),
+                                brows(w.ao, abs_rows));
+            }
         }
         if (p.nonabs && !selecting && p.T > p.DT) dense(c, batch, rows, p);
         /* the rows the fused expansion has not gated already */
