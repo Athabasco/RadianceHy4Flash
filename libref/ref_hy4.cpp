@@ -419,7 +419,9 @@ int ref_mla_attn_paged_sink(const RadArgs* a, RadStream) {
     if (cu_at(&cu, 0) != 0 || cu_at(&cu, n_seq) != rows || bt.shape[0] < n_seq) return RAD_E_SHAPE;
     std::vector<uint16_t> qrbuf;
     RadTensor qrr = qr;
-    RAD_REF_TRY(sink_rope(a, 8, qr, rows, H, R, &qrbuf, &qrr));
+    /* Not folded into RAD_REF_TRY: a call the macro hides is one the linter cannot see. */
+    const int frst = sink_rope(a, 8, qr, rows, H, R, &qrbuf, &qrr);
+    RAD_REF_TRY(frst);
     qr = qrr;
     REF_PAR_FOR_DYN(rows * H * 64)
     for (int64_t job = 0; job < rows * H; ++job) {
@@ -460,7 +462,8 @@ int ref_mla_attn_sel_sink(const RadArgs* a, RadStream) {
     const int64_t rows = q.shape[0];
     std::vector<uint16_t> qrbuf;
     RadTensor qrr = qr;
-    RAD_REF_TRY(sink_rope(a, 7, qr, rows, H, R, &qrbuf, &qrr));
+    const int frst = sink_rope(a, 7, qr, rows, H, R, &qrbuf, &qrr);
+    RAD_REF_TRY(frst);
     qr = qrr;
     REF_PAR_FOR_DYN(rows * H * 64)
     for (int64_t job = 0; job < rows * H; ++job) {

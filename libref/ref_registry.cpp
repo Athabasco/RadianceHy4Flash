@@ -1480,10 +1480,11 @@ static const RadOpSchema kSchemas[] = {
   "q_rope.rope_j); out = sum exp(s_j) latent_j / (sum exp(s_j) + exp(sink[h])): the sink joins the "
   "softmax once and carries no value. No visible key gives zero. `stable` 1 (optional, default 0) "
   "asks that a row's bytes not depend on the launch (M, its other rows); a row-independent "
-  "kernel ignores it. `rope_pos` (optional) is the rotary's positions, indexed by the row's "
-  "absolute position (`row0` included): with it the fragment is turned here from q_rope's raw "
-  "columns (`rope_theta`, `rope_scale`, `rope_mode` gptj or imrope_gptj, `rope_sections`), so the "
-  "rows need no `rope` launch; without it q_rope arrives rotated." },
+  "kernel ignores it. `rope_pos` (optional) is the rotary's positions, indexed by the row of "
+  "this launch (the operand is this launch's rows, a view of a whole step's array): with it "
+  "the fragment is turned here from q_rope's raw columns (`rope_theta`, `rope_scale`, "
+  "`rope_mode` gptj or imrope_gptj, `rope_sections`), so the rows need no `rope` launch; "
+  "without it q_rope arrives rotated." },
 { "mla_attn_sel_sink", ARR(pMlaAttnSelSink), ARR(oMlaAttnSelSink),
   "mla_attn's per-query page table and visible length with a rotary part and a sink: tokens "
   "[0, length[r]) of table row bt[r]. The score, the sink and `stable` are "
