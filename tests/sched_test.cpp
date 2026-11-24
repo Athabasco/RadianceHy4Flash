@@ -10846,6 +10846,47 @@ TEST(a_prefill_only_step_is_cut_into_slices_by_the_hook) {
     CHECK_EQ(f.sch.find(p)->n_computed, n_tok);
 }
 
+/* A prefill-only group plans no sub-step ahead: step_next() issues the step a commit would plan
+ * from the group's decode rows (`group_.dec`, the frozen rows of the step before), and the hook's
+ * group has none -- its rows are the same prefill rows on every sub-step. The next sub-step is
+ * planned by step() after the commit, and step_next() refuses with MidPrompt rather than plan from
+ * an empty `dec`. The same call on a group that carries a decoder plans one (above). */
+TEST(a_prefill_only_group_plans_no_sub_step_ahead) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/0);
+    f.cfg.chunk_slices_prefill = 4;
+    CHECK_OK(f.start());
+    f.submit(496, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    const StepPlan& first = f.sch.plan();
+    CHECK_EQ(first.slice_m, 4);
+    CHECK_EQ(first.slice_j, 0);
+    REQUIRE_EQ((int)first.e.size(), 1);      /* the chunk, and no decode row */
+    const int32_t hi = first.layer_hi;
+    const int64_t refused0 = f.sch.metrics().ahead_refused_mid_prompt;
+
+    CHECK(f.sch.step_next() == nullptr);
+    CHECK_EQ(f.sch.metrics().ahead_refused_mid_prompt, refused0 + 1);
+    CHECK_EQ((int)f.sch.next_plan().e.size(), 0);   /* nothing was planned */
+
+    /* The sub-step is unharmed: it commits, and step() plans the next one from where it stopped. */
+    f.commit_plain(20);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().slice_j, 1);
+    CHECK_EQ(f.sch.plan().layer_lo, hi);
+
+    /* Beside a decoder the same group plans its sub-step ahead, so what refused above is the empty
+     * decode row and not step_next(). */
+    Fixture g;
+    slice_fixture(g, /*slices=*/4);
+    CHECK_OK(g.start());
+    uint64_t dec = 0, chunk = 0;
+    REQUIRE(slice_start(g, &dec, &chunk) != nullptr);
+    CHECK_EQ(g.sch.plan().slice_m, 4);
+    CHECK(g.sch.step_next() != nullptr);
+    CHECK_EQ(g.sch.next_plan().slice_j, 1);
+}
+
 /* The hook is off by default, and it never slices a step it cannot: a plugin that reports no
  * resumable layer range (RadArchProbe::slice_layers_ok = 0) leaves the prefill step whole, and so
  * does m of 1. */
