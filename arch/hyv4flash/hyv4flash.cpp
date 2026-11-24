@@ -1137,8 +1137,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* Every junction needs its narrow reduction for the pipeline to have one form to issue on the
      * second lane; then name what that lane touches to the planner (Ctx::lane1_ rule 3: a transient
      * there could otherwise share arena bytes with a run of lane 0's that overlaps it in time). The
-     * connection buffers are PERSIST already, so this costs the routed/shared sums and the
-     * attention's output, the only transients lane 1 reads. */
+     * connection buffers are named to the planner below, so this costs the routed/shared sums and
+     * the attention's output, the only transients lane 1 reads. (They are transient themselves
+     * unless the graph slices, where `carried` makes them PERSIST; the loop names them either way,
+     * which is what the planner needs.) */
     for (const Layer& l : m.layers)
         if (!l.j_mid.pipe_ok() || !l.j_end.pipe_ok()) m.pipe_on = false;
     if (m.pipe_on) {
