@@ -1538,14 +1538,16 @@ TEST(quantised_trunk_linears_share_one_quantiser_an_input) {
  * RADIANCE_HY4_FUSE_QPROJ=0, and never for a pair of two forms nor for two runs of the trellis --
  * the run is the fold's length and the pair folds once. The pair's two Ns differ (the mini model's
  * q_nope is H * qk_nope_head_dim wide, its q_rope H * qk_rope_head_dim), which is what the row's
- * N2 is for. */
+ * N2 is for. On an engine whose library does not declare the row the pair keeps its two launches,
+ * as on the switch's off arm: the fallback is the plain kernel's launches, not a refused declare. */
 TEST(the_q_projections_go_out_as_one_launch) {
-    struct Run { const char* what; bool same, off; uint32_t nope_run, rope_run; int duals; };
+    struct Run { const char* what; bool same, off, host; uint32_t nope_run, rope_run; int duals; };
     const Run runs[] = {
-        { "one form, one run", true, false, 16, 16, 3 },
-        { "one form, fused off", true, true, 16, 16, 0 },
-        { "two forms", false, false, 16, 16, 0 },
-        { "two runs", true, false, 16, 32, 0 },
+        { "one form, one run", true, false, false, 16, 16, 3 },
+        { "one form, no dual row", true, false, true, 16, 16, 0 },
+        { "one form, fused off", true, true, false, 16, 16, 0 },
+        { "two forms", false, false, false, 16, 16, 0 },
+        { "two runs", true, false, false, 16, 32, 0 },
     };
     for (const Run& r : runs) {
         fprintf(stderr, "run %s\n", r.what);
@@ -1558,6 +1560,8 @@ TEST(the_q_projections_go_out_as_one_launch) {
                       { { "attn_q_nope", enc_trellis(RAD_U5, true, r.nope_run) },
                         { "attn_q_rope", r.same ? enc_trellis(RAD_U5, true, r.rope_run)
                                                 : enc_i8(true) } });
+        /* A CPU engine: no device-only fused row, this file's idiom for one. */
+        if (r.host) b.undeclared.insert("gemm_nt_q_dual");
         /* K is the q_lora rank: a trellis weight takes K in whole 128-column runs of the table. */
         MetaKV mk = mini_meta(/* wide */ true);
         mk.set("q_lora_rank", "128");
@@ -1570,6 +1574,9 @@ TEST(the_q_projections_go_out_as_one_launch) {
         REQUIRE_EQ(rc, RAD_OK);
         /* One dual a layer where the pair is one form and one run, and none otherwise. */
         CHECK_EQ(count_op(b, "gemm_nt_q_dual"), r.duals);
+        /* No op reaches rad_decl_op that the library does not carry: the pair without the row
+         * declares its two Lins and nothing else, where asking would fail the declare. */
+        CHECK_EQ(join(b.asked_undeclared), std::string());
         /* Both own GEMMs stay declared: the pair serves the GEMV's band and every wider pass keeps
          * the Lins' launches, so neither weight loses its launch. */
         int own = 0;
@@ -1596,6 +1603,29 @@ TEST(the_q_projections_go_out_as_one_launch) {
             }
         every_weight_read(b);
         steps_clean_at(b, 0, 1);
+        /* A one-token decode step: the pair's launch where it is declared, and the two Lins' own
+         * launches (both parts, three layers) everywhere else -- the switch off, a form or a run
+         * apart, a library with no such row. */
+        {
+            auto k = kit(b, { 1 }, {}, 0);
+            k->b.positions_h = k->pos.data();
+            auto v = run_passes(b, hyv4flash::step, { k.get() }, 0, 1);
+            CHECK_PASSES(b, v);
+            auto issued = [&](bool dual) {
+                int n = 0;
+                for (const auto& i : v[0]->issues) {
+                    const RecOp* o = b.op_of(i.op);
+                    if (!o) continue;
+                    if (dual) n += o->op == "gemm_nt_q_dual";
+                    else if (o->op == "gemm_nt_q" && pint(o, "K") == 128 &&
+                             (pint(o, "N") == 96 || pint(o, "N") == 192 ||
+                              pint(o, "N") == 32 || pint(o, "N") == 64)) ++n;
+                }
+                return n;
+            };
+            CHECK_EQ(issued(true), r.duals);
+            CHECK_EQ(issued(false), r.duals ? 0 : 6);
+        }
     }
 }
 
