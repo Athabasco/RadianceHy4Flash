@@ -53,9 +53,9 @@ __device__ __forceinline__ float gather_mac(float wj, float x, float acc) {
  * amax/127 and the codes are round-to-nearest into -127..127. Same rotation, same sum order and
  * same rounding, so the codes are byte for byte the standalone quantiser's.
  *
- * `c` is the lane's first column (a multiple of eight), `lane` its hardware lane: the sixteen lanes
- * of a 128-wide block are a contiguous column range, starting on a block boundary. */
-/* The wave's lane c holds its 8 columns of the sum row; `q` is already at the row's column c, and
+ * `c` is the lane's first column (a multiple of eight) and `lane` its hardware lane: the sixteen
+ * lanes of a 128-wide block are a contiguous column range, starting on a block boundary, so the
+ * wave's lane `c` holds its 8 columns of the sum row, `q` is already at the row's column `c` and
  * `s` at the row's first scale. */
 __device__ __forceinline__ void gather_quant(const uint32_t o[4], uint32_t lane, uint32_t c,
                                             uint32_t g8, uint8_t* __restrict__ q,

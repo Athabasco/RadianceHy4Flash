@@ -44,6 +44,7 @@
 #include "r4d_plugin.h"
 #include "r4d_emit.h"
 #include "r4d_gemm_args.h"
+#include "r4d_launch.h"
 #include "r4d_moe_sort.h"
 #include "r4d_moe_gather.h"
 
@@ -337,7 +338,7 @@ constexpr uint32_t kScatterTile = 256;
 __global__ __launch_bounds__(kScatterTile) void scatter_hist_kernel(
     const int32_t* __restrict__ ids, int32_t* __restrict__ bcnt, uint32_t T, uint32_t n_expert,
     int32_t base, Protect prot) {
-    extern __shared__ int32_t s_h[];
+    R4D_DYN_LDS(int32_t, s_h);
     const uint32_t tid = threadIdx.x, b = blockIdx.x;
     for (uint32_t e = tid; e < n_expert; e += blockDim.x) s_h[e] = 0;
     __syncthreads();
@@ -2347,28 +2348,19 @@ __device__ __forceinline__ void gather_wide_body(
         r4d_moegather::gather_quant(o, lane, c, g8, q8 + (size_t)t * q_ld + c, s8 + (size_t)t * s_ld);
 }
 
-template <uint32_t NW>
+/* `Q` adds the sum's rotated int8 codes and their scales (moe_gather_inv_i8g, K-19) to the same
+ * sums and store, so one kernel and one argument list serve both forms (moe_gather_body's wide
+ * branch); the codes' operands are unused and may be null without it. */
+template <uint32_t NW, bool Q = false>
 __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
-    const uint16_t* __restrict__ ye, const uint16_t* __restrict__ ew,
-    const int32_t* __restrict__ inv, uint16_t* __restrict__ y,
-    uint32_t M, uint32_t n, uint32_t top_k, uint32_t ye_ld, uint32_t ew_ld, uint32_t y_ld,
-    const uint16_t* __restrict__ sh, const uint16_t* __restrict__ sg,
-    uint32_t sh_ld, uint32_t sg_ld, int sig) {
-    gather_wide_body<NW>(ye, ew, inv, y, M, n, top_k, ye_ld, ew_ld, y_ld, sh, sg, sh_ld, sg_ld,
-                         sig);
-}
-
-/* The quantising form of it (moe_gather_inv_i8g, K-19): the same sums and store, plus the codes. */
-template <uint32_t NW>
-__global__ __launch_bounds__(NW * kWave) void gather_wide_q8_kernel(
     const uint16_t* __restrict__ ye, const uint16_t* __restrict__ ew,
     const int32_t* __restrict__ inv, uint16_t* __restrict__ y,
     uint32_t M, uint32_t n, uint32_t top_k, uint32_t ye_ld, uint32_t ew_ld, uint32_t y_ld,
     const uint16_t* __restrict__ sh, const uint16_t* __restrict__ sg,
     uint32_t sh_ld, uint32_t sg_ld, int sig, uint8_t* __restrict__ q8, float* __restrict__ s8,
     uint32_t q_ld, uint32_t s_ld, uint32_t g8) {
-    gather_wide_body<NW, true>(ye, ew, inv, y, M, n, top_k, ye_ld, ew_ld, y_ld, sh, sg, sh_ld,
-                               sg_ld, sig, q8, s8, q_ld, s_ld, g8);
+    gather_wide_body<NW, Q>(ye, ew, inv, y, M, n, top_k, ye_ld, ew_ld, y_ld, sh, sg, sh_ld, sg_ld,
+                            sig, q8, s8, q_ld, s_ld, g8);
 }
 
 /* ================================================================== scale_rows
@@ -3555,24 +3547,22 @@ static int moe_gather_body(const RadArgs* a, RadStream s, bool given, bool quant
         constexpr uint32_t NW = 8;
         const unsigned gw = (unsigned)((n + kWave * kGatherWideCols - 1) / (kWave * kGatherWideCols));
         const dim3 grid((unsigned)((M + NW - 1) / NW), gw), blk(NW * kWave);
-        if (quant)
-            hipLaunchKernelGGL((gather_wide_q8_kernel<NW>), grid, blk, 0, (hipStream_t)s,
-                               (const uint16_t*)ye->data, (const uint16_t*)ew->data, inv,
-                               (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,
-                               (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,
-                               sh ? (const uint16_t*)sh->data : nullptr,
-                               sh ? (const uint16_t*)sg->data : nullptr,
-                               (uint32_t)sh_ld, (uint32_t)sg_ld, sig,
-                               (uint8_t*)q8->data, (float*)s8->data, (uint32_t)q_ld,
-                               (uint32_t)s_ld, (uint32_t)g8);
-        else
-        hipLaunchKernelGGL((gather_wide_kernel<NW>), grid, blk, 0, (hipStream_t)s,
-                           (const uint16_t*)ye->data, (const uint16_t*)ew->data, inv,
-                           (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,
-                           (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,
-                           sh ? (const uint16_t*)sh->data : nullptr,
-                           sh ? (const uint16_t*)sg->data : nullptr,
-                           (uint32_t)sh_ld, (uint32_t)sg_ld, sig);
+        /* No shared expert in the quantising form, so its plane and gate are absent there and the
+         * codes take their place (moe_gather_inv_i8g has no scalar). */
+        uint8_t* const qp = quant ? (uint8_t*)q8->data : nullptr;
+        float*   const sp = quant ? (float*)s8->data : nullptr;
+#define R4D_MGW(...)                                                                             \
+        hipLaunchKernelGGL((__VA_ARGS__), grid, blk, 0, (hipStream_t)s,                          \
+                           (const uint16_t*)ye->data, (const uint16_t*)ew->data, inv,            \
+                           (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,        \
+                           (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,                     \
+                           sh ? (const uint16_t*)sh->data : nullptr,                             \
+                           sh ? (const uint16_t*)sg->data : nullptr,                             \
+                           (uint32_t)sh_ld, (uint32_t)sg_ld, sig, qp, sp,                        \
+                           (uint32_t)q_ld, (uint32_t)s_ld, (uint32_t)g8)
+        if (quant) { R4D_MGW(gather_wide_kernel<NW, true>); }
+        else       { R4D_MGW(gather_wide_kernel<NW>); }
+#undef R4D_MGW
         R4D_MOE_CHK();
         return RAD_OK;
     }
@@ -3801,7 +3791,10 @@ __global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_kernel(
     /* The GEMM's partial tiles, then (last block only, after two barriers) the sort's LDS; the
      * shim sizes it for the larger. */
     if (CH::on) r4d_chain_wait();
-    extern __shared__ __align__(16) unsigned char rg_smem[];
+    /* R4D_DYN_LDS is `extern __shared__` in a build and the emulator's own storage where that one
+     * drives this source (r4d_launch.h); the uint4 element keeps the 16-byte alignment. */
+    R4D_DYN_LDS(uint4, rg_smem16);
+    unsigned char* const rg_smem = (unsigned char*)rg_smem16;
     float* const red = (float*)rg_smem;
     const uint32_t tid = threadIdx.x, wave = tid / kWave, lane = tid % kWave;
 
