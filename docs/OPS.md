@@ -3878,10 +3878,16 @@ read `xn` issue no quantiser; the chain gains the quantiser as its last step.
 `imrope_gptj` with `sections` and `[3, M]` positions, `theta`, `scale`), then `kv_store` of the row as
 one KV head of `(latent + rope_dim) / 2`, its first half the key slot and the rest the value slot, into
 `kv_cache` `[blocks, 1, block_size, latent + rope_dim]` at `slot_mapping`. The row is left as the
-chain leaves it. Byte-identical to the three ops (the same bodies run in the same order, one workgroup
-of 256 threads a token; the norm's sum is the 256-lane partition at every width). It publishes no
+chain leaves it. Byte-identical to the three ops: one pass restates their arithmetic — the norm's
+per-column form over the same 256-lane partition at every width, `rope_turn`'s angle and its bf16
+rounding, `kv_store`'s slot rule and its dword store — and writes the row and the slot out of the
+registers that produced each value, where the chain wrote the row and copied it back. One workgroup
+of 256 threads a token; the rope phase strides over every pair of the rotary, so any even `rope_dim`
+is covered. It publishes no
 `replaces` hook: the chain's operands are column slices of one buffer, which a hook cannot wire.
-r4d_selftest runs it against the three rows on column-slice operands. `arch/hyv4flash` issues it in
+r4d_selftest runs it against the three rows on column-slice operands, and `tests/r4d_emu_row` holds
+it to them in the emulator, byte for byte, including a rotary wider than a workgroup.
+`arch/hyv4flash` issues it in
 front of the paged store (not the streamed one, nor with the debug taps on) when the op is declared.
 
 ### `mla_attn_paged_sink`, `mla_attn_sel_sink`, `attn_kv_sink`

@@ -26,6 +26,7 @@
 #include "r4d_args.h"
 #include "r4d_emit.h"
 #include "r4d_common.h"
+#include "r4d_rope.h"
 #include "rad_yarn.h"
 #include "r4d_fp8_wmma.h"
 #include "r4d_chain.h"
@@ -635,53 +636,8 @@ __global__ __launch_bounds__(kThreads) void r4dchain_gelu_mul(R4D_GM_PARAMS) {
 //
 // Multi-component modes (ref_rope's rope_freqs): `mode` 2 mrope, 3 imrope, 4 axial, up to three
 // sections, with component c of token m at pos[c * plane + m]. `plane` 0 is the one-component
-// form, where every mode is neox.
-// The angle one rotary pair turns by, in one place. rope_body is the kernel that owns the rotation;
-// mla_row_front turns a pair by the same angle as it writes the cache slot from the registers that
-// produce the row. Both call rope_turn and rope_comp rather than restating them, so there is one
-// expression, no fast-math, and no accumulation in a narrower type: the per-component position
-// (mrope / imrope / axial), the base ladder's exponent over `den`, yarn's frequency scaling, the
-// proportional cut at `nfreq`, and the accurate sincosf. Do not "simplify" it here -- a kernel that
-// turns by a different angle is not byte-identical to the launch it replaces.
-__device__ __forceinline__ int rope_comp(int mode, uint32_t i, const int* sec, int n_sec,
-                                         uint32_t* j) {
-    *j = i;
-    if (mode == 3) {
-        if (i % 3 == 1 && (int)i < 3 * sec[1]) return 1;
-        if (i % 3 == 2 && (int)i < 3 * sec[2]) return 2;
-        return 0;
-    }
-    int c = 0, start = 0;
-    while (c + 1 < n_sec && (int)i >= start + sec[c]) { start += sec[c]; ++c; }
-    *j = i - (uint32_t)start;
-    return c;
-}
-__device__ __forceinline__ void rope_turn(const int32_t* __restrict__ pos, uint32_t m, uint32_t i,
-                                          int den, uint32_t nfreq, float theta, float rscale,
-                                          int mode, const int* sec, int n_sec, uint32_t plane,
-                                          RadYarn yarn, RadLlama3 l3, float* c, float* s) {
-    const float div = rscale != 0.0f ? rscale : 1.0f;
-    const float p0 = (float)pos[m] / div;
-    float inv = 1.0f / powf(theta, (float)(2 * i) / (float)den);
-    float p = p0;
-    if (plane) {
-        uint32_t j = i;
-        const int comp = rope_comp(mode, i, sec, n_sec, &j);
-        p = (float)pos[(size_t)comp * plane + m] / div;
-        if (mode == 4)
-            inv = 1.0f / powf(theta, (float)(2 * j) / (float)(2 * sec[comp]));
-    }
-    inv = yarn.frequency(inv, (int)i);
-    inv = l3.frequency(inv);
-    /* The proportional ladder rotates the whole head with every frequency past nfreq zero (HF's
-     * _compute_proportional_rope_parameters): pair i is (i, i + head_dim/2), and pairs past nfreq
-     * turn by 0 (cos 1, sin 0), returning the value exactly. */
-    if (i >= nfreq) inv = 0.0f;
-    const float ang = p * inv;
-    sincosf(ang, s, c);
-    if (yarn.factor != 0.0f) { *c *= yarn.magnitude; *s *= yarn.magnitude; }
-}
-
+// form, where every mode is neox. The angle itself is r4d_rope.h's rope_turn, which this kernel,
+// mla_row_front and the latent sinks' folded rotary all call.
 // r4dchain_rope is the chained form (r4d_chain.h), taken at decode heights.
 #define R4D_ROPE_PARAMS                                                                          \
     uint16_t* __restrict__ qkv, const int32_t* __restrict__ pos, uint32_t head_dim,              \
@@ -884,10 +840,11 @@ __global__ __launch_bounds__(kThreads) void mla_row_front_kernel(MlaRowFront p) 
     }
     /* The rotary, from the same pair of registers: rope_body's angle (rope_turn) and its rounding,
      * written to the row in place as rope_kernel writes it, and to the slot columns the pair
-     * owns. */
+     * owns. Every pair of the rotary, at any width: the loop strides over `rhalf` the way
+     * rope_body's does (`t += kThreads * gridDim.y` there), so a rope_dim above 2 * kThreads still
+     * rotates all of it. */
     const uint32_t rhalf = p.R / 2;
-    if (threadIdx.x < rhalf) {
-        const uint32_t i = threadIdx.x;
+    for (uint32_t i = threadIdx.x; i < rhalf; i += kThreads) {
         uint16_t* __restrict__ hd = yr + p.L;
         float cc, sn;
         rope_turn(p.pos, m, i, (int)p.R, rhalf, p.theta, p.rscale, p.mode, sec, p.n_sec, p.plane,

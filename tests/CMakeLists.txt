@@ -709,7 +709,7 @@ else()
   endif()
 endif()
 if(R4D_EMU_BUILT)
-  foreach(t pick norm escale qsa lora f32 mhc kda mla moefuse kvres dsa lili vit hy4 mla_sink mla_kv)
+  foreach(t pick norm escale qsa lora f32 mhc kda mla moefuse kvres dsa lili vit hy4 mla_sink mla_kv row)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # Hy4-flash's non-absorbed prefill (attn_kv_sink_h256): about 4 s.
@@ -730,6 +730,10 @@ if(R4D_EMU_BUILT)
   # rounding, and that test needs it.
   # r4d_emu_mla_kv: the kv_b projections on WMMA against libref, their law and the fused gate.
   set_tests_properties(r4d_emu_mla_kv PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
+  # r4d_emu_row: mla_row_norm_rope_store's fused norm / rope / kv_store against the chain the three
+  # ops make, byte for byte, over plain and imrope rotary, both gain dtypes, padding slots, a
+  # chained call and a rotary wider than a block.
+  set_tests_properties(r4d_emu_row PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   set_tests_properties(r4d_emu_lora r4d_emu_kda r4d_emu_hy4 r4d_emu_mla_kv PROPERTIES
                        ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
   # A seeded random sweep, mostly prefill shapes on the WMMA kernel, which the emulator runs at

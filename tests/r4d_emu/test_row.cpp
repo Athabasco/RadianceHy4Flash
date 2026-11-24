@@ -275,6 +275,20 @@ int main() {
         c.scale = 0.7071067811865476;
         fails += one(c);
     }
+    {   /* A rotary wider than a block: rope_dim 1024 is 512 pairs, twice kThreads, so the rope
+         * phase's loop has to stride over them; a pair the first pass leaves unwritten is a
+         * column of the row and of the slot that keeps its pre-rotation value. */
+        Cfg c = base();
+        c.L = 512;
+        c.R = 1024;
+        c.pitch = 1536;
+        c.M = 2;
+        c.bs = 4;
+        c.blocks = 3;
+        c.slot = { 0, 8 };
+        c.pos = { 3, 7 };
+        fails += one(c);
+    }
     std::printf("row front: %d failure(s)\n", fails);
     return fails ? 1 : 0;
 }
