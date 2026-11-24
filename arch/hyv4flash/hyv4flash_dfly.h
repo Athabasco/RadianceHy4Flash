@@ -22,7 +22,7 @@
  * full pass's first rows.
  *
  * What the trunk step leaves for it (only while the drafter is served): final_hidden (PERSIST,
- * every row), and for each distinct Lidx a snapshot of the indexer's selection by trunk row
+ * every possible anchor row), and for each distinct Lidx a snapshot of the indexer's selection by trunk row
  * (`dfly.sel_snap.<l>`, `dfly.nsel_snap.<l>`, nsel 0 for a row that attended densely), taken right
  * after qsa_select and before a streamed group's kv_resolve rewrites it into ring slots.
  *
@@ -211,6 +211,7 @@ struct Dfly {
     /* ---------------------------------------------------------------- the trunk's snapshots */
     struct Snap {
         int layer = -1;
+        int64_t width = 0;
         rad_buf sel = 0, nsel = 0, ids = 0;   /* ids: taps only, the selection as group ids */
         rad_op op_sel = 0, op_nsel = 0, op_zero = 0, op_ids = 0;
     };
@@ -227,6 +228,7 @@ struct Dfly {
         const int64_t T = g.max_tok, G = s.ix_group_topk;
         Snap sn;
         sn.layer = l;
+        sn.width = G;
         sn.sel = decl_b(b, nm.f("dfly.sel_snap.%d", l), RAD_I32, { T, G }, RAD_BUF_PERSIST);
         sn.nsel = decl_b(b, nm.f("dfly.nsel_snap.%d", l), RAD_I32, { T }, RAD_BUF_PERSIST);
         if (!sn.sel || !sn.nsel) return RAD_E_INVAL;
@@ -247,15 +249,23 @@ struct Dfly {
     }
     /* Issued after layer l's Indexer::step, before its attention (whose kv_resolve may rewrite
      * `ix.selected` in place). */
-    void snap_step(RadCtx* c, int l, const IndexWire& iw, int64_t T, bool select) const {
+    void snap_step(RadCtx* c, int l, const IndexWire& iw, bool select, QueryRows rows) const {
         const Snap* sn = snap_of(l);
-        if (!sn || T <= 0) return;
+        if (!sn || !rows.n) return;
         if (select) {
-            RAD_ISSUE_N(c, sn->op_sel, T, brows(iw.sel, T), brows(sn->sel, T));
-            RAD_ISSUE_N(c, sn->op_nsel, T, brows(iw.nsel, T), brows(sn->nsel, T));
-            if (sn->op_ids) RAD_ISSUE_N(c, sn->op_ids, T, brows(iw.sel_ids, T), brows(sn->ids, T));
+            rows.spans([&](int64_t orig, int64_t compact, int64_t n) {
+                RAD_ISSUE_N(c, sn->op_sel, n, brow_slice(iw.sel, compact, n, sn->width),
+                            brow_slice(sn->sel, orig, n, sn->width));
+                RAD_ISSUE_N(c, sn->op_nsel, n, brow_slice(iw.nsel, compact, n, 1),
+                            brow_slice(sn->nsel, orig, n, 1));
+                if (sn->op_ids)
+                    RAD_ISSUE_N(c, sn->op_ids, n, brow_slice(iw.sel_ids, compact, n, sn->width),
+                                brow_slice(sn->ids, orig, n, sn->width));
+            });
         } else if (!break_nsel_keep) {
-            RAD_ISSUE_N(c, sn->op_zero, T, brows(sn->nsel, T));
+            rows.spans([&](int64_t orig, int64_t, int64_t n) {
+                RAD_ISSUE_N(c, sn->op_zero, n, brow_slice(sn->nsel, orig, n, 1));
+            });
         }
     }
 

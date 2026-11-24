@@ -194,17 +194,26 @@ inline rad_op decl_copy(RadBuilder* b, int64_t rows, int64_t n, uint32_t dt, rad
 /* rope (interleaved pairs, `gptj`) over `heads` heads of `dim`, all of them rotated, in place.
  * The text trunk's M-RoPE with equal components is this rotation (plan D6). With `sections`
  * (a program that serves pictures, Shape::mrope) it is `imrope_gptj`, the reference's interleaved
- * M-RoPE over the same pairs, issued with the step's [3, T] rotary positions (rope_pos_of). */
+ * M-RoPE over the same pairs, issued with the step's [3, T] rotary positions (rope_pos_of).
+ *
+ * `op` names the op to declare: "rope", or "rope_rows", the same op under its row-form name.
+ * The row form is one thread per (token, pair) looping the heads -- one `sincosf` a (token, pair)
+ * instead of one a (token, head, pair) -- and the kernel's launch takes it at 64+ rows and 4+ heads
+ * (r4d_model_bf16.hip:1530-1541), so the same declaration keeps the per-(head, pair) launch at
+ * decode and for a narrow rope. Both names are byte-identical, and every kernel library carries
+ * both rows, so the name is the opt-in: "rope_rows" goes on a rope that rotates the query heads of
+ * a whole prefill chunk, which is where the `sincosf` count is `heads` times what it needs to be. */
 inline rad_op decl_rope_gptj(RadBuilder* b, int64_t rows, int64_t heads, int64_t dim,
-                             double theta, rad_buf x, const char* sections = nullptr) {
+                             double theta, rad_buf x, const char* sections = nullptr,
+                             const char* op = "rope") {
     if (sections && *sections)
-        return mk(b, "rope",
+        return mk(b, op,
                   { RAD_RANGE("M", 1, rows), RAD_INT("head_dim", dim), RAD_INT("n_head", heads),
                     RAD_INT("n_head_kv", 0), RAD_F64("theta", theta), RAD_F64("scale", 1.0),
                     RAD_STR("mode", "imrope_gptj"), RAD_INT("rotary_dim", dim),
                     RAD_STR("sections", sections) },
                   {}, { x }, { x });
-    return mk(b, "rope",
+    return mk(b, op,
               { RAD_RANGE("M", 1, rows), RAD_INT("head_dim", dim), RAD_INT("n_head", heads),
                 RAD_INT("n_head_kv", 0), RAD_F64("theta", theta), RAD_F64("scale", 1.0),
                 RAD_STR("mode", "gptj"), RAD_INT("rotary_dim", dim) },
