@@ -3572,7 +3572,8 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   the last sub-step's. The compact
   pass and the trunk's checkpoint are the last sub-step's. The pipeline is never taken for a
   sub-step. `--chunk-slices-prefill m` is the test hook: a prefill-only step cut into m, so that a
-  single greedy run serves a prompt sliced and unsliced.
+  single greedy run serves a prompt sliced and unsliced, and `scripts/backlog/s02_slice.py`
+  compares the two runs' text and dumped buffers.
 
 ### Tensor parallelism
 
