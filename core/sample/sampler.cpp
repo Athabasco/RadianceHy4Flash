@@ -997,7 +997,8 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
             if (pen || dry || ngram) {
                 const int64_t len  = n_total + dk;
                 const int64_t take = std::min<int64_t>(len, cfg_.max_hist);
-                /* C-06: the plane rides at the widest row this step stages, not at max_hist. */
+                /* C-06: record the widest row this step stages; run() weighs uploading the
+                 * planes at that width against the full width. */
                 hist_w_ = std::max(hist_w_, take);
                 int32_t* h = hist_stage_ + row * cfg_.max_hist;
                 /* The three sources are contiguous runs of one logical sequence, so the tail
@@ -1266,17 +1267,27 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     if (late)
         RAD_TRY(rad_memcpy_async(rad_buf_ptr(c, buf_params_late_), late_stage_,
                                  n_seq_ * (int64_t)sizeof(DeviceSampleParams), s));
-    /* C-06: the history planes ride at the width some row of this step uses, not at max_hist.
-     * Every row addresses its own [hist_off, hist_len) span and clamps it to the operand's
-     * width, so a row that staged `take` cells reads the same values at a pitch of max(take)
-     * as at max_hist; a row that staged nothing reads none of it (its hist_len is 0). The
-     * kernels, the libavx host forms and libref all read the pitch as numel/M of the operand,
-     * so the compact upload below and the cell-count operands at issue are the whole change. */
+    /* C-06: a step whose rows read short histories can ride the history planes at the width
+     * those rows use instead of at max_hist. Every row addresses its own [hist_off, hist_len)
+     * span and clamps it to the operand's width, so a row that staged `take` cells reads the
+     * same values at a pitch of max(take) as at max_hist; a row that staged nothing reads none
+     * of it (its hist_len is 0). The kernels, the libavx host forms and libref all read the
+     * pitch as numel/M of the operand, so the upload width and the cell-count operands at
+     * issue are the whole change.
+     *
+     * Compacting is a trade, though: it costs a host copy of n_seq_ * hist_w cells (and the
+     * same again for the breakers) to save an upload of exactly that many, against the full
+     * upload of n_seq_ * max_hist. Below half the full width the copy is at most as large as
+     * the upload it removes and the transfer saved is at least as large again; at a width only
+     * slightly short of max_hist the two are of a size, so such a step keeps the plain
+     * full-width upload instead of paying a copy to shave a similar-sized transfer. */
     const int64_t hist_w = std::max<int64_t>(hist_w_, 1);
-    const int64_t hist_cells = n_seq_ * hist_w;
+    const bool pack_hist = hist_w * 2 <= cfg_.max_hist;
+    const int64_t hist_pitch = pack_hist ? hist_w : cfg_.max_hist;
+    const int64_t hist_cells = n_seq_ * hist_pitch;
     if (any_penalty || any_dry || any_ngram) {
         const int32_t* hist_up = hist_stage_;
-        if (hist_w < cfg_.max_hist) {
+        if (pack_hist) {
             for (int64_t r = 0; r < n_seq_; ++r)
                 std::memcpy(hist_pack_ + r * hist_w, hist_stage_ + r * cfg_.max_hist,
                             (size_t)hist_w * sizeof(int32_t));
@@ -1288,7 +1299,7 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     const bool pass_brk = any_dry && any_brk_;
     if (pass_brk) {
         const uint8_t* brk_up = brk_stage_;
-        if (hist_w < cfg_.max_hist) {
+        if (pack_hist) {
             for (int64_t r = 0; r < n_seq_; ++r)
                 std::memcpy(brk_pack_ + r * hist_w, brk_stage_ + r * cfg_.max_hist,
                             (size_t)hist_w);
