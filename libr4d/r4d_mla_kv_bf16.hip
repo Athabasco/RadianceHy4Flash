@@ -44,6 +44,7 @@
 #include "r4d_common.h"
 #include "r4d_emit.h"
 #include "r4d_fwht.h"
+#include "r4d_mla_sink_fold.h"
 #include "r4d_q8.h"
 #include <cstdint>
 
@@ -288,7 +289,7 @@ constexpr int kQG = 128;          // the quantiser's group: the rotation width a
 constexpr int kQTiles = kQG / 16; // column tiles of a group
 constexpr int kQThreads = 32 * kQTiles * 4;   // 8 tiles x 4 quarters of the contraction = 1024
 
-template <class CH>
+template <class CH, bool FOLD = false>
 __device__ __forceinline__ void kvq_body(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
                                          const uint16_t* __restrict__ g, signed char* __restrict__ q,
                                          float* __restrict__ sc, uint16_t* __restrict__ y,
@@ -302,7 +303,11 @@ __device__ __forceinline__ void kvq_body(const uint16_t* __restrict__ x, const u
     const int o0 = (int)blockIdx.x * kQG + ct * 16, t0 = (int)blockIdx.z * 16, kq = quarter * K;
     const uint16_t* const wb = w + ((long)head * kRows + kKd) * m.wp + kq;
     const int tl = min(t0 + (lane & 15), m.rows - 1);
-    const uint16_t* const xp = x + (long)tl * m.xr + (long)head * kLatent + kq + 8 * (lane >> 4);
+    /* FOLD: x is this block's tile of rows in LDS (16 rows of the one head, no head offset);
+     * otherwise the latent's own row, its head's slice of it. */
+    const uint16_t* const xrow = FOLD ? x + (long)(tl - t0) * kLatent
+                                      : x + (long)tl * m.xr + (long)head * kLatent;
+    const uint16_t* const xp = xrow + kq + 8 * (lane >> 4);
     v8f acc;
 #pragma unroll
     for (int e = 0; e < 8; ++e) acc[e] = 0.0f;
@@ -403,6 +408,70 @@ __global__ __launch_bounds__(kQThreads) void kv_expand_gate_quant(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ w, const uint16_t* __restrict__ g,
     signed char* __restrict__ q, float* __restrict__ sc, uint16_t* __restrict__ y, KvQuantMeta m) {
     kvq_body<CH>(x, w, g, q, sc, y, m);
+    if constexpr (CH::on) r4d_chain_done();
+}
+
+/* ---- the sink's slots folded into the expand ------------------------------------------------- */
+
+/* Where the sink left its partials (MlaSinkForm: splits > 1): slot s of (row, head) at
+ * parts + row * hp + head * pitch + s * kMlaPart, and the latent the fused launch writes its own
+ * rows of at lat + row * lat_r + head * lat_h. */
+struct MlaFoldMeta {
+    const float* parts;
+    const float* sinks;
+    uint16_t* lat;
+    long hp, pitch, ss, lat_r, lat_h;
+    int splits;
+};
+
+/* The block's rows of one head, folded from the sink's partials into LDS as bf16 and, from the row's
+ * first column block only, into the latent (the merge's bytes, once). One thread a column and two
+ * rows a pass; the fold is merge_sink_body's, column by column: the first visible slot copied, each
+ * later one by fmaf(v, b, value * a), the sink once at the end. */
+__device__ __forceinline__ void mla_sink_fold_lds(uint16_t* __restrict__ xl, const MlaFoldMeta& f,
+                                                  int t0, int nr, int head) {
+    constexpr int kPerRow = kQThreads / kLatent;   /* rows folded in one pass */
+    const int col = threadIdx.x % kLatent, rr = threadIdx.x / kLatent;
+    const float sink = f.sinks[head * f.ss];
+    for (int j = rr; j < nr; j += kPerRow) {
+        const long row = t0 + j;
+        const float* const slot = f.parts + row * f.hp + head * f.pitch;
+        float value = 0.0f, acc_m = -INFINITY, den = 0.0f;
+        for (int s = 0; s < f.splits; ++s) {
+            const float* const sl = slot + (long)s * kMlaPart;
+            const float pm = sl[kMlaD], pd = sl[kMlaD + 1];
+            if (!(pd > 0.0f)) continue;
+            const float v = sl[col];
+            if (!(den > 0.0f)) {
+                acc_m = pm;
+                den = pd;
+                value = v;
+                continue;
+            }
+            const SinkFold g = sink_fold(acc_m, pm);
+            den = fmaf(pd, g.b, den * g.a);
+            acc_m = g.m;
+            value = fmaf(v, g.b, value * g.a);
+        }
+        const uint16_t o = f32_to_bf16(value * sink_inv(acc_m, den, sink));
+        xl[j * kLatent + col] = o;
+        if (blockIdx.x == 0) f.lat[row * f.lat_r + (long)head * f.lat_h + col] = o;
+    }
+}
+
+/* The expand's x from the sink's partials: the block folds its head's rows of the tile into its
+ * LDS (16 KB beside the contraction's 36) and then contracts exactly as kv_expand_gate_quant does.
+ * Emitted where the sink split (splits > 1), so merge_sink's launch and its round trip through the
+ * latent are gone; where the sink wrote the latent itself the plain kernel reads it. */
+template <typename CH>
+__global__ __launch_bounds__(kQThreads) void kv_sink_expand_gate_quant(
+    const MlaFoldMeta f, const uint16_t* __restrict__ w, const uint16_t* __restrict__ g,
+    signed char* __restrict__ q, float* __restrict__ sc, uint16_t* __restrict__ y, KvQuantMeta m) {
+    __shared__ __align__(16) uint16_t xl[16 * kLatent];
+    const int t0 = (int)blockIdx.z * 16;
+    mla_sink_fold_lds(xl, f, t0, min(16, m.rows - t0), (int)blockIdx.y);
+    __syncthreads();
+    kvq_body<CH, true>(xl, w, g, q, sc, y, m);
     if constexpr (CH::on) r4d_chain_done();
 }
 
@@ -547,13 +616,21 @@ extern "C" int r4d_rad_mla_expand_gate(const RadArgs* a, RadStream s) {
     return kvp_launch(a, s, x, w, g, y, false);
 }
 
-/* Operands: [0] x (the latent attention's output) [1] w (kv_b) [2] g (the gate's logits) [3] q
- * (int8 [M, heads * v_dim]) [4] scale (f32 [M, heads * v_dim / 128]) [5] out_bf16? (the gated product,
- * [M, heads, v_dim] or [M, heads * v_dim]). */
-extern "C" int r4d_rad_mla_expand_gate_had_quant_i8g(const RadArgs* a, RadStream s) {
-    const RadTensor *x = r4d_opt(a, 0), *w = r4d_opt(a, 1), *g = r4d_opt(a, 2), *q = r4d_opt(a, 3),
-                    *sc = r4d_opt(a, 4), *y = r4d_opt(a, 5);
-    if (!x || !w || !g || !q || !sc) return R4D_NO(RAD_E_INVAL);
+/* mla_expand_gate_had_quant_i8g's operands, checked once for that op and for the sink's fused one
+ * (whose x is the latent the sink wrote or the fold fills). */
+struct KvqArgs {
+    const uint16_t* xp;
+    const uint16_t* wp;
+    const uint16_t* gp;
+    signed char* qp;
+    float* scp;
+    uint16_t* yp;
+    KvQuantMeta m;
+    long long rows;
+    bool chain;
+};
+static int kvq_args(const RadArgs* a, const RadTensor* x, const RadTensor* w, const RadTensor* g,
+                    const RadTensor* q, const RadTensor* sc, const RadTensor* y, KvqArgs* o) {
     if (x->dtype != RAD_BF16 || w->dtype != RAD_BF16 || g->dtype != RAD_BF16 || q->dtype != RAD_I8 ||
         sc->dtype != RAD_F32 || (y && y->dtype != RAD_BF16))
         return R4D_NO(RAD_E_DTYPE);
@@ -566,7 +643,8 @@ extern "C" int r4d_rad_mla_expand_gate_had_quant_i8g(const RadArgs* a, RadStream
                     qr = r4d_rows_pitch(q, h * kVd, &Mq), sr = r4d_rows_pitch(sc, h * kVd / kQG, &Ms),
                     yr = y ? r4d_rows_pitch(y, h * kVd, &My) : 0;
     if (xr < 0 || gr < 0 || qr < 0 || sr < 0 || yr < 0) return R4D_NO(RAD_E_STRIDE);
-    if (M < 1 || M > 65535 || Mg != M || Mq != M || Ms != M || (y && My != M)) return R4D_NO(RAD_E_SHAPE);
+    if (M < 1 || M > 65535 || Mg != M || Mq != M || Ms != M || (y && My != M))
+        return R4D_NO(RAD_E_SHAPE);
     if (w->rank != 2 || w->shape[0] != h * kRows || w->shape[1] != kLatent || w->stride[1] != 1 ||
         w->stride[0] < kLatent)
         return R4D_NO(RAD_E_SHAPE);
@@ -579,13 +657,78 @@ extern "C" int r4d_rad_mla_expand_gate_had_quant_i8g(const RadArgs* a, RadStream
         !r4d_aligned(wp, 16) || !r4d_aligned(gp, 16) || (yp && !r4d_aligned(yp, 16)) ||
         !r4d_aligned(q->data, 4))
         return R4D_NO(RAD_E_ALIGN);
-    const KvQuantMeta m{ (long)xr, (long)w->stride[0], (long)gr, (long)qr, (long)sr, (long)yr, (int)M };
-    const dim3 grid(kVd / kQG, (unsigned)h, (unsigned)((M + 15) / 16));
-    if (r4d_geti_or(a, "chain", 0) != 0 && M <= 64)
-        return R4D_EMIT(s, (kv_expand_gate_quant<r4dchain>), grid, dim3(kQThreads), 0, xp, wp, gp,
-                        (signed char*)q->data, (float*)sc->data, yp, m);
-    return R4D_EMIT(s, (kv_expand_gate_quant<R4dUnchained>), grid, dim3(kQThreads), 0, xp, wp, gp,
-                    (signed char*)q->data, (float*)sc->data, yp, m);
+    o->xp = xp;
+    o->wp = wp;
+    o->gp = gp;
+    o->qp = (signed char*)q->data;
+    o->scp = (float*)sc->data;
+    o->yp = yp;
+    o->m = KvQuantMeta{ (long)xr, (long)w->stride[0], (long)gr, (long)qr, (long)sr, (long)yr, (int)M };
+    o->rows = M;
+    o->chain = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
+    return RAD_OK;
+}
+
+/* Operands: [0] x (the latent attention's output) [1] w (kv_b) [2] g (the gate's logits) [3] q
+ * (int8 [M, heads * v_dim]) [4] scale (f32 [M, heads * v_dim / 128]) [5] out_bf16? (the gated product,
+ * [M, heads, v_dim] or [M, heads * v_dim]). */
+extern "C" int r4d_rad_mla_expand_gate_had_quant_i8g(const RadArgs* a, RadStream s) {
+    const RadTensor *x = r4d_opt(a, 0), *w = r4d_opt(a, 1), *g = r4d_opt(a, 2), *q = r4d_opt(a, 3),
+                    *sc = r4d_opt(a, 4), *y = r4d_opt(a, 5);
+    if (!x || !w || !g || !q || !sc) return R4D_NO(RAD_E_INVAL);
+    KvqArgs k;
+    const int rc = kvq_args(a, x, w, g, q, sc, y, &k);
+    if (rc != RAD_OK) return rc;
+    const dim3 grid(kVd / kQG, (unsigned)r4d_geti_or(a, "heads", 0),
+                    (unsigned)((k.rows + 15) / 16));
+    return k.chain ? R4D_EMIT(s, (kv_expand_gate_quant<r4dchain>), grid, dim3(kQThreads), 0, k.xp,
+                              k.wp, k.gp, k.qp, k.scp, k.yp, k.m)
+                  : R4D_EMIT(s, (kv_expand_gate_quant<R4dUnchained>), grid, dim3(kQThreads), 0,
+                             k.xp, k.wp, k.gp, k.qp, k.scp, k.yp, k.m);
+}
+
+/* Operands: [0] q [1] q_rope [2] kv [3] block_table [4] seqused [5] cu_seqlens [6] sinks [7] out
+ * (the latent [M, heads, latent_dim], contiguous in its head) -- mla_attn_paged_sink's own -- then
+ * [8] w (kv_b) [9] g (the gate's logits) [10] q8 [11] scale [12] out_bf16?; parameters are that
+ * op's and mla_expand_gate_had_quant_i8g's.
+ *
+ * The sink's attention and its rows' expand in one launch pair: the sink exactly as
+ * mla_attn_paged_sink emits it, without merge_sink, and then the expand, whose block folds its
+ * head's slots from the scratch into its LDS where the sink split (splits > 1). The latent is
+ * merge_sink's bytes: written once, from the row's first column block. Where the sink wrote the
+ * latent itself (an unsplit or fused launch) the second kernel is the plain expand. */
+extern "C" int r4d_rad_mla_attn_paged_sink_expand_i8g(const RadArgs* a, RadStream s) {
+    if (!r4d_opt(a, 7) || !r4d_opt(a, 8) || !r4d_opt(a, 9) || !r4d_opt(a, 10) || !r4d_opt(a, 11))
+        return R4D_NO(RAD_E_INVAL);
+    const RadTensor* const lat = r4d_opt(a, 7);
+    KvqArgs k;
+    int rc = kvq_args(a, lat, r4d_opt(a, 8), r4d_opt(a, 9), r4d_opt(a, 10), r4d_opt(a, 11),
+                      r4d_opt(a, 12), &k);
+    if (rc != RAD_OK) return rc;
+    /* The rows the sink walks are q's; the fold writes the latent's head slices the contraction
+     * reads, so both must be the plain layout. */
+    if (k.rows != a->t[0].shape[0] || lat->rank != 3 || lat->stride[1] != kLatent ||
+        lat->stride[2] != 1)
+        return R4D_NO(RAD_E_SHAPE);
+    MlaSinkForm form;
+    rc = mla_sink_launch(a, s, &form);
+    if (rc != RAD_OK) return rc;
+    const long h = r4d_geti_or(a, "heads", 0);
+    const dim3 grid(kVd / kQG, (unsigned)h, (unsigned)((k.rows + 15) / 16));
+    if (form.splits > 1 && !form.fused) {
+        const MlaFoldMeta f{ (const float*)a->scratch, (const float*)a->t[6].data,
+                             (uint16_t*)lat->data, h * form.splits * kMlaPart,
+                             (long)form.splits * kMlaPart, form.ss, (long)lat->stride[0], kLatent,
+                             form.splits };
+        return k.chain ? R4D_EMIT(s, (kv_sink_expand_gate_quant<r4dchain>), grid, dim3(kQThreads),
+                                  0, f, k.wp, k.gp, k.qp, k.scp, k.yp, k.m)
+                      : R4D_EMIT(s, (kv_sink_expand_gate_quant<R4dUnchained>), grid,
+                                 dim3(kQThreads), 0, f, k.wp, k.gp, k.qp, k.scp, k.yp, k.m);
+    }
+    return k.chain ? R4D_EMIT(s, (kv_expand_gate_quant<r4dchain>), grid, dim3(kQThreads), 0, k.xp,
+                              k.wp, k.gp, k.qp, k.scp, k.yp, k.m)
+                  : R4D_EMIT(s, (kv_expand_gate_quant<R4dUnchained>), grid, dim3(kQThreads), 0,
+                             k.xp, k.wp, k.gp, k.qp, k.scp, k.yp, k.m);
 }
 
 extern "C" int r4d_rad_mla_kv_split(const RadArgs* a, RadStream s) {

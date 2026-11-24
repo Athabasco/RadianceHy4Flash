@@ -2162,6 +2162,27 @@ static const RadOperandSpec oMlaAttnPagedSink[] = { { "q", RAD_OPD_IN, 0 },
                                                     { "cu_seqlens", RAD_OPD_IN, 0 },
                                                     { "sinks", RAD_OPD_WEIGHT, 0 },
                                                     { "out", RAD_OPD_OUT, 0 } };
+/* mla_attn_paged_sink_expand_i8g (K-15): the sink's parameters and the expand's after them. */
+static const RadParamSpec pMlaAttnPagedSinkX[] = {
+    P_INT("M"),          P_INT("heads"),  P_INT("latent_dim"), P_INT("rope_dim"),
+    P_INT("block_size"), P_INT("window"), P_F64("scale"),      P_STR("dtype"),
+    P_INTO("stable"),    P_INT("k_dim"),  P_INT("v_dim"),      P_INT("group"),
+};
+static const RadOperandSpec oMlaAttnPagedSinkX[] = {
+    { "q", RAD_OPD_IN, 0 },
+    { "q_rope", RAD_OPD_IN, 0 },
+    { "kv", RAD_OPD_IN, 0 },
+    { "block_table", RAD_OPD_IN, 0 },
+    { "seqused", RAD_OPD_IN, 0 },
+    { "cu_seqlens", RAD_OPD_IN, 0 },
+    { "sinks", RAD_OPD_WEIGHT, 0 },
+    { "out", RAD_OPD_OUT, 0 },
+    { "w", RAD_OPD_WEIGHT, 0 },
+    { "g", RAD_OPD_IN, 0 },
+    { "q8", RAD_OPD_OUT, 0 },
+    { "scale", RAD_OPD_OUT, 0 },
+    { "out_bf16", RAD_OPD_OUT, 1 },
+};
 static const RadParamSpec pMlaAttnSelSink[] = { P_INT("M"),          P_INT("heads"),
                                                 P_INT("latent_dim"), P_INT("rope_dim"),
                                                 P_INT("blocks"),     P_INT("block_size"),
@@ -3449,6 +3470,12 @@ static const RadOpSchema kSchemas[] = {
            "softmax once and carries no value. No visible key gives zero. `stable` 1 (optional, default 0) "
            "asks that a row's bytes not depend on the launch (M, its other rows); a row-independent "
            "kernel ignores it."),
+    SCHEMA("mla_attn_paged_sink_expand_i8g", pMlaAttnPagedSinkX, oMlaAttnPagedSinkX,
+           "mla_attn_paged_sink and its rows' mla_expand_gate_had_quant_i8g in one launch pair (K-15): "
+           "the sink's partials stay in the op's scratch and the expand's block folds its head's slots "
+           "into its LDS, so merge_sink's launch and the latent's round trip through memory are gone. "
+           "`out`, the latent, is merge_sink's bytes; where the sink wrote it itself (an unsplit or "
+           "fused launch) the second kernel is the plain expand. Byte-identical to the three ops."),
     SCHEMA("mla_attn_sel_sink", pMlaAttnSelSink, oMlaAttnSelSink,
            "mla_attn's per-query page table and visible length with a rotary part and a sink: tokens "
            "[0, length[r]) of table row bt[r]. The score, the sink and `stable` are "
@@ -5467,6 +5494,14 @@ static const RadConstraint cMlaAttnPagedSink[] = {
     C_GE("heads", 8),   C_LE("heads", 64),     C_DIV("heads", 8),
     C_IN("block_size", "1 2 4 8 16 32 64 128 256"), C_GE("window", 0), C_IN("dtype", "bf16")
 };
+/* The sink's geometry and the expand's, in one launch pair: the second kernel is a workgroup a
+ * token tile of 16, so decode-class heights only. */
+static const RadConstraint cMlaAttnPagedSinkX[] = {
+    C_GE("M", 1),      C_LE("M", 64),          C_EQ("latent_dim", 512), C_EQ("rope_dim", 64),
+    C_GE("heads", 8),  C_LE("heads", 64),      C_DIV("heads", 8),
+    C_IN("block_size", "1 2 4 8 16 32 64 128 256"), C_GE("window", 0), C_EQ("k_dim", 192),
+    C_EQ("v_dim", 256), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16")
+};
 static const RadConstraint cMlaAttnSelSink[] = {
     C_GE("M", 1),       C_LE("M", 65535),      C_EQ("latent_dim", 512), C_EQ("rope_dim", 64),
     C_GE("heads", 8),   C_LE("heads", 64),     C_DIV("heads", 8),       C_GE("blocks", 1),
@@ -7346,6 +7381,18 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaAttnPagedSink), NOTUNE,
   nullptr, nullptr, r4d_rad_mla_attn_paged_sink, r4d_rad_mla_attn_paged_sink_scratch, nullptr,
   nullptr, r4d_shape_mla_attn_paged_sink },
+{ "mla_attn_paged_sink_expand_i8g", "mla_attn_paged_sink_expand_i8g", "attn",
+  "mla_attn_paged_sink and its rows' expand, gate and rotated int8 quantiser in one launch pair: the "
+  "expand's block folds its head's sink partials from the scratch into its LDS where the sink split "
+  "(one thread a column, merge_sink's rule), so merge_sink's launch, its global round trip and the "
+  "latent's re-read are gone",
+  "as mla_attn_paged_sink_bf16 with M 1..64 and the expand's k_dim 192, v_dim 256, latent 512, "
+  "group 128",
+  "bf16 Q/rotary/cache/weights/gate, f32 sinks, softmax and partials, int8 codes with an f32 scale "
+  "per (row, 128 columns); the latent [M, heads, latent_dim] is merge_sink's bytes",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaAttnPagedSinkX), NOTUNE,
+  nullptr, nullptr, r4d_rad_mla_attn_paged_sink_expand_i8g, r4d_rad_mla_attn_paged_sink_scratch,
+  nullptr, nullptr, r4d_shape_mla_attn_paged_sink_expand_i8g },
 { "mla_attn_sel_sink_bf16", "mla_attn_sel_sink", "attn",
   "mla_attn_paged_sink_bf16's kernel over a per-row table and length (the indexer's selection), "
   "128-token super-chunks of the table order",

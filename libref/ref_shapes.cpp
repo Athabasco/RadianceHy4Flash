@@ -1105,6 +1105,38 @@ int ref_mla_attn_paged_sink_shape(const RadParam* p, int n_p, int operand, RadOp
     return o.finish("mla_attn_paged_sink", operand, out);
 }
 
+/* mla_attn_paged_sink_expand_i8g: the sink's operands with the expand's after them; the sink's
+ * latent is the expand's x. */
+int ref_mla_attn_paged_sink_expand_i8g_shape(const RadParam* p, int n_p, int operand,
+                                             RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), L = gi(p, n_p, "latent_dim", 0),
+                  R = gi(p, n_p, "rope_dim", 0), H = gi(p, n_p, "heads", 0),
+                  bs = gi(p, n_p, "block_size", 0), kd = gi(p, n_p, "k_dim", 0),
+                  vd = gi(p, n_p, "v_dim", 0);
+    const int64_t ng = scale_groups(H * vd, gi(p, n_p, "group", 0));
+    if (M < 1 || L < 1 || L > 2048 || R < 1 || H < 1 || bs < 1 || kd < 1 || vd < 1)
+        return RAD_E_UNSUPPORTED;
+    int64_t ctx = gi(p, n_p, "ctx", 0);
+    if (ctx < M) ctx = M;
+    const int64_t blocks = (ctx + bs - 1) / bs;
+    const uint32_t dtype = act_dt(p, n_p);
+    Opd o;
+    o.t(dtype, { M, H, L });
+    o.t(dtype, { M, H, R });
+    o.t(dtype, { blocks, 1, bs, L + R });
+    o.t_idx({ 1, blocks }, blocks, -1, 0);
+    o.t_idx({ 1 }, 0, ctx, 0);
+    o.t_idx({ 2 }, M, -1, (uint32_t)RAD_OPD_F_IDX_CU);
+    o.t((uint32_t)RAD_F32, { H });                    /* sinks */
+    o.t(dtype, { M, H, L });                          /* out: the latent */
+    o.t(dtype, { H * (kd + vd), L });                 /* w */
+    o.t(dtype, { M, H * vd });                        /* g */
+    o.t((uint32_t)RAD_I8, { M, H * vd });             /* q8 */
+    o.t((uint32_t)RAD_F32, { M, ng });                /* scale */
+    o.t(dtype, { M, H * vd });                        /* out_bf16 */
+    return o.finish("mla_attn_paged_sink_expand_i8g", operand, out);
+}
+
 int ref_mla_attn_sel_sink_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), L = gi(p, n_p, "latent_dim", 0),
                   R = gi(p, n_p, "rope_dim", 0), H = gi(p, n_p, "heads", 0);

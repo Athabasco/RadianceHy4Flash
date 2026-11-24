@@ -55,21 +55,23 @@
 #include "r4d_common.h"
 #include "r4d_emit.h"
 #include "r4d_gdn_wmma.h"
+#include "r4d_mla_sink_fold.h"
 #include <algorithm>
 #include <climits>
 #include <cmath>
 #include <cstring>
 
 namespace {
-/* A partial: 512 values, max, den, padded to 16 bytes for the merge's vector loads. */
-constexpr int D = 512, RD = 64, W = D + RD, PART = D + 4;
+/* A partial: 512 values, max, den, padded to 16 bytes for the merge's vector loads (its layout and
+ * the fold's rule live in r4d_mla_sink_fold.h: the expand's fold applies the same ones). */
+constexpr int D = kMlaD, RD = 64, W = D + RD, PART = kMlaPart;
 /* Row pitch of a staged token in LDS: 576 + 8, so consecutive rows do not share a bank pattern. */
 constexpr int kPitch = W + 8;
 constexpr int kPieces = 16 * W / 8; /* 16-byte pieces of a 16-token chunk */
 /* Super-chunks: 64 tokens with a window, 128 at window 0 and in the selection form. A lone
  * workgroup takes about 1.8 us a 16-token chunk (gfx1201), so a decode row's time is the chunks of
  * one super-chunk; more of them cost the partials' write and merge. The merge holds kMaxSplits. */
-constexpr int kShiftWindow = 6, kShiftFull = 7, kMaxSplits = 20;
+constexpr int kShiftWindow = 6, kShiftFull = 7, kMaxSplits = kMlaSplitsMax;
 /* The most rows a `stable 0` launch splits; past them the workgroups fill the card unsplit, which
  * is then also faster (measured: the window at 16 rows 79 us split against 68 unsplit, the
  * selection at 64 rows 362 against 269). `stable 1` splits at every M. */
@@ -123,25 +125,6 @@ __device__ __forceinline__ void sink_range(const int* used, const int* cu, const
         lo = (int)(bottom < top ? bottom : top);
         trow = s;
     }
-}
-
-/* The law's merge, shared by merge_sink and the fused form so both give the same bytes: slots with
- * a visible key folded in ascending order into (acc_m, acc_d, acc), the first one copied, each later
- * one by acc = acc * exp(acc_m - m') + part * exp(part_m - m'), m' = max(acc_m, part_m); explicit
- * fmaf so no contraction choice of the compiler differs between the two kernels. */
-struct SinkFold {
-    float a, b, m;
-};
-__device__ __forceinline__ SinkFold sink_fold(float acc_m, float part_m) {
-    const float mn = fmaxf(acc_m, part_m);
-    return { expf(acc_m - mn), expf(part_m - mn), mn };
-}
-/* The sink once at the end: shift to max(m, sink) as libref does, so a sink far above every score
- * cannot overflow. No visible key gives zero, sink or not. */
-__device__ __forceinline__ float sink_inv(float m, float d, float sink) {
-    if (!(d > 0)) return 0;
-    const float top = fmaxf(m, sink), c = expf(m - top);
-    return c / fmaf(d, c, expf(sink - top));
 }
 
 /* FUSED: the fused form (m.fused), its own instance so its accumulator's registers do not touch
@@ -540,7 +523,7 @@ bool row_tensor_ok(const RadTensor& t, long rows, long heads, long width) {
  * block_table [seqs, blocks], seqused [seqs], cu_seqlens [seqs + 1], sinks [>= heads] f32, out
  * [M, heads, 512]. Selection: q, q_rope, kv, bt [>= M, blocks], length [>= M], sinks, out. */
 template <bool SEL>
-int sink_body(const RadArgs* a, RadStream stream) {
+int sink_body(const RadArgs* a, RadStream stream, MlaSinkForm* taken = nullptr) {
     const int nt = SEL ? 7 : 8;
     if (!a || a->n_t < nt) return RAD_E_INVAL;
     for (int i = 0; i < nt; ++i)
@@ -656,6 +639,14 @@ int sink_body(const RadArgs* a, RadStream stream) {
     const auto* sp = (const float*)sk.data;
     auto* op = (uint16_t*)o.data;
     auto* scr = (float*)a->scratch;
+    /* A caller that takes the launch over writes the latent itself (the expand folds these slots
+     * where it needs them), so the merge is not emitted for it. */
+    if (taken) {
+        taken->ss = sk.stride[0];
+        taken->rows = (int)rows;
+        taken->splits = splits;
+        taken->fused = fused;
+    }
     const bool chain = r4d_geti_or(a, "chain", 0) != 0 && rows <= 64;   /* decode heights */
 #define SINK_EMIT3(HG, WD, FU, CH)                                                                 \
     R4D_EMIT(stream, (mla_sink_rows<HG, WD, SEL, FU, CH>),                                         \
@@ -674,7 +665,7 @@ int sink_body(const RadArgs* a, RadStream stream) {
 #undef SINK_EMIT
 #undef SINK_EMIT2
 #undef SINK_EMIT3
-    if (rc == RAD_OK && splits > 1)
+    if (rc == RAD_OK && splits > 1 && !taken)
         rc = chain ? R4D_EMIT(stream, (merge_sink<r4dchain>), dim3((unsigned)rows, (unsigned)heads),
                               dim3(128), 0, (const float*)scr, sp, op, m)
                    : R4D_EMIT(stream, (merge_sink<R4dUnchained>),
@@ -717,3 +708,8 @@ extern "C" int64_t r4d_rad_mla_attn_sel_sink_scratch(const RadArgs* a) {
     return sink_scratch(a, true);
 }
 extern "C" void r4d_mla_sink_pin_form(int form) { g_sink_form = form; }
+
+/* See r4d_mla_sink_fold.h: the sink's launch, its form, and no merge when the caller takes it. */
+int mla_sink_launch(const RadArgs* a, RadStream stream, MlaSinkForm* form) {
+    return sink_body<false>(a, stream, form);
+}

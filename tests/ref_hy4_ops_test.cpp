@@ -199,7 +199,8 @@ struct Uniform {
 /* ================================================================== schemas */
 TEST(every_hy4_op_has_a_schema_with_f64_floats_and_str_enums_and_a_shape_description) {
     const char* ops[] = { "ihc_pre", "ihc_post", "mla_project_kv", "mla_attn_paged_sink",
-        "mla_attn_sel_sink", "mla_kv_split", "attn_kv_sink", "gate_mul", "idx_pool_gated", "idx_pool_gated_fp8", "idx_pool_gated_i8",
+        "mla_attn_sel_sink", "mla_attn_paged_sink_expand_i8g", "mla_kv_split", "attn_kv_sink", "gate_mul",
+        "idx_pool_gated", "idx_pool_gated_fp8", "idx_pool_gated_i8",
         "idx_score", "engram_ids", "engram_norm", "engram_gate", "dfly_sel" };
     const char* f64[] = { "eps", "hc_eps", "post_mag", "scale", "theta" };
     const char* str[] = { "dtype", "mode", "sections" };
@@ -236,6 +237,10 @@ TEST(every_hy4_op_describes_all_its_operands_at_a_typical_geometry) {
                               RAD_INT("latent_dim", 64), S("mode", "absorb"), S("dtype", "bf16") } },
         { "mla_attn_paged_sink", { RAD_INT("M", 5), RAD_INT("heads", 4), RAD_INT("latent_dim", 64),
                               RAD_INT("rope_dim", 8), RAD_INT("block_size", 16), RAD_INT("window", 8), S("dtype", "bf16") } },
+        { "mla_attn_paged_sink_expand_i8g", { RAD_INT("M", 5), RAD_INT("heads", 4), RAD_INT("latent_dim", 64),
+                              RAD_INT("rope_dim", 8), RAD_INT("block_size", 16), RAD_INT("window", 8),
+                              RAD_INT("k_dim", 24), RAD_INT("v_dim", 32), RAD_INT("group", 8),
+                              S("dtype", "bf16") } },
         { "mla_attn_sel_sink", { RAD_INT("M", 5), RAD_INT("heads", 4), RAD_INT("latent_dim", 64),
                               RAD_INT("rope_dim", 8), RAD_INT("blocks", 6), RAD_INT("block_size", 4), S("dtype", "bf16") } },
         { "mla_kv_split", { RAD_INT("M", 5), RAD_INT("heads", 4), RAD_INT("k_dim", 24), RAD_INT("v_dim", 32),

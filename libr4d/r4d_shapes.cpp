@@ -887,6 +887,35 @@ extern "C" int r4d_shape_mla_attn_paged_sink(const RadParam* p, int n_p, int ope
                                 opd((uint32_t)RAD_BF16, M, h, L) };
     R4D_PICK(list);
 }
+/* mla_attn_paged_sink_expand_i8g: mla_attn_paged_sink's operands with mla_expand_gate_had_quant_i8g's
+ * after them, the latent (the sink's own out) being the expand's x. */
+extern "C" int r4d_shape_mla_attn_paged_sink_expand_i8g(const RadParam* p, int n_p, int operand,
+                                                      RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), h = pi(p, n_p, "heads"), L = pi(p, n_p, "latent_dim"),
+                  R = pi(p, n_p, "rope_dim"), bs = pi(p, n_p, "block_size"),
+                  kd = pi(p, n_p, "k_dim", 0), vd = pi(p, n_p, "v_dim", 0),
+                  g = pi(p, n_p, "group", R4D_FP8_BLOCK);
+    if (M <= 0 || h <= 0 || L <= 0 || R <= 0 || bs <= 0 || kd <= 0 || vd <= 0)
+        return RAD_E_UNSUPPORTED;
+    if (g != R4D_FP8_BLOCK || (h * vd) % g) return RAD_E_UNSUPPORTED;
+    int64_t ctx = pi(p, n_p, "ctx", 0);
+    if (ctx < M) ctx = M;
+    const int64_t blocks = (ctx + bs - 1) / bs;
+    const RadOpdDesc list[] = { opd((uint32_t)RAD_BF16, M, h, L),
+                                opd((uint32_t)RAD_BF16, M, h, R),
+                                opd((uint32_t)RAD_BF16, blocks, 1, bs, L + R),
+                                opd_idx(1, blocks, blocks),
+                                opd_idx(1, 0, 0, ctx),
+                                opd_idx(2, 0, M + 1, -1, (uint32_t)RAD_OPD_F_IDX_CU),
+                                opd((uint32_t)RAD_F32, h),
+                                opd((uint32_t)RAD_BF16, M, h, L),
+                                opd((uint32_t)RAD_BF16, h * (kd + vd), L),
+                                opd((uint32_t)RAD_BF16, M, h * vd),
+                                opd((uint32_t)RAD_I8, M, h * vd),
+                                opd((uint32_t)RAD_F32, M, h * vd / g),
+                                opd((uint32_t)RAD_BF16, M, h * vd) };
+    R4D_PICK(list);
+}
 /* mla_attn_sel_sink: mla_attn's per-row tables with the rotary query and the sinks. */
 extern "C" int r4d_shape_mla_attn_sel_sink(const RadParam* p, int n_p, int operand,
                                            RadOpdDesc* out) {

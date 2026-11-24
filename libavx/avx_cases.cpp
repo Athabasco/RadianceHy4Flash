@@ -216,6 +216,16 @@ std::vector<Case> build_cases() {
         add("mla_attn_paged_sink", { HI("M", 1), HI("heads", 2), HI("latent_dim", 32),
                                      HI("rope_dim", 8), HI("block_size", 4), HI("window", 512),
                                      HF("scale", 0.125), HI("ctx", 50), HS("dtype", dt) });
+        add("mla_attn_paged_sink_expand_i8g", { HI("M", 3), HI("heads", 2), HI("latent_dim", 512),
+                                                 HI("rope_dim", 64), HI("block_size", 4),
+                                                 HI("window", 0), HF("scale", 0.125),
+                                                 HI("ctx", 21), HI("k_dim", 192), HI("v_dim", 256),
+                                                 HI("group", 128), HS("dtype", "bf16") });
+        add("mla_attn_paged_sink_expand_i8g", { HI("M", 2), HI("heads", 2), HI("latent_dim", 512),
+                                                 HI("rope_dim", 64), HI("block_size", 16),
+                                                 HI("window", 5), HF("scale", 0.125),
+                                                 HI("ctx", 33), HI("k_dim", 192), HI("v_dim", 256),
+                                                 HI("group", 128), HS("dtype", "bf16") });
         add("mla_attn_sel_sink", { HI("M", 3), HI("heads", 2), HI("latent_dim", 40),
                                    HI("rope_dim", 8), HI("blocks", 7), HI("block_size", 4),
                                    HF("scale", 0.125), HS("dtype", dt) });

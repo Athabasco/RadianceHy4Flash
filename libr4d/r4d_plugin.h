@@ -911,6 +911,8 @@ int64_t r4d_rad_mla_attn_paged_sink_scratch(const RadArgs*);
 int64_t r4d_rad_mla_attn_sel_sink_scratch(const RadArgs*);
 int r4d_shape_mla_attn_paged_sink(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_mla_attn_sel_sink(const RadParam*, int, int, RadOpdDesc*);
+int r4d_rad_mla_attn_paged_sink_expand_i8g(const RadArgs*, RadStream);
+int r4d_shape_mla_attn_paged_sink_expand_i8g(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_router_sigmoid_topk(const RadArgs*, RadStream);
 int r4d_rad_router_sigmoid_group_topk(const RadArgs*, RadStream);
 int r4d_shape_router_sigmoid_group_topk(const RadParam*, int, int, RadOpdDesc*);
