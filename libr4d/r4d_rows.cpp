@@ -5661,6 +5661,15 @@ static const RadConstraint cMoeGemmBf16[] = {
 static const RadConstraint cMoeGather[] = {
     C_GE("M", 1), C_GE("n", 1), C_GE("top_k", 1), C_IN("dtype", "bf16"),
 };
+/* moe_gather_inv_i8g is the gather that also writes the sum's codes, so its band is the entry
+ * point's own (r4d_rad_moe_gather_inv_i8g) rather than moe_gather_inv's: top_k = 16, n a whole
+ * number of the codes' 256-column waves, and a scale group of 128 or 256 (the two 256-column-wave
+ * forms are the only ones whose whole wave is live to quantise). Read off that entry point's
+ * rejection tests, as the rows of the "band is read off the entry point" section are. */
+static const RadConstraint cMoeGatherQ8[] = {
+    C_GE("M", 1), C_DIV("n", 256), C_EQ("top_k", 16), C_IN("group", "128 256"),
+    C_IN("dtype", "bf16"),
+};
 
 /* R <= 32 is stage 2's PT (R4D_TOPK_PT2): a lane holds the whole answer, so no distribution of the
  * candidates over lanes can lose one. The merge and the rerank share the limit. */
@@ -9865,7 +9874,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "four-byte-aligned codes; the codes are the standalone quantiser's bytes",
   "bf16 in, f32 or bf16 routing weights, int8 codes + f32 scales out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
-  ROW(cMoeGather), NOTUNE,
+  ROW(cMoeGatherQ8), NOTUNE,
   nullptr, nullptr, r4d_rad_moe_gather_inv_i8g, nullptr, nullptr, nullptr,
   r4d_shape_moe_gather_inv_i8g },
 

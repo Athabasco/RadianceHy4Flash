@@ -1924,6 +1924,10 @@ extern "C" int r4d_shape_moe_gather_inv_i8g(const RadParam* p, int n_p, int oper
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
     const int64_t k = pi(p, n_p, "top_k"), g = pi(p, n_p, "group");
     if (M <= 0 || n <= 0 || k <= 0 || g <= 0 || n % g != 0) return RAD_E_UNSUPPORTED;
+    /* The entry point's band (r4d_rad_moe_gather_inv_i8g, r4d_moe.hip): the codes need a whole
+     * 256-column wave live, the sixteen-slot form needs top_k = 16, and the scale is written once a
+     * `group`-wide block, which is 128 or 256 wide. */
+    if (n % 256 != 0 || k != 16 || (g != 128 && g != 256)) return RAD_E_UNSUPPORTED;
     const uint32_t D = dt_act(p, n_p, "dtype");
     const RadOpdDesc l[] = {
         opd(D, M * k, n),
