@@ -730,6 +730,50 @@ extern "C" int r4d_fuse_mla_expand_gate_had_quant_i8g(const RadParam* p, int n_p
 }
 
 /* ==========================================================================================
+ * mla_attn_paged_sink_expand_i8g -- mla_attn_paged_sink and its rows'
+ * mla_expand_gate_had_quant_i8g in one launch pair (K-15).
+ * (row: mla_attn_paged_sink_expand_i8g; kernels: libr4d/r4d_mla_sink.hip,
+ *  libr4d/r4d_mla_kv_bf16.hip, kv_sink_expand_gate_quant)
+ *
+ * Operands: [0] q  [1] q_rope  [2] kv  [3] block_table  [4] seqused  [5] cu_seqlens  [6] sinks
+ *           [7] out  [8] w  [9] g  [10] q8  [11] scale  [12] out_bf16?
+ *
+ * No temporaries: the sink writes the latent into `out` -- merge_sink over its split partials, or
+ * the sink itself where it does not split -- and the expansion reads it as `x`. The second launch
+ * folds those partials in the expansion's workgroup rather than in a launch of its own, and that
+ * fold writes the same bytes merge_sink does, so the chain is the sink's own row, merge and all,
+ * then the expansion. With `out_bf16` absent the gated product stays in a temporary, as it does in
+ * the expansion's row. */
+extern "C" int r4d_fuse_mla_attn_paged_sink_expand_i8g(const RadParam* p, int n_p, uint64_t present,
+                                                       int step, RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    const int64_t heads = pi(p, n_p, "heads"), kd = pi(p, n_p, "k_dim"), vd = pi(p, n_p, "v_dim");
+    if (heads <= 0 || kd <= 0 || vd <= 0 || pi(p, n_p, "latent_dim") <= 0 ||
+        pi(p, n_p, "group", R4D_FP8_BLOCK) != R4D_FP8_BLOCK)
+        return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "mla_attn_paged_sink");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "heads").mirror(p, n_p, "latent_dim")
+         .mirror(p, n_p, "rope_dim").mirror(p, n_p, "block_size").mirror(p, n_p, "window")
+         .mirror(p, n_p, "scale").mirror(p, n_p, "dtype").mirror_opt(p, n_p, "stable");
+        /* q, q_rope, kv, block_table, seqused, cu_seqlens, sinks, out */
+        return s.wire({ 0, 1, 2, 3, 4, 5, 6, 7 });
+    }
+    case 1: {
+        Step s(out, "mla_expand_gate_had_quant_i8g");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "heads").mirror(p, n_p, "k_dim")
+         .mirror(p, n_p, "v_dim").mirror(p, n_p, "latent_dim").mirror(p, n_p, "group")
+         .mirror(p, n_p, "dtype");
+        /* x = the latent, w, g, q8, scale, out_bf16 */
+        return s.wire({ 7, 8, 9, 10, 11, opt_opd(present, 12) });
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
  * add_rmsnorm -- add (x += a), then rmsnorm of the x it wrote.
  * (row: add_rmsnorm_bf16; kernel: libr4d/r4d_model_bf16.hip, add_rmsnorm_kernel)
  *

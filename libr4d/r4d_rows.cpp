@@ -7392,7 +7392,8 @@ static const RadKernelInfo kKernels[] = {
   "per (row, 128 columns); the latent [M, heads, latent_dim] is merge_sink's bytes",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaAttnPagedSinkX), NOTUNE,
   nullptr, nullptr, r4d_rad_mla_attn_paged_sink_expand_i8g, r4d_rad_mla_attn_paged_sink_scratch,
-  nullptr, nullptr, r4d_shape_mla_attn_paged_sink_expand_i8g },
+  nullptr, nullptr, r4d_shape_mla_attn_paged_sink_expand_i8g, nullptr,
+  r4d_fuse_mla_attn_paged_sink_expand_i8g },
 { "mla_attn_sel_sink_bf16", "mla_attn_sel_sink", "attn",
   "mla_attn_paged_sink_bf16's kernel over a per-row table and length (the indexer's selection), "
   "128-token super-chunks of the table order",
