@@ -3566,9 +3566,10 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   layer, so a layer outside the slice runs that band alone, under a decode plan (`T = DT`, `S = D`,
   `P = 0`); a prefill-only sub-step without decode rows issues nothing for them. The step head
   (embed, the streams) runs the whole step on the first slice and the decode band after it, and the
-  head after the trunk (the collapse, the output norm, the gather and `logits_gemm`) runs the extent
-  the trunk's last layer ran: the chunk's rows on the slice that ran its end, the decode band's
-  alone before that, since the engine hands a sub-step the out rows its entries own. The compact
+  head after the trunk (the collapse, the output norm, the gather and `logits_gemm`) runs the
+  chunk's rows on the slice that ran the trunk's end and the decode band's alone before that, since
+  the engine hands a sub-step the out rows its own entries carry and the chunk's `final_hidden` is
+  the last sub-step's. The compact
   pass and the trunk's checkpoint are the last sub-step's. The pipeline is never taken for a
   sub-step. `--chunk-slices-prefill m` is the test hook: a prefill-only step cut into m, so that a
   single greedy run serves a prompt sliced and unsliced.
@@ -3639,8 +3640,9 @@ trunk step with media rows: embed_lookup, the encoder's rows over their placehol
   and TP2, 136 comparisons each, 0 fail. `data/kernels_hy4.rkb` carries the vision rows.
 
 Tests: `hyv4flash_arch_test` (the declared graph of the `mini` geometry, each step kind lint clean,
-the taps, the refusals, a sliced sub-step: its layer range only, the decode band on every layer, the
-state it resumes declared persistent; at two and four ranks every weight covered exactly once, each
+the taps, the refusals (including a sliced declare where the trunk cannot stop), a sliced sub-step:
+its layer range only, the decode band on every layer, the head over the rows the sub-step completed,
+the state it resumes declared persistent; at two and four ranks every weight covered exactly once, each
 rank's heads, experts and vocabulary, two exact reductions a layer, every step kind lint clean on
 every rank)
 and, against transformers, the harness of the plugin's work directory (`ref/run_rad.py --preset
