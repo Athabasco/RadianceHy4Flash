@@ -16,8 +16,8 @@ read these before working:
    (`Fixes #N` / `Closes #N`). Without the keyword, the follow does not bind your PR to the
    issue and nobody reviews it (`#172` was missed exactly that way).
 3. Title the PR `[measured] <item>: <subject>` when you measured the item's whole merge bar
-   yourself (see below), `[needs lane] <item>: <subject>` when you could not; a lane then
-   measures it and merges by §2.
+   yourself (see below), `[needs testing] <item>: <subject>` when you could not; the issue then
+   gets `ready-for-testing` and someone with a free GPU measures it (CARDS.md §6.1).
 
 ## What a change carries
 
@@ -43,7 +43,7 @@ With a GPU, measure the change yourself (CARDS.md §6 step 3): before (merge bas
 Never compare your numbers with a lane's baseline.
 
 What you could not measure, list in the PR body: the item's "Verify" GPU checks and the
-`stamps` / `kbench` rows still owed. A lane here measures only that part. Never claim numbers
+`stamps` / `kbench` rows still owed; a tester measures that part (CARDS.md §6.1). Never claim numbers
 you did not run.
 
 ## How the review works here

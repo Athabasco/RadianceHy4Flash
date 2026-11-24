@@ -324,7 +324,7 @@ but the tier, which is what the A/B measures.
 Merge when all three hold:
 
 1. The output is byte-identical, or inside the item's stated bound (ORD / PF; see the field key at the top of the backlog's §3).
-2. The kernel, op or step the item targets is measurably faster in ms (AQL stamps, rad-kbench or profile-ops) on its lane.
+2. The kernel, op or step the item targets is measurably faster in ms (AQL stamps, rad-kbench or profile-ops), before and after on one machine (§6 step 3).
 3. End-to-end tok/s or TTFT is not worse beyond noise.
 
 A kernel gain whose end-to-end effect is inside noise still merges: gains compound.
@@ -376,12 +376,23 @@ A worker without access to the lanes can still do a card, and measures it as far
    - the raw output of each run (in a `<details>` block), not only a summary.
    Numbers from your machine are compared with each other only, never with a lane's baseline.
 4. Push a branch and open a PR. Title it `[measured] <item>: <subject>` when step 3 covers the item's whole merge bar,
-   `[needs lane] <item>: <subject>` when it does not (no GPU, or the bar needs the u3 served A/B you cannot run). A
-   `[needs lane]` PR lists the GPU checks from the item's "Verify" part and the rows still owed.
+   `[needs testing] <item>: <subject>` when it does not (no GPU). A `[needs testing]` PR lists the GPU checks from the
+   item's "Verify" part and the rows still owed.
 5. The review checks the measurement: the commit ids match the PR's base and head, before and after come from one
    machine, the rows are the ones §2 asks for, the raw output carries the numbers. When it holds, the review records
-   `MEASURED: contributor (<GPUs>): <numbers>` and the PR merges by §2 without a lane. Otherwise the review asks for the
-   missing rows, or records `MEASURED: owed` and a lane measures the PR here.
+   `MEASURED: contributor (<who>, <GPUs>): <numbers>` and the PR merges by §2.
+6. When the review approves the code but no measurement holds, the issue gets the label `ready-for-testing`.
 
+### 6.1 Testing a `ready-for-testing` issue
+
+No lane on the Moebius server measures anything. Anyone with a free GPU can measure a change that waits on the label
+`ready-for-testing`, without writing code:
+
+1. Check out the PR's head and its merge base (`git merge-base origin/<base> <head>`).
+2. Measure both as step 3 above says.
+3. Post the result as a comment on the issue, starting with a `## Measurement` heading.
+
+Within the hour the board picks it up: the Reviewer checks the numbers and the change merges, or the issue gets an
+answer saying what is missing, and the label stays.
 Items whose whole value is a measurement (marked "lane required" in their issue) need a lane from the start. Lossy items
 keep §3.
