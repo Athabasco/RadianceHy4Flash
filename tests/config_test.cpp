@@ -613,7 +613,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
         { "--mixed-step-target-ms", { "150" } },
         { "--chunk-slices", { "4" } }, { "--chunk-slice-target-ms", { "200" } },
-        { "--chunk-slice-cost-pct", { "15" } },
+        { "--chunk-slice-cost-pct", { "15" } }, { "--chunk-slices-prefill", { "4" } },
         { "--prefill-room-gate", { "off" } },
         { "--preempt-wait-ms", { "5000" } },
         { "--max-num-seqs", { "4" } },

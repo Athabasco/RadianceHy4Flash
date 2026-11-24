@@ -220,6 +220,17 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                      (long long)std::min<int64_t>(std::min<int64_t>(cfg.chunk_slices, 8),
                                                   n_layers_));
     }
+    if (cfg.chunk_slices_prefill > 1) {
+        if (!slice_ok_ || n_layers_ < 2)
+            RAD_INFO("scheduler: --chunk-slices-prefill: this model's plugin reports no resumable "
+                     "layer range, so a prefill step is never sliced");
+        else
+            RAD_INFO("scheduler: --chunk-slices-prefill %lld: a prefill step with no decode rows "
+                     "is planned as %lld layer-sliced sub-steps (a test hook: the chunk's result "
+                     "must be identical, its time is not)",
+                     (long long)cfg.chunk_slices_prefill,
+                     (long long)chunk_slice_count_prefill());
+    }
     if (cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_BLOCK && prog.drafter.window > 0 &&
         hit_holes_draft_) {
         draft_refill_ = prog.drafter.window;
@@ -1627,6 +1638,18 @@ int32_t Scheduler::chunk_slice_count(int64_t tokens) const {
     return m < 2 ? 1 : m;
 }
 
+/* The hook's m (--chunk-slices-prefill): a prefill-only step, cut into m so the plugin's own
+ * resumption is what a single-stream greedy run exercises. It exists to test the slice (§8.2 of the
+ * design), not to gain time, so it takes any chunk size and needs no measurement. A mixed step is
+ * --chunk-slices' to slice. */
+int32_t Scheduler::chunk_slice_count_prefill() const {
+    if (!slice_ok_ || n_layers_ < 2) return 1;
+    int32_t m = (int32_t)cfg_.chunk_slices_prefill;
+    if (m > 8) m = 8;
+    if (m > n_layers_) m = n_layers_;
+    return m < 2 ? 1 : m;
+}
+
 int32_t Scheduler::next_prefill_first_layer(bool next_plan) const {
     const StepPlan& p = next_plan ? plan_next_ : plan_;
     if (p.slice_m > 0 && !p.slice_last) return p.layer_hi;
@@ -1645,7 +1668,9 @@ void Scheduler::fill_group_step(StepPlan& p, bool ahead) {
                               : (int32_t)(((int64_t)(group_.next + 1) * n_layers_) / group_.n_slices);
     p.n_spec = 0;
     p.spec_is_tree = tree_;
-    p.phase = RAD_PHASE_MIXED;
+    /* A prefill-only group's sub-steps are prefill steps of the same rows (--chunk-slices-prefill):
+     * nothing about them is mixed. */
+    p.phase = group_.dec.empty() ? RAD_PHASE_PREFILL : RAD_PHASE_MIXED;
 
     int32_t row = 0;
     for (int32_t slot : group_.dec) {
@@ -1731,8 +1756,15 @@ bool Scheduler::plan_group_ahead() {
 /* Decide whether the mixed step just planned opens a group (§2.3 of the design). Every refusal
  * here leaves the step exactly as it was: one whole chunk with its decode rows. */
 bool Scheduler::start_group() {
-    if (!slice_ok_ || cfg_.chunk_slices == 0 || n_layers_ < 2) return false;
-    if (plan_.phase != RAD_PHASE_MIXED || plan_.n_tok_decode <= 0) return false;
+    if (!slice_ok_ || n_layers_ < 2) return false;
+    /* A chunk beside decoding rows is --chunk-slices' to slice; a prefill-only step is the test
+     * hook's (--chunk-slices-prefill m). */
+    const bool solo = plan_.n_tok_decode <= 0;
+    if (solo) {
+        if (cfg_.chunk_slices_prefill < 2 || plan_.phase != RAD_PHASE_PREFILL) return false;
+    } else {
+        if (cfg_.chunk_slices == 0 || plan_.phase != RAD_PHASE_MIXED) return false;
+    }
     if (plan_.n_spec != 0) return false;   /* drafting inside a group would move the base */
     int32_t pf = -1;
     for (int32_t i = 0; i < (int32_t)plan_.e.size(); ++i) {
@@ -1742,14 +1774,17 @@ bool Scheduler::start_group() {
             pf = i;
             continue;
         }
+        if (solo) return false;             /* a prefill-only step has no decode row */
         if (e.n_spec != 0 || e.n_tokens != 1) return false;
     }
     if (pf < 0) return false;
+    /* The hook's step is the chunk and nothing else. */
+    if (solo && plan_.e.size() != (size_t)pf + 1) return false;
     const StepEntry ce = plan_.e[(size_t)pf];
     /* A checkpoint inside the chunk, or a restore from a prefix hit, is one whole pass. */
     if (ce.ckpt_restore >= 0) return false;
     if (ce.ckpt_tok >= 0 && ce.ckpt_slot >= 0 && ce.ckpt_tok + 1 < ce.n_tokens) return false;
-    const int32_t m = chunk_slice_count(ce.n_tokens);
+    const int32_t m = solo ? chunk_slice_count_prefill() : chunk_slice_count(ce.n_tokens);
     if (m < 2) return false;
     /* Reserve the frozen decode rows' KV for the whole group now: no sub-step may fail an
      * ensure, and a shortfall is one more reason to leave the chunk whole. */
@@ -3257,6 +3292,12 @@ const RadBatch* Scheduler::step_next_locked() {
      * the step after the last sub-step is planned normally by step() after the commit. */
     if (group_.active) {
         if (group_.next >= group_.n_slices) return refuse_ahead(AheadRefused::MidPrompt);
+        /* A prefill-only group (--chunk-slices-prefill) has no decode row whose next token could be
+         * issued early: the sub-steps run the same rows through the trunk, and nothing after them
+         * is known until the last commits. Planning an ahead step from it would also be wrong
+         * twice over: --ahead's machinery reads a decode row's StepSlot. Leave the next sub-step to
+         * the commit, as a mid-prompt chunk's is left. */
+        if (group_.dec.empty()) return refuse_ahead(AheadRefused::MidPrompt);
         const int32_t lo = group_.lo;
         plan_next_.reset();
         plan_next_.spec_is_tree = tree_;

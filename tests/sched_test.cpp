@@ -10795,6 +10795,81 @@ TEST(a_group_scatters_its_media_on_the_first_slice_only) {
     (void)p;
 }
 
+/* S-02b's test hook: --chunk-slices-prefill m cuts a prefill-only step (no decode row beside the
+ * chunk) into m sub-steps, so a single-stream greedy run exercises the plugin's own resumption with
+ * no client and no decoder (design §8.2). It is the same group as a chunk beside a decoder, with no
+ * decode row to carry: each sub-step is a PREFILL step of the same rows, none of them emits the
+ * chunk's token but the last, and the chunk commits once, whole, at the end. */
+TEST(a_prefill_only_step_is_cut_into_slices_by_the_hook) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/0);          /* --chunk-slices off: the hook alone slices */
+    f.cfg.chunk_slices_prefill = 4;
+    CHECK_OK(f.start());
+    const uint64_t p = f.submit(496, 64);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+
+    const StepPlan& pl = f.sch.plan();
+    CHECK_EQ(pl.phase, RAD_PHASE_PREFILL);
+    CHECK_EQ(pl.slice_m, 4);
+    CHECK_EQ(pl.slice_j, 0);
+    CHECK_EQ(pl.layer_lo, 0);
+    CHECK_EQ(pl.layer_hi, 2);                /* 8 layers over 4 slices */
+    CHECK(!pl.slice_last);
+    REQUIRE_EQ((int)pl.e.size(), 1);         /* the chunk, and no decode row */
+    CHECK(!pl.e[0].produces_token);          /* the chunk's token is the last sub-step's */
+    CHECK_EQ(pl.e[0].dev_out, -1);
+    CHECK_EQ(pl.n_tok_decode, 0);
+    CHECK_EQ(b->n_out, 0);
+    CHECK_EQ(b->layer_lo, 0);
+    CHECK_EQ(b->layer_hi, 2);
+    const int64_t n_tok = pl.e[0].n_tokens;
+    REQUIRE(n_tok > 0);
+
+    for (int32_t j = 0; j < 4; ++j) {
+        const StepPlan& s = f.sch.plan();
+        const bool last = j == 3;
+        CHECK_EQ(s.phase, RAD_PHASE_PREFILL);
+        CHECK_EQ(s.slice_j, j);
+        CHECK_EQ(s.slice_last, last);
+        CHECK_EQ(s.layer_lo, (int32_t)(((int64_t)j * 8) / 4));
+        CHECK_EQ(s.layer_hi, last ? 8 : (int32_t)(((int64_t)(j + 1) * 8) / 4));
+        REQUIRE_EQ((int)s.e.size(), 1);
+        CHECK_EQ(s.e[0].n_tokens, n_tok);    /* the same rows, again */
+        CHECK_EQ(s.e[0].produces_token, last);
+        CHECK_EQ(s.e[0].dev_out, last ? 0 : -1);
+        f.commit_plain(20 + j);
+        if (!last) REQUIRE(f.sch.step() != nullptr);
+    }
+    /* Committed once: the chunk's rows are the request's prompt, and no token was sampled. */
+    REQUIRE(f.sch.find(p) != nullptr);
+    CHECK_EQ(f.sch.find(p)->n_computed, n_tok);
+}
+
+/* The hook is off by default, and it never slices a step it cannot: a plugin that reports no
+ * resumable layer range (RadArchProbe::slice_layers_ok = 0) leaves the prefill step whole, and so
+ * does m of 1. */
+TEST(the_hook_leaves_a_prefill_step_whole_where_it_cannot_slice_it) {
+    for (int32_t m : { 0, 1, 4 }) {
+        for (int ok : { 1, 0 }) {
+            if ((m < 2) == (ok == 0)) continue;
+            Fixture f;
+            slice_fixture(f, /*slices=*/0);
+            f.cfg.chunk_slices_prefill = m;
+            f.cfg.slice_layers_ok = ok != 0;
+            CHECK_OK(f.start());
+            f.submit(496, 64);
+            const RadBatch* b = f.sch.step();
+            REQUIRE(b != nullptr);
+            CHECK_EQ(f.sch.plan().phase, RAD_PHASE_PREFILL);
+            CHECK_EQ(f.sch.plan().slice_m, 0);
+            CHECK_EQ(b->n_out, 1);           /* the chunk's last row, as without the hook */
+            CHECK_EQ(b->layer_lo, 0);
+            CHECK_EQ(b->layer_hi, 0);
+        }
+    }
+}
+
 /* Nothing is admitted inside a group: a newcomer waits for the last sub-step, and the chunk's
  * rows and blocks stay what they were. */
 TEST(admission_waits_for_a_group_s_last_slice) {

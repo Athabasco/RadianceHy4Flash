@@ -755,6 +755,9 @@ int config_parse(int argc, char** argv, Config* c) {
             else if (!std::strcmp(v, "auto")) c->chunk_slices = -1;
             else if (!parse_int(a.c_str(), v, 1, 8, &c->chunk_slices)) return RAD_E_INVAL;
         }
+        else if (S("--chunk-slices-prefill")) {
+            if (!parse_int(a.c_str(), v ? v : "0", 0, 8, &c->chunk_slices_prefill)) return RAD_E_INVAL;
+        }
         else if (S("--chunk-slice-target-ms")) { if (!num(1, 60000, &c->chunk_slice_target_ms)) return RAD_E_INVAL; }
         else if (S("--chunk-slice-cost-pct"))  { if (!num(0, 100, &c->chunk_slice_cost_pct)) return RAD_E_INVAL; }
         else if (S("--prefill-room-gate")) {
@@ -1788,6 +1791,8 @@ const ShowRow kShow[] = {
     { "--chunk-slices", [](const Config& c) {
           return c.chunk_slices < 0 ? std::string("auto")
                : c.chunk_slices == 0 ? std::string("off") : num(c.chunk_slices); } },
+    { "--chunk-slices-prefill", [](const Config& c) {
+          return c.chunk_slices_prefill > 1 ? num(c.chunk_slices_prefill) : std::string("off"); } },
     { "--chunk-slice-target-ms", [](const Config& c) { return num(c.chunk_slice_target_ms); } },
     { "--chunk-slice-cost-pct",  [](const Config& c) { return num(c.chunk_slice_cost_pct); } },
     { "--prefill-room-gate", [](const Config& c) {

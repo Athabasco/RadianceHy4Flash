@@ -864,6 +864,12 @@ struct Config {
      * capped at 8 and at the trunk's layers. Only a model whose plugin reports it can run the
      * trunk over a layer range (RadArchProbe::slice_layers_ok) is sliced. */
     int64_t chunk_slices = 0;
+    /* --chunk-slices-prefill m: the test hook of S-02b (notes/backlog/design/S-02.md §8.2). Cuts a
+     * prefill-only step with no decode rows into m layer-sliced sub-steps, so a single-stream greedy
+     * run serves the same prompt both ways (this off, and m) and compares the text and the chunk's
+     * KV bytes. 0 or 1 = off, the default. It is a test vehicle, not a lever: it adds the decode-
+     * free slice overhead and gains nothing. */
+    int64_t chunk_slices_prefill = 0;
     /* --chunk-slice-target-ms: the duration a sub-step targets; m follows from it and the learned
      * chunk and decode step times (Scheduler::chunk_slice_count). */
     int64_t chunk_slice_target_ms = 150;

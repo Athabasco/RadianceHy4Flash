@@ -421,6 +421,10 @@ public:
      * and advance the group; `ahead` picks entry_next over entry. */
     void            fill_group_step(StepPlan& p, bool ahead);
     int32_t         chunk_slice_count(int64_t tokens) const;
+    /* The prefill-only test hook's m (--chunk-slices-prefill): a prefill step cut into m, for the
+     * byte-identical comparison of design §8.2. 1 = off, as are a model that cannot slice and a
+     * trunk of one layer. */
+    int32_t         chunk_slice_count_prefill() const;
     /* Why step_next_locked did not issue the next step ahead of the commit, counted per reason in
      * SchedMetrics::ahead_refused_* (S-07). The first check that refuses names it; a staging
      * failure is not one of these. */
