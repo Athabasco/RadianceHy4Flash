@@ -3335,7 +3335,7 @@ the drafter's `dfly.blk.<i>`, the tower `v.`.
 | `index_head`, `index_key`, `index_key_norm` | `head_weight_projection`, `token_key_projection`, `token_key_norm` | sparse layers |
 | `index_pool_value`, `index_pool_gate`, `index_pool_norm`, `index_ape` | `key_value_projection`, `key_gate_projection`, `key_norm`, `intra_group_ape` | f32 |
 | `ffn_gate_up`, `ffn_down`, `ffn_post_norm` | `mlp.gate_proj` + `up_proj`, `down_proj`, `post_fc2_norm` | layer 0 |
-| `glm_router.weight`, `glm_router.correction` | `mlp.gate.weight`, `mlp.gate.e_score_correction_bias` | f32; MoeFP8's router (GlmRouter) |
+| `glm_router.weight`, `glm_router.correction` | `mlp.gate.weight`, `mlp.gate.e_score_correction_bias` | bf16 weight, f32 correction (GlmRouter) |
 | `ffn_latent_in`, `ffn_latent_out` | `mlp.routed_expert_down_proj`, `mlp.routed_expert_up_proj` | |
 | `ffn_gate_up_exps.<e>`, `ffn_down_exps.<e>` | slice `e` of `mlp.experts.gate_up_proj` [512, 3072, 1536] and `down_proj` [512, 1536, 1536] | one movement unit an expert |
 | `ffn_gate_up_shexp`, `ffn_down_shexp`, `ffn_post_norm` | `mlp.shared_experts.gate_proj` + `up_proj`, `down_proj`, `mlp.combine_output_norm` | |
@@ -3388,12 +3388,14 @@ per layer
            the E4M3 round trip (quant_act_fp8 one group a row, dequant), engram_norm,
            gemm_nt_bias key and value, engram_gate into the streams
   ihc_pre (hc_attn), rmsnorm (attn_norm)
-  q_a, rmsnorm, q_nope / q_rope; kv_a, rmsnorm on the latent, rope (gptj) on the key, kv_store
-  of the row [latent | key] as one KV head of (512 + 64) / 2; attn_gate (a decode step's query
-  rotary is folded into the sink instead: its stable instance's optional `rope_pos`, one launch a
-  layer less; `RADIANCE_HY4_FOLD_QROPE=0` issues the `rope` launch as well)
+  q_a, rmsnorm, q_nope / q_rope; kv_a, rmsnorm on the latent, rope (gptj) on q_rope -- under
+  `rope_rows`, its row-form name -- and on the key,
+  kv_store of the row [latent | key] as one KV head of (512 + 64) / 2; attn_gate (a decode step's
+  query rotary is folded into the sink instead: its stable instance's optional `rope_pos`, one
+  launch a layer less; `RADIANCE_HY4_FOLD_QROPE=0` issues the `rope_rows` launch as well)
   [sparse] index_key, rmsnorm, qsa_work, idx_pool_gated into the indexer cache, qsa_tail_store;
-           selecting: index_query_nope / _rope, rope, index_head, idx_score, qsa_select(own 1)
+           selecting: index_query_nope / _rope, rope_rows, index_head, idx_score,
+           qsa_select(own 1)
   absorbed:     mla_project_kv absorb, mla_attn_paged_sink (window) or mla_attn_sel_sink, expand
                 and gate_mul as one mla_expand_gate (libr4d fuses it; libref / libavx run the pair)
   non-absorbed: the latent copied, gemm_nt kv_b, mla_kv_split, the query assembled, attn_kv_sink
@@ -3460,22 +3462,41 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   the shared expert's gate_up (the feed-forward norm's output); the leader writes a pair of its own
   (`trunk_codes.<role>.*`). Where libr4d serves them, the q residual's norm writes q_b's rotated
   codes itself (`rmsnorm_had_quant_i8g`, q_a then writes `q_a_raw`) and the dense and shared MLPs'
-  gate writes their down's (`gated_had_quant_i8g`). MoeFP8's `router_fuse` runs the selection and
-  the expert sort as one `router_sigmoid_topk_scatter` at decode and verify heights. All
+  gate writes their down's (`gated_had_quant_i8g`). MoeFP8's `router_fuse` runs the
+  selection and the expert sort as one `router_sigmoid_topk_scatter` at decode and verify heights. All
   byte-identical (greedy tokens and logprobs equal on gpu-mini at TP1/TP2, drafter off and depth 5,
-  bf16, 128-group int8 and IQ8R + w4nl64 containers). The 128-group rotated quantisers
+  bf16, 128-group int8 and IQ8R + w4nl64 containers). The q residual's `q_nope` and `q_rope`, whose
+  codes are the one pair above, then go out as one launch at a decode step: `gemm_nt_q_dual` over the
+  two weights and their two widths, a concatenated grid of eight-wave blocks in which a part taking
+  four waves a tile carries two of its 16-row tiles and one taking eight one, so each part does what
+  the block of its own launch does and both products are the two launches' byte for byte
+  (`RADIANCE_HY4_FUSE_QPROJ`, `r4d_selftest`'s `gemm_iqr_dual` case comparing them at 6144/2048,
+  3072/1024 and 12288/4096, the last the one pair where both parts take four waves a tile; a pass
+  wider than one row stays two launches, as does a pair on an engine whose library carries no such
+  row). The 128-group rotated quantisers
   (`had_quant_act_i8g`, `rmsnorm_had_quant_i8g`, the experts' `had_quant_act_fp8`) run their
   chained forms (`chained` 1, `Geom::chain_q8`), since every GEMM around them chains. Launches of a
-  recorded gpu-mini decode pass: bf16 132 -> 129, int8 170 -> 148. Switches (default on):
+  recorded gpu-mini decode pass: bf16 132 -> 129, int8 170 -> 148, three fewer again with the q
+  pair in one launch (a layer's, 3 layers). Switches (default on):
   `RADIANCE_HY4_SHARE_CODES`, `RADIANCE_HY4_FUSED_QUANT`, `RADIANCE_HY4_ROUTER_FUSE`,
-  `RADIANCE_HY4_CHAIN_Q8`. Not fused: the attention norm and the feed-forward norm are the
-  junction's (`rmsnorm_ihc_junction`), and o_proj's input comes out of `mla_expand_gate`.
+  `RADIANCE_HY4_CHAIN_Q8`, `RADIANCE_HY4_FUSE_QPROJ`. Not fused: the attention norm and the
+  feed-forward norm are the junction's (`rmsnorm_ihc_junction`), and o_proj's input comes out of
+  `mla_expand_gate`.
+  `ffn_latent_out`'s is the one fused producer that is not a norm or a gate: the routed MoE gather
+  (`moe_gather_inv_i8g`, K-19) writes the sum's rotated int8 codes and scales in the launch that
+  sums it, so that linear declares no `had_quant_act_i8g`. It needs the slot table, no shared arm
+  in the gather, `top_k` 16, a latent that is a whole number of the codes' 256-column waves
+  (`latent % 256 == 0`), a latent its weight's scale group divides (128 or 256), and a write that
+  does not fold the gather in (a fold writes no codes); else the plain gather serves and the linear
+  quantises for itself. `RADIANCE_HY4_FUSE_GATHER_Q8=0` turns it off.
 - **The Engram table on disk** (`ngram-placement: disk`). The ids and the gathered rows are
   host-domain buffers (as `rad_block_ple.h`'s), so libavx's host gather reads and writes them in the
   host arena; a device gather (vram, ram) reads and writes them over the link. A prefill chunk's
   `engram_ids` also hashes up to two steps of the following prompt (`RadBatch::n_ahead`) into
   `ahead_ids`, and the gather hands them to libavx's reader thread (the friend's `ahead_ids`), so the
-  next chunk's rows are read while this one computes; `RADIANCE_HY4_ENGRAM_AHEAD=0` turns it off.
+  next chunk's rows are read while this one computes. A device gather ignores them, so the hashing
+  runs only where the gather goes to the host; `RADIANCE_HY4_ENGRAM_AHEAD=0` turns it off and any
+  other value hashes them at every placement (the A/B arm).
   Before this the plugin's device-domain ids made a disk-placed table crash the first prefill.
 - **The pipelined prefill at TP4** (`RADIANCE_HY4_PIPE=1`, off by default). A step wider than a band
   runs as two row pieces: piece 0's junction (the `add`, the `overlap 1` exact all-reduce, the

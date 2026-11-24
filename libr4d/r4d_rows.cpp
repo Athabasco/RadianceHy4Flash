@@ -974,6 +974,8 @@ static const RadOperandSpec oAllGather[] = {
 };
 
 /* ------------------------------------------------------------------------------------- GEMM */
+static const RadParamSpec pGemmF32[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype"),
+                                         P_INTO("weight_bf16") };
 static const RadParamSpec pGemmNt[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "N",     RAD_P_INT, RAD_REQUIRED },
@@ -1301,6 +1303,24 @@ static const RadOperandSpec oMoeGatherInv[] = {
     { "shared",      RAD_OPD_IN,  1 },
     { "shared_gate", RAD_OPD_IN,  1 },
     { "y",           RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pMoeGatherQ8[] = {
+    P_INT("M"), P_INT("n"), P_INT("top_k"), P_STR("dtype"),
+    /* The rotation is 128 wide and the amax covers a whole scale group: 128, or 256 for an IQ8R
+     * trunk, whose two 128-wide blocks share one scale. No shared arm in this form -- the plane and
+     * its gate are the plain gather's. */
+    P_INT("group"),
+};
+static const RadOperandSpec oMoeGatherInvQ8[] = {
+    { "y_expert", RAD_OPD_IN,  0 },
+    { "expert_w", RAD_OPD_IN,  0 },
+    { "inverse",  RAD_OPD_IN,  0 },
+    /* `moe_gather_inv` also writing its sum's rotated int8 codes and their per-group scales: what
+     * a `had_quant_act_i8g` would have written from `y`, so the int8 linear that reads the sum
+     * declares no quantiser of its own (K-19). Both are outputs of this op, written with `y`. */
+    { "q8",       RAD_OPD_OUT, 0 },
+    { "q8_scale", RAD_OPD_OUT, 0 },
+    { "y",        RAD_OPD_OUT, 0 },
 };
 
 /* `vocab_off` and `pairs` are the vocab-parallel form, both absent on a single-rank graph (which
@@ -1934,6 +1954,29 @@ static const RadOperandSpec oGemmNtQGated[] = {
     { "q",        RAD_OPD_OUT,    0 },
     { "scale",    RAD_OPD_OUT,    0 },
     { "out_bf16", RAD_OPD_OUT,    1 },
+};
+/* Two IQR weights of one activation's codes, read in one launch -- a decode step's `q_nope` and
+ * `q_rope`. Its own op rather than a flag on `gemm_nt_q` -- an op's operand count is fixed -- with
+ * gemm_nt_q's operands as the prefix and the second weight's after them, so the first part reads
+ * exactly as it does alone. The two weights are one form and one K but not one N: the second's N
+ * is `N2`, and each part's blocks are its own launch's, which is why the two Ns are separate. */
+static const RadParamSpec pGemmNtQDual[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "N",     RAD_P_INT, RAD_REQUIRED },
+    { "N2",    RAD_P_INT, RAD_REQUIRED },
+    { "K",     RAD_P_INT, RAD_REQUIRED },
+    { "group", RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oGemmNtQDual[] = {
+    { "a",        RAD_OPD_IN,     0 },
+    { "a_scale",  RAD_OPD_IN,     0 },
+    { "b",        RAD_OPD_WEIGHT, 0 },
+    { "b_scale",  RAD_OPD_WEIGHT, 0 },
+    { "y",        RAD_OPD_OUT,    0 },
+    { "b2",       RAD_OPD_WEIGHT, 0 },
+    { "b2_scale", RAD_OPD_WEIGHT, 0 },
+    { "y2",       RAD_OPD_OUT,    0 },
 };
 /* The same fold over an OCP-MXFP4 gate_up weight, which gemm_nt_q reads with a per-row reference
  * exponent (`b_ref`). A schema of its own, since an op's operand count is fixed for the plugins
@@ -3474,8 +3517,8 @@ static const RadOpSchema kSchemas[] = {
            "Channel-wise softmax pooling with learned position bias, BF16, normalized Hadamard, BF16, power-of-two FP8."),
     SCHEMA("dsa_query", pMnDtype, oQuantActFp8,
            "Normalized Hadamard, BF16 boundary and power-of-two E4M3 quantization per query head."),
-    SCHEMA("gemm_nt_f32", pGemmNt, oGemmNt,
-           "BF16 activations times F32 weights, F32 accumulation and output; preserves routing and index gate precision."),
+    SCHEMA("gemm_nt_f32", pGemmF32, oGemmNt,
+           "BF16 activations times F32 or stored BF16 weights, F32 accumulation and output; preserves routing and index gate precision."),
     SCHEMA("swiglu_step", pSwigluClamped, oGateUp,
            "min(silu(gate),limit)*clamp(up,-limit,limit); gate is the first half."),
     SCHEMA("swiglu_clamped", pSwigluClamped, oGateUp,
@@ -4051,6 +4094,13 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("moe_gather_inv", pMoeGather, oMoeGatherInv,
            "`moe_gather` reading the slot table `moe_scatter_inv` wrote instead of rebuilding it "
            "from `sorted_tok`: the same sums in ascending slot order, the same bytes."),
+    SCHEMA("moe_gather_inv_i8g", pMoeGatherQ8, oMoeGatherInvQ8,
+           "`moe_gather_inv`, also writing the rotated int8 codes `q8` and their scales "
+           "`q8_scale` of the row it sums -- the quantiser of that row folded into the launch that "
+           "produces it, so the int8 linear reading the sum spends one launch less. The codes are "
+           "the ones `had_quant_act_i8g` would write from `y`: the same 128-wide rotation, the same "
+           "amax over each `group`-wide block, the same scale and rounding. `n` is a whole number "
+           "of 256-column waves and `top_k` is 16 (the eight-column forms)."),
     SCHEMA("moe_gemm", pMoeGemm, oMoeGemm,
            "y[i] = a[row(i)] @ w[e]^T in SORTED order, e being the expert whose offset range "
            "contains i, both operands unquantised and one accumulator over K. `a_order` picks "
@@ -4156,6 +4206,14 @@ static const RadOpSchema kSchemas[] = {
            "columns) and optionally the bf16 product, and no [M, 2n] tensor is ever written. "
            "Byte-identical to the two ops it replaces, which is what makes it substitutable "
            "rather than a second numerical path."),
+    SCHEMA("gemm_nt_q_dual", pGemmNtQDual, oGemmNtQDual,
+           "two GEMMs of ONE activation's codes over two weights of one encoding and one K, in one "
+           "launch: `b` -> `y` (N columns) and `b2` -> `y2` (N2 columns), the same [M, K] `a` and "
+           "its scales read twice. The two launches' blocks are concatenated in one grid, each "
+           "part doing exactly what its own launch does -- a part taking four waves a tile puts "
+           "two of its 16-row tiles in a block, one taking eight one -- so both outputs are "
+           "byte-identical to the pair of `gemm_nt_q` calls it replaces. A decode step's launch: "
+           "the pair costs one launch and one ramp instead of two."),
     SCHEMA("gate_quant_fp8", pGateQuantFp8, oGateQuantFp8,
            "the same, with the gate in its own operand rather than packed beside x."),
     SCHEMA("gate_had_quant_i8g", pGateQuantFp8, oGateQuantFp8,
@@ -5644,6 +5702,15 @@ static const RadConstraint cMoeGemmBf16[] = {
 static const RadConstraint cMoeGather[] = {
     C_GE("M", 1), C_GE("n", 1), C_GE("top_k", 1), C_IN("dtype", "bf16"),
 };
+/* moe_gather_inv_i8g is the gather that also writes the sum's codes, so its band is the entry
+ * point's own (r4d_rad_moe_gather_inv_i8g) rather than moe_gather_inv's: top_k = 16, n a whole
+ * number of the codes' 256-column waves, and a scale group of 128 or 256 (the two 256-column-wave
+ * forms are the only ones whose whole wave is live to quantise). Read off that entry point's
+ * rejection tests, as the rows of the "band is read off the entry point" section are. */
+static const RadConstraint cMoeGatherQ8[] = {
+    C_GE("M", 1), C_DIV("n", 256), C_EQ("top_k", 16), C_IN("group", "128 256"),
+    C_IN("dtype", "bf16"),
+};
 
 /* R <= 32 is stage 2's PT (R4D_TOPK_PT2): a lane holds the whole answer, so no distribution of the
  * candidates over lanes can lose one. The merge and the rerank share the limit. */
@@ -5787,6 +5854,17 @@ static const RadConstraint cGemmNtQGatedIqr[] = {
 static const RadConstraint cGemmNtIqrTiled[] = {
     C_DIV("K", 256), C_DIV("N", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK),
     C_IN("dtype", "i8a8 i8a8h"),
+};
+/* Two IQR weights of one input in one launch (K-02's q_nope and q_rope). One token a step: the
+ * GEMV, where the pair is two launches' launch and ramp cost, and the one band both parts' blocks
+ * are laid out for -- wider passes keep both Lins' own launches. Both weights one encoding, hence
+ * one K; each N a multiple of its own launch's block and its own: 16 columns, and 32 from 4096
+ * columns up, where that launch's block is two tiles and the two halves of a block are its. The
+ * constraint below holds the 16 every N needs; a wide part's 32 is the launch's, which refuses a
+ * pair outside its block before it emits (`dual_launch`). */
+static const RadConstraint cGemmNtQIqrDual[] = {
+    C_LE("M", 1), C_DIV("K", 256), C_DIV("N", 16), C_DIV("N2", 16),
+    C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "i8a8 i8a8h"),
 };
 /* libr4d's `K DIV 4`, renamed to docs/OPS.md's `n` as in every quantiser row here. */
 static const RadConstraint cQuantActFp8[] = {
@@ -7381,7 +7459,7 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_dsa_query_i8, nullptr, nullptr, nullptr,
   r4d_shape_dsa_query_i8 },
 { "gemm_nt_f32_bf16", "gemm_nt_f32", "gemm", "F32 routing and index gate projection",
-  "N<=512, K<=16384; pitched rows", "bf16 input, f32 weights and output",
+  "N<=512, K<=16384; pitched rows", "bf16 input, f32 or bf16 weights, f32 output",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cGemmNtF32), NOTUNE,
   nullptr, nullptr, r4d_rad_gemm_nt_f32, nullptr, nullptr, nullptr,
   r4d_shape_gemm_nt_f32 },
@@ -9448,6 +9526,23 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   /* The byte-identity claim above, as a chain of two rows of this plugin (r4d_fuse.cpp). */
   r4d_fuse_gemm_nt_q_gated_iqr },
 
+{ "gemm_iqr_dual", "gemm_nt_q_dual", "gemm",
+  "two IQR weights of one activation's codes in one launch: the two GEMV grids concatenated, one "
+  "eight-wave block size, a part that takes four waves a tile carrying two of its 16-row tiles in "
+  "a block and a part that takes eight one, each tile folded over its own waves as its own launch "
+  "folds it (K-02's q_nope and q_rope)",
+  "M == 1; both weights one encoding and one K; K a multiple of 256, each N of 16 and of a "
+  "trellis's run (of 32 from 4096 columns up, where its launch's block is two tiles)",
+  "i8 A with an f32 scale per (row, 128 K) read by both, W and W2 an IQR form's codes with their "
+  "scales, bf16 C and C2. Byte-identical to the two gemm_iqr_nt_m64 launches it replaces -- each "
+  "part's blocks are the blocks of its own launch",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGemmNtQIqrDual), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_iqr_dual, nullptr,
+  r4d_rad_layout_iqr_dual, r4d_rad_relayout_iqr_dual, nullptr, r4d_rad_unrelayout_iqr_dual,
+  /* The byte-identity claim above, as a chain of two rows of this plugin (r4d_fuse.cpp). */
+  r4d_fuse_gemm_nt_q_dual_iqr },
+
 { "gemm_iqr_tiled", "gemm_nt_q", "gemm",
   "the prefill GEMM over an IQR weight: the call decodes the weight's codes into the int8 fragment "
   "plane in its scratch, once, and runs gemm_i8a8_tiled (or its rb8 / rb32 fold on a tcq_rb "
@@ -9824,7 +9919,8 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 
 { "moe_gather_bf16", "moe_gather", "moe",
   "the weighted scatter back to token order, summing a token's slots in ascending slot order",
-  "any M and n; the inverse permutation is built in scratch rather than searched",
+  "any M and n; the inverse permutation is built in scratch rather than searched, and top_k = 16\n"
+  "  with sixteen-byte rows takes the sixteen-slot form (eight columns a lane, one load a slot)",
   "bf16 in and out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cMoeGather), NOTUNE,
@@ -9839,6 +9935,17 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cMoeGather), NOTUNE,
   nullptr, nullptr, r4d_rad_moe_gather_inv, nullptr, nullptr, nullptr,
   r4d_shape_moe_gather_inv },
+
+{ "moe_gather_inv_i8g", "moe_gather_inv_i8g", "moe",
+  "moe_gather_inv, also writing the sum's rotated int8 codes and their scales: the quantiser of "
+  "the row folded into the launch that sums it",
+  "moe_gather_inv's two 256-column-wave forms, with top_k = 16, n a whole number of waves and "
+  "four-byte-aligned codes; the codes are the standalone quantiser's bytes",
+  "bf16 in, f32 or bf16 routing weights, int8 codes + f32 scales out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cMoeGatherQ8), NOTUNE,
+  nullptr, nullptr, r4d_rad_moe_gather_inv_i8g, nullptr, nullptr, nullptr,
+  r4d_shape_moe_gather_inv_i8g },
 
 { "rowtopk_bf16", "row_topk", "select",
   "exact per-row top-R of a bf16 matrix, descending, ties to the lower column",
@@ -11943,8 +12050,11 @@ extern "C" int rad_kernel_concurrent(int i) {
  *
  * They answer 2: every chained form here ends its wait in r4d_chain_acquire, which empties the
  * scalar data cache behind the fence, so the engine may issue their packets without the packet
- * processor's acquire. A form that waited without it would have to keep this at 1 for the whole
- * library: one row's 1 keeps the fences on every chained packet of the engine. */
+ * processor's acquire. One form takes rad_abi.h's other way to 2: the head's matvec at M <= 2
+ * (r4dchain_mvm) waits with r4d_chain_wait_vec, and behind its acquire it has no scalar load from
+ * anything but its argument segment -- every operand it reads is a lane-varying one
+ * (tests/chain_scalar_audit.py). A form that waited with neither would have to keep this at 1 for
+ * the whole library: one row's 1 keeps the fences on every chained packet of the engine. */
 extern "C" int rad_kernel_chain(int i) {
     const RadKernelInfo* k = rad_kernel_at(i);
     if (!k) return 0;
@@ -11991,8 +12101,8 @@ extern "C" int rad_kernel_chain(int i) {
         /* the two-rank one-shot at a decode-sized message, and the rotated wire's row for the
          * messages under its size floor, which the exact kernel carries */
         "ar_oneshot_2rank_exact", "ar_oneshot_2rank_wht6",
-        /* the decode tail: the embedding, the sampled rows' gather, the lm_head's WMMA pass (the
-         * matvec below three rows stays plain) and the soft-cap */
+        /* the decode tail: the embedding, the sampled rows' gather, the lm_head's WMMA and matvec
+         * passes (the matvec is chained at M <= 2; the IQR head's stays plain) and the soft-cap */
         "embed_lookup_bf16", "gather_rows_bf16", "logits_gemm_i8",
         "logit_softcap_bf16", "logit_softcap_f32",
         /* the vocab-parallel sampler's candidate chain (temperature, top-k, the gathered sets'
@@ -12008,7 +12118,8 @@ extern "C" int rad_kernel_chain(int i) {
          * trellis's GEMV and 16-token tile, plain and gated, and the 128-group gated and gate
          * quantisers (the gated one for E4M3 codes too, which the w4 experts read) */
         "hc_read_e4m3", "router_gemm_topk_scatter_bf16", "moe_gemm_iqr", "moe_gemm_iqr_mod4",
-        "gemm_iqr_nt_m64", "gemm_iqr_gated", "gated_had_quant_i8g", "gate_had_quant_i8g",
+        "gemm_iqr_nt_m64", "gemm_iqr_dual", "gemm_iqr_gated", "gated_had_quant_i8g",
+        "gate_had_quant_i8g",
         /* G-3: the clamped SwiGLU with the rotated int8 quantiser on its pass */
         "swiglu_clamped_had_quant_i8g",
                 "gdn_conv_recurrent_update_k128_v128_bf16", "gdn_conv_recurrent_update_had_k128_v128_bf16",

@@ -741,9 +741,29 @@ for it. `residual` present is the `fused_add_rms_norm` form.
 | `rmsnorm_quant_i8g` | `M` `n` `eps`:f64 `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `gelu_mul_quant_i8` | `M` `n` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `gelu_mul_quant_i8g` | `M` `n` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
+| `gemm_nt_q_dual` | `M`(range) `N` `N2` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w → `y`; `b2`w, `b2_scale`w → `y2` |
 
 `gelu_mul_quant_i8` is `gelu_mul` with `rmsnorm_quant_i8`'s quantiser on its pass, byte-identical
 to the pair.
+
+`gemm_nt_q_dual` is two GEMMs of one activation's codes over two weights of one encoding and one
+`K`, in one launch: `b` → `y` (`N` columns) and `b2` → `y2` (`N2`), both reading the one `a` and
+`a_scale`. The two launches' blocks are concatenated in one grid, each part decoding and folding
+exactly as it does alone, so both outputs are byte-identical to the pair of calls it replaces --
+which is what makes it a gain rather than a numerical path. One encoding is the pair's condition in
+full: a pair of two forms is not its subject, nor is a pair of two runs of a computed trellis, whose
+fold length differs -- the encoding carries the planes' runs and row-blocks, so the two differ there
+too. The two widths are the pair's own, which is why `N2` is a parameter of its own: each part's
+blocks are the blocks its own launch gives it, so each `N` is a multiple of that block -- 16
+columns, and 32 from 4096 columns up, where the block is two tiles. libr4d's row is `gemm_iqr_dual`:
+both weights IQR, one row (the GEMV, where the two launches are launch and ramp cost), a block of
+eight waves per part -- two of its 16-row tiles where that part's own launch takes four waves a
+tile, one where it takes eight. K-02: Hy4-flash's
+`q_nope` and `q_rope` read the one q residual's codes at 6144 and 2048 columns on a sparse layer
+(3.84 and 1.32 MiB of codes) or 12288 and 4096 on a sliding one (7.61 and 2.58 MiB), and a layer's
+two launches become one. A sparse layer is 32 heads unsharded and 16 a rank at TP2, a sliding one
+64 and 32, at 192 + 64 columns a head; the narrower pair is also what a sliding layer has at TP2
+and the wider one what it has at TP1.
 
 `gated_had_quant_i8g` and `rmsnorm_had_quant_i8g` are `gated_quant_fp8` and `rmsnorm_quant_fp8`
 with `had_quant_act_i8g`'s quantiser on their pass: the `group`-wide rotation of the bf16-rounded
@@ -804,7 +824,7 @@ may not have arrived.
 | op | params | operands |
 |---|---|---|
 | `gemm_nt` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
-| `gemm_nt_f32` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
+| `gemm_nt_f32` | `M`(range) `N` `K` `dtype` `weight_bf16`/opt | `a`, `b`w → `y` |
 | `gemm_nt_bias` | `M`(range) `N` `K` `dtype` `act`/opt | `a`, `b`w, `bias`w, `res`? → `y` |
 | `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt `w_rb`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
 | `gemm_nt_q_bias` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w, `bias`w → `y` |
@@ -884,9 +904,11 @@ may be `y` itself, the residual stream updated in place (the encoder towers' lay
 implementation reads `res` before it stores the product over it.
 
 `gemm_nt_f32` is `y[M, N] = a[M, K] @ b[N, K]^T` with a bf16 activation, an f32 weight, f32
-accumulation and an f32 `y`; `dtype` (`bf16`) names the activation. It exists for the projections
-whose weights and results must not narrow to bf16: GLM's router logits and its indexer's signed
-head gates.
+accumulation and an f32 `y`; `dtype` (`bf16`) names the activation. With `weight_bf16=1` the weight
+operand is the checkpoint's stored bf16 instead, widened exactly to f32 in the kernel, so `y` is
+byte for byte what the f32 copy of the same values gives. It exists for the projections whose
+weights and results must not narrow to bf16: GLM's router logits and its indexer's signed head
+gates.
 
 libr4d's `gemm_nt_f32_bf16` takes `N` up to 512, `K` up to 16384, `M` up to 65535 and pitched
 rows. A wave computes a tile of rows by columns, chosen by `M` and `N` (a single column per wave
@@ -2171,6 +2193,7 @@ The VAEs' convolutions are `conv3d_ndhwc` with `tpad` and the audio VAE's `conv2
 | `router_sigmoid_topk_scatter` | `M`(range) `n_expert` `n_local`/opt `top_k` `norm` `route_scale`:f64 `dtype` `expert_base`/opt `protect`:str/opt | `logits`, `bias`w → `ids`, `weights`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`?, `inverse`? |
 | `moe_scatter_inv` | `M`(range) `n_expert` `top_k` `expert_base`/opt `protect`:str/opt | `expert_ids` → `sorted_tok`, `expert_offset`, `expert_count`, `inverse` |
 | `moe_gather_inv` | `M`(range) `n` `top_k` `dtype` `act`:str/opt | `y_expert`, `expert_w`, `inverse`, `shared`?, `shared_gate`? → `y` |
+| `moe_gather_inv_i8g` | `M`(range) `n` `top_k` `dtype` `group` | `y_expert`, `expert_w`, `inverse` → `q8`, `q8_scale`, `y` |
 | `moe_gather` | `M`(range) `n` `top_k` `dtype` `act`:str/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`? → `y` |
 | `row_topk` | `M`(range) `N` `R` `vocab_off`/opt `dtype` | `x` → `idx`, `val`, `pairs`? |
 | `row_topk_merge` | `M` `R` `world_size` `dtype` | `gathered` → `idx`, `val` |
@@ -2268,7 +2291,11 @@ the sum; only the gathered result narrows to bf16, as with bf16 weights.
 libr4d's `moe_gather_bf16` takes f32 weights in its column-per-thread kernel, with the self-scan
 up to 512 slots (and `top_k` up to 64) and the two prepass launches above. The wave-per-token
 form past 512 slots reads bf16 weights only, so f32 weights stay on the column-per-thread kernel
-at every size.
+at every size. At `top_k = 16`, whose rows every launch in the trunk has, that kernel takes its
+sixteen-slot form: eight columns a lane and one sixteen-byte load a slot, the slots of a column
+summed in the same ascending order, so the bytes are the column-per-thread kernel's; it needs
+every row sixteen-byte aligned. A block that declares its sort's inverse table (K-18) also hands
+the gather `moe_gather_inv`, which reads the table instead of scanning the sort or building it.
 
 ### Quantised experts and the row gate
 
@@ -2366,6 +2393,18 @@ own because `moe_scatter`'s and `moe_gather`'s operand lists are the shared voca
 512), and `moe_gather_inv` runs the kernel `moe_gather` picks at the same size, bf16 or f32
 weights; both are byte-identical to the pair they replace, at GLM's shape with f32 routing weights
 and the shared arm folded in (`r4d_selftest`).
+
+**`moe_gather_inv_i8g`** is `moe_gather_inv` at `top_k = 16` with no shared arm, writing the sum's
+rotated int8 codes (`q8`, `[M, n]` i8) and their f32 scales (`q8_scale`, `[M, n / group]`) in the
+same launch, so a linear reading the sum declares no quantiser of its own -- one launch fewer a
+layer (K-19). The gather's 256-column wave is exactly the 128-wide FWHT and the group's amax that
+`quant_act_i8g` runs (`group` 128, or 256 for an IQ8R trunk), so `q8` and `q8_scale` are
+byte-identical to running `quant_act_i8g` over `y` afterwards; `y` is byte-identical to
+`moe_gather_inv`'s (`tests/r4d_emu/test_moefuse.cpp` drives its entry point over both of its wave
+forms and each pinned form, codes and scales against a host reference over six shapes;
+`--perfmoefuse` checks the same against the gather + `had_quant_act_i8g` pair on the card). `n` is
+a multiple of 256 and `group` is 128 or 256; operands are writes after the reads because the shared
+vocabulary's lists are fixed, hence an op of its own.
 
 At `dtype=mxfp4a8` (the host libraries; libr4d has no row), `w` and `w_odd` are OCP e2m1 codes and `w_scale` and `w_odd_scale` hold one
 E8M0 exponent per (row, 32 of K), typed `e8m0` or raw `u8`; either way a byte is an exponent, not
@@ -2724,7 +2763,9 @@ whole form elsewhere (the host mailbox included), which keeps every promise `sp`
 `logits_gemm` is separate from `gemm_nt` because `lm_head` is its own access class
 (`RAD_ACCESS_VOCAB`) and because the sampler fuses against it: under the distributed top-k a rank
 never materialises a full logits row (`spec.md` §9, §13). `M` is one row per sampled position,
-`gather_rows` having run first. A quantised head (codes and a scale plane: E4M3 or int8) reaches a
+`gather_rows` having run first — except when every row of the step is an output row (a plain
+decode/verify step), where the gather would copy the hidden rows onto themselves and the head reads
+`final_hidden` directly. A quantised head (codes and a scale plane: E4M3 or int8) reaches a
 host kernel joined (Weights of several planes, above).
 
 **`logits_gemm_vocab`** (device-only) is `logits_gemm` over a head stored as up to four width
@@ -3929,8 +3970,11 @@ maximum is taken (libref shifts by the maximum of the scores and the sink).
   order, the sink once), at every `M` under `stable 1`, sizing its scratch for every row of
   the declared `M` and refusing a launch whose scratch is short (`RAD_E_SCRATCH`); under `stable
   0` it runs that law up to 16 rows (window) / 32 rows (window 0, selection) and one unsplit pass
-  past them, which may differ in the last place. Hy4-flash declares its decode-class rows with
-  `stable 1` and its prefill rows with `stable 0`.
+  past them, which may differ in the last place. `stable 1` splits to its own cap, 48 rows (window,
+  window 0 and the selection form), which covers a speculative step's verify heights: up to there a
+  workgroup takes a slot instead of walking the row, and its scratch is sized for those partials (25
+  MiB at 48 rows of 32 heads and 8 slots). Hy4-flash declares its decode-class rows with `stable 1`
+  and its prefill rows with `stable 0`.
 - **`rope_pos`** (both ops, optional) is the rotary's positions -- `[rows]` or `[3, rows]`, indexed
   by the row of this launch (the operand is this launch's rows, a view of a whole step's array) --
   and with it `q_rope` holds the projection's raw columns and the launch turns them itself, so

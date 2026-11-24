@@ -377,6 +377,8 @@ static const RadParamSpec pDequantW4[] = { P_INT("N"), P_INT("K"), P_INT("group"
 static const RadOperandSpec oDequantW4[] = { WGT("wq"), WGT("ws"), OUT("y") };
 
 /* ---- gemm --------------------------------------------------------------------------------- */
+static const RadParamSpec pGemmF32[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype"),
+                                         P_INTO("weight_bf16") };
 static const RadParamSpec pGemm[]       = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype") };
 static const RadOperandSpec oGemm[]     = { OPD("a"), WGT("b"), OUT("y") };
 static const RadParamSpec pGemmBias[]   = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype"),
@@ -1262,8 +1264,8 @@ static const RadOpSchema kSchemas[] = {
   "Per-head query absorption or value expansion through the shared [head,(K|V),latent] BF16 matrix." },
 { "dsa_score", ARR(pDsaScore), ARR(oDsaScore),
   "Per-head ReLU of FP8 dot products, then signed head gates and scales; invalid history is -inf." },
-{ "gemm_nt_f32", ARR(pGemm), ARR(oGemm),
-  "BF16 activations times F32 weights, F32 accumulation and output; preserves routing and index gate precision." },
+{ "gemm_nt_f32", ARR(pGemmF32), ARR(oGemm),
+  "BF16 activations times F32 or stored BF16 weights, F32 accumulation and output; preserves routing and index gate precision." },
 { "dsa_query", ARR(pMnD), ARR(oQuantFp8),
   "Normalized Hadamard, BF16 boundary and power-of-two E4M3 quantization per query head." },
 { "dsa_query_i8", ARR(pMnD), ARR(oQuantFp8),
