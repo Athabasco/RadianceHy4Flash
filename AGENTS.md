@@ -11,7 +11,7 @@ read these before working:
 ## How an item is taken
 
 1. Take an item through its issue: assign yourself (or comment `/take` with the tooling you
-   have) and work one item at a time.
+   have).
 2. Open a PR whose title or body contains a closing keyword for the item's issue
    (`Fixes #N` / `Closes #N`). Without the keyword, the follow does not bind your PR to the
    issue and nobody reviews it (`#172` was missed exactly that way).
