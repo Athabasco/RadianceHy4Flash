@@ -318,6 +318,17 @@ Paths are relative to `src/`. Line numbers were read at c655f58c by the area aud
 - Change: `r4d_mla_sink.hip:443-482`: (a) value loads wait on the denominator load (`:452-455`): load `part[s]` unconditionally (the fold already skips den <= 0, `:461`), load `sinks[head]` early, store 4 bf16 as one 8-byte store (`:478-481`); (b) check the (M, heads) x 128 grid at 32 heads x 8 slots for per-head serial slot folds with dependent L2 round trips and for the stable-split scratch layout (16 workgroups write, 32 read).
 - Why: M: `merge_sink` 42 x 15.2 us = 0.64 ms = 4.7 % of a c1 pass; sliding layers 19.0 us, sparse 6.3 us with the same key count (short context). Arithmetic is ~0.5 us. Exclusive attribution inside a chained trio is fuzzy, so first kbench the row alone (heads 32, slots 8, M 1, chained and plain).
 - Verify: kbench `mla_attn_paged_sink` M = 1 cases (93 in `kernels_hy4.rkb`); `tests/r4d_emu/test_mla_sink.cpp` bytes; stamps.
+- Closed, without code (`notes/backlog/closed/K-14.md`): (a) was built lossless (the slot values loaded with the
+  maxima, `sinks[head]` hoisted, four bf16 as one 8-byte store where the out strides leave them aligned, emu bytes and
+  the fused form equal) and (b) checks clean, but the premise does not hold — the merge's own body is **1.15 us** at the
+  item's geometry (32 heads x 8 slots, `mla_sink_rows` + merge 8.87 us, 7.72 us with the body cut) and **1.9 us** at the
+  20-slot law, not 15.2 us. That op is the sink and the merge only (the expand is its own launch), so its 8.83 us is not
+  the served trio's total; the 19.0 us bracket stays unexplained, but it is not the slot chain the item names: the
+  16-head layers fold 20 slots per thread and are bracketed at 6.3 us, the 32-head 8-slot ones at 19.0. Measured on
+  one card (iks, gfx1201, kbench `--timing-only --max-cases 1 --op mla_attn_paged_sink`, plain and `--chain-forms`, three
+  builds), the change moves the op 8.87 -> 8.83 us at the item's row (its own +-0.5 %) and 9.66 -> 9.56 us on the
+  20-slot rows: not measurable against the 0.64 ms the item was going to win, so the merge bar is not met and the code
+  is reverted. K-15 and K-17's launch-count prize inherit an open question (what the brackets carry), not the body's.
 
 #### K-15 Fold `merge_sink` into the expand (G-3h alternative) or `mla_sink_rows` + merge one launch
 - Area kernel+plugin · BI · Gain 0.5-1.5 % / 0.5 % / 1 % / 0 · Conf medium · Effort M · Deps K-14 result (if K-14 fixes the 19 us, the rest is launch price only)
