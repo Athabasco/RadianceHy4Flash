@@ -11936,8 +11936,11 @@ extern "C" int rad_kernel_concurrent(int i) {
  *
  * They answer 2: every chained form here ends its wait in r4d_chain_acquire, which empties the
  * scalar data cache behind the fence, so the engine may issue their packets without the packet
- * processor's acquire. A form that waited without it would have to keep this at 1 for the whole
- * library: one row's 1 keeps the fences on every chained packet of the engine. */
+ * processor's acquire. One form takes rad_abi.h's other way to 2: the head's matvec at M <= 2
+ * (r4dchain_mvm) waits with r4d_chain_wait_vec, and behind its acquire it has no scalar load from
+ * anything but its argument segment -- every operand it reads is a lane-varying one
+ * (tests/chain_scalar_audit.py). A form that waited with neither would have to keep this at 1 for
+ * the whole library: one row's 1 keeps the fences on every chained packet of the engine. */
 extern "C" int rad_kernel_chain(int i) {
     const RadKernelInfo* k = rad_kernel_at(i);
     if (!k) return 0;

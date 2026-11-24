@@ -832,8 +832,9 @@ extern "C" int r4d_logits_gemm_i8(long a, long wq, long c, int M, int K, int N,
     return logits_gemm_8<true>(a, wq, c, M, K, N, a_ld, c_ld, w_ld, stream);
 }
 
-/* `chain`: the WMMA pass's chained form (the plugin entry, where the row resolved with `chain`);
- * the matvec below three rows stays plain. */
+/* `chain`: the plugin entry, where the row resolved with `chain`, so each pass this row launches
+ * takes its chained form: the WMMA pass above (r4dchain_lm_wmma) and the matvec at M <= 2
+ * (r4dchain_mvm). The IQR head's matvec has none and stays plain (see R4D_LGF8 below). */
 template <bool I8, uint32_t TB>
 static int logits_gemm_8(long a, long wq, long c, int M, int K, int N, int a_ld, int c_ld,
                          int w_ld, long stream, bool chain) {
