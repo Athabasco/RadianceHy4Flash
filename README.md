@@ -39,7 +39,9 @@ models:
     tp: 2
     placement: expert_tiered          # experts that do not fit stay in pinned host memory
     host-pool-mib: 39000
-    ngram-placement: ram              # Engram tables in host RAM, off the cards
+    ngram-placement: ram=/dev/shm/radiance-ngram   # the Engram table as a file in a tmpfs: a start
+                                      # that finds it filled pins it where it lies instead of
+                                      # reading the 60 GiB again (see below on what it costs)
     max-model-len: 1000000
     max-num-batched-tokens: 2048
     checkpoint-interval: 1984         # a quantum under the batch: a chunk sharing its step with
@@ -72,6 +74,27 @@ Run it with:
 ```sh
 radiance --config hy4-tp2.yaml
 ```
+
+The Engram placement is the key here that decides what a start costs. `ram` reads the table into a
+private pinned copy at every start: four tables one after the other at 1.4 GB/s, about 42 s of a
+66 s startup. `ram=DIR` keeps that copy as a file, `DIR/ngram-<id>.tab`, in a tmpfs, so a start that
+finds it complete checks samples of it against the container and pins it where it lies instead of
+reading the table again, which is 15-25 s off that start. The last engine to leave deletes the file,
+so what a file saves is a start after a crash, or after a stop that killed the engine before it
+cleaned up, rather than a planned restart; and a file left behind is 60 GiB of tmpfs that the next
+start counts against the free memory it checks before it pins anything. So it pays where the host
+has the room to leave it in place, and where two engines on separate card sets hold one table in
+host memory instead of two. Mount the directory's tmpfs with huge pages, since a tmpfs takes them
+only where `shmem_enabled` allows them and that defaults to `never`:
+
+```sh
+sudo mkdir -p /dev/shm/radiance-ngram
+sudo mount -t tmpfs -o size=70G,huge=always tmpfs /dev/shm/radiance-ngram
+```
+
+In a container, mount it on the host and pass it through
+(`-v /dev/shm/radiance-ngram:/dev/shm/radiance-ngram`): Docker's own `/dev/shm` is 64 MiB, and
+`--tmpfs` refuses `huge=` (`--shm-size` raises the size and takes no page size).
 
 Measured with this config (u3 container, TP2, 210 W power cap, sampled at T 0.9):
 

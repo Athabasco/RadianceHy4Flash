@@ -1005,6 +1005,15 @@ the pinned total is twice the table: set `amdgpu.no_system_mem_limit=1` (the cap
 and 1.5 GiB) or the second pin can be refused. The kernel charges the tmpfs pages to the memory
 cgroup of the engine that filled them.
 
+A tmpfs holds the file on huge pages only where `shmem_enabled` allows them
+(`/sys/kernel/mm/transparent_hugepage/shmem_enabled`, `never` by default), so a plain `/dev/shm`
+leaves the table on 4 KiB pages: mount the directory's tmpfs with `huge=always`, or set
+`shmem_enabled=advise`. The gather reads 96-byte rows at random, so the page size is a cost of the
+cards' TLB and the driver's mapping rather than of the bandwidth; what the pages buy is startup,
+where the file is filled and pinned a whole range at a time. A container cannot ask for them itself
+(`docker run --tmpfs` refuses `huge=`, `--shm-size` sets a size and no page size, and the sysfs
+knob is the host's), so the mount belongs on the host and the directory is passed in from there.
+
 `ngram-placement: disk=DIR` reads the table from its own file, `DIR/ngram-<id>.bin`, instead of from
 the container: a table on a faster or separate drive (an Optane beside a model on a large NVMe, or a
 model on a hard disk with its table on an SSD) at no host memory. The first start fills the file from
