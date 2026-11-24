@@ -115,29 +115,6 @@ __device__ __forceinline__ float bf16w_hi(uint32_t w) { return __uint_as_float(w
 typedef __attribute__((address_space(1))) const uint16_t* r4d_gu16;
 __device__ __forceinline__ uint32_t ldg_u16(const uint16_t* p) { return *(r4d_gu16)p; }
 
-// The four consecutive bf16 columns a lane owns of a 128-column group, in one 8-byte load when `p`
-// is 8-byte aligned (`a8`, from r4d_aligned8), else in four 2-byte loads. Both forms read the same
-// four halves, so they are the same bytes: the narrow one is for a row pointer whose pitch is not a
-// multiple of four elements, and every caller passes `a8` computed from that pointer.
-struct R4dHalf4 { uint16_t h[4]; };
-__device__ __forceinline__ bool r4d_aligned8(const void* p) {
-    return ((uintptr_t)p & 7u) == 0;
-}
-__device__ __forceinline__ R4dHalf4 r4d_ld_half4(const uint16_t* __restrict__ p, bool a8) {
-    R4dHalf4 r;
-    if (a8) {
-        const uint2 w = *(const uint2*)p;
-        r.h[0] = (uint16_t)w.x;
-        r.h[1] = (uint16_t)(w.x >> 16);
-        r.h[2] = (uint16_t)w.y;
-        r.h[3] = (uint16_t)(w.y >> 16);
-    } else {
-#pragma unroll
-        for (int j = 0; j < 4; ++j) r.h[j] = p[j];
-    }
-    return r;
-}
-
 // `lane ^ N` without the LDS pipe. `__shfl_xor` lowers to `ds_bpermute_b32` plus `s_wait_dscnt`,
 // an LDS round trip that dominates a dependency chain (e.g. a dot product closed in a token loop).
 // gfx10+ DPP16 has ROW_XMASK (0x160 | N), so for N < 16 the partner read is a modifier on the

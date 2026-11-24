@@ -153,9 +153,6 @@ __device__ __forceinline__ void norm_quant_row(
     uint8_t* __restrict__ qr, float* __restrict__ s, size_t s_row, uint32_t n, uint32_t nkb,
     float rs, float wadd) {
     const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
-    // The row's four columns a lane in one load when the pointer allows it (r4d_common.h): the
-    // staged row in LDS always does, a global row with a pitch that is a multiple of four elements.
-    const bool a8 = r4d_aligned8(nr);
     for (uint32_t kb = wave; kb < nkb; kb += THR / kWave) {
         float v[SUB][4];
         uint32_t c0[SUB];
@@ -168,16 +165,17 @@ __device__ __forceinline__ void norm_quant_row(
             // columns are all in or all out. Per-column guards would serialise the loads.
             if (c0[b] < n) {
                 float g[4];
-                const R4dHalf4 x = r4d_ld_half4(nr + c0[b], a8);
+                uint16_t x[4];
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
                     g[j] = WF32 ? ((const float*)w)[c0[b] + j]
                                 : bf2f(((const uint16_t*)w)[c0[b] + j]);
+                    x[j] = nr[c0[b] + j];
                 }
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
                     // The bf16 round trip is deliberate: the unfused quantiser reads these bytes.
-                    const uint16_t h = f2bf(bf2f(x.h[j]) * rs * (g[j] + wadd));
+                    const uint16_t h = f2bf(bf2f(x[j]) * rs * (g[j] + wadd));
                     if (yr) yr[c0[b] + j] = h;
                     v[b][j] = bf2f(h);
                 }
@@ -200,15 +198,6 @@ __device__ __forceinline__ void norm_quant_row(
 template <bool WF32, bool RES, uint32_t THR, bool HI8 = false, uint32_t SUB = 1>
 __device__ __forceinline__ void rmsnorm_quant_fp8_body(R4D_RQ_PARAMS) {
     __shared__ float lds[THR / kWave];
-    // The row, staged for pass two. Without it the quantiser re-reads from L2 the row pass one has
-    // just written (the L1 is write-through on store), which at decode heights is a round trip no
-    // other wave hides; with it pass two reads LDS. 6 KiB covers the 3072-wide rows this plugin
-    // runs; a wider row (another architecture's 5376, 8704) keeps the re-read, and the bytes are
-    // the same either way. block_sum's barrier, which every thread reaches between the two passes,
-    // is what publishes the staged row.
-    constexpr uint32_t kRowLDS = 3072;
-    __shared__ __align__(8) uint16_t srow[kRowLDS];
-    const bool stage = n <= kRowLDS;
     const uint32_t row = blockIdx.x;
     const uint16_t* __restrict__ xr = x + (size_t)row * x_ld;
     uint16_t* __restrict__ rr = RES ? res + (size_t)row * r_ld : nullptr;
@@ -234,17 +223,13 @@ __device__ __forceinline__ void rmsnorm_quant_fp8_body(R4D_RQ_PARAMS) {
             const uint32_t i = i0 + u * THR;
             if (i < n) {
                 float v;
-                uint16_t hb;
                 if (RES) {
                     const uint16_t h = f2bf(bf2f(ra[u]) + bf2f(xa[u]));
                     rr[i] = h;
                     v = bf2f(h);
-                    hb = h;
                 } else {
                     v = bf2f(xa[u]);
-                    hb = xa[u];
                 }
-                if (stage) srow[i] = hb;
                 if constexpr (THR == kR4dSumLanes) ss += v * v;
                 else (void)v;
             }
@@ -256,17 +241,9 @@ __device__ __forceinline__ void rmsnorm_quant_fp8_body(R4D_RQ_PARAMS) {
     }
     const float rs = rsqrtf(block_sum<THR / kWave>(ss, lds) / (float)n + eps);
 
-    /* The two pointers are passed one at a time rather than selected: a select of a shared array
-     * and a global row is a generic pointer, which the compiler may only read through flat_load
-     * -- correct, but it pays the aperture check a ds_load does not. Inlined twice, each copy
-     * knows its address space. */
-    auto pass2 = [&](const uint16_t* r) {
-        norm_quant_row<WF32, THR, HI8, SUB>(r, w, y ? y + (size_t)row * y_ld : nullptr,
-                                           q + (size_t)row * q_ld, s, (size_t)row * s_ld, n, nkb,
-                                           rs, wadd);
-    };
-    if (stage) pass2(srow);
-    else pass2(nr);
+    norm_quant_row<WF32, THR, HI8, SUB>(nr, w, y ? y + (size_t)row * y_ld : nullptr,
+                                        q + (size_t)row * q_ld, s, (size_t)row * s_ld, n, nkb, rs,
+                                        wadd);
 }
 template <bool WF32, bool RES, uint32_t THR, bool HI8 = false, uint32_t SUB = 1>
 __global__ __launch_bounds__(THR) void rmsnorm_quant_fp8_kernel(R4D_RQ_PARAMS) {
@@ -305,9 +282,6 @@ __device__ __forceinline__ void gated_quant_fp8_body(R4D_GQ_PARAMS) {
     const uint16_t* __restrict__ gr = gu + (size_t)row * gu_ld;
     uint16_t* __restrict__ yr = y ? y + (size_t)row * y_ld : nullptr;
     uint8_t*  __restrict__ qr = q + (size_t)row * q_ld;
-    // The gate and the up half four columns a lane in one load each, when the pointer allows it
-    // (r4d_common.h): `n % 4 == 0` keeps the up half's offset a multiple of the four columns.
-    const bool a8g = r4d_aligned8(gr), a8u = r4d_aligned8(gr + n);
 
     for (uint32_t kb = wave; kb < nkb; kb += blockDim.x / kWave) {
         float v[SUB][4];
@@ -319,24 +293,27 @@ __device__ __forceinline__ void gated_quant_fp8_body(R4D_GQ_PARAMS) {
             for (int j = 0; j < 4; ++j) v[b][j] = 0.0f;
             // One branch for all four columns; see norm_quant_row.
             if (c0[b] < n) {
-                const R4dHalf4 g4 = r4d_ld_half4(gr + c0[b], a8g);
-                const R4dHalf4 u4 = r4d_ld_half4(gr + n + c0[b], a8u);
+                uint16_t gb[4], ub[4];
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    const uint16_t gb = g4.h[j], ub = u4.h[j];
+                    gb[j] = gr[c0[b] + j];
+                    ub[j] = gr[n + c0[b] + j];
+                }
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
                     if constexpr (ACT == 3) {
                         // swiglu_clamped_kernel's expression (r4d_glm.hip): the gate clipped above,
                         // the up both ways, then the product rounded once.
-                        const float g = fminf(bf2f(gb), lim);
-                        const float u = fminf(fmaxf(bf2f(ub), -lim), lim);
+                        const float g = fminf(bf2f(gb[j]), lim);
+                        const float u = fminf(fmaxf(bf2f(ub[j]), -lim), lim);
                         const uint16_t h = f2bf((g / (1.0f + expf(-g))) * u);
                         if (yr) yr[c0[b] + j] = h;
                         v[b][j] = bf2f(h);
                         continue;
                     }
-                    const float g = bf2f(gb);
+                    const float g = bf2f(gb[j]);
                     const float a = ACT == 0 ? g / (1.0f + expf(-g)) : 1.0f / (1.0f + expf(-g));
-                    const uint16_t h = f2bf(a * bf2f(ub));
+                    const uint16_t h = f2bf(a * bf2f(ub[j]));
                     if (yr) yr[c0[b] + j] = h;
                     v[b][j] = bf2f(h);
                 }
@@ -389,8 +366,6 @@ __device__ __forceinline__ void gate_quant_fp8_body(R4D_GTQ_PARAMS) {
     const uint16_t* __restrict__ xr = x + (size_t)row * x_ld;
     uint16_t* __restrict__ yr = y ? y + (size_t)row * y_ld : nullptr;
     uint8_t*  __restrict__ qr = q + (size_t)row * q_ld;
-    // Both sources four columns a lane in one load each, when the pointer allows it (r4d_common.h).
-    const bool a8g = r4d_aligned8(gr), a8x = r4d_aligned8(xr);
 
     for (uint32_t kb = wave; kb < nkb; kb += blockDim.x / kWave) {
         float v[SUB][4];
@@ -402,23 +377,26 @@ __device__ __forceinline__ void gate_quant_fp8_body(R4D_GTQ_PARAMS) {
             for (int j = 0; j < 4; ++j) v[b][j] = 0.0f;
             // One branch for all four columns; see norm_quant_row.
             if (c0[b] < n) {
-                const R4dHalf4 g4 = r4d_ld_half4(gr + c0[b], a8g);
-                const R4dHalf4 x4 = r4d_ld_half4(xr + c0[b], a8x);
+                uint16_t gb[4], xb[4];
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    const uint16_t gb = g4.h[j], xb = x4.h[j];
+                    gb[j] = gr[c0[b] + j];
+                    xb[j] = xr[c0[b] + j];
+                }
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
                     uint16_t h;
                     if (ACT == 2) {
-                        h = f2bf(bf2f(gb) * bf2f(xb));
+                        h = f2bf(bf2f(gb[j]) * bf2f(xb[j]));
                     } else {
-                        const float gv = bf2f(gb);
+                        const float gv = bf2f(gb[j]);
                         // The activation is rounded to bf16 before the multiply, unlike
                         // gated_quant_fp8: the unfused reference here is `sigmoid` then `mul` with
                         // a bf16 buffer between them (silu_mul_bf16 keeps f32). Skipping the round
                         // trip changes the output.
                         const uint16_t ab =
                             f2bf(ACT == 0 ? gv / (1.0f + expf(-gv)) : 1.0f / (1.0f + expf(-gv)));
-                        h = f2bf(bf2f(ab) * bf2f(xb));
+                        h = f2bf(bf2f(ab) * bf2f(xb[j]));
                     }
                     if (yr) yr[c0[b] + j] = h;
                     v[b][j] = bf2f(h);
