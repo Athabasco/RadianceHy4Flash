@@ -301,6 +301,8 @@ def dfly(base, rec, out):
 #   python3 data/kernels_hy4.py g3 raw_g3.rkb
 #   rad-kbench --fixture raw_g3.rkb --kernels libref --rerecord g3.rkb
 #   python3 data/kernels_hy4.py append data/kernels_hy4.rkb g3.rkb data/kernels_hy4.rkb
+#   python3 data/kernels_hy4.py k15 k15.rkb
+#   python3 data/kernels_hy4.py append data/kernels_hy4.rkb k15.rkb data/kernels_hy4.rkb
 BF16, F32, I32, I8 = 3, 1, 11, 8
 IN_, OUT_, W_ = 0, 1, 3
 PINT, PSTR, PF64 = 1, 2, 4
@@ -344,6 +346,27 @@ def g3c_cases(base):
                 out.append(mkcase('mla_expand_gate_had_quant_i8g', M, p, ops,
                                   f"g3c mla_expand_gate_had_quant_i8g M={M} H={H}{' +plane' if plane else ''}", salt)); salt += 1
     return out
+def k15_cases(base):
+    """mla_attn_paged_sink_expand_i8g: the paged sink and the G-3c expansion in one launch pair, at the TP2 /
+    TP4 head shares and the decode-class heights (K-15). One sequence, its page table (block 4, full window),
+    with and without the bf16 plane. The baseline is the sink's own row plus the g3c row at the same M and H."""
+    out, salt = [], base
+    for H in (16, 8, 32):
+        for M in (1, 6, 8, 16, 17, 64):
+            for plane in (False, True):
+                if H != 16 and M not in (1, 17, 64): continue
+                pages = (M + 3) // 4
+                p = [('M', M), ('heads', H), ('latent_dim', 512), ('rope_dim', 64), ('block_size', 4),
+                     ('window', 0), ('scale', 0.0625), ('k_dim', 192), ('v_dim', 256), ('group', 128),
+                     ('dtype', 'bf16')]
+                ops = [(IN_, BF16, (M, H, 512)), (IN_, BF16, (M, H, 64)), (IN_, BF16, (pages, 1, 4, 576)),
+                       (IN_, I32, (1, pages)), (IN_, I32, (1,)), (IN_, I32, (2,)), (W_, F32, (H,)),
+                       (OUT_, BF16, (M, H, 512)), (W_, BF16, (H * 448, 512)), (IN_, BF16, (M, H * 256)),
+                       (OUT_, I8, (M, H * 256)), (OUT_, F32, (M, H * 2)),
+                       (OUT_, BF16, (M, H * 256)) if plane else (OUT_, BF16, (M, H * 256), 'absent')]
+                out.append(mkcase('mla_attn_paged_sink_expand_i8g', M, p, ops,
+                                  f"k15 mla_attn_paged_sink_expand_i8g M={M} H={H}{' +plane' if plane else ''}", salt)); salt += 1
+    return out
 def g3b_cases(src, base):
     """rmsnorm_ihc_junction with the next norm's rotated int8 codes (`group` 128, xq / xs operands): the recorded
     tail junction points (gpu-mini n 512, the n 3072 clones) at M 1, 6, 8, 16, 64, with and without the addend."""
@@ -361,6 +384,11 @@ def g3b_cases(src, base):
         d['band'] = c['band'] + ' +codes'
         out.append(d)
     return out
+def k15(out):
+    cases = k15_cases(0x91500000)
+    fx = dict(version=6, samples=1024, source='hy4-flash K-15, merge_sink folded into the expand', oracle='libref',
+              recorded='2026-11-24', cases=cases)
+    save(fx, out); print(len(cases), 'cases ->', out)
 def g3(out, src='data/kernels_hy4.rkb'):
     cases = g3a_cases(0x93a00000) + g3b_cases(src, 0x93b00000) + g3c_cases(0x93c00000)
     fx = dict(version=6, samples=1024, source='hy4-flash G-3 fused launches (levers-general L3)', oracle='libref',
@@ -368,4 +396,4 @@ def g3(out, src='data/kernels_hy4.rkb'):
     save(fx, out); print(len(cases), 'cases ->', out)
 
 if __name__ == '__main__':
-    {'raw': raw, 'merge': merge, 'vis': vis, 'wp163': wp163, 'junction': junction, 'append': append, 'dfly': dfly, 'g3': g3}[sys.argv[1]](*sys.argv[2:])
+    {'raw': raw, 'merge': merge, 'vis': vis, 'wp163': wp163, 'junction': junction, 'append': append, 'dfly': dfly, 'g3': g3, 'k15': k15}[sys.argv[1]](*sys.argv[2:])
