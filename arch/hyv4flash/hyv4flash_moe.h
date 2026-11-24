@@ -32,6 +32,14 @@ struct GatedMlp {
      * fused_quant_on), where down is rotated int8 and libr4d serves it: `ff` carries the codes and
      * down declares no quantiser. Byte-identical to silu_mul followed by had_quant_act_i8g. */
     bool gfuse = false;
+    /* The same fold one launch further (decl_gated_fold_iqr, `gemm_nt_q_gated` at i8a8h): the
+     * gate_up GEMM's epilogue writes the codes the pair's gated_had_quant_i8g writes, for the rows
+     * that row serves (M <= 16, `gated_rows`), and the pair stays for the longer ones. Declared
+     * over an IQR gate_up weight only: gemm_iqr_gated decodes that layout. Byte-identical to the
+     * pair (docs/OPS.md, "gemm_nt_q_gated"; K-23). It writes the codes only, like the fused gate
+     * it replaces. */
+    rad_op  op_gated = 0;
+    int64_t gated_rows = 0;
     /* `feed`: gate_up reads the codes that linear wrote of the same input (Lin::feed). */
     int declare(RadBuilder* b, Names& nm, const Geom& g, const Shape& s, int l, const char* gu_name,
                 const char* dn_name, const char* mp, int64_t ff_w, rad_buf x, rad_buf y,
@@ -76,34 +84,76 @@ struct GatedMlp {
             }
         }
         if (!gfuse) RAD_ARCH_TRY(act.declare(b, g, gu, ff, ff_w, "silu"));
+        /* The fold: gate_up, the gate and the codes of the product in one epilogue (the rule every
+         * gated MLP shares, gated_fold_iqr_ok). Declared beside the pair, after `act`, so the codes
+         * it writes exist; the gate write the codes alone (the fold has no bf16 product) and the
+         * library must serve the op (a CPU-only engine keeps the pair). A gate_up whose input codes
+         * are fed (the shared expert behind the latent linear, Lin::feed) declares no quantiser, so
+         * the fold reads the producer's pair; the others quantise their input in front of it. */
+        const ActFP8 in_fold = gate_up.with_codes(in);
+        if (gfuse && !act.want_x && gated_fold_iqr_ok(gate_up, in_fold, ff, in_fold.q8_fed) &&
+            rad_op_declared(b, "gemm_nt_q_gated"))
+            op_gated = decl_gated_fold_iqr(b, g.max_tok, gate_up.N, gate_up.K, gate_up.w,
+                                           gate_up.ws, { in_fold.q8, in_fold.s8 },
+                                           { ff.q8, ff.s8 }, &gated_rows);
         down.fed_codes = gfuse ? &ff : nullptr;
         RAD_ARCH_TRY(down.declare(b, nm, g, dn_name, s.n_embd, ff_w, RAD_SHARD_COL, grp,
                                   { nm.ckpt("%s.down_proj.weight", mp) }, ff, y));
         down.fed_codes = nullptr;
         return RAD_OK;
     }
-    /* Stage `k` of the arm: 0 gate_up, 1 the gate, 2 down (SharedSide issues them apart). */
+    /* Whether the fold serves rows [r0, r0 + n) (op_gated, gated_rows). */
+    bool folds(int64_t n) const { return op_gated && n > 0 && n <= gated_rows; }
+    /* gate_up, the gate and its quantiser over rows [r0, r0 + n): the fold where it serves these
+     * rows, the pair otherwise. */
+    void gate(RadCtx* c, const ActFP8& in, int64_t T, int64_t r0, int64_t n) const {
+        if (folds(n)) {
+            const ActFP8 a = gate_up.with_codes(in);
+            gate_up.quantise(c, a, T, r0, n);   /* nothing when the codes are fed */
+            RAD_ISSUE_N(c, op_gated, n, brow_slice(a.q8, r0, n, gate_up.K),
+                        brow_slice(a.s8, r0, n, gate_up.K / a.g8), RAD_W(gate_up.w),
+                        RAD_W(gate_up.ws), brow_slice(ff.q8, r0, n, down.K),
+                        brow_slice(ff.s8, r0, n, down.K / ff.g8));
+            return;
+        }
+        gate_up.step(c, in, gu, T, r0, n);
+        act.step(c, gu, T, r0, n);
+    }
+    void step(RadCtx* c, rad_buf x, rad_buf y, int64_t T) const {
+        ActFP8 in{};
+        in.x = x;
+        gate(c, in, T, 0, T);
+        down.step(c, ff, y, T);
+    }
+    /* Stage `k` of step() (SharedSide issues them apart): 0 the fold where it serves the T rows,
+     * gate_up otherwise; 1 the gate, nothing after the fold; 2 down. The three in turn issue what
+     * step() issues, launch for launch. */
     void stage(RadCtx* c, rad_buf x, rad_buf y, int64_t T, int k) const {
         ActFP8 in{};
         in.x = x;
-        if (k == 0) gate_up.step(c, in, gu, T);
-        else if (k == 1) act.step(c, gu, T);
-        else down.step(c, ff, y, T);
-    }
-    void step(RadCtx* c, rad_buf x, rad_buf y, int64_t T) const {
-        for (int k = 0; k < 3; ++k) stage(c, x, y, T, k);
+        if (k == 0) {
+            if (folds(T)) gate(c, in, T, 0, T);
+            else gate_up.step(c, in, gu, T, 0, T);
+        } else if (k == 1) {
+            if (!folds(T)) act.step(c, gu, T, 0, T);
+        } else {
+            down.step(c, ff, y, T);
+        }
     }
     /* Whether the arm writes only buffers of its own: neither linear quantises for itself, which
      * would write a width's shared code pair (Codes) that another linear in between may use. Fed
-     * (or bf16) gate_up, and a down fed by the gate's codes (gfuse) or bf16. */
+     * (or bf16) gate_up -- the fold's quantiser then issues nothing -- and a down fed by the
+     * gate's codes (gfuse, which the fold writes too) or bf16. */
     bool writes_own_only() const {
         return (!gate_up.q8 || gate_up.fed) && (!down.q8 || down.fed);
     }
-    /* Every buffer the arm writes (the gate's code planes, its product, the output): excluded
-     * from sharing when it is issued ahead of its declared place (SharedSide). */
+    /* Every buffer the arm writes (gate_up's product, the gate's code planes -- the fold's too --
+     * its product, the output, and gate_up's input codes where it quantises them): excluded from
+     * sharing when it is issued ahead of its declared place (SharedSide). */
     int mark_concurrent(RadBuilder* b, rad_buf y) const {
+        const rad_buf gq8 = gate_up.fed ? 0 : gate_up.q8, gs8 = gate_up.fed ? 0 : gate_up.s8;
         for (rad_buf v : { gu, y, ff.x, ff.q, ff.s, ff.q8, ff.s8, act.a.x, act.a.q, act.a.s,
-                           act.a.q8, act.a.s8 })
+                           act.a.q8, act.a.s8, gq8, gs8 })
             if (v) RAD_ARCH_TRY(rad_buf_concurrent(b, v));
         return RAD_OK;
     }
@@ -111,8 +161,7 @@ struct GatedMlp {
     void step(RadCtx* c, rad_buf x, rad_buf y, int64_t T, int64_t r0, int64_t n) const {
         ActFP8 in{};
         in.x = x;
-        gate_up.step(c, in, gu, T, r0, n);
-        act.step(c, gu, T, r0, n);
+        gate(c, in, T, r0, n);
         down.step(c, ff, y, T, r0, n);
     }
 };
