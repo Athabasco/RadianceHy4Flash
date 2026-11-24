@@ -974,6 +974,8 @@ static const RadOperandSpec oAllGather[] = {
 };
 
 /* ------------------------------------------------------------------------------------- GEMM */
+static const RadParamSpec pGemmF32[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype"),
+                                         P_INTO("weight_bf16") };
 static const RadParamSpec pGemmNt[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "N",     RAD_P_INT, RAD_REQUIRED },
@@ -3487,8 +3489,8 @@ static const RadOpSchema kSchemas[] = {
            "Channel-wise softmax pooling with learned position bias, BF16, normalized Hadamard, BF16, power-of-two FP8."),
     SCHEMA("dsa_query", pMnDtype, oQuantActFp8,
            "Normalized Hadamard, BF16 boundary and power-of-two E4M3 quantization per query head."),
-    SCHEMA("gemm_nt_f32", pGemmNt, oGemmNt,
-           "BF16 activations times F32 weights, F32 accumulation and output; preserves routing and index gate precision."),
+    SCHEMA("gemm_nt_f32", pGemmF32, oGemmNt,
+           "BF16 activations times F32 or stored BF16 weights, F32 accumulation and output; preserves routing and index gate precision."),
     SCHEMA("swiglu_step", pSwigluClamped, oGateUp,
            "min(silu(gate),limit)*clamp(up,-limit,limit); gate is the first half."),
     SCHEMA("swiglu_clamped", pSwigluClamped, oGateUp,
@@ -7410,7 +7412,7 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_dsa_query_i8, nullptr, nullptr, nullptr,
   r4d_shape_dsa_query_i8 },
 { "gemm_nt_f32_bf16", "gemm_nt_f32", "gemm", "F32 routing and index gate projection",
-  "N<=512, K<=16384; pitched rows", "bf16 input, f32 weights and output",
+  "N<=512, K<=16384; pitched rows", "bf16 input, f32 or bf16 weights, f32 output",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cGemmNtF32), NOTUNE,
   nullptr, nullptr, r4d_rad_gemm_nt_f32, nullptr, nullptr, nullptr,
   r4d_shape_gemm_nt_f32 },

@@ -821,7 +821,7 @@ may not have arrived.
 | op | params | operands |
 |---|---|---|
 | `gemm_nt` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
-| `gemm_nt_f32` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
+| `gemm_nt_f32` | `M`(range) `N` `K` `dtype` `weight_bf16`/opt | `a`, `b`w → `y` |
 | `gemm_nt_bias` | `M`(range) `N` `K` `dtype` `act`/opt | `a`, `b`w, `bias`w, `res`? → `y` |
 | `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt `w_rb`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
 | `gemm_nt_q_bias` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w, `bias`w → `y` |
@@ -901,9 +901,11 @@ may be `y` itself, the residual stream updated in place (the encoder towers' lay
 implementation reads `res` before it stores the product over it.
 
 `gemm_nt_f32` is `y[M, N] = a[M, K] @ b[N, K]^T` with a bf16 activation, an f32 weight, f32
-accumulation and an f32 `y`; `dtype` (`bf16`) names the activation. It exists for the projections
-whose weights and results must not narrow to bf16: GLM's router logits and its indexer's signed
-head gates.
+accumulation and an f32 `y`; `dtype` (`bf16`) names the activation. With `weight_bf16=1` the weight
+operand is the checkpoint's stored bf16 instead, widened exactly to f32 in the kernel, so `y` is
+byte for byte what the f32 copy of the same values gives. It exists for the projections whose
+weights and results must not narrow to bf16: GLM's router logits and its indexer's signed head
+gates.
 
 libr4d's `gemm_nt_f32_bf16` takes `N` up to 512, `K` up to 16384, `M` up to 65535 and pitched
 rows. A wave computes a tile of rows by columns, chosen by `M` and `N` (a single column per wave
@@ -3942,8 +3944,11 @@ maximum is taken (libref shifts by the maximum of the scores and the sink).
   order, the sink once), at every `M` under `stable 1`, sizing its scratch for every row of
   the declared `M` and refusing a launch whose scratch is short (`RAD_E_SCRATCH`); under `stable
   0` it runs that law up to 16 rows (window) / 32 rows (window 0, selection) and one unsplit pass
-  past them, which may differ in the last place. Hy4-flash declares its decode-class rows with
-  `stable 1` and its prefill rows with `stable 0`.
+  past them, which may differ in the last place. `stable 1` splits to its own cap, 48 rows (window,
+  window 0 and the selection form), which covers a speculative step's verify heights: up to there a
+  workgroup takes a slot instead of walking the row, and its scratch is sized for those partials (25
+  MiB at 48 rows of 32 heads and 8 slots). Hy4-flash declares its decode-class rows with `stable 1`
+  and its prefill rows with `stable 0`.
 - **`attn_kv_sink`** is dense attention over separate keys and values (the non-absorbed prefill).
   `cu_q`, `cu_k` hold absolute offsets into `q` and into `k` / `v`; sequence `s` has `m_s` query
   rows and `n_s >= m_s` key rows (otherwise `RAD_E_SHAPE`), query `i` sits at key index

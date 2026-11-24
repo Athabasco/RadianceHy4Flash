@@ -23403,6 +23403,14 @@ static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int ite
     std::vector<float> w((size_t)N * (size_t)K);
     for (size_t i = 0; i < w.size(); ++i)
         w[i] = (float)((int)(st_mix32((uint32_t)i + 0x51ed27u) % 2001) - 1000) / 8000;
+    std::vector<uint16_t> packed;
+    if (!timed) {
+        packed.resize(w.size());
+        for (size_t i = 0; i < w.size(); ++i) {
+            packed[i] = h_to_bf16(w[i]);
+            w[i] = h_bf16(packed[i]);
+        }
+    }
     for (int c = 0; c < copies; ++c)
         st_memcpy((uint8_t*)d_w + (size_t)c * wbytes, w.data(), wbytes, hipMemcpyHostToDevice);
     std::vector<RadTensor> ts = {
@@ -23444,6 +23452,20 @@ static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int ite
     ok(fmt("gemm_nt_f32 at M=%lld N=%lld K=%lld: byte-identical to the host arithmetic",
            (long long)M, (long long)N, (long long)K).c_str(),
        same, rc != RAD_OK ? fmt("rc=%d", rc) : same ? "" : fmt("first byte %zu", first));
+    if (!timed && same) {
+        ts[1].dtype = RAD_BF16;
+        ps.push_back(PI("weight_bf16", 1));
+        a.p = ps.data();
+        a.n_p = (int)ps.size();
+        st_memcpy(d_w, packed.data(), packed.size() * sizeof(uint16_t), hipMemcpyHostToDevice);
+        st_memcpy(d_y, fill.data(), ybytes, hipMemcpyHostToDevice);
+        rc = r->launch(&a, nullptr);
+        if (rc == RAD_OK && st_stream_sync(nullptr) != hipSuccess) rc = RAD_E_DEVICE;
+        std::vector<uint8_t> packed_y(ybytes);
+        if (rc == RAD_OK) st_memcpy(packed_y.data(), d_y, ybytes, hipMemcpyDeviceToHost);
+        ok(fmt("gemm_nt_f32 stored bf16 vs widened f32 at M=%lld N=%lld K=%lld",
+               (long long)M, (long long)N, (long long)K).c_str(), rc == RAD_OK && packed_y == got);
+    }
     if (timed && rc == RAD_OK) {
         const double bytes = (double)wbytes + (double)M * K * 2 + (double)M * N * 4;
         const double flop = 2.0 * (double)M * (double)N * (double)K;
@@ -34675,13 +34697,19 @@ static void ar_ihc_junction_case(const Plugin& pl, const std::vector<int>& devs,
     if (!ar_peer_path_ok(devs, world)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     const bool host = std::strstr(name, "_host") != nullptr;
     std::vector<IjCase> cs;
-    auto C = [&](int64_t M, int64_t n, bool add, bool ys, bool xs, bool tail, bool head) {
-        IjCase c; c.M = M; c.n = n; c.hc = 4; c.add = add; c.ys = ys; c.xs = xs; c.tail = tail; c.head = head;
+    auto C = [&](int64_t M, int64_t n, bool add, bool ys, bool xs, bool tail, bool head, int64_t hc = 4) {
+        IjCase c; c.M = M; c.n = n; c.hc = hc; c.add = add; c.ys = ys; c.xs = xs; c.tail = tail; c.head = head;
         cs.push_back(c);
     };
     C(1, 3072, false, false, false, true, false); C(1, 3072, true, true, true, true, false);
     C(6, 3072, true, false, false, true, false);  C(17, 512, false, true, false, true, true);
     C(3, 512, true, false, false, false, false);
+    /* K-13: a row is split over several blocks at decode heights (four up to six rows, two at
+     * eight), so these are the split's own bytes: the two-block count, the widest form (hc 8, so
+     * 17 sums a wave), and a narrow row whose last blocks own no words and no pieces. */
+    C(8, 3072, true, true, true, true, false);
+    C(2, 3072, false, false, false, true, false, 8);
+    C(4, 512, false, false, false, false, false, 2);
     /* 256 rows: 256 blocks of 16 waves would sit on the full-card cliff, so the launch takes 255 */
     if (world == 2) { C(192, 3072, true, false, false, true, false); C(96, 3072, false, true, true, true, false);
                       C(256, 3072, false, false, false, true, false); }
@@ -38124,6 +38152,8 @@ static void device_phase(const Plugin& pl) {
             for (int64_t cols : { 4, 32, 36, 288 }) f32_forms(pl, rows, cols, 4096, 0, false);
         f32_forms(pl, 7, 31, 129, 0, false);
         f32_forms(pl, 70, 13, 130, 0, false);
+        f32_forms(pl, 1, 512, 3072, 0, false);
+        f32_forms(pl, 256, 256, 129, 0, false);
     }
     if (sel("dsa_score_fp8")) {
         dsa_score_check(pl, 1, 17);
@@ -38271,6 +38301,12 @@ static void device_phase(const Plugin& pl) {
         mla_sink_check(pl, false, 32, { 100 }, { 300 }, 0, 4, 0, 1);
         mla_sink_check(pl, false, 16, { 6, 6, 6, 6 }, { 530, 2100, 700, 4097 }, 512, 16, 0, 1);
         mla_sink_bytes(pl, 64, { 6, 6, 6, 6 }, { 530, 2100, 700, 1200 }, 512, 4, 1);
+        /* the sliding layer's shape at TP2 at the widest speculative step (8 streams x 6 = 48
+         * rows, the `stable 1` split cap) and one row past it */
+        mla_sink_bytes(pl, 32, { 6, 6, 6, 6, 6, 6, 6, 6 }, { 600, 520, 900, 3000, 512, 513, 17, 2049 },
+                       512, 4, 1);
+        mla_sink_bytes(pl, 32, { 7, 6, 6, 6, 6, 6, 6, 6 }, { 600, 520, 900, 3000, 512, 513, 17, 2049 },
+                       512, 4, 1);
         mla_sink_bytes(pl, 16, { 6, 6, 6, 6, 6, 6, 6, 6 }, { 600, 520, 900, 3000, 512, 513, 17, 2049 },
                        512, 16, 1);
         mla_sink_bytes(pl, 32, { 6, 6, 6, 6 }, { 2049, 600, 1500, 2100 }, 0, 4, 1);

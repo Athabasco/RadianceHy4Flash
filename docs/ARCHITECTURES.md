@@ -3335,7 +3335,7 @@ the drafter's `dfly.blk.<i>`, the tower `v.`.
 | `index_head`, `index_key`, `index_key_norm` | `head_weight_projection`, `token_key_projection`, `token_key_norm` | sparse layers |
 | `index_pool_value`, `index_pool_gate`, `index_pool_norm`, `index_ape` | `key_value_projection`, `key_gate_projection`, `key_norm`, `intra_group_ape` | f32 |
 | `ffn_gate_up`, `ffn_down`, `ffn_post_norm` | `mlp.gate_proj` + `up_proj`, `down_proj`, `post_fc2_norm` | layer 0 |
-| `glm_router.weight`, `glm_router.correction` | `mlp.gate.weight`, `mlp.gate.e_score_correction_bias` | f32; MoeFP8's router (GlmRouter) |
+| `glm_router.weight`, `glm_router.correction` | `mlp.gate.weight`, `mlp.gate.e_score_correction_bias` | bf16 weight, f32 correction (GlmRouter) |
 | `ffn_latent_in`, `ffn_latent_out` | `mlp.routed_expert_down_proj`, `mlp.routed_expert_up_proj` | |
 | `ffn_gate_up_exps.<e>`, `ffn_down_exps.<e>` | slice `e` of `mlp.experts.gate_up_proj` [512, 3072, 1536] and `down_proj` [512, 1536, 1536] | one movement unit an expert |
 | `ffn_gate_up_shexp`, `ffn_down_shexp`, `ffn_post_norm` | `mlp.shared_experts.gate_proj` + `up_proj`, `down_proj`, `mlp.combine_output_norm` | |
@@ -3484,7 +3484,9 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   host arena; a device gather (vram, ram) reads and writes them over the link. A prefill chunk's
   `engram_ids` also hashes up to two steps of the following prompt (`RadBatch::n_ahead`) into
   `ahead_ids`, and the gather hands them to libavx's reader thread (the friend's `ahead_ids`), so the
-  next chunk's rows are read while this one computes; `RADIANCE_HY4_ENGRAM_AHEAD=0` turns it off.
+  next chunk's rows are read while this one computes. A device gather ignores them, so the hashing
+  runs only where the gather goes to the host; `RADIANCE_HY4_ENGRAM_AHEAD=0` turns it off and any
+  other value hashes them at every placement (the A/B arm).
   Before this the plugin's device-domain ids made a disk-placed table crash the first prefill.
 - **The pipelined prefill at TP4** (`RADIANCE_HY4_PIPE=1`, off by default). A step wider than a band
   runs as two row pieces: piece 0's junction (the `add`, the `overlap 1` exact all-reduce, the

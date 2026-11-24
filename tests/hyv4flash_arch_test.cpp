@@ -76,6 +76,8 @@ void bf16_encs(RadBuilder* b) {
     b->encs.clear();
     b->encs.push_back({ "ffn_gate_up_exps", rad_enc_plain(RAD_BF16) });
     b->encs.push_back({ "ffn_down_exps", rad_enc_plain(RAD_BF16) });
+    b->encs.push_back({ "blk.1.glm_router.weight", rad_enc_plain(RAD_BF16) });
+    b->encs.push_back({ "blk.2.glm_router.weight", rad_enc_plain(RAD_F32) });
     b->kv_block_by_consumer = true;
 }
 
@@ -278,11 +280,13 @@ TEST(the_mini_graph_declares_every_layer_kind) {
     CHECK_EQ(eg->d.dtype, RAD_I32);
 
     /* The weights the graph reads under the names it declares them (PLAN D10: the router is
-     * GlmRouter's). kv_b is plain bf16, the router f32. */
+     * GlmRouter's). Both its projection and kv_b are stored bf16. */
     CHECK(find_w(b, "blk.1.glm_router.weight") != nullptr);
     CHECK(find_w(b, "blk.1.glm_router.correction") != nullptr);
     CHECK(find_w(b, "blk.1.ffn_gate_inp.weight") == nullptr);
-    CHECK_EQ(find_w(b, "blk.1.glm_router.weight")->d.dtype, RAD_F32);
+    CHECK_EQ(find_w(b, "blk.1.glm_router.weight")->d.dtype, RAD_BF16);
+    CHECK_EQ(find_w(b, "blk.2.glm_router.weight")->d.dtype, RAD_F32);
+    CHECK_EQ(find_w(b, "blk.1.glm_router.correction")->d.dtype, RAD_F32);
     CHECK_EQ(find_w(b, "blk.0.attn_kv_b.weight")->d.dtype, RAD_BF16);
     CHECK(find_w(b, "blk.0.attn_q_nope.weight") != nullptr);
     CHECK(find_w(b, "blk.0.attn_q_rope.weight") != nullptr);
@@ -378,6 +382,51 @@ TEST(every_step_kind_is_lint_clean) {
     CHECK_EQ(count_issued(a.b, c, "sub_i32"), 1);   /* P-04: absorbed on every layer, rebased once */
 }
 
+/* P-05 (audit F15): the ahead ids are hashed only where a gather reads them. A prefill step with
+ * a following prompt hashes them into eg.ids_ahead and hands them to the gather only when the
+ * step's embed_lookup_q dispatches to the host domain (the table on disk, read by libavx's
+ * reader thread); a device gather ignores them, so their hashing is skipped. RADIANCE_HY4_ENGRAM_-
+ * AHEAD=1 hashes them at every placement (the A/B arm), =0 never. */
+TEST(the_ahead_ids_are_hashed_only_for_a_host_gather) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    rad_op gather_h = 0;
+    for (size_t i = 0; i < d.b.ops.size() && !gather_h; ++i)
+        if (d.b.ops[i].op == "embed_lookup_q") gather_h = (rad_op)(i + 1);
+    REQUIRE(gather_h != 0);
+    auto k = kit(d.b, {}, { 12 }, 0);
+    k->b.positions_h = k->pos.data();
+    k->b.n_ahead = 7;
+    const int64_t T = k->b.n_tok;
+    auto run = [&](bool host, const char* env) {
+        if (env) setenv("RADIANCE_HY4_ENGRAM_AHEAD", env, 1);
+        else     unsetenv("RADIANCE_HY4_ENGRAM_AHEAD");
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        if (host) c.host_ops.push_back(gather_h);
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(d.b, &c);
+        const RecIssue* ids = issue_of(d.b, c, "engram_ids");
+        const RecIssue* g = issue_of(d.b, c, "embed_lookup_q");
+        REQUIRE(ids != nullptr);
+        REQUIRE(g != nullptr);
+        const bool forced = env && *env && std::strcmp(env, "0") != 0;
+        const bool off = env && std::strcmp(env, "0") == 0;
+        const bool on = !off && (forced || host);
+        if (on) {
+            CHECK_EQ(ids->opd[0].rows, T + 7);          /* the ahead tokens ride the same read */
+            CHECK_EQ(g->opd.back().kind, (uint8_t)RAD_OPK_BUF);
+            CHECK_EQ(g->opd.back().rows, (int64_t)7);   /* the ahead ids go to the host gather */
+        } else {
+            CHECK_EQ(ids->opd[0].rows, T);              /* the device gather ignores them */
+            CHECK_EQ(g->opd.back().kind, (uint8_t)RAD_OPK_NONE);
+        }
+    };
+    run(false, nullptr);        /* device gather: no ahead hashing */
+    run(true, nullptr);         /* host gather (disk-placed table): the read-ahead runs */
+    run(false, "1");            /* the A/B arm: hashed for a device gather too */
+    run(true, "0");             /* never hashed */
+    unsetenv("RADIANCE_HY4_ENGRAM_AHEAD");
 TEST(last_layer_keeps_cache_writers_at_chunk_height_and_queries_at_output_height) {
     RadBuilder b;
     bf16_encs(&b);
@@ -1202,6 +1251,16 @@ TEST(each_rank_declares_its_share_and_reduces_twice_a_layer) {
             CHECK_EQ(kv_named(b, "kv_latent_sparse")->d.head_dim, 20);
             CHECK_EQ(pint(find_op(b, "idx_score"), "heads"), 2);
             CHECK_EQ(pint(find_op(b, "router_sigmoid_topk"), "n_expert"), 8);
+            int packed_projections = 0;
+            for (const auto& o : b.ops) {
+                if (o.op != "gemm_nt_f32" || o.w.empty()) continue;
+                const auto& weight = b.weights.at(o.w[0] - 1);
+                if (weight.name.find(".glm_router.weight") == std::string::npos) continue;
+                CHECK_EQ(pint(&o, "weight_bf16") == 1, weight.d.dtype == RAD_BF16);
+                packed_projections += weight.d.dtype == RAD_BF16;
+            }
+            /* Eight experts split into four f32 logits per rank at TP2. */
+            CHECK_EQ(packed_projections, world == 2 ? 2 : 1);
             int based = 0;
             for (const auto& o : b.ops)
                 if (param(&o, "expert_base")) {
