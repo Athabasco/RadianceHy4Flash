@@ -2130,7 +2130,9 @@ TEST(an_engine_step_with_dfly2_is_lint_clean_and_the_query_pass_touches_no_trunk
         CHECK_EQ(std::count(q.begin(), q.end(), std::string("dfly_sel")), 1);
         CHECK_EQ(std::count(q.begin(), q.end(), std::string("mla_attn_sel_sink")), 1);
         CHECK_EQ(std::count(q.begin(), q.end(), std::string("logits_gemm")), depth);
-        CHECK_EQ(std::count(q.begin(), q.end(), std::string("row_topk")), depth);
+        /* the f32 logits' top-k in one op where a library serves it (D-04) */
+        CHECK_EQ(std::count(q.begin(), q.end(), std::string("cast_row_topk")), depth);
+        CHECK_EQ(std::count(q.begin(), q.end(), std::string("row_topk")), 0);
         const auto& df = d.df();
         size_t store = SIZE_MAX, attn = SIZE_MAX;
         for (size_t i = 0; i < ps[2]->issues.size(); ++i) {
@@ -2144,6 +2146,66 @@ TEST(an_engine_step_with_dfly2_is_lint_clean_and_the_query_pass_touches_no_trunk
         int snap = 0;
         for (const auto& is : ps[0]->issues) snap += is.op == df.snap[0].op_sel;
         CHECK_EQ(snap, 1);
+    }
+}
+
+/* D-04: each chain round's top-k reads the f32 logits through cast_row_topk, which rounds them as
+ * `cast` does (the same bytes, one op); without a library that declares it, or with one that
+ * refuses it, the round keeps the pair, `cast` into logits_bf16 then row_topk. Whole and sharded. */
+void no_cast_topk(RadBuilder* b) { bf16_encs(b); b->undeclared.insert("cast_row_topk"); }
+void refused_cast_topk(RadBuilder* b) { bf16_encs(b); b->refuse.insert("cast_row_topk"); }
+TEST(dfly2_takes_cast_row_topk_where_served_and_the_cast_pair_otherwise) {
+    const int depth = 5;
+    for (int world : { 1, 2 }) for (int form = 0; form < 3; ++form) {
+        DeclDfly d(depth, dfly_meta(), world, 0,
+                   form == 0 ? bf16_encs : form == 1 ? no_cast_topk : refused_cast_topk);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        RadBuilder& b = d.b;
+        const auto& df = d.df();
+        const bool fused = form == 0;
+        for (const auto& S : df.steps) {
+            CHECK_EQ(S.op_ctopk != 0, fused);
+            CHECK_EQ(S.op_lcast != 0, !fused);
+            CHECK_EQ(S.op_topk != 0, !fused);
+            const RecOp* o = b.op_of(fused ? S.op_ctopk : S.op_topk);
+            REQUIRE(o);
+            CHECK_EQ(pstr(o, "dtype"), std::string(fused ? "f32" : "bf16"));
+            CHECK_EQ(pint(o, "N"), 320 / world);
+            REQUIRE_EQ(o->reads.size(), (size_t)1);
+            CHECK_EQ(b.bufs[o->reads[0] - 1].name.find(fused ? "dfly.logits" : "logits_bf16") !=
+                         std::string::npos, true);
+            CHECK_EQ(o->writes.size(), (size_t)(world > 1 ? 3 : 2));
+            if (world > 1) CHECK_EQ(pint(o, "vocab_off"), 0);
+        }
+        if (world > 1) continue;   /* the passes below are the whole-vocabulary engine's */
+        auto trunk = kit(b, std::vector<int>(2, depth + 1), {});
+        trunk->b.positions_h = trunk->pos.data();
+        auto ctxp = context_pass(b, *trunk);
+        Query qp(b, 2, depth + 1, depth);
+        auto ps = run_passes(b, hyv4flash::step, { trunk.get(), ctxp.get(), qp.k.get() });
+        for (const auto& c : ps) {
+            if (!c->step_fail.empty()) fprintf(stderr, "%s\n", c->step_fail.c_str());
+            CHECK(c->step_fail.empty());
+        }
+        CHECK_LINT(b, ps[0].get(), ps[1].get(), ps[2].get());
+        const auto q = issued_ops(b, *ps[2]);
+        auto count = [&](const char* op) { return (int64_t)std::count(q.begin(), q.end(), std::string(op)); };
+        CHECK_EQ(count("cast_row_topk"), fused ? depth : 0);
+        CHECK_EQ(count("row_topk"), fused ? 0 : depth);
+        CHECK_EQ(count("cast") >= (fused ? 0 : depth), true);
+        /* each round: the head, then (the cast and) the top-k */
+        for (const auto& S : df.steps) {
+            size_t at_head = SIZE_MAX, at_cast = SIZE_MAX, at_top = SIZE_MAX;
+            const auto& is = ps[2]->issues;
+            for (size_t i = 0; i < is.size(); ++i) {
+                if (is[i].op == S.op_head && at_head == SIZE_MAX) at_head = i;
+                if (S.op_lcast && is[i].op == S.op_lcast && at_cast == SIZE_MAX) at_cast = i;
+                if (is[i].op == (fused ? S.op_ctopk : S.op_topk) && at_top == SIZE_MAX) at_top = i;
+            }
+            REQUIRE(at_head != SIZE_MAX && at_top != SIZE_MAX);
+            CHECK(at_head < at_top);
+            if (!fused) { REQUIRE(at_cast != SIZE_MAX); CHECK(at_head < at_cast && at_cast < at_top); }
+        }
     }
 }
 
@@ -2194,7 +2256,7 @@ TEST(dfly2_serves_a_short_block_of_four_rows) {
                     return (int64_t)std::count(q.begin(), q.end(), std::string(op));
                 };
                 CHECK_EQ(count("logits_gemm"), rounds);
-                CHECK_EQ(count("row_topk"), rounds);
+                CHECK_EQ(count("cast_row_topk"), rounds);
                 CHECK_EQ(count("mtp_couple_propose"), coupled ? rounds : 0);
                 /* each anchor and each round's row found at this block's stride */
                 int row0 = 0, row0_lo = 0, rowk = 0, rowk_lo = 0;
@@ -2283,7 +2345,7 @@ TEST(dfly2_coupled_draws_each_chain_step_from_its_shortlist_law) {
                 const auto& S = df.steps[(size_t)k];
                 size_t at_top = SIZE_MAX, at_c = SIZE_MAX, at_tok = SIZE_MAX, at_merge = SIZE_MAX;
                 for (size_t i = 0; i < is.size(); ++i) {
-                    if (is[i].op == S.op_topk) at_top = i;
+                    if (is[i].op == (S.op_ctopk ? S.op_ctopk : S.op_topk)) at_top = i;
                     if (is[i].op == S.op_merge && S.op_merge) at_merge = i;
                     if (is[i].op == S.op_couple) at_c = i;
                     if (is[i].op == S.op_tok) at_tok = i;
@@ -2608,7 +2670,7 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
                 CHECK_EQ(pint(b.op_of(L.p_gu.op), "N"), 2 * ff / world);
                 CHECK_EQ(pint(b.op_of(L.p_down.op), "K"), ff / world);
                 CHECK_EQ(pint(b.op_of(df.steps[0].op_head), "n_vocab"), 320 / world);
-                CHECK_EQ(pint(b.op_of(df.steps[0].op_topk), "vocab_off"), 320 / world * rank);
+                CHECK_EQ(pint(b.op_of(df.steps[0].op_ctopk), "vocab_off"), 320 / world * rank);
                 /* The correction's three linears are this rank's width too, and its down's partial
                  * sum is reduced exactly before the residual and the proposal law read it. */
                 CHECK_EQ(pint(b.op_of(df.c_g.op), "N"), df.E / world);
@@ -2657,7 +2719,7 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
                         add = add || op == st.op_add;
                     }
                     if (op == df.c_d.op || op == df.op_ar_c || add) chain.push_back(i);
-                    if (op == df.steps[0].op_topk) ++tk;
+                    if (op == df.steps[0].op_ctopk) ++tk;
                     if (op == L.p_out.op) i_out = i;
                     if (op == df.op_ar_o) i_ar = i;
                     if (op == L.op_post || (op == L.op_add1 && i_post == SIZE_MAX)) i_post = std::min(i_post, i);
