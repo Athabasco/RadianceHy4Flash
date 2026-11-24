@@ -177,6 +177,13 @@ __global__ __launch_bounds__(kThreads) void ar_ihc_junction_2rank_kernel(
         unsigned long long z = 0, t0 = 0ull;
         while (r4d_ar_seq_behind(arij_load_acq(&my_flags[bk]), sq))
             if (++z > R4D_ARIJ_SPIN_MAX || r4d_ar_spin_late(z, t0)) __builtin_trap();
+    } else {
+        /* K-12: this thread's share of the wait, spent reading the row's operands (r4d_ihc.h's
+         * warm_row): its h, its gains and its fn are in L2 when it asks for them. Loads only, so
+         * the block's bytes are the plain launch's. */
+        JuncRow w = r;
+        w.hr += (size_t)r0 * hp;
+        r4d_ihc::warm_row<HC, POST, TAIL>(w, (uint32_t)tid);
     }
     __syncthreads();
     if (acq) __threadfence_system();
