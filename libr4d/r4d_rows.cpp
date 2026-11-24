@@ -4172,7 +4172,7 @@ static const RadOpSchema kSchemas[] = {
            "Byte-identical to the two ops it replaces, which is what makes it substitutable "
            "rather than a second numerical path."),
     SCHEMA("gemm_nt_q_dual", pGemmNtQDual, oGemmNtQDual,
-           "two GEMMs of ONE activation's codes over two weights of one form and one K, in one "
+           "two GEMMs of ONE activation's codes over two weights of one encoding and one K, in one "
            "launch: `b` -> `y` (N columns) and `b2` -> `y2` (N2 columns), the same [M, K] `a` and "
            "its scales read twice. The two launches' blocks are concatenated in one grid, each "
            "part doing exactly what its own launch does -- a part taking four waves a tile puts "
@@ -5813,8 +5813,11 @@ static const RadConstraint cGemmNtIqrTiled[] = {
 };
 /* Two IQR weights of one input in one launch (K-02's q_nope and q_rope). One token a step: the
  * GEMV, where the pair is two launches' launch and ramp cost, and the one band both parts' blocks
- * are laid out for -- wider passes keep both Lins' own launches. Both weights one form, hence one
- * K; each N a multiple of 16 and its own, each part's blocks the blocks of its own launch. */
+ * are laid out for -- wider passes keep both Lins' own launches. Both weights one encoding, hence
+ * one K; each N a multiple of its own launch's block and its own: 16 columns, and 32 from 4096
+ * columns up, where that launch's block is two tiles and the two halves of a block are its. The
+ * constraint below holds the 16 every N needs; a wide part's 32 is the launch's, which refuses a
+ * pair outside its block before it emits (`dual_launch`). */
 static const RadConstraint cGemmNtQIqrDual[] = {
     C_LE("M", 1), C_DIV("K", 256), C_DIV("N", 16), C_DIV("N2", 16),
     C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "i8a8 i8a8h"),
@@ -9484,8 +9487,8 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "eight-wave block size, a part that takes four waves a tile carrying two of its 16-row tiles in "
   "a block and a part that takes eight one, each tile folded over its own waves as its own launch "
   "folds it (K-02's q_nope and q_rope)",
-  "M == 1; both weights one form and one K; K a multiple of 256, each N of 16 and of a trellis's "
-  "run",
+  "M == 1; both weights one encoding and one K; K a multiple of 256, each N of 16 and of a "
+  "trellis's run (of 32 from 4096 columns up, where its launch's block is two tiles)",
   "i8 A with an f32 scale per (row, 128 K) read by both, W and W2 an IQR form's codes with their "
   "scales, bf16 C and C2. Byte-identical to the two gemm_iqr_nt_m64 launches it replaces -- each "
   "part's blocks are the blocks of its own launch",
