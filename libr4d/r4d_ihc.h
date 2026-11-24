@@ -203,40 +203,6 @@ struct JuncRow {
 };
 static_assert(sizeof(JuncRow) == 15 * 8 + 8 * 4, "JuncRow carries no padding");
 
-// K-12: the row's operands, read a row early. At two ranks thread 0 of the all-reduce twin's
-// block waits on the peer's flag (ar_ihc_junction_2rank_kernel, r4d_ar_ihc_junction.hip) and the
-// block's other threads have nothing to do until it clears; they spend it reading what the row
-// will read: h (HC * n bf16), the post norm's gain (n f32) and, behind a tail, the next norm's
-// gain and fn (R rows of HC * n f32, the widest of the row's reads). The row then streams them
-// from L2 rather than from memory. Loads only: no value read here is used and no byte here is
-// written (h is the row's own and the row writes it after this), so the row's bytes are the plain
-// launch's. `tid` is the thread's index in the block; thread 0 does not take part, and thread t >
-// 0 warms word t - 1, t - 1 + kThreads - 1, ... of each range in 16-byte reads, the granularity
-// acc_piece, norm_row and the row's own h read at.
-template <int HC, bool POST, bool TAIL>
-__device__ __forceinline__ void warm_row(const JuncRow& r, uint32_t tid) {
-    constexpr int R = POST ? 2 * HC : HC;
-    constexpr uint32_t kRead = kThreads - 1;
-    if (tid == 0u) return;
-    uint32_t acc = 0u;
-    auto warm = [&](const void* p, uint32_t nw) {
-        const uint4* w = (const uint4*)p;
-        for (uint32_t i = tid - 1u; i < nw; i += kRead) {
-            const uint4 v = w[i];
-            acc ^= v.x ^ v.y ^ v.z ^ v.w;
-        }
-    };
-    warm(r.hr, (uint32_t)HC * r.n / 8u);   // h, eight bf16 a word
-    warm(r.w_post, r.n / 4u);              // the post norm's gain, four f32 a word
-    if constexpr (TAIL) {
-        warm(r.w_next, r.n / 4u);          // the next norm's gain
-        for (int j = 0; j < R; ++j) warm(r.fn + (uint64_t)j * r.fp, (uint32_t)HC * r.n / 4u);
-    }
-    // The reads are the whole of it, so hand the word to an empty asm that the compiler can
-    // neither drop nor see into, and keep them ahead of the barrier behind this.
-    asm volatile("" ::"r"(acc) : "memory");
-}
-
 template <int HC, bool POST, bool TAIL>
 __device__ __forceinline__ void junction_row(JuncLds<HC, POST>& L, uint16_t* ybuf, const JuncRow& r) {
     constexpr int R = POST ? 2 * HC : HC;
