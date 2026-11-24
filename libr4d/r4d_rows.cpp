@@ -974,6 +974,8 @@ static const RadOperandSpec oAllGather[] = {
 };
 
 /* ------------------------------------------------------------------------------------- GEMM */
+static const RadParamSpec pGemmF32[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype"),
+                                         P_INTO("weight_bf16") };
 static const RadParamSpec pGemmNt[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "N",     RAD_P_INT, RAD_REQUIRED },
@@ -1301,6 +1303,24 @@ static const RadOperandSpec oMoeGatherInv[] = {
     { "shared",      RAD_OPD_IN,  1 },
     { "shared_gate", RAD_OPD_IN,  1 },
     { "y",           RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pMoeGatherQ8[] = {
+    P_INT("M"), P_INT("n"), P_INT("top_k"), P_STR("dtype"),
+    /* The rotation is 128 wide and the amax covers a whole scale group: 128, or 256 for an IQ8R
+     * trunk, whose two 128-wide blocks share one scale. No shared arm in this form -- the plane and
+     * its gate are the plain gather's. */
+    P_INT("group"),
+};
+static const RadOperandSpec oMoeGatherInvQ8[] = {
+    { "y_expert", RAD_OPD_IN,  0 },
+    { "expert_w", RAD_OPD_IN,  0 },
+    { "inverse",  RAD_OPD_IN,  0 },
+    /* `moe_gather_inv` also writing its sum's rotated int8 codes and their per-group scales: what
+     * a `had_quant_act_i8g` would have written from `y`, so the int8 linear that reads the sum
+     * declares no quantiser of its own (K-19). Both are outputs of this op, written with `y`. */
+    { "q8",       RAD_OPD_OUT, 0 },
+    { "q8_scale", RAD_OPD_OUT, 0 },
+    { "y",        RAD_OPD_OUT, 0 },
 };
 
 /* `vocab_off` and `pairs` are the vocab-parallel form, both absent on a single-rank graph (which
@@ -3464,8 +3484,8 @@ static const RadOpSchema kSchemas[] = {
            "Channel-wise softmax pooling with learned position bias, BF16, normalized Hadamard, BF16, power-of-two FP8."),
     SCHEMA("dsa_query", pMnDtype, oQuantActFp8,
            "Normalized Hadamard, BF16 boundary and power-of-two E4M3 quantization per query head."),
-    SCHEMA("gemm_nt_f32", pGemmNt, oGemmNt,
-           "BF16 activations times F32 weights, F32 accumulation and output; preserves routing and index gate precision."),
+    SCHEMA("gemm_nt_f32", pGemmF32, oGemmNt,
+           "BF16 activations times F32 or stored BF16 weights, F32 accumulation and output; preserves routing and index gate precision."),
     SCHEMA("swiglu_step", pSwigluClamped, oGateUp,
            "min(silu(gate),limit)*clamp(up,-limit,limit); gate is the first half."),
     SCHEMA("swiglu_clamped", pSwigluClamped, oGateUp,
@@ -4041,6 +4061,13 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("moe_gather_inv", pMoeGather, oMoeGatherInv,
            "`moe_gather` reading the slot table `moe_scatter_inv` wrote instead of rebuilding it "
            "from `sorted_tok`: the same sums in ascending slot order, the same bytes."),
+    SCHEMA("moe_gather_inv_i8g", pMoeGatherQ8, oMoeGatherInvQ8,
+           "`moe_gather_inv`, also writing the rotated int8 codes `q8` and their scales "
+           "`q8_scale` of the row it sums -- the quantiser of that row folded into the launch that "
+           "produces it, so the int8 linear reading the sum spends one launch less. The codes are "
+           "the ones `had_quant_act_i8g` would write from `y`: the same 128-wide rotation, the same "
+           "amax over each `group`-wide block, the same scale and rounding. `n` is a whole number "
+           "of 256-column waves and `top_k` is 16 (the eight-column forms)."),
     SCHEMA("moe_gemm", pMoeGemm, oMoeGemm,
            "y[i] = a[row(i)] @ w[e]^T in SORTED order, e being the expert whose offset range "
            "contains i, both operands unquantised and one accumulator over K. `a_order` picks "
@@ -5633,6 +5660,15 @@ static const RadConstraint cMoeGemmBf16[] = {
 };
 static const RadConstraint cMoeGather[] = {
     C_GE("M", 1), C_GE("n", 1), C_GE("top_k", 1), C_IN("dtype", "bf16"),
+};
+/* moe_gather_inv_i8g is the gather that also writes the sum's codes, so its band is the entry
+ * point's own (r4d_rad_moe_gather_inv_i8g) rather than moe_gather_inv's: top_k = 16, n a whole
+ * number of the codes' 256-column waves, and a scale group of 128 or 256 (the two 256-column-wave
+ * forms are the only ones whose whole wave is live to quantise). Read off that entry point's
+ * rejection tests, as the rows of the "band is read off the entry point" section are. */
+static const RadConstraint cMoeGatherQ8[] = {
+    C_GE("M", 1), C_DIV("n", 256), C_EQ("top_k", 16), C_IN("group", "128 256"),
+    C_IN("dtype", "bf16"),
 };
 
 /* R <= 32 is stage 2's PT (R4D_TOPK_PT2): a lane holds the whole answer, so no distribution of the
@@ -7371,7 +7407,7 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_dsa_query_i8, nullptr, nullptr, nullptr,
   r4d_shape_dsa_query_i8 },
 { "gemm_nt_f32_bf16", "gemm_nt_f32", "gemm", "F32 routing and index gate projection",
-  "N<=512, K<=16384; pitched rows", "bf16 input, f32 weights and output",
+  "N<=512, K<=16384; pitched rows", "bf16 input, f32 or bf16 weights, f32 output",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cGemmNtF32), NOTUNE,
   nullptr, nullptr, r4d_rad_gemm_nt_f32, nullptr, nullptr, nullptr,
   r4d_shape_gemm_nt_f32 },
@@ -9814,7 +9850,8 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 
 { "moe_gather_bf16", "moe_gather", "moe",
   "the weighted scatter back to token order, summing a token's slots in ascending slot order",
-  "any M and n; the inverse permutation is built in scratch rather than searched",
+  "any M and n; the inverse permutation is built in scratch rather than searched, and top_k = 16\n"
+  "  with sixteen-byte rows takes the sixteen-slot form (eight columns a lane, one load a slot)",
   "bf16 in and out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cMoeGather), NOTUNE,
@@ -9829,6 +9866,17 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cMoeGather), NOTUNE,
   nullptr, nullptr, r4d_rad_moe_gather_inv, nullptr, nullptr, nullptr,
   r4d_shape_moe_gather_inv },
+
+{ "moe_gather_inv_i8g", "moe_gather_inv_i8g", "moe",
+  "moe_gather_inv, also writing the sum's rotated int8 codes and their scales: the quantiser of "
+  "the row folded into the launch that sums it",
+  "moe_gather_inv's two 256-column-wave forms, with top_k = 16, n a whole number of waves and "
+  "four-byte-aligned codes; the codes are the standalone quantiser's bytes",
+  "bf16 in, f32 or bf16 routing weights, int8 codes + f32 scales out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cMoeGatherQ8), NOTUNE,
+  nullptr, nullptr, r4d_rad_moe_gather_inv_i8g, nullptr, nullptr, nullptr,
+  r4d_shape_moe_gather_inv_i8g },
 
 { "rowtopk_bf16", "row_topk", "select",
   "exact per-row top-R of a bf16 matrix, descending, ties to the lower column",

@@ -15,7 +15,8 @@ namespace {
 /* The `mini` preset as rad-convert records its config: 3 layers (sparse, sliding, sparse; layer 0
  * dense, 1-2 latent MoE), two streams, an Engram in front of layer 1, dense limit 16. `wide` is
  * `mini4`: 4 sparse and 8 sliding heads and 8 experts, so four ranks hold whole heads. */
-MetaKV mini_meta(bool wide = false, int64_t ff_exp = 128, int64_t n_embd = 128) {
+MetaKV mini_meta(bool wide = false, int64_t ff_exp = 128, int64_t n_embd = 128,
+                 int64_t latent = 0, int64_t top_k = 0, int64_t n_exp = 0) {
     RadModelMeta m{};
     m.arch_id = "hyv4flash";
     m.name = "test-hy4-mini";
@@ -68,6 +69,14 @@ MetaKV mini_meta(bool wide = false, int64_t ff_exp = 128, int64_t n_embd = 128) 
         k.set("n_routed_experts", "8");
     }
     if (ff_exp != 128) k.set("moe_intermediate_size", std::to_string(ff_exp).c_str());
+    /* A trunk whose routed MoE is wider than the preset's (K-19's fusion wants a latent a 256-group
+     * divides and the sixteen-slot selection), and one with a wider routed arm. */
+    if (latent) k.set("routed_expert_hidden_size", std::to_string(latent).c_str());
+    if (top_k) k.set("num_experts_per_tok", std::to_string(top_k).c_str());
+    if (n_exp) {
+        k.m.n_expert = n_exp;
+        k.set("n_routed_experts", std::to_string(n_exp).c_str());
+    }
     return k;
 }
 
@@ -76,6 +85,8 @@ void bf16_encs(RadBuilder* b) {
     b->encs.clear();
     b->encs.push_back({ "ffn_gate_up_exps", rad_enc_plain(RAD_BF16) });
     b->encs.push_back({ "ffn_down_exps", rad_enc_plain(RAD_BF16) });
+    b->encs.push_back({ "blk.1.glm_router.weight", rad_enc_plain(RAD_BF16) });
+    b->encs.push_back({ "blk.2.glm_router.weight", rad_enc_plain(RAD_F32) });
     b->kv_block_by_consumer = true;
 }
 
@@ -128,8 +139,9 @@ struct Declared {
     RadBuildCtx ctx = build_ctx();
     int rc = 0;
     explicit Declared(void (*encs)(RadBuilder*) = bf16_encs, int world = 1, int rank = 0,
-                      bool wide = false, int64_t ff_exp = 128)
-        : mk(mini_meta(wide, ff_exp)) {
+                      bool wide = false, int64_t ff_exp = 128, int64_t latent = 0,
+                      int64_t top_k = 0, int64_t n_exp = 0)
+        : mk(mini_meta(wide, ff_exp, 128, latent, top_k, n_exp)) {
         encs(&b);
         ctx = build_ctx(rank, world);
         G3Env g3env;
@@ -277,11 +289,13 @@ TEST(the_mini_graph_declares_every_layer_kind) {
     CHECK_EQ(eg->d.dtype, RAD_I32);
 
     /* The weights the graph reads under the names it declares them (PLAN D10: the router is
-     * GlmRouter's). kv_b is plain bf16, the router f32. */
+     * GlmRouter's). Both its projection and kv_b are stored bf16. */
     CHECK(find_w(b, "blk.1.glm_router.weight") != nullptr);
     CHECK(find_w(b, "blk.1.glm_router.correction") != nullptr);
     CHECK(find_w(b, "blk.1.ffn_gate_inp.weight") == nullptr);
-    CHECK_EQ(find_w(b, "blk.1.glm_router.weight")->d.dtype, RAD_F32);
+    CHECK_EQ(find_w(b, "blk.1.glm_router.weight")->d.dtype, RAD_BF16);
+    CHECK_EQ(find_w(b, "blk.2.glm_router.weight")->d.dtype, RAD_F32);
+    CHECK_EQ(find_w(b, "blk.1.glm_router.correction")->d.dtype, RAD_F32);
     CHECK_EQ(find_w(b, "blk.0.attn_kv_b.weight")->d.dtype, RAD_BF16);
     CHECK(find_w(b, "blk.0.attn_q_nope.weight") != nullptr);
     CHECK(find_w(b, "blk.0.attn_q_rope.weight") != nullptr);
@@ -375,6 +389,53 @@ TEST(every_step_kind_is_lint_clean) {
     CHECK_LINT(a.b, &c);
     CHECK_EQ(count_issued(a.b, c, "attn_kv_sink"), 0);
     CHECK_EQ(count_issued(a.b, c, "sub_i32"), 1);   /* P-04: absorbed on every layer, rebased once */
+}
+
+/* P-05 (audit F15): the ahead ids are hashed only where a gather reads them. A prefill step with
+ * a following prompt hashes them into eg.ids_ahead and hands them to the gather only when the
+ * step's embed_lookup_q dispatches to the host domain (the table on disk, read by libavx's
+ * reader thread); a device gather ignores them, so their hashing is skipped. RADIANCE_HY4_ENGRAM_-
+ * AHEAD=1 hashes them at every placement (the A/B arm), =0 never. */
+TEST(the_ahead_ids_are_hashed_only_for_a_host_gather) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    rad_op gather_h = 0;
+    for (size_t i = 0; i < d.b.ops.size() && !gather_h; ++i)
+        if (d.b.ops[i].op == "embed_lookup_q") gather_h = (rad_op)(i + 1);
+    REQUIRE(gather_h != 0);
+    auto k = kit(d.b, {}, { 12 }, 0);
+    k->b.positions_h = k->pos.data();
+    k->b.n_ahead = 7;
+    const int64_t T = k->b.n_tok;
+    auto run = [&](bool host, const char* env) {
+        if (env) setenv("RADIANCE_HY4_ENGRAM_AHEAD", env, 1);
+        else     unsetenv("RADIANCE_HY4_ENGRAM_AHEAD");
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        if (host) c.host_ops.push_back(gather_h);
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(d.b, &c);
+        const RecIssue* ids = issue_of(d.b, c, "engram_ids");
+        const RecIssue* g = issue_of(d.b, c, "embed_lookup_q");
+        REQUIRE(ids != nullptr);
+        REQUIRE(g != nullptr);
+        const bool forced = env && *env && std::strcmp(env, "0") != 0;
+        const bool off = env && std::strcmp(env, "0") == 0;
+        const bool on = !off && (forced || host);
+        if (on) {
+            CHECK_EQ(ids->opd[0].rows, T + 7);          /* the ahead tokens ride the same read */
+            CHECK_EQ(g->opd.back().kind, (uint8_t)RAD_OPK_BUF);
+            CHECK_EQ(g->opd.back().rows, (int64_t)7);   /* the ahead ids go to the host gather */
+        } else {
+            CHECK_EQ(ids->opd[0].rows, T);              /* the device gather ignores them */
+            CHECK_EQ(g->opd.back().kind, (uint8_t)RAD_OPK_NONE);
+        }
+    };
+    run(false, nullptr);        /* device gather: no ahead hashing */
+    run(true, nullptr);         /* host gather (disk-placed table): the read-ahead runs */
+    run(false, "1");            /* the A/B arm: hashed for a device gather too */
+    run(true, "0");             /* never hashed */
+    unsetenv("RADIANCE_HY4_ENGRAM_AHEAD");
 }
 
 TEST(last_layer_keeps_cache_writers_at_chunk_height_and_queries_at_output_height) {
@@ -1201,6 +1262,16 @@ TEST(each_rank_declares_its_share_and_reduces_twice_a_layer) {
             CHECK_EQ(kv_named(b, "kv_latent_sparse")->d.head_dim, 20);
             CHECK_EQ(pint(find_op(b, "idx_score"), "heads"), 2);
             CHECK_EQ(pint(find_op(b, "router_sigmoid_topk"), "n_expert"), 8);
+            int packed_projections = 0;
+            for (const auto& o : b.ops) {
+                if (o.op != "gemm_nt_f32" || o.w.empty()) continue;
+                const auto& weight = b.weights.at(o.w[0] - 1);
+                if (weight.name.find(".glm_router.weight") == std::string::npos) continue;
+                CHECK_EQ(pint(&o, "weight_bf16") == 1, weight.d.dtype == RAD_BF16);
+                packed_projections += weight.d.dtype == RAD_BF16;
+            }
+            /* Eight experts split into four f32 logits per rank at TP2. */
+            CHECK_EQ(packed_projections, world == 2 ? 2 : 1);
             int based = 0;
             for (const auto& o : b.ops)
                 if (param(&o, "expert_base")) {
@@ -1387,6 +1458,62 @@ TEST(quantised_routed_experts_are_served_clamped) {
     }
 }
 
+/* K-18: the block declares the sort's inverse table, so the fused selection or the separate
+ * `moe_scatter_inv` writes `moe.expert_slot` and `moe_gather_inv` reads it instead of rebuilding
+ * it; without the device rows the pair falls back to `moe_scatter` / `moe_gather`, which scan the
+ * sort and add the two prepass launches above 512 slots. */
+std::vector<std::string> g_undecl;
+void undeclaring_encs(RadBuilder* b) {
+    bf16_encs(b);
+    for (const std::string& op : g_undecl) b->undeclared.insert(op);
+}
+TEST(the_moe_gather_reads_the_sorts_inverse_table) {
+    struct Case {
+        const char* what;
+        std::vector<std::string> undecl;
+        int invg;    /* per MoE layer: moe_gather_inv (1) or moe_gather (0) */
+        int writers; /* ops that write the inverse table: the fused selection and the separate
+                      * scatter above it (the block declares both, each for a size of pass) */
+    };
+    const Case cases[] = {
+        { "the fused selection", {}, 1, 4 },
+        { "the separate sort", { "router_sigmoid_topk_scatter" }, 1, 2 },
+        { "no device rows", { "router_sigmoid_topk_scatter", "moe_scatter_inv", "moe_gather_inv" },
+          0, 0 },
+    };
+    for (const Case& c : cases) {
+        fprintf(stderr, "case %s\n", c.what);
+        g_undecl = c.undecl;
+        Declared d(undeclaring_encs);
+        g_undecl.clear();
+        REQUIRE_EQ(d.rc, RAD_OK);
+        const rad_buf inv = buf_named(d.b, "moe.expert_slot");
+        const rad_buf sorted = buf_named(d.b, "moe.expert_sorted");
+        REQUIRE(inv != 0);
+        REQUIRE(sorted != 0);
+        int writers = 0;
+        for (const auto& o : d.b.ops)
+            if (in(o.writes, inv)) ++writers;
+        CHECK_EQ(count_op(d.b, "moe_gather_inv"), c.invg * 2);
+        CHECK_EQ(count_op(d.b, "moe_gather"), (1 - c.invg) * 2);
+        CHECK_EQ(writers, c.writers);
+        for (int i = 0; i < c.invg * 2; ++i) {
+            const RecOp* o = find_op(d.b, "moe_gather_inv", i);
+            REQUIRE(o != nullptr);
+            REQUIRE(o->reads.size() >= 3);
+            CHECK_EQ(o->reads[2], inv);
+        }
+        for (int i = 0; i < (1 - c.invg) * 2; ++i) {
+            const RecOp* o = find_op(d.b, "moe_gather", i);
+            REQUIRE(o != nullptr);
+            REQUIRE(o->reads.size() >= 3);
+            CHECK_EQ(o->reads[2], sorted);
+        }
+        every_weight_read(d.b);
+        steps_clean_at(d.b, 0, 1);
+    }
+}
+
 /* Trunk linears a recipe made int8 (rotated or not) or the u5 trellis read int8 codes from their
  * input's bf16 plane; the others stay bf16 GEMMs, and an int8 lm_head is read by logits_gemm at its
  * codes' dtype. Linears of one input and one code form share one quantiser (Lin::feed: q_a with
@@ -1412,6 +1539,61 @@ void int8_trunk_encs_host(RadBuilder* b) {
     int8_trunk_encs(b);
     for (const char* op : { "gated_had_quant_i8g", "rmsnorm_had_quant_i8g", "router_sigmoid_topk_scatter" })
         b->undeclared.insert(op);
+}
+
+/* K-19: the gather writes the routed sum's rotated int8 codes and scales in the launch that sums
+ * it (`moe_gather_inv_i8g`), so `ffn_latent_out` declares no `had_quant_act_i8g` of its own -- one
+ * launch fewer on every MoE layer, the same codes. It needs the slot table, no shared arm in the
+ * gather, `top_k` 16 (the codes' 256-column wave is written from the sixteen-slot selection), a
+ * latent that is a whole number of those waves and one the weight's scale group divides; where any
+ * of those fails the plain gather serves and the linear quantises for itself (and the codes' pair
+ * is only declared, never written, when the switch is off). */
+TEST(the_moe_gather_writes_the_routed_sums_codes) {
+    struct Run {
+        const char* what;
+        bool off;              /* RADIANCE_HY4_FUSE_GATHER_Q8=0 */
+        int64_t latent, top_k;
+        int q8g;               /* moe_gather_inv_i8g launches, one on each of the two MoE layers */
+        int had;               /* had_quant_act_i8g: the latent_out pair gone where fused */
+    };
+    const Run runs[] = {
+        { "latent 256, sixteen slots", false, 256, 16, 2, 8 - 2 },
+        { "the switch off", true, 256, 16, 0, 8 },
+        { "a latent the group does not divide", false, 128, 16, 0, 8 },
+        { "eight slots, not the sixteen the codes need", false, 256, 8, 0, 8 },
+    };
+    for (const Run& r : runs) {
+        fprintf(stderr, "run %s\n", r.what);
+        if (r.off) setenv("RADIANCE_HY4_FUSE_GATHER_Q8", "0", 1);
+        Declared d(int8_trunk_encs, 1, 0, false, 128, r.latent, r.top_k, 16);
+        unsetenv("RADIANCE_HY4_FUSE_GATHER_Q8");
+        REQUIRE_EQ(d.rc, RAD_OK);
+        const RadBuilder& b = d.b;
+        CHECK_EQ(count_op(b, "moe_gather_inv_i8g"), r.q8g);
+        CHECK_EQ(count_op(b, "moe_gather_inv"), r.q8g ? 0 : 2);
+        CHECK_EQ(count_op(b, "had_quant_act_i8g"), r.had);
+        /* The routed sum's pair: a role of its own (`sum`), the trunk's for that width and group,
+         * the codes one int8 a column; lat_out reads them only where the gather wrote them. */
+        const RecBuf* q8 = find_b(b, "trunk_codes.sum.256.128.q8");
+        CHECK_EQ(q8 != nullptr, r.q8g > 0);
+        if (q8) CHECK_EQ(q8->d.dtype, RAD_I8);
+        for (int i = 0; i < r.q8g; ++i) {
+            const RecOp* o = find_op(b, "moe_gather_inv_i8g", i);
+            REQUIRE(o != nullptr);
+            /* y_expert, expert_w and the slot table read; the codes, their scales and the sum
+             * written -- the sum being the bf16 latent ffn_latent_out reads. */
+            REQUIRE_EQ(o->reads.size(), (size_t)3);
+            REQUIRE_EQ(o->writes.size(), (size_t)3);
+            CHECK_EQ(o->writes[0], buf_named(b, "trunk_codes.sum.256.128.q8"));
+            CHECK_EQ(o->writes[1], buf_named(b, "trunk_codes.sum.256.128.s8"));
+            CHECK_EQ(o->writes[2], buf_named(b, "moe.latent"));
+            CHECK_EQ(pint(o, "group"), 128);
+            CHECK_EQ(pint(o, "n"), 256);
+            CHECK_EQ(pint(o, "top_k"), 16);
+        }
+        every_weight_read(b);
+        steps_clean_at(d.b, 0, 1);
+    }
 }
 
 TEST(quantised_trunk_linears_share_one_quantiser_an_input) {

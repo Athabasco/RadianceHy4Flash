@@ -448,6 +448,8 @@ static const RadParamSpec pDequant[] = { P_INT("M"), P_INT("n"), P_INT("group"),
 static const RadOperandSpec oDequant[] = { OPD("q"), OPD("scale"), OUT("y") };
 
 /* ---- gemm --------------------------------------------------------------------------------- */
+static const RadParamSpec pGemmF32[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype"),
+                                         P_INTO("weight_bf16") };
 static const RadParamSpec pGemm[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype") };
 static const RadOperandSpec oGemm[]     = { OPD("a"), WGT("b"), OUT("y") };
 /* The bias form carries an optional epilogue: an activation of the biased product, then a residual
@@ -1729,8 +1731,8 @@ static const RadOpSchema kSchemas[] = {
   "y = q * scale, the inverse of quant_act_i8g. It does NOT undo a rotation." },
 
 { "gemm_nt", ARR(pGemm), ARR(oGemm), "y[M,N] = a[M,K] @ b[N,K]^T, f32 accumulate." },
-{ "gemm_nt_f32", ARR(pGemm), ARR(oGemm),
-  "BF16 activations times F32 weights, F32 accumulation and output; preserves routing and index gate precision." },
+{ "gemm_nt_f32", ARR(pGemmF32), ARR(oGemm),
+  "BF16 activations times F32 or stored BF16 weights, F32 accumulation and output; preserves routing and index gate precision." },
 { "gemm_nt_bias", ARR(pGemmBias), ARR(oGemmBias),
   "gemm_nt with a per-column bias added in f32, rounded to y's dtype; then, optionally, `act` of "
   "that (\"gelu\" exact, \"gelu_tanh\" the tanh approximation, \"none\"), rounded; then `res` "

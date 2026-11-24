@@ -3335,7 +3335,7 @@ the drafter's `dfly.blk.<i>`, the tower `v.`.
 | `index_head`, `index_key`, `index_key_norm` | `head_weight_projection`, `token_key_projection`, `token_key_norm` | sparse layers |
 | `index_pool_value`, `index_pool_gate`, `index_pool_norm`, `index_ape` | `key_value_projection`, `key_gate_projection`, `key_norm`, `intra_group_ape` | f32 |
 | `ffn_gate_up`, `ffn_down`, `ffn_post_norm` | `mlp.gate_proj` + `up_proj`, `down_proj`, `post_fc2_norm` | layer 0 |
-| `glm_router.weight`, `glm_router.correction` | `mlp.gate.weight`, `mlp.gate.e_score_correction_bias` | f32; MoeFP8's router (GlmRouter) |
+| `glm_router.weight`, `glm_router.correction` | `mlp.gate.weight`, `mlp.gate.e_score_correction_bias` | bf16 weight, f32 correction (GlmRouter) |
 | `ffn_latent_in`, `ffn_latent_out` | `mlp.routed_expert_down_proj`, `mlp.routed_expert_up_proj` | |
 | `ffn_gate_up_exps.<e>`, `ffn_down_exps.<e>` | slice `e` of `mlp.experts.gate_up_proj` [512, 3072, 1536] and `down_proj` [512, 1536, 1536] | one movement unit an expert |
 | `ffn_gate_up_shexp`, `ffn_down_shexp`, `ffn_post_norm` | `mlp.shared_experts.gate_proj` + `up_proj`, `down_proj`, `mlp.combine_output_norm` | |
@@ -3470,6 +3470,13 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   `RADIANCE_HY4_SHARE_CODES`, `RADIANCE_HY4_FUSED_QUANT`, `RADIANCE_HY4_ROUTER_FUSE`,
   `RADIANCE_HY4_CHAIN_Q8`. Not fused: the attention norm and the feed-forward norm are the
   junction's (`rmsnorm_ihc_junction`), and o_proj's input comes out of `mla_expand_gate`.
+  `ffn_latent_out`'s is the one fused producer that is not a norm or a gate: the routed MoE gather
+  (`moe_gather_inv_i8g`, K-19) writes the sum's rotated int8 codes and scales in the launch that
+  sums it, so that linear declares no `had_quant_act_i8g`. It needs the slot table, no shared arm
+  in the gather, `top_k` 16, a latent that is a whole number of the codes' 256-column waves
+  (`latent % 256 == 0`), a latent its weight's scale group divides (128 or 256), and a write that
+  does not fold the gather in (a fold writes no codes); else the plain gather serves and the linear
+  quantises for itself. `RADIANCE_HY4_FUSE_GATHER_Q8=0` turns it off.
 - **The shared expert beside the routed GEMMs** (P-01). The shared expert is the plugin's own gated
   MLP (MoeFP8 runs with no shared arm), so MoeFP8's interleave never reached it and its gate and down
   projection were ordered launches behind `latent_out`. `MoeFP8::step` takes a `side` (SideOps) and
@@ -3486,7 +3493,9 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   host arena; a device gather (vram, ram) reads and writes them over the link. A prefill chunk's
   `engram_ids` also hashes up to two steps of the following prompt (`RadBatch::n_ahead`) into
   `ahead_ids`, and the gather hands them to libavx's reader thread (the friend's `ahead_ids`), so the
-  next chunk's rows are read while this one computes; `RADIANCE_HY4_ENGRAM_AHEAD=0` turns it off.
+  next chunk's rows are read while this one computes. A device gather ignores them, so the hashing
+  runs only where the gather goes to the host; `RADIANCE_HY4_ENGRAM_AHEAD=0` turns it off and any
+  other value hashes them at every placement (the A/B arm).
   Before this the plugin's device-domain ids made a disk-placed table crash the first prefill.
 - **The pipelined prefill at TP4** (`RADIANCE_HY4_PIPE=1`, off by default). A step wider than a band
   runs as two row pieces: piece 0's junction (the `add`, the `overlap 1` exact all-reduce, the
