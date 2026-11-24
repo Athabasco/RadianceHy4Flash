@@ -10958,6 +10958,47 @@ TEST(a_sliced_plan_comes_with_the_persistent_set_declared) {
     }
 }
 
+/* A calibration window reads the trunk between two layers -- exactly where a slice stops and the
+ * next one resumes -- so a serve that records one is never sliced, even where the plugin reports
+ * the range: the CLI's --calib-* reach the plugin only at declare, after its probe, so the engine
+ * withdraws the report beside the plan (layer_slices_available). One answer for the plan and the
+ * declare, so the model comes up at m = 1 instead of refusing at declare. */
+TEST(a_calibration_window_keeps_a_chunk_whole) {
+    const int32_t L = 8;
+    struct Case { const char* dir; int32_t lo, hi; };
+    const Case cases[] = { { "/tmp/calib", 0, 0 }, { "", 2, 4 } };
+    for (const Case& c : cases) {
+        /* The lever and a decoder beside the chunk: what slices without the window. */
+        Fixture f;
+        slice_fixture(f, /*slices=*/4);
+        f.cfg.calib_dir = c.dir;
+        f.cfg.calib_layer_lo = c.lo;
+        f.cfg.calib_layer_hi = c.hi;
+        CHECK(f.cfg.slice_layers_ok);        /* what the plugin's probe reported */
+        CHECK_EQ(rad::declared_layer_slices(f.cfg, L), 0);
+        CHECK_OK(f.start());
+        uint64_t dec = 0, chunk = 0;
+        REQUIRE(slice_start(f, &dec, &chunk) != nullptr);
+        CHECK_EQ(f.sch.plan().slice_m, 0);
+        CHECK_EQ(f.sch.plan().layer_lo, 0);
+        CHECK_EQ(f.sch.plan().layer_hi, 0);
+    }
+    /* And the hook's prefill-only step, which slices without the window. */
+    {
+        Fixture f;
+        slice_fixture(f, /*slices=*/0);
+        f.cfg.chunk_slices_prefill = 4;
+        f.cfg.calib_dir = "/tmp/calib";
+        CHECK_EQ(rad::declared_layer_slices(f.cfg, L), 0);
+        CHECK_OK(f.start());
+        f.submit(496, 64);
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.plan().slice_m, 0);
+        CHECK_EQ(f.sch.plan().layer_lo, 0);
+        CHECK_EQ(f.sch.plan().layer_hi, 0);
+    }
+}
+
 /* Nothing is admitted inside a group: a newcomer waits for the last sub-step, and the chunk's
  * rows and blocks stay what they were. */
 TEST(admission_waits_for_a_group_s_last_slice) {

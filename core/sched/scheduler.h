@@ -31,16 +31,28 @@
 
 namespace rad {
 
+/* S-02: whether a chunk may be planned as layer-sliced sub-steps at all: the plugin reports it can
+ * run the trunk over a layer range and resume from it (RadArchProbe::slice_layers_ok, as
+ * Engine::declare recorded it in cfg), and nothing reads the trunk between two layers. A
+ * calibration window does -- its taps sit between two layers, which is where a slice stops and
+ * resumes -- and the CLI's --calib-* are the engine's, not the plugin's: the plugin maps them into
+ * the environment only when it declares, i.e. after its probe filled slice_layers_ok, so it cannot
+ * report them itself. The withdrawal lives here, and both the plan (Scheduler::start_group) and the
+ * declare (declared_layer_slices) read this one answer, so a calibration serve comes up at m = 1
+ * rather than refusing at declare. */
+inline bool layer_slices_available(const Config& cfg) {
+    if (!cfg.slice_layers_ok) return false;
+    return cfg.calib_dir.empty() && cfg.calib_layer_lo <= 0 && cfg.calib_layer_hi <= 0;
+}
+
 /* S-02: whether the engine must declare the chunk's persistent state (RadBuildCtx::layer_slices,
  * i.e. the plugin's own `sliced`): some lever that can make the scheduler plan layer-sliced
- * sub-steps, and a plugin that reports it can run the trunk over a layer range and resume from it
- * (RadArchProbe::slice_layers_ok, as Engine::declare recorded it in cfg). The scheduler plans a
- * slice only where the same conditions hold (Scheduler::start_group), so a sliced step always finds
- * what it resumes declared rather than transient memory the next engine step resets. The answer is
- * the layer count (a sliced pass runs the trunk over `layer_hi == n_layers` in more than one step)
- * or 0 for a whole trunk. */
+ * sub-steps, and layer_slices_available. The scheduler plans a slice only where the same
+ * conditions hold (Scheduler::start_group), so a sliced step always finds what it resumes declared
+ * rather than transient memory the next engine step resets. The answer is the layer count (a sliced
+ * pass runs the trunk over `layer_hi == n_layers` in more than one step) or 0 for a whole trunk. */
 inline int32_t declared_layer_slices(const Config& cfg, int32_t n_layers) {
-    if (n_layers < 2 || !cfg.slice_layers_ok) return 0;
+    if (n_layers < 2 || !layer_slices_available(cfg)) return 0;
     if (cfg.chunk_slices == 0 && cfg.chunk_slices_prefill < 2) return 0;
     return n_layers;
 }

@@ -977,7 +977,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* S-02: a sliced trunk stops between two layers and resumes from the persistent set. Refuse a
      * graph the engine asks to slice where the plugin cannot: debug taps and a calibration run read
      * the trunk between every two ops, and the model has to say so rather than run on the wrong
-     * rows. (The probe reports slice_layers_ok 0 for them; this is the backstop.) */
+     * rows. (The probe reports slice_layers_ok 0 for the taps and for a calibration window it can see
+     * in the environment, and the engine withdraws the report for the CLI's --calib-* before it
+     * declares layer slicing: core/sched/scheduler.h's layer_slices_available. This is the
+     * backstop.) */
     m.sliced = ctx->layer_slices > 0;
     if (m.sliced && (taps_on() || s.calib_lo > 0 || s.calib_hi > 0 ||
                      (ctx->calib_dir && *ctx->calib_dir)))
@@ -1625,8 +1628,11 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
      * from a persistent set (declared under RadBuildCtx::layer_slices), then report the chunk's
      * token when its rows have run every layer. The persistent set is declared when the engine asks
      * (S-02b); the debug taps and a calibration run read the trunk between every two ops, so a graph
-     * running them says 0 and a --chunk-slices request keeps m = 1. */
-    out->slice_layers_ok = taps_on() ? 0 : 1;
+     * running them says 0 and a --chunk-slices request keeps m = 1. A calibration window exported
+     * into the environment is visible here; one given as --calib-dir/--calib-layers is not, since
+     * the engine maps the CLI into the environment only when the plugin declares, after this probe
+     * (core/sched/scheduler.h's layer_slices_available withdraws it there). */
+    out->slice_layers_ok = (taps_on() || calib_env_on()) ? 0 : 1;
     /* declare() honours RadBuildCtx::shape_probe (probe_model above): the core sizes the arena's
      * levels, lends their tops to the expert slab and arms the prefill stager. */
     {   /* RADIANCE_HY4_SHAPE_PROBE=0: no sizing declares (an A/B switch, hy4-perf). */

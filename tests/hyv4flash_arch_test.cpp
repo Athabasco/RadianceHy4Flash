@@ -191,7 +191,10 @@ TEST(the_replicated_kv_groups_and_the_chain_request) {
 /* S-02: the plugin reports whether its step's trunk can be stopped between two layers and resumed
  * from a persistent set. S-02b declares that set (hyv4flash.cpp's Model::sliced, from
  * RadBuildCtx::layer_slices), so the report is 1 and the core may slice a chunk on it — except where
- * the trunk cannot stop: the debug taps read the trunk between every two ops (RADIANCE_HY4_TAPS). */
+ * the trunk cannot stop: the debug taps read the trunk between every two ops (RADIANCE_HY4_TAPS),
+ * and a calibration window records one there too. A window the *environment* names is visible at the
+ * probe; one the CLI names (--calib-dir/--calib-layers) reaches the plugin only when it declares, so
+ * the engine withdraws the report for it (core/sched/scheduler.h's layer_slices_available). */
 TEST(the_probe_reports_a_resumable_layer_range) {
     RadArchProbe p{};
     CHECK_OK(hyv4flash::probe(mini_meta().meta(), &p));
@@ -208,6 +211,25 @@ TEST(the_probe_reports_a_resumable_layer_range) {
         CHECK_OK(hyv4flash::probe(mini_meta().meta(), &t));
     }
     CHECK_EQ(t.slice_layers_ok, 0);
+    /* And with a calibration window exported: its taps are per-layer copies of whole-trunk values,
+     * declared between two layers, so the same 0. */
+    struct Calib {
+        const char* var;
+        const char* val;
+        explicit Calib(const char* v, const char* x) : var(v), val(x) { setenv(var, val, 1); }
+        ~Calib() { unsetenv(var); }
+    };
+    for (int which = 0; which < 2; ++which) {
+        RadArchProbe c{};
+        if (which == 0) {
+            Calib dir("RADIANCE_CALIB_DIR", "/tmp/hyv4-calib");
+            CHECK_OK(hyv4flash::probe(mini_meta().meta(), &c));
+        } else {
+            Calib layers("RADIANCE_CALIB_LAYERS", "2-3");
+            CHECK_OK(hyv4flash::probe(mini_meta().meta(), &c));
+        }
+        CHECK_EQ(c.slice_layers_ok, 0);
+    }
 }
 
 void int8_trunk_encs(RadBuilder* b);   /* defined with the quantised recipes below */

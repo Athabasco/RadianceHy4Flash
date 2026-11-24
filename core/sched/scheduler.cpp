@@ -199,13 +199,21 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     draft_refill_ = 0;
     /* S-02: the chunk a step carries may be planned as m layer-sliced sub-steps only when the
      * plugin reports it can run the trunk over a layer range and resume from a slice
-     * (RadArchProbe::slice_layers_ok, which Engine::declare put in cfg) and the trunk has more than
-     * one layer to split. --chunk-slices off (the default) never slices. */
+     * (RadArchProbe::slice_layers_ok, which Engine::declare put in cfg), nothing reads the trunk
+     * between two layers (layer_slices_available: a calibration window does), and the trunk has more
+     * than one layer to split. --chunk-slices off (the default) never slices. */
     n_layers_  = prog.meta.n_layers;
-    slice_ok_  = cfg.slice_layers_ok;
+    slice_ok_  = layer_slices_available(cfg);
+    /* The plugin reported the range and this serve withdrew it: a calibration run's taps read the
+     * trunk between two layers. */
+    const bool calib_window = cfg.slice_layers_ok && !slice_ok_;
     group_ = ChunkGroup{};
     if (cfg.chunk_slices != 0 && n_layers_ > 1) {
-        if (!slice_ok_)
+        if (!slice_ok_ && calib_window)
+            RAD_INFO("scheduler: --chunk-slices: this serve records a calibration window "
+                     "(--calib-dir/--calib-layers), whose taps read the trunk between two layers, "
+                     "so a chunk is never sliced");
+        else if (!slice_ok_)
             RAD_INFO("scheduler: --chunk-slices: this model's plugin reports no resumable layer "
                      "range (RadArchProbe::slice_layers_ok), so a chunk is never sliced");
         else if (cfg.chunk_slices < 0)
@@ -221,7 +229,11 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                                                   n_layers_));
     }
     if (cfg.chunk_slices_prefill > 1) {
-        if (!slice_ok_ || n_layers_ < 2)
+        if (!slice_ok_ && calib_window)
+            RAD_INFO("scheduler: --chunk-slices-prefill: this serve records a calibration window, "
+                     "whose taps read the trunk between two layers, so a prefill step is never "
+                     "sliced");
+        else if (!slice_ok_ || n_layers_ < 2)
             RAD_INFO("scheduler: --chunk-slices-prefill: this model's plugin reports no resumable "
                      "layer range, so a prefill step is never sliced");
         else

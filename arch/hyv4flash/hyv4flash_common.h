@@ -467,6 +467,17 @@ inline bool taps_on() {
     return e && *e && std::strcmp(e, "0") != 0;
 }
 
+/* A calibration window exported into the environment (--calib-dir/--calib-layers map to these, but
+ * only at declare, after the probe reads them here): the taps record a whole-trunk value between
+ * two layers. Read the environment directly rather than rad_arch.h's calib_dir(), whose first read
+ * is cached -- the probe runs before that cache is meaningful. */
+inline bool calib_env_on() {
+    const char* d = std::getenv("RADIANCE_CALIB_DIR");
+    if (d && *d) return true;
+    const char* l = std::getenv("RADIANCE_CALIB_LAYERS");
+    return l && *l;
+}
+
 struct Tap {
     rad_buf buf = 0;
     rad_op op = 0;
