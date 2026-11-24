@@ -35,9 +35,10 @@
  * streams gives the single-row decode at each position bit for bit, and the paged form at window 0
  * equals the selection form over a table listing the same pages in order (both anchor at 0).
  *
- * Two forms run the law. The split form (up to kRowsWindow / kRowsFull rows): a workgroup a slot,
- * the partial (relative to its own maximum) to the scratch, merge_sink folds them. The fused form
- * (more rows, `stable 1`): one workgroup walks the row's chunks as the unsplit pass does and at
+ * Two forms run the law. The split form (up to the form's row cap: kRowsWindow / kRowsFull for
+ * `stable 0`, kRowsStableWindow / kRowsStableFull for `stable 1`): a workgroup a slot, the partial
+ * (relative to its own maximum) to the scratch, merge_sink folds them. The fused form (more rows,
+ * `stable 1`): one workgroup walks the row's chunks as the unsplit pass does and at
  * each super-chunk boundary folds the slot's state into an accumulator a row in the scratch with
  * the merge's arithmetic (sink_fold, explicit fmaf), so the bytes are the split form's without its
  * partials' traffic (8 or 20 of them a row and head). The order of the vLLM-style merge (every
@@ -72,8 +73,14 @@ constexpr int kPieces = 16 * W / 8; /* 16-byte pieces of a 16-token chunk */
 constexpr int kShiftWindow = 6, kShiftFull = 7, kMaxSplits = 20;
 /* The most rows a `stable 0` launch splits; past them the workgroups fill the card unsplit, which
  * is then also faster (measured: the window at 16 rows 79 us split against 68 unsplit, the
- * selection at 64 rows 362 against 269). `stable 1` splits at every M. */
-constexpr long kRowsWindow = 16, kRowsFull = 32;
+ * selection at 64 rows 362 against 269).
+ *
+ * `stable 1` (the plugin's decode-class instance) splits to its own, larger cap: its rows are the
+ * decode-class ones, and a speculative step (c4-c8 DFly2) asks for 17 to 48 of them, where the
+ * `stable 0` measurement above did not reach: one workgroup a row then walks the row's whole
+ * range instead of the 4 chunks a slot. 48 rows is the widest such step today (max_seqs x
+ * (max_spec + 1) = 8 x 6), and what it costs in scratch is in the scratch hook's note below. */
+constexpr long kRowsWindow = 16, kRowsFull = 32, kRowsStableWindow = 48, kRowsStableFull = 48;
 /* Table entries a split reads through LDS: a selection split of 128 tokens at block size 1. */
 constexpr int kSpanPages = 160;
 
@@ -519,7 +526,12 @@ int sink_slots(bool sel, long window, long cap) {
     const long need = cap < 1 ? 1 : ((cap - 1) >> sink_shift(sel, window)) + 1;
     return (int)std::min<long>(sink_law(sel, window), need);
 }
-long sink_rows_cap(bool sel, long window) { return !sel && window > 0 ? kRowsWindow : kRowsFull; }
+/* The most rows the launch splits: the form's cap, `stable 1` past `stable 0`'s. Moves no bits (both
+ * forms run the law). */
+long sink_rows_cap(bool sel, long window, bool stable) {
+    if (stable) return !sel && window > 0 ? kRowsStableWindow : kRowsStableFull;
+    return !sel && window > 0 ? kRowsWindow : kRowsFull;
+}
 
 void heads_view(RadTensor& t, long heads, long width) {
     if (heads > 0 && t.rank == 2 && t.shape[1] == heads * width) {
@@ -598,11 +610,12 @@ int sink_body(const RadArgs* a, RadStream stream) {
                    fused_fits = have >= rows * heads * PART * 4;
         if (form == 4) {
             splits = 1;
-        } else if (form == 6 || (stable && (rows > sink_rows_cap(SEL, window) || !split_fits))) {
+        } else if (form == 6 ||
+                   (stable && (rows > sink_rows_cap(SEL, window, true) || !split_fits))) {
             if (!fused_fits) return RAD_E_SCRATCH; /* never silently unsplit */
             splits = 1;
             fused = 1;
-        } else if (rows > sink_rows_cap(SEL, window) || !split_fits) {
+        } else if (rows > sink_rows_cap(SEL, window, stable != 0) || !split_fits) {
             splits = 1;
         }
     }
@@ -695,7 +708,7 @@ int64_t sink_scratch(const RadArgs* a, bool sel) {
     const int slots = sel && blocks > 0 && bs > 0 ? sink_slots(true, 0, blocks * bs)
                                                   : sink_law(sel, window);
     if (slots <= 1) return 0;
-    const long cap = std::min(rows, sink_rows_cap(sel, window));
+    const long cap = std::min(rows, sink_rows_cap(sel, window, stable != 0));
     /* stable 1: the split form's partials up to the cap, the fused form's accumulator past it */
     return (stable ? std::max(cap * slots, rows) : cap * slots) * heads * PART * 4;
 }
@@ -707,9 +720,11 @@ extern "C" int r4d_rad_mla_attn_paged_sink(const RadArgs* a, RadStream stream) {
 extern "C" int r4d_rad_mla_attn_sel_sink(const RadArgs* a, RadStream stream) {
     return sink_body<true>(a, stream);
 }
-/* Per row: 8 slots at a window of 512 and 64 heads 1.06 MiB (stable 0: 16 rows, 16.9 MiB); 20
- * slots at window 0 and 32 heads 1.32 MiB (stable 0: 32 rows, 42.3 MiB); the selection at blocks
- * x block_size 2048 has 16 slots (1.06 MiB a row at 32 heads). */
+/* Per row: 8 slots at a window of 512 and 64 heads 1.06 MiB (stable 0: 16 rows, 16.9 MiB; stable 1:
+ * 48 rows at 32 heads, 24.2 MiB); 20 slots at window 0 and 32 heads 1.32 MiB (stable 0: 32 rows,
+ * 42.3 MiB; stable 1: 48 rows, 60.4 MiB); the selection at blocks x block_size 2048 has 16 slots
+ * (1.06 MiB a row at 32 heads: stable 1 48 rows, 48.4 MiB; 24.2 MiB at the 16 heads a rank has at
+ * TP2). */
 extern "C" int64_t r4d_rad_mla_attn_paged_sink_scratch(const RadArgs* a) {
     return sink_scratch(a, false);
 }

@@ -38015,6 +38015,12 @@ static void device_phase(const Plugin& pl) {
         mla_sink_check(pl, false, 32, { 100 }, { 300 }, 0, 4, 0, 1);
         mla_sink_check(pl, false, 16, { 6, 6, 6, 6 }, { 530, 2100, 700, 4097 }, 512, 16, 0, 1);
         mla_sink_bytes(pl, 64, { 6, 6, 6, 6 }, { 530, 2100, 700, 1200 }, 512, 4, 1);
+        /* the sliding layer's shape at TP2 at the widest speculative step (8 streams x 6 = 48
+         * rows, the `stable 1` split cap) and one row past it */
+        mla_sink_bytes(pl, 32, { 6, 6, 6, 6, 6, 6, 6, 6 }, { 600, 520, 900, 3000, 512, 513, 17, 2049 },
+                       512, 4, 1);
+        mla_sink_bytes(pl, 32, { 7, 6, 6, 6, 6, 6, 6, 6 }, { 600, 520, 900, 3000, 512, 513, 17, 2049 },
+                       512, 4, 1);
         mla_sink_bytes(pl, 16, { 6, 6, 6, 6, 6, 6, 6, 6 }, { 600, 520, 900, 3000, 512, 513, 17, 2049 },
                        512, 16, 1);
         mla_sink_bytes(pl, 32, { 6, 6, 6, 6 }, { 2049, 600, 1500, 2100 }, 0, 4, 1);
