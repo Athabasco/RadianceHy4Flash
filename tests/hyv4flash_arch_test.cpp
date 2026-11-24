@@ -94,15 +94,16 @@ RadEncoding enc_nl64(int bits) {
     rad_enc_copy_str(e.transform, "fwht128");
     return e;
 }
-/* The rotated computed trellis under one f32 scale a row (IQR; tcq_code=mad). */
-RadEncoding enc_trellis(uint32_t codes, bool colf) {
+/* The rotated computed trellis under one f32 scale a row (IQR; tcq_code=mad), its run (libquant's
+ * tcq_rows: the rows a run of the plane's table) as given. */
+RadEncoding enc_trellis(uint32_t codes, bool colf, uint32_t run = 128) {
     RadEncoding e{};
     rad_enc_clear(&e);
     rad_enc_copy_str(e.scheme, "trellis");
     rad_enc_add_plane(&e, "codes", codes, 1, 1);
     rad_enc_add_plane(&e, "scale", RAD_F32, 1, 0);
     const int t = rad_enc_add_table(&e, "trellis", RAD_I8, 1 << 16, 1);
-    e.plane[t].block[0] = 128;
+    e.plane[t].block[0] = run;
     rad_enc_add_table(&e, "trellis.mad", RAD_U32, 2, 1);
     if (colf) rad_enc_add_plane(&e, "scale.col", RAD_F32, 0, 128);
     rad_enc_copy_str(e.transform, "fwht128");
@@ -1466,6 +1467,74 @@ TEST(quantised_trunk_linears_share_one_quantiser_an_input) {
         every_weight_read(d.b);
         /* Every fed GEMM's codes are written before it in each step kind. */
         steps_clean_at(d.b, 0, 1);
+    }
+}
+
+/* K-02 (P-14's switch): q_nope and q_rope read one q residual's codes, so where both are one IQR
+ * form the plugin gives the pair one gemm_nt_q_dual a layer, at a decode step's GEMV only (M == 1,
+ * kDualMaxM) -- the two launches' blocks in one grid, each part's blocks the blocks its own launch
+ * gives it, so both products are byte-identical (the row's oracle). Off with
+ * RADIANCE_HY4_FUSE_QPROJ=0, and never for a pair of two forms nor for two runs of the trellis --
+ * the run is the fold's length and the pair folds once. The pair's two Ns differ (the mini model's
+ * q_nope is H * qk_nope_head_dim wide, its q_rope H * qk_rope_head_dim), which is what the row's
+ * N2 is for. */
+TEST(the_q_projections_go_out_as_one_launch) {
+    struct Run { const char* what; bool same, off; uint32_t nope_run, rope_run; int duals; };
+    const Run runs[] = {
+        { "one form, one run", true, false, 16, 16, 3 },
+        { "one form, fused off", true, true, 16, 16, 0 },
+        { "two forms", false, false, 16, 16, 0 },
+        { "two runs", true, false, 16, 32, 0 },
+    };
+    for (const Run& r : runs) {
+        fprintf(stderr, "run %s\n", r.what);
+        /* G3Env leaves a switch alone when the test has already set it: the on arm asks for the pair
+         * itself, the off arm for the two launches. */
+        setenv("RADIANCE_HY4_FUSE_QPROJ", r.off ? "0" : "1", 1);
+        RadBuilder b;
+        bf16_encs(&b);
+        b.encs.insert(b.encs.begin(),
+                      { { "attn_q_nope", enc_trellis(RAD_U5, true, r.nope_run) },
+                        { "attn_q_rope", r.same ? enc_trellis(RAD_U5, true, r.rope_run)
+                                                : enc_i8(true) } });
+        /* K is the q_lora rank: a trellis weight takes K in whole 128-column runs of the table. */
+        MetaKV mk = mini_meta(/* wide */ true);
+        mk.set("q_lora_rank", "128");
+        RadBuildCtx ctx = build_ctx();
+        G3Env g3env;
+        int rc = 0;
+        const std::string err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
+        unsetenv("RADIANCE_HY4_FUSE_QPROJ");
+        if (rc != RAD_OK) fputs(err.c_str(), stderr);
+        REQUIRE_EQ(rc, RAD_OK);
+        /* One dual a layer where the pair is one form and one run, and none otherwise. */
+        CHECK_EQ(count_op(b, "gemm_nt_q_dual"), r.duals);
+        /* Both own GEMMs stay declared: the pair serves the GEMV's band and every wider pass keeps
+         * the Lins' launches, so neither weight loses its launch. */
+        int own = 0;
+        for (const auto& o : b.ops)
+            if (o.op == "gemm_nt_q" && pint(&o, "K") == 128 &&
+                (pint(&o, "N") == 96 || pint(&o, "N") == 192 || pint(&o, "N") == 32 ||
+                 pint(&o, "N") == 64)) {
+                ++own;
+                const RecParam* m = param(&o, "M");
+                REQUIRE(m != nullptr);
+                CHECK(m->ihi > 1);
+            }
+        CHECK_EQ(own, 6);
+        /* The dual carries the two widths and the one K, and is declared at the GEMV's height. */
+        for (const auto& o : b.ops)
+            if (o.op == "gemm_nt_q_dual") {
+                const int64_t N = pint(&o, "N"), N2 = pint(&o, "N2");
+                CHECK(N == 96 || N == 192);
+                CHECK_EQ(N2, N == 96 ? 32 : 64);
+                CHECK_EQ(pint(&o, "K"), 128);
+                const RecParam* m = param(&o, "M");
+                REQUIRE(m != nullptr);
+                CHECK_EQ(m->ihi, 1);
+            }
+        every_weight_read(b);
+        steps_clean_at(b, 0, 1);
     }
 }
 
