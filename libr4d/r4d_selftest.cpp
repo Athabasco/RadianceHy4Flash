@@ -16779,26 +16779,26 @@ static void fused_quant_fp8_numeric(const Plugin& pl) {
     }
 }
 
-/* K-22: a quantiser row at a width, a pitch and a scale group ----------------------------------
+/* K-22: a quantiser row at a width, a pitch, a scale group and a padded launch ---------------
  *
- * A lane reads the four columns it owns in one 8-byte load when the row pointer allows it and in
- * four 2-byte loads otherwise (r4d_ld_half4), and quant_act_fp8's launcher spreads a row's groups
- * over blocks (blockIdx.y) instead of running them a wave in turn. Neither may move a byte, so
- * every case runs the row through the fused kernel and through the unfused chain it replaces, on
- * the same input, and compares the bf16 output, the codes and the scales byte for byte; the row is
- * then quantised once more at the pitch, against the contiguous quantisation of the same values.
+ * quant_act_fp8's launcher pads the row count with r4d_cliff_rows, so that a launch whose
+ * wavefront count lands on a multiple of the card's 2048 (r4d_common.h) carries a few extra rows
+ * that the kernel returns from at once. That may not move a byte, so every case runs the row
+ * through the fused kernel and through the unfused chain it replaces, on the same input, and
+ * compares the bf16 output, the codes and the scales byte for byte; the row is then quantised
+ * once more at the pitch, against the contiguous quantisation of the same values.
  *
  * The shapes are the ones the launchers' own rules pick, not round numbers. 73 rows is past every
- * crossover of r4d_act_threads (72 for a 3072-wide row, 120 from 4096 up), so the norm's workgroup
- * is the 256-lane one that folds the sum of squares itself and stages the row for pass two; 8 rows
- * widens it to 1024, where lanes_sumsq reads the row back and the staged copy only serves pass two.
- * K 3072 is the 24-group row this plugin runs (three blocks of eight, where one block used to run
- * three groups a wave); K 3328 is 26 groups, so the last block carries two waves, and it is past
- * the 3072 halves a row may hold in LDS, which takes the re-read. `pad` widens the pitch past n:
- * at pad 2 row r starts 4 * r bytes into an 8-byte boundary, so the rows alternate between the
- * one-load and the four-load path inside one launch and both are compared. The pads themselves
- * hold 0x7f7f, a bf16 NaN pattern no arithmetic above survives, so a row read at the wrong pitch
- * cannot pass by rounding.
+ * crossover of r4d_act_threads (72 for a 3072-wide row, 120 from 4096 up), so the norm's
+ * workgroup is the 256-lane one; 8 rows widens it to 1024, where lanes_sumsq reads the row back.
+ * K 3072 is the 24-group row this plugin runs, which a block of eight waves runs three groups at
+ * a time; K 3328 is 26 groups, so its last wave carries two. A block a row is eight wavefronts,
+ * so 253 rows is the first count inside the slow window (2024 of 2048) and is launched as 257
+ * rows, four of them idle; 256 rows lands on the multiple itself and takes one idle row; 84 and
+ * 300 rows are clear of it. `pad` widens the pitch past n: at pad 2 row r starts 4 * r bytes into
+ * an 8-byte boundary, so the rows alternate between the load forms the compiler picks inside one
+ * launch, and both are compared. The pads hold 0x7f7f, a bf16 NaN pattern no arithmetic above
+ * survives, so a row read at the wrong pitch cannot pass by rounding.
  */
 static void quant_row_width_case(const RadKernelInfo* nrm, const RadKernelInfo* qz,
                                  const RadKernelInfo* fz, uint32_t code_dt, int64_t M, int64_t K,
@@ -16915,15 +16915,25 @@ static void quantizer_row_shape(const Plugin& pl) {
         return;
     }
     quant_row_width_case(nrm, qz, rq, RAD_F8E4M3, 73, 3072, 128, 0,
-                         "rmsnorm_quant_fp8 M=73 K=3072 (256-lane block, row staged)");
+                         "rmsnorm_quant_fp8 M=73 K=3072 (256-lane block)");
     quant_row_width_case(nrm, qz, rq, RAD_F8E4M3, 73, 3072, 128, 2,
                          "rmsnorm_quant_fp8 M=73 K=3072 pitch 3074");
     quant_row_width_case(nrm, qz, rq, RAD_F8E4M3, 73, 3328, 128, 0,
-                         "rmsnorm_quant_fp8 M=73 K=3328 (26 groups, row re-read)");
+                         "rmsnorm_quant_fp8 M=73 K=3328 (26 groups)");
+    quant_row_width_case(nrm, qz, rq, RAD_F8E4M3, 84, 3072, 128, 0,
+                         "rmsnorm_quant_fp8 M=84 K=3072 (three groups a wave)");
+    quant_row_width_case(nrm, qz, rq, RAD_F8E4M3, 253, 3072, 128, 0,
+                         "rmsnorm_quant_fp8 M=253 K=3072 (in the window, four idle rows)");
+    quant_row_width_case(nrm, qz, rq, RAD_F8E4M3, 300, 3072, 128, 0,
+                         "rmsnorm_quant_fp8 M=300 K=3072 (clear of the window)");
+    quant_row_width_case(nrm, qz, rq, RAD_F8E4M3, 256, 3072, 128, 2,
+                         "rmsnorm_quant_fp8 M=256 K=3072 pitch 3074 (one idle row)");
     quant_row_width_case(nrm, qz, rq, RAD_F8E4M3, 8, 3072, 128, 2,
                          "rmsnorm_quant_fp8 M=8 K=3072 pitch 3074 (1024-lane block)");
     quant_row_width_case(nrm, qh, rh, RAD_I8, 73, 3072, 128, 2,
                          "rmsnorm_had_quant_i8g M=73 K=3072 pitch 3074");
+    quant_row_width_case(nrm, qh, rh, RAD_I8, 253, 3072, 128, 0,
+                         "rmsnorm_had_quant_i8g M=253 K=3072 (in the window, four idle rows)");
     quant_row_width_case(nrm, qh, rh, RAD_I8, 8, 3072, 256, 0,
                          "rmsnorm_had_quant_i8g M=8 K=3072 group 256");
     /* The gate rows read two sources a lane, so they have two pointers to test; both are pitched
