@@ -7748,6 +7748,240 @@ static void iqr_gemm_case(const Plugin& pl, const IqrCase& f, int64_t M, int64_t
     dfree_all();
 }
 
+/* gemm_iqr_dual against the two gemm_iqr_nt_m64 launches it replaces, byte for byte: one launch over
+ * two weights of one form, one K and one activation's codes, their two widths its own (K-02's q_nope
+ * at N and q_rope at N2). The second weight is a plane of its own, drawn differently and wider or
+ * narrower than the first, so a part reading its neighbour's weight, scales, output or row pitch
+ * shows as a differing byte. The height is the GEMV's -- the row serves that band and a wider pass
+ * keeps both launches, which `refuse` checks. */
+static void iqr_dual_case(const Plugin& pl, const IqrCase& f, int64_t M, int64_t N, int64_t N2,
+                          int64_t K, bool refuse = false) {
+    if (!sel("gemm_iqr_dual")) return;
+    static const char* kKind[] = { "", "signed", "zero", "table", "grid", "trellis", "trellis-mad" };
+    const bool tr = f.kind == 5 || f.kind == 6;   /* 6: the computed trellis (tcq_code=mad) */
+    char nm[220];
+    std::snprintf(nm, sizeof nm, "gemm_iqr_dual %s B=%d%s%s%s M=%lld N=%lld N2=%lld K=%lld%s",
+                  kKind[f.kind], f.B, tr ? (" L=" + std::to_string(f.L)).c_str() : "",
+                  f.rb > 1 ? (" rb=" + std::to_string(f.rb)).c_str() : "",
+                  f.rowf ? " row-f32" : f.two ? " e4m3" : "", (long long)M, (long long)N,
+                  (long long)N2, (long long)K, refuse ? " (above the band, refused)" : "");
+    const RadKernelInfo* rd = find(pl, "gemm_iqr_dual");
+    const RadKernelInfo* r1 = find(pl, "gemm_iqr_nt_m64");
+    if (!rd || !r1 || !rd->layout || !rd->relayout || !r1->layout || !r1->relayout) {
+        ok(nm, false, "rows or hooks absent");
+        return;
+    }
+    const int64_t nkb = K / 128;
+    static const uint32_t kU[] = { 0, RAD_U1, RAD_U2, RAD_U3, RAD_U4, RAD_U5, RAD_U6, RAD_U7,
+                                   RAD_U8, RAD_U9, RAD_U10, RAD_U11, RAD_U12 };
+    /* The pair's two weights: one encoding, two draws, and each its own N. The op carries both Ns
+     * (N and N2) and the second weight's operands are 5 and 6, so its layout goes through the row's
+     * hook, which reads N2 where the first weight's N is. */
+    Planes p[2];
+    std::vector<uint8_t> wq[2], wsc[2];
+    RadLayout lw[2], ls[2];
+    const std::vector<RadParam> lp = { PI("N", N), PI("N2", N2), PI("K", K), PI("group", 128),
+                                       PS("dtype", f.rot ? "i8a8h" : "i8a8") };
+    for (int q = 0; q < 2; ++q) {
+        const int64_t Nq = q ? N2 : N;
+        uint64_t z = 0x9E3779B97F4A7C15ull *
+                     (uint64_t)(f.kind * 131 + f.B * 17 + f.L + f.rb + M + 65537 * (q + 1));
+        auto rnd = [&]() {
+            z += 0x9E3779B97F4A7C15ull;
+            uint64_t x = z;
+            x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+            x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+            return x ^ (x >> 31);
+        };
+        Planes& pp = p[q];
+        if (tr) {
+            rad_enc_clear(&pp.enc);
+            rad_enc_copy_str(pp.enc.scheme, "trellis");
+            rad_enc_add_plane(&pp.enc, "codes", kU[f.B], 1, 1);
+            if (f.rowf) rad_enc_add_plane(&pp.enc, "scale", RAD_F32, 1, 0);
+            else rad_enc_add_plane(&pp.enc, "scale", f.two ? RAD_F8E4M3 : RAD_BF16, 1, 128);
+            if (f.two && !f.rowf) rad_enc_add_plane(&pp.enc, "scale.1", RAD_F32, 0, 0);
+            const int t = rad_enc_add_table(&pp.enc, "trellis", RAD_I8, (int64_t)1 << f.L, 1);
+            pp.enc.plane[t].block[0] = 256;
+            pp.enc.plane[t].block[1] = f.rb > 1 ? f.rb : 0;
+            if (f.kind == 6) rad_enc_add_table(&pp.enc, "trellis.mad", RAD_U32, 2, 1);
+            if (f.rowf) rad_enc_add_plane(&pp.enc, "scale.col", RAD_F32, 0, 128);
+        } else {
+            pp.enc = rad_enc_affine(kU[f.B], RAD_BF16, 1, 128);
+            if (f.kind == 4) {
+                pp.enc.plane[0].block[1] = f.V;
+                rad_enc_add_table(&pp.enc, "grid", RAD_I8, (int64_t)1 << f.B, f.V);
+            } else if (f.kind == 3) {
+                rad_enc_add_table(&pp.enc, "table", RAD_I8, 1, (int64_t)1 << f.B);
+            } else if (f.kind == 2) {
+                rad_enc_add_plane(&pp.enc, "zero", RAD_U6, 1, 128);
+            }
+        }
+        if (f.rot) rad_enc_copy_str(pp.enc.transform, "fwht128");
+        pp.size(Nq, K);
+        const int ic = pp.find("codes"), is = pp.find("scale"), is2 = pp.find("scale.1");
+        const int ia = tr ? pp.find("trellis") : f.kind == 4 ? pp.find("grid")
+                      : f.kind == 3 ? pp.find("table") : f.kind == 2 ? pp.find("zero") : -1;
+        const int64_t cols = f.kind == 4 ? K / f.V : K;
+        for (int64_t n = 0; n < Nq; ++n)
+            for (int64_t c = 0; c < cols; ++c)
+                rad_store_bits(pp.data[(size_t)ic].data() + n * pp.row_bytes(ic), f.B, c,
+                               (uint32_t)(rnd() & ((1ull << f.B) - 1)));
+        if (f.kind == 2)
+            for (int64_t n = 0; n < Nq; ++n)
+                for (int64_t g = 0; g < nkb; ++g)
+                    rad_store_bits(pp.data[(size_t)ia].data() + n * pp.row_bytes(ia), 6, g,
+                                   (uint32_t)(24 + rnd() % 17));
+        else if (ia >= 0)
+            for (auto& v : pp.data[(size_t)ia]) v = (uint8_t)(int8_t)((int)(rnd() % 255) - 127);
+        if (f.kind == 6) {
+            const uint32_t A = (uint32_t)(rnd() & 0xFFFFFFu) | 1u, Bc = (uint32_t)rnd();
+            uint32_t* ab = (uint32_t*)pp.data[(size_t)pp.find("trellis.mad")].data();
+            ab[0] = A;
+            ab[1] = Bc;
+            for (uint32_t st = 0; st < (1u << f.L); ++st) {
+                const uint32_t h = ((st & 0xFFFFFFu) * A + Bc) & 0x3F3F3F3Fu;
+                pp.data[(size_t)ia][st] = (uint8_t)(int8_t)((int)((h & 0xFFu) + ((h >> 8) & 0xFFu) +
+                                                                 ((h >> 16) & 0xFFu) + (h >> 24)) - 126);
+            }
+        }
+        std::vector<float> rsv((size_t)Nq), cfv((size_t)nkb);
+        for (int64_t n = 0; n < Nq; ++n)
+            rsv[(size_t)n] = std::ldexp(1.0f + (float)(rnd() % 64) / 64.0f, -9 - (int)(rnd() % 4));
+        for (int64_t g = 0; g < nkb; ++g) cfv[(size_t)g] = std::ldexp(1.0f, (int)(rnd() % 4) - 1);
+        if (f.rowf) {
+            for (int64_t n = 0; n < Nq; ++n) ((float*)pp.data[(size_t)is].data())[n] = rsv[(size_t)n];
+            float* cfp = (float*)pp.data[(size_t)pp.find("scale.col")].data();
+            for (int64_t g = 0; g < nkb; ++g) cfp[g] = cfv[(size_t)g];
+        } else {
+            for (int64_t n = 0; n < Nq; ++n)
+                for (int64_t g = 0; g < nkb; ++g) {
+                    if (f.two) pp.data[(size_t)is][(size_t)(n * nkb + g)] = (uint8_t)(0x30 + rnd() % 0x28);
+                    else rad_store_f32(pp.data[(size_t)is].data(), RAD_BF16, n * nkb + g,
+                                       rsv[(size_t)n]);
+                }
+            if (f.two) rad_store_f32(pp.data[(size_t)is2].data(), RAD_F32, 0, 0.0123f);
+        }
+        /* The pair's weight operands: the first weight at 2 and 3, the second at 5 and 6. */
+        const int oq = q ? 5 : 2, os = q ? 6 : 3;
+        const char* aux_role = tr ? "trellis" : f.kind == 4 ? "grid" : f.kind == 3 ? "table" : "zero";
+        const int rw = f.kind == 6 ? stored(rd, lp, oq, pp, { "codes", aux_role, "trellis.mad" }, &wq[q], &lw[q])
+                     : f.kind == 1 ? stored(rd, lp, oq, pp, { "codes" }, &wq[q], &lw[q])
+                     : stored(rd, lp, oq, pp, { "codes", aux_role }, &wq[q], &lw[q]);
+        const int rs = f.rowf ? stored(rd, lp, os, pp, { "scale", "scale.col" }, &wsc[q], &ls[q])
+                     : f.two ? stored(rd, lp, os, pp, { "scale", "scale.1" }, &wsc[q], &ls[q])
+                     : stored(rd, lp, os, pp, { "scale" }, &wsc[q], &ls[q]);
+        if (rw != RAD_OK || rs != RAD_OK) {
+            ok(nm, false, "relayout rc " + std::to_string(rw) + "/" + std::to_string(rs));
+            dfree_all();
+            return;
+        }
+    }
+
+    std::vector<int8_t> ha((size_t)(M * K));
+    std::vector<float> has((size_t)(M * nkb));
+    uint64_t za = 0x2545F4914F6CDD1Dull * (uint64_t)(M * 31 + N + N2 + K);
+    auto rnda = [&]() {
+        za += 0x9E3779B97F4A7C15ull;
+        uint64_t x = za;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+        return x ^ (x >> 31);
+    };
+    for (auto& v : ha) v = (int8_t)((int)(rnda() % 255) - 127);
+    for (auto& v : has) v = std::ldexp(1.0f + (float)(rnda() % 256) / 256.0f, -7);
+    const size_t n1 = (size_t)(M * N), n2 = (size_t)(M * N2);
+    void* d_a = dalloc(ha.size());
+    void* d_as = dalloc(has.size() * 4);
+    void* d_w[2] = { dalloc(wq[0].size()), dalloc(wq[1].size()) };
+    void* d_s[2] = { dalloc(wsc[0].size()), dalloc(wsc[1].size()) };
+    void* d_y = dalloc(n1 * 2);     /* the pair launch's two outputs */
+    void* d_y2 = dalloc(n2 * 2);
+    void* d_r[2] = { dalloc(n1 * 2), dalloc(n2 * 2) };   /* the two launches */
+    if (!d_a || !d_as || !d_w[0] || !d_w[1] || !d_s[0] || !d_s[1] || !d_y || !d_y2 || !d_r[0] ||
+        !d_r[1]) {
+        ok(nm, false, "hipMalloc failed");
+        dfree_all();
+        return;
+    }
+    st_memcpy(d_a, ha.data(), ha.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_as, has.data(), has.size() * 4, hipMemcpyHostToDevice);
+    for (int q = 0; q < 2; ++q) {
+        st_memcpy(d_w[q], wq[q].data(), wq[q].size(), hipMemcpyHostToDevice);
+        st_memcpy(d_s[q], wsc[q].data(), wsc[q].size(), hipMemcpyHostToDevice);
+    }
+    auto launch = [&](const RadKernelInfo* k, std::vector<RadTensor> ts, std::vector<RadParam> ps) {
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        if (k->scratch) {
+            const int64_t need = k->scratch(&a);
+            if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+        }
+        const int rc = k->launch(&a, (RadStream) nullptr);
+        return rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess ? RAD_OK : (rc ? rc : -1);
+    };
+    std::vector<RadParam> gp = { PI("M", M), PI("N", N), PI("N2", N2), PI("K", K), PI("group", 128),
+                                 PS("dtype", f.rot ? "i8a8h" : "i8a8") };
+    /* The pair: a, a_scale, b, b_scale, y, b2, b2_scale, y2. */
+    std::vector<RadTensor> tq = { T(d_a, RAD_I8, { M, K }), T(d_as, RAD_F32, { M, nkb }),
+                                  T(d_w[0], lw[0].dtype, { N, K }), T(d_s[0], ls[0].dtype, { N, nkb }),
+                                  T(d_y, RAD_BF16, { M, N }),
+                                  T(d_w[1], lw[1].dtype, { N2, K }), T(d_s[1], ls[1].dtype, { N2, nkb }),
+                                  T(d_y2, RAD_BF16, { M, N2 }) };
+    int rq = launch(rd, tq, gp);
+    if (refuse) {
+        /* Above the GEMV's band the row refuses and both launches keep the work: nothing may run. */
+        ok(nm, rq != RAD_OK, rq == RAD_OK ? "the row launched above its band" : "");
+        dfree_all();
+        return;
+    }
+    int rr[2] = { RAD_OK, RAD_OK };
+    for (int q = 0; q < 2 && rq == RAD_OK; ++q) {
+        const int64_t Nq = q ? N2 : N;
+        std::vector<RadParam> gq = { PI("M", M), PI("N", Nq), PI("K", K), PI("group", 128),
+                                     PS("dtype", f.rot ? "i8a8h" : "i8a8") };
+        std::vector<RadTensor> t2 = { T(d_a, RAD_I8, { M, K }), T(d_as, RAD_F32, { M, nkb }),
+                                      T(d_w[q], lw[q].dtype, { Nq, K }), T(d_s[q], ls[q].dtype, { Nq, nkb }),
+                                      T(d_r[q], RAD_BF16, { M, Nq }), T(nullptr, RAD_F32, { 1 }),
+                                      T(nullptr, RAD_U8, { 1 }) };
+        absent(t2[5]);
+        absent(t2[6]);
+        rr[q] = launch(r1, t2, gq);
+    }
+    if (rq != RAD_OK || rr[0] != RAD_OK || rr[1] != RAD_OK) {
+        ok(nm, false, "rc " + std::to_string(rq) + " (two launches " + std::to_string(rr[0]) + "/" +
+                          std::to_string(rr[1]) + ")");
+        dfree_all();
+        return;
+    }
+    std::vector<uint16_t> y1(n1), y2(n2), r_1(n1), r_2(n2);
+    st_memcpy(y1.data(), d_y, n1 * 2, hipMemcpyDeviceToHost);
+    st_memcpy(y2.data(), d_y2, n2 * 2, hipMemcpyDeviceToHost);
+    st_memcpy(r_1.data(), d_r[0], n1 * 2, hipMemcpyDeviceToHost);
+    st_memcpy(r_2.data(), d_r[1], n2 * 2, hipMemcpyDeviceToHost);
+    int64_t bad[2] = { 0, 0 }, first[2] = { -1, -1 };
+    for (size_t i = 0; i < n1; ++i)
+        if (y1[i] != r_1[i]) { if (first[0] < 0) first[0] = (int64_t)i; ++bad[0]; }
+    for (size_t i = 0; i < n2; ++i)
+        if (y2[i] != r_2[i]) { if (first[1] < 0) first[1] = (int64_t)i; ++bad[1]; }
+    /* The two products are their own: a part writing its neighbour's output would pass the two
+     * comparisons above only if the weights drew the same bytes, which they do not. */
+    bool apart = false;
+    for (size_t i = 0; i < n1 && i < n2 && !apart; ++i) apart = y1[i] != y2[i];
+    ok(nm, bad[0] == 0 && bad[1] == 0 && apart,
+       (bad[0] || bad[1]) ? (std::to_string(bad[0]) + " of " + std::to_string(n1) +
+                             " first output bytes differ, " + std::to_string(bad[1]) + " of " +
+                             std::to_string(n2) + " second, first [" + std::to_string(first[0]) +
+                             "] " + std::to_string(h_bf16(y1[(size_t)(first[0] < 0 ? 0 : first[0])])) + " vs " +
+                             std::to_string(h_bf16(r_1[(size_t)(first[0] < 0 ? 0 : first[0])])))
+                         : apart ? "the two launches' bytes, both products"
+                                 : "the two products are one, so the comparison proves nothing");
+    dfree_all();
+}
+
 /* moe_gemm_iqr against the dense IQR GEMM over the same expert buffers. Every expert is an IQR
  * weight (the computed trellis under one f32 scale a row, `run` rows a trellis run), in two classes
  * of their own rows and K; the routing is random with `drop` trailing dropped slots. The grouped
@@ -37398,6 +37632,34 @@ static void device_phase(const Plugin& pl) {
                 iqr_gemm_case(pl, f, 17, 512, 1024);
                 iqr_gemm_case(pl, f, 64, 512, 2560);
                 iqr_gemm_case(pl, f, 300, 512, 1024);
+            }
+            /* K-02's shapes first, at the GEMV the pair serves: a sliding layer's q_nope 6144 and
+             * q_rope 2048 at TP2 (four waves a tile for one part, eight for the other: the mix the
+             * launch exists for) and a sparse layer's 3072 and 1024 (eight for both), both u5
+             * trellis, K 3072. Then the pair unsharded, 12288 and 4096 (the container's sliding
+             * layers, four times the TP2 pair), where both parts take four waves a tile and so two
+             * 16-row tiles a block -- the one pairing of the two wave counts the shapes above do
+             * not reach -- at the q_b site's own K 1024. Then other forms and the trellis under a
+             * per-row f32 scale, and the band's edge: the model's form takes one row, so a second is
+             * refused and both launches keep the work. */
+            const IqrCase fd[] = {
+                /* the model's own pair: u5, tcq_code=mad, one f32 scale a row -- the form whose
+                 * GEMV serves one row, which is the band the row is declared at */
+                { 6, 5, 1, 16, 1, false, true, true },
+                { 5, 5, 0, 12, 1, true, true },
+                /* zero is built on 6-bit codes only (R4D_IQR_FORMS), whatever the base row's list */
+                { 2, 6, 0, 0, 1, false, true }, { 5, 4, 0, 12, 1, true, true },
+                { 6, 4, 0, 16, 1, true, true }, { 6, 4, 0, 16, 1, false, true, true },
+            };
+            iqr_dual_case(pl, fd[0], 1, 6144, 2048, 3072);
+            iqr_dual_case(pl, fd[0], 1, 12288, 4096, 1024);   /* both parts four waves a tile */
+            iqr_dual_case(pl, fd[0], 1, 3072, 1024, 1536);
+            iqr_dual_case(pl, fd[1], 1, 6144, 2048, 3072);
+            iqr_dual_case(pl, fd[1], 1, 2048, 6144, 3072);   /* the roles the other way round */
+            iqr_dual_case(pl, fd[0], 2, 6144, 2048, 3072, /* refuse */ true);
+            for (size_t i = 2; i < sizeof fd / sizeof fd[0]; ++i) {
+                iqr_dual_case(pl, fd[i], 1, 3072, 1024, 1024);
+                iqr_dual_case(pl, fd[i], 1, 1024, 3072, 1024);
             }
         }
         /* The bias GEMM: three shapes on the 128 x 128 kernel (ragged N with an unaligned pitch;
