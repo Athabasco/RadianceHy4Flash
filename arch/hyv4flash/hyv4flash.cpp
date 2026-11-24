@@ -1348,6 +1348,20 @@ static void step(RadCtx* c, const RadBatch* batch) {
     const int64_t lo = std::min<int64_t>(std::max<int64_t>(batch->layer_lo, 0), last);
     const int64_t hi = batch->layer_hi > 0 ? std::min<int64_t>(batch->layer_hi, last) : last;
     const bool sliced = lo > 0 || hi < last;
+    /* A sliced batch needs the graph declared sliced (RadBuildCtx::layer_slices > 0, m.sliced): the
+     * state a sub-step hands to the next is declared persistent there, while an unsliced declare
+     * makes it transient, and the engine resets a step's transients before the next sub-step — the
+     * resumption would read memory nobody kept. Engine::build_ctx and the scheduler read one
+     * predicate (declared_layer_slices), so this is a backstop, not a state the engine reaches. */
+    if (sliced && !m.sliced) {
+        char why[256];
+        snprintf(why, sizeof why,
+                 "hyv4flash: a layer-sliced step (layers %lld..%lld of %lld) needs the graph "
+                 "declared sliced (RadBuildCtx::layer_slices), and this build asked for none",
+                 (long long)lo, (long long)hi, (long long)last);
+        rad_step_fail(c, why);
+        return;
+    }
     RadBatch dec{};
     if (sliced) {
         dec = *batch;

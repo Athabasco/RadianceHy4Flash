@@ -128,11 +128,13 @@ struct Declared {
     RadBuildCtx ctx = build_ctx();
     int rc = 0;
     explicit Declared(void (*encs)(RadBuilder*) = bf16_encs, int world = 1, int rank = 0,
-                      bool wide = false, int64_t ff_exp = 128, int layer_slices = 0)
+                      bool wide = false, int64_t ff_exp = 128, int layer_slices = 0,
+                      int64_t max_tok = 0)
         : mk(mini_meta(wide, ff_exp)) {
         encs(&b);
         ctx = build_ctx(rank, world);
         ctx.layer_slices = layer_slices;
+        if (max_tok > 0) ctx.max_tok = max_tok;
         G3Env g3env;
         std::string err;
         err = stderr_of([&] { rc = hyv4flash::declare(&b, mk.meta(), &ctx); });
@@ -439,6 +441,154 @@ TEST(the_decode_band_runs_every_layer_of_a_sub_step) {
         REQUIRE(h != nullptr);
         CHECK_EQ(h->n, want_out[j]);
     }
+}
+
+/* S-02b / design §8.2: the sub-steps of a sliced chunk issue, one after the other, exactly what the
+ * whole chunk issues in one step — the same op, over the same rows, the same offsets and the same
+ * strides, over the same operands (the chunk's buffers and KV groups, the batch's own arrays) — so
+ * the KV the store ops write and the hidden state the trunk leaves behind are the same bytes by
+ * construction, not by tolerance. That is the card-less half of §8.2; the served half (the greedy
+ * text and the per-token log-probabilities of the two arms, and the chunk's dumps compared byte for
+ * byte) is scripts/backlog/s02_slice.py, which needs a card. */
+TEST(the_sub_steps_issue_what_the_whole_chunk_issues)
+{
+    Declared d(bf16_encs, 1, 0, false, 128, 4);   /* a graph the engine asked to slice */
+    REQUIRE_EQ(d.rc, RAD_OK);
+    RadBuilder& b = d.b;
+    const int32_t n = (int32_t)hyv4flash::models[0]->layers.size();
+    REQUIRE_EQ(n, 3);
+    /* One step's issue list, as the rows it covers: the op, the rows and lane, then every operand
+     * as its kind, handle, row/column slice and raw pointer. The raw pointers are the batch's own
+     * arrays, which the kit gives each run at a different address; the signature uses the same kit
+     * for every run so that a raw operand compares as the same field of the same batch. */
+    auto signature = [](const RadBuilder& b, const RadCtx& c) {
+        std::vector<std::string> out;
+        for (const RecIssue& is : c.issues) {
+            const RecOp* o = b.op_of(is.op);
+            std::string s = (o ? o->op : std::string("op-") + std::to_string(is.op)) +
+                            " n=" + std::to_string(is.n) + " lane=" + std::to_string(is.lane);
+            for (const RadOperand& a : is.opd) {
+                char one[128];
+                snprintf(one, sizeof one, " [%u h%u o%lld r%lld c%lld p%p]", (unsigned)a.kind,
+                         a.handle, (long long)a.offset, (long long)a.rows, (long long)a.cols,
+                         (void*)a.raw);
+                s += one;
+            }
+            out.push_back(std::move(s));
+        }
+        return out;
+    };
+    const int64_t T = 10;
+    /* The chunk's rows through the whole trunk, then the same chunk through one layer range a
+     * step; one batch for every run, so a batch array an op reads is the same operand in both
+     * lists, and the chunk's out rows are restored for the sub-step that reaches the head. */
+    auto k = kit(b, {}, { (int)T });
+    const int64_t out_n = k->b.n_out;
+    const int32_t* out_ids = k->b.out_ids;
+    auto run = [&](Kit& kit_use, int32_t lo, int32_t hi) {
+        kit_use.b.layer_lo = lo;
+        kit_use.b.layer_hi = hi;   /* 0 is the whole trunk */
+        /* A sub-step that does not reach the last layer finishes no sequence: no logits. */
+        const bool end = hi == 0 || hi == n;
+        kit_use.b.n_out = end ? out_n : 0;
+        kit_use.b.out_ids = end ? out_ids : nullptr;
+        RadCtx c{ .b = &b, .batch = &kit_use.b };
+        hyv4flash::step(&c, &kit_use.b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(b, &c);
+        std::vector<std::string> list = signature(b, c);
+        /* The one op a sub-step adds: the step setup that rebases the chunk's sequence bounds into
+         * cu_prefill (op_rebase). It runs at the head of every step, writes the same bytes from the
+         * same inputs, and touches no chunk state; both arms' lists drop it, so the rest of a
+         * sub-step's ops compare with the whole step's one for one. */
+        std::vector<std::string> kept;
+        for (std::string& s : list)
+            if (s.rfind("sub_i32 ", 0) != 0) kept.push_back(std::move(s));
+        return kept;
+    };
+    /* The chunk's rows through the whole trunk, then the same chunk through one layer range a
+     * step; one batch, so the two lists can be compared as they stand. */
+    const std::vector<std::string> whole = run(*k, 0, 0);
+    std::vector<std::string> sliced;
+    for (int32_t j = 0; j < n; ++j)
+        for (std::string& s : run(*k, j, j + 1)) sliced.push_back(std::move(s));
+    CHECK(!whole.empty());
+    REQUIRE_EQ(sliced.size(), whole.size());
+    for (size_t i = 0; i < whole.size(); ++i) {
+        if (sliced[i] == whole[i]) continue;
+        fprintf(stderr, "    issue %zu differs:\n      whole  %s\n      sliced %s\n", i,
+                whole[i].c_str(), sliced[i].c_str());
+        CHECK_EQ(sliced[i], whole[i]);
+        break;
+    }
+}
+
+/* S-02b: a sliced batch on an unsliced declare is refused, not run. The engine asks for the
+ * declare from the same predicate the scheduler plans the slice from, so this is a backstop; without
+ * it a mis-planned slice would resume transient memory the next engine step resets and the run
+ * would be silently wrong (design §3, §8.2). */
+TEST(a_sliced_batch_on_an_unsliced_declare_is_refused) {
+    Declared d(bf16_encs, 1, 0, false, 128, /*layer_slices=*/0);
+    REQUIRE_EQ(d.rc, RAD_OK);
+    auto k = kit(d.b, {}, { 8 });
+    k->b.layer_lo = 1;
+    k->b.layer_hi = 2;
+    RadCtx c{ .b = &d.b, .batch = &k->b };
+    hyv4flash::step(&c, &k->b);
+    CHECK(c.issues.empty());
+    CHECK(!c.step_fail.empty());
+    CHECK(c.step_fail.find("layer_slices") != std::string::npos);
+    /* The whole trunk on the same declare is served: only the slice is the refused shape. */
+    k->b.layer_lo = 0;
+    k->b.layer_hi = 0;
+    RadCtx w{ .b = &d.b, .batch = &k->b };
+    hyv4flash::step(&w, &k->b);
+    CHECK(w.step_fail.empty());
+    CHECK(!w.issues.empty());
+}
+
+/* S-02b: a sliced sub-step never takes the pipelined prefill (design §2.3, §7). The pipeline
+ * runs a junction's two pieces beside the other piece's arms on the second lane, and both pieces
+ * are the same layer range; a sub-step's next rows are its next layer range, on the next step. So
+ * the gate is `!sliced`, and it only shows where the pipeline lives (world > 1): the same 2048-row
+ * chunk (two pieces over the 1024-row band floor) issues on lane 1 whole and not sliced. */
+TEST(a_sliced_sub_step_never_takes_the_pipelined_prefill) {
+    setenv("RADIANCE_HY4_PIPE", "1", 1);
+    Declared d(bf16_encs, /*world=*/2, /*rank=*/0, /*wide=*/false, /*ff_exp=*/128,
+               /*layer_slices=*/4, /*max_tok=*/4096);
+    REQUIRE_EQ(d.rc, RAD_OK);
+    RadBuilder& b = d.b;
+    const int64_t last = (int64_t)hyv4flash::models[0]->layers.size();
+    const int64_t T = 2048;   /* two 1024-row pieces */
+    struct Run { int lane1 = 0; size_t joins = 0; int64_t head = 0; };
+    auto run = [&](int64_t hi) {
+        auto k = kit(b, {}, { (int)T });
+        k->b.layer_lo = 0;
+        k->b.layer_hi = (int32_t)hi;   /* 0 is the whole trunk */
+        RadCtx c{ .b = &b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        CHECK_LINT(b, &c);
+        Run r;
+        r.joins = c.joins.size();
+        for (const auto& is : c.issues) r.lane1 += is.lane == 1;
+        for (const auto& is : c.issues) {
+            const RecOp* o = b.op_of(is.op);
+            if (!o) continue;
+            for (rad_buf w : o->writes)
+                if (w == hyv4flash::models[0]->final_hidden) r.head += is.n;
+        }
+        return r;
+    };
+    const Run whole = run(0);
+    CHECK(whole.lane1 > 0);
+    CHECK(whole.joins > 0);
+    CHECK_EQ(whole.head, T);
+    const Run sliced = run(last - 1);   /* the chunk's rows stop one layer short */
+    CHECK_EQ(sliced.lane1, 0);
+    CHECK_EQ(sliced.joins, 0);
+    CHECK_EQ(sliced.head, 0);
+    unsetenv("RADIANCE_HY4_PIPE");
 }
 
 /* Every layer kind's ops, once each where the plan says so: the connections, both MLA forms on
