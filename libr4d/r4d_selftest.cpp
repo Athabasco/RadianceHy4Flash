@@ -1502,7 +1502,7 @@ static bool attn_verify_bits_case(const Plugin& pl, const char* name, int64_t gq
     for (int64_t j = 0; j < q_len; ++j)
         eq += !std::memcmp(&ver[(size_t)(j * row)], &one[(size_t)(j * row)], (size_t)row * 2);
     const bool good = rc == RAD_OK && eq == q_len;
-    while (g_allocs.size() > mark) { hipFree(g_allocs.back()); g_allocs.pop_back(); }
+    while (g_allocs.size() > mark) { (void)hipFree(g_allocs.back()); g_allocs.pop_back(); }
     if (!quiet || !good)
         ok(tag.c_str(), good, fmt("rc=%d, rows bit-equal %lld/%lld", rc, (long long)eq, (long long)q_len));
     return good;
@@ -23169,6 +23169,14 @@ static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int ite
     std::vector<float> w((size_t)N * (size_t)K);
     for (size_t i = 0; i < w.size(); ++i)
         w[i] = (float)((int)(st_mix32((uint32_t)i + 0x51ed27u) % 2001) - 1000) / 8000;
+    std::vector<uint16_t> packed;
+    if (!timed) {
+        packed.resize(w.size());
+        for (size_t i = 0; i < w.size(); ++i) {
+            packed[i] = h_to_bf16(w[i]);
+            w[i] = h_bf16(packed[i]);
+        }
+    }
     for (int c = 0; c < copies; ++c)
         st_memcpy((uint8_t*)d_w + (size_t)c * wbytes, w.data(), wbytes, hipMemcpyHostToDevice);
     std::vector<RadTensor> ts = {
@@ -23210,6 +23218,20 @@ static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int ite
     ok(fmt("gemm_nt_f32 at M=%lld N=%lld K=%lld: byte-identical to the host arithmetic",
            (long long)M, (long long)N, (long long)K).c_str(),
        same, rc != RAD_OK ? fmt("rc=%d", rc) : same ? "" : fmt("first byte %zu", first));
+    if (!timed && same) {
+        ts[1].dtype = RAD_BF16;
+        ps.push_back(PI("weight_bf16", 1));
+        a.p = ps.data();
+        a.n_p = (int)ps.size();
+        st_memcpy(d_w, packed.data(), packed.size() * sizeof(uint16_t), hipMemcpyHostToDevice);
+        st_memcpy(d_y, fill.data(), ybytes, hipMemcpyHostToDevice);
+        rc = r->launch(&a, nullptr);
+        if (rc == RAD_OK && st_stream_sync(nullptr) != hipSuccess) rc = RAD_E_DEVICE;
+        std::vector<uint8_t> packed_y(ybytes);
+        if (rc == RAD_OK) st_memcpy(packed_y.data(), d_y, ybytes, hipMemcpyDeviceToHost);
+        ok(fmt("gemm_nt_f32 stored bf16 vs widened f32 at M=%lld N=%lld K=%lld",
+               (long long)M, (long long)N, (long long)K).c_str(), rc == RAD_OK && packed_y == got);
+    }
     if (timed && rc == RAD_OK) {
         const double bytes = (double)wbytes + (double)M * K * 2 + (double)M * N * 4;
         const double flop = 2.0 * (double)M * (double)N * (double)K;
@@ -30655,7 +30677,7 @@ static void gather_two_rank(const Plugin& pl, const std::vector<int>& devs, cons
        "rc " + std::to_string(a.rc_launch) + "/" + std::to_string(b.rc_launch));
 
     /* What each rank sent, rebuilt on the host rather than read from the device. */
-    auto sent = [numel](int rank, int64_t i) -> uint32_t {
+    auto sent = [](int rank, int64_t i) -> uint32_t {
         if ((i & 1) == 0) return (uint32_t)(rank * 124160 + (int)i + 1);
         uint32_t u; const float v = (float)(rank + 1) * 0.5f + (float)(i - 1);
         std::memcpy(&u, &v, 4);
@@ -34441,13 +34463,19 @@ static void ar_ihc_junction_case(const Plugin& pl, const std::vector<int>& devs,
     if (!ar_peer_path_ok(devs, world)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
     const bool host = std::strstr(name, "_host") != nullptr;
     std::vector<IjCase> cs;
-    auto C = [&](int64_t M, int64_t n, bool add, bool ys, bool xs, bool tail, bool head) {
-        IjCase c; c.M = M; c.n = n; c.hc = 4; c.add = add; c.ys = ys; c.xs = xs; c.tail = tail; c.head = head;
+    auto C = [&](int64_t M, int64_t n, bool add, bool ys, bool xs, bool tail, bool head, int64_t hc = 4) {
+        IjCase c; c.M = M; c.n = n; c.hc = hc; c.add = add; c.ys = ys; c.xs = xs; c.tail = tail; c.head = head;
         cs.push_back(c);
     };
     C(1, 3072, false, false, false, true, false); C(1, 3072, true, true, true, true, false);
     C(6, 3072, true, false, false, true, false);  C(17, 512, false, true, false, true, true);
     C(3, 512, true, false, false, false, false);
+    /* K-13: a row is split over several blocks at decode heights (four up to six rows, two at
+     * eight), so these are the split's own bytes: the two-block count, the widest form (hc 8, so
+     * 17 sums a wave), and a narrow row whose last blocks own no words and no pieces. */
+    C(8, 3072, true, true, true, true, false);
+    C(2, 3072, false, false, false, true, false, 8);
+    C(4, 512, false, false, false, false, false, 2);
     /* 256 rows: 256 blocks of 16 waves would sit on the full-card cliff, so the launch takes 255 */
     if (world == 2) { C(192, 3072, true, false, false, true, false); C(96, 3072, false, true, true, true, false);
                       C(256, 3072, false, false, false, true, false); }
@@ -37662,12 +37690,22 @@ static void device_phase(const Plugin& pl) {
         if (sel("moe_gemm_iqr")) {
             if (!g_case) std::printf("\nthe grouped MoE GEMM over IQR experts, against the dense IQR GEMM\n");
             static const MoeIqrShape kIqr[] = {
-                /* the (tile, run) grid: a decode step's rows */
+                /* the run-tile grid: a decode step's rows */
                 { "decode gate/up", 4, 16, 128, 64, 4, 3, 768, 512, 2560, 2560, 2, false, 0 },
                 { "decode gate/up, a dropped slot", 4, 16, 128, 64, 4, 3, 768, 512, 2560, 2560, 2, false, 1 },
                 { "decode down", 4, 16, 256, 64, 4, 3, 2560, 2560, 512, 256, 1, true, 0 },
                 { "verify gate/up, runs of several rows", 4, 16, 128, 16, 4, 6, 768, 512, 2560, 2560, 2, false, 2 },
                 { "verify down", 3, 16, 256, 16, 4, 6, 2560, 2560, 512, 256, 1, true, 2 },
+                /* a c8 DFly2 verify's heights over 512 experts: the run tiles' numbering, whose
+                 * blocks are the runs' own tiles and not 16-row tiles of sorted rows */
+                { "verify gate/up, T 16", 4, 16, 128, 512, 4, 4, 512, 256, 1280, 1280, 2, false, 0 },
+                { "verify gate/up, T 128", 4, 16, 128, 512, 4, 32, 512, 256, 1280, 1280, 2, false, 1 },
+                /* a coupled draft's verify step at one row: six tokens of eight slots, where the
+                 * runs of three and more rows now take their own tile */
+                { "verify gate/up, T 48", 4, 16, 128, 512, 8, 6, 512, 256, 1280, 1280, 2, false, 0 },
+                { "verify gate/up, T 480", 4, 16, 128, 512, 4, 120, 512, 256, 1280, 1280, 2, false, 2 },
+                { "verify gate/up, T 768", 4, 16, 128, 512, 4, 192, 512, 256, 1280, 1280, 2, false, 0 },
+                { "verify down, T 768", 4, 16, 128, 512, 4, 192, 256, 128, 512, 512, 1, true, 0 },
                 /* the run map: a prefill chunk's rows */
                 { "prefill gate/up", 4, 16, 128, 32, 4, 64, 768, 512, 2560, 2560, 2, false, 0 },
                 { "prefill gate/up, dropped slots", 3, 16, 128, 32, 4, 64, 768, 512, 2560, 2560, 2, false, 37 },
@@ -37852,6 +37890,8 @@ static void device_phase(const Plugin& pl) {
             for (int64_t cols : { 4, 32, 36, 288 }) f32_forms(pl, rows, cols, 4096, 0, false);
         f32_forms(pl, 7, 31, 129, 0, false);
         f32_forms(pl, 70, 13, 130, 0, false);
+        f32_forms(pl, 1, 512, 3072, 0, false);
+        f32_forms(pl, 256, 256, 129, 0, false);
     }
     if (sel("dsa_score_fp8")) {
         dsa_score_check(pl, 1, 17);
@@ -37999,6 +38039,12 @@ static void device_phase(const Plugin& pl) {
         mla_sink_check(pl, false, 32, { 100 }, { 300 }, 0, 4, 0, 1);
         mla_sink_check(pl, false, 16, { 6, 6, 6, 6 }, { 530, 2100, 700, 4097 }, 512, 16, 0, 1);
         mla_sink_bytes(pl, 64, { 6, 6, 6, 6 }, { 530, 2100, 700, 1200 }, 512, 4, 1);
+        /* the sliding layer's shape at TP2 at the widest speculative step (8 streams x 6 = 48
+         * rows, the `stable 1` split cap) and one row past it */
+        mla_sink_bytes(pl, 32, { 6, 6, 6, 6, 6, 6, 6, 6 }, { 600, 520, 900, 3000, 512, 513, 17, 2049 },
+                       512, 4, 1);
+        mla_sink_bytes(pl, 32, { 7, 6, 6, 6, 6, 6, 6, 6 }, { 600, 520, 900, 3000, 512, 513, 17, 2049 },
+                       512, 4, 1);
         mla_sink_bytes(pl, 16, { 6, 6, 6, 6, 6, 6, 6, 6 }, { 600, 520, 900, 3000, 512, 513, 17, 2049 },
                        512, 16, 1);
         mla_sink_bytes(pl, 32, { 6, 6, 6, 6 }, { 2049, 600, 1500, 2100 }, 0, 4, 1);
@@ -38864,8 +38910,9 @@ static void usage(void) {
                 "             one card, here and in the eight-rank exact all-reduces' cases.\n"
                 "  --perfmhcpre M [iters]:  mhc_pre (whole, partials alone, finish alone) and\n"
                 "             mhc_post at GLM's shape, 16-byte rows against pitched ones.\n"
-                "  --perfrouter M [iters]:  router_sigmoid_topk at GLM's shape (288 experts, top 8),\n"
-                "             the wave-per-row select timed.\n"
+                "  --perfrouter M [iters] [ne k]:  router_sigmoid_topk, the wave-per-row select\n"
+                "             timed at GLM's shape (288 experts, top 8) unless ne and k are given\n"
+                "             (Hy4-flash's 512 experts, top 16).\n"
                 "  --perfmoefuse M [iters]:  GLM's decode fusions of the MoE block at M token\n"
                 "             rows (288 experts, top 8, TP8 widths), each against the separate\n"
                 "             launches it replaces: time of both and a byte comparison of every\n"
@@ -38954,7 +39001,7 @@ int main(int argc, char** argv) {
     const char* ar8_w = nullptr;
     long long mhc_m = 0;
     int mhc_it = 200;
-    long long rt_m = 0;
+    long long rt_m = 0, rt_ne = 288, rt_k = 8;
     int rt_it = 200;
     long long mf_m = 0;
     int mf_it = 200;
@@ -39171,6 +39218,10 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { usage(); return 2; }
             rt_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) rt_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 2 < argc && argv[i + 1][0] != 0x2d && argv[i + 2][0] != 0x2d) {
+                rt_ne = std::strtoll(argv[++i], nullptr, 0);
+                rt_k = std::strtoll(argv[++i], nullptr, 0);
+            }
         } else if (!std::strcmp(argv[i], "--perfmoefuse")) {
             if (i + 1 >= argc) { usage(); return 2; }
             mf_m = std::strtoll(argv[++i], nullptr, 0);
@@ -39436,7 +39487,7 @@ int main(int argc, char** argv) {
     if (rt_m) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
-        router_select(pl, rt_m, 288, 8, 1, false, rt_it);
+        router_select(pl, rt_m, rt_ne, rt_k, 1, false, rt_it);
         dfree_all();
 #else
         skip("router timing", "built without HIP");

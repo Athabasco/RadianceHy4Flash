@@ -897,7 +897,7 @@ int  r4d_ar_rmsnorm_had_quant_i8g(long peer_scratch, long my_scratch, long peer_
 /* ar_rmsnorm_ihc_junction's launches (r4d_ar_ihc_junction.hip): `j` points at the checked operands
  * (r4d_ihc.h's R4dIhcJunction, from r4d_ihc_junction_args). 0 or a negative code. */
 int  r4d_ar_ihc_junction_2rank(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
-                               long seq_ctrs, long slot_stride16, const void* j, long stream,
+                               long seq_ctrs, long slot_stride16, long jparts, const void* j, long stream,
                                int nblocks, int drain, int acq, long stage, int chain, int coded);
 int  r4d_ar_ihc_junction_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                long peer_flags0, long peer_flags1, long peer_flags2,

@@ -76,6 +76,8 @@ void bf16_encs(RadBuilder* b) {
     b->encs.clear();
     b->encs.push_back({ "ffn_gate_up_exps", rad_enc_plain(RAD_BF16) });
     b->encs.push_back({ "ffn_down_exps", rad_enc_plain(RAD_BF16) });
+    b->encs.push_back({ "blk.1.glm_router.weight", rad_enc_plain(RAD_BF16) });
+    b->encs.push_back({ "blk.2.glm_router.weight", rad_enc_plain(RAD_F32) });
     b->kv_block_by_consumer = true;
 }
 
@@ -185,6 +187,16 @@ TEST(the_replicated_kv_groups_and_the_chain_request) {
     CHECK_EQ(p.chain_pays, (int)RAD_CHAIN_ALWAYS);
 }
 
+/* S-02: the plugin reports whether its step's trunk can be stopped between two layers and resumed
+ * from a persistent set. This step still runs the whole trunk and declares no persistent set, so a
+ * --chunk-slices request must not slice a chunk on it: the report is 0, and the core keeps m = 1.
+ * S-02b declares the set and reports 1 here when the trunk can stop between two layers. */
+TEST(the_probe_reports_no_resumable_layer_range_on_the_trunk_step) {
+    RadArchProbe p{};
+    CHECK_OK(hyv4flash::probe(mini_meta().meta(), &p));
+    CHECK_EQ(p.slice_layers_ok, 0);
+}
+
 /* Every layer kind's ops, once each where the plan says so: the connections, both MLA forms on
  * both layer kinds (the sparse ones with the selection form), the indexer on the sparse layers, the
  * dense MLP and the latent MoE, the Engram in front of layer 1, the head. */
@@ -267,11 +279,13 @@ TEST(the_mini_graph_declares_every_layer_kind) {
     CHECK_EQ(eg->d.dtype, RAD_I32);
 
     /* The weights the graph reads under the names it declares them (PLAN D10: the router is
-     * GlmRouter's). kv_b is plain bf16, the router f32. */
+     * GlmRouter's). Both its projection and kv_b are stored bf16. */
     CHECK(find_w(b, "blk.1.glm_router.weight") != nullptr);
     CHECK(find_w(b, "blk.1.glm_router.correction") != nullptr);
     CHECK(find_w(b, "blk.1.ffn_gate_inp.weight") == nullptr);
-    CHECK_EQ(find_w(b, "blk.1.glm_router.weight")->d.dtype, RAD_F32);
+    CHECK_EQ(find_w(b, "blk.1.glm_router.weight")->d.dtype, RAD_BF16);
+    CHECK_EQ(find_w(b, "blk.2.glm_router.weight")->d.dtype, RAD_F32);
+    CHECK_EQ(find_w(b, "blk.1.glm_router.correction")->d.dtype, RAD_F32);
     CHECK_EQ(find_w(b, "blk.0.attn_kv_b.weight")->d.dtype, RAD_BF16);
     CHECK(find_w(b, "blk.0.attn_q_nope.weight") != nullptr);
     CHECK(find_w(b, "blk.0.attn_q_rope.weight") != nullptr);
@@ -412,6 +426,207 @@ TEST(the_ahead_ids_are_hashed_only_for_a_host_gather) {
     run(false, "1");            /* the A/B arm: hashed for a device gather too */
     run(true, "0");             /* never hashed */
     unsetenv("RADIANCE_HY4_ENGRAM_AHEAD");
+TEST(last_layer_keeps_cache_writers_at_chunk_height_and_queries_at_output_height) {
+    RadBuilder b;
+    bf16_encs(&b);
+    b.encs.push_back({ "attn_q_a.", enc_i8(true) });
+    b.encs.push_back({ "attn_kv_a.", enc_i8(true) });
+    auto mk = mini_meta();
+    mk.set("kv_lora_rank", "56");  /* kv_a's 64 output channels admit an int8 weight */
+    auto ctx = build_ctx();
+    G3Env env;
+    REQUIRE_EQ(hyv4flash::declare(&b, mk.meta(), &ctx), RAD_OK);
+    const auto& last = hyv4flash::models[0]->layers.back();
+    REQUIRE(last.attn.kv_a.fed);
+    REQUIRE(last.attn.q_a.op_q);
+    for (int outputs : {0, 1}) {
+        auto k = kit(b, {}, {12}, 10);
+        k->b.positions_h = k->pos.data();
+        k->b.n_out = outputs;
+        int32_t tail[] = {outputs, 0, 0, outputs, 0, outputs, 11, 21};
+        k->b.prefill_tail_h = tail;
+        RadCtx c{ .b = &b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK_LINT(b, &c);
+        CHECK(c.step_fail.empty());
+        auto height = [&](rad_op op) {
+            int64_t total = 0;
+            for (const auto& issue : c.issues)
+                if (issue.op == op) total += issue.n;
+            return total;
+        };
+        CHECK_EQ(height(last.attn.q_a.op_q), 12);
+        CHECK_EQ(height(last.attn.kv_a.op), 12);
+        CHECK_EQ(height(last.ix.key.op), 12);
+        CHECK_EQ(height(last.ix.op_work), 12);
+        CHECK_EQ(height(last.ix.op_tail), 12);
+        CHECK_EQ(height(last.attn.q_a.op), outputs);
+        CHECK_EQ(height(last.ix.op_select), outputs);
+        CHECK_EQ(height(last.attn.op_sel_pf), outputs);
+        CHECK_EQ(height(last.attn.out.op), outputs);
+        CHECK_EQ(height(hyv4flash::models[0]->op_head), outputs);
+    }
+}
+
+TEST(compact_dense_prefill_keeps_full_keys_and_restores_gather_indices) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const auto& m = *hyv4flash::models[0];
+    const auto& last = m.layers.back();
+    auto k = kit(d.b, {}, {6, 4});
+    k->b.positions_h = k->pos.data();
+    int32_t tail[] = {2, 0, 0, 1, 2, 0, 1, 2, 5, 9, 5, 3};
+    k->b.prefill_tail_h = tail;
+    RadCtx c{ .b = &d.b, .batch = &k->b };
+    hyv4flash::step(&c, &k->b);
+    CHECK_LINT(d.b, &c);
+    CHECK(c.step_fail.empty());
+    int dense = 0;
+    std::vector<int64_t> restored;
+    for (const auto& issue : c.issues) {
+        if (issue.op == last.attn.op_dense) {
+            ++dense;
+            CHECK_EQ(issue.n, 2);
+            CHECK_EQ(issue.opd[0].rows, 2);
+            CHECK_EQ(issue.opd[1].rows, 10);
+            CHECK_EQ(issue.opd[2].rows, 10);
+            CHECK(issue.opd[3].kind != issue.opd[4].kind);
+        }
+        if (issue.op == m.unpack_hidden)
+            restored.push_back(issue.opd[1].offset / m.s.n_embd);
+    }
+    CHECK_EQ(dense, 1);
+    CHECK((restored == std::vector<int64_t>{9, 5}));
+}
+
+/* #74 review, point 3 (and the P-04 rebase): the last layer's compact pass reads its query
+ * bounds from the tail's prefill_cu, at the offset the derivation writes it (TailLayout), in both
+ * the absorbed (paged) and the non-absorbed (dense) prefill. Every other layer, and the keys,
+ * read the trunk's once-a-step rebase of the full batch (m.cu_prefill). */
+TEST(the_compact_pass_reads_its_query_bounds_from_the_tail) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const auto& m = *hyv4flash::models[0];
+    const auto& last = m.layers.back();
+    auto raw_at = [&](RadCtx& c, int64_t off) {
+        return (const void*)((const int32_t*)rad_buf_ptr(&c, m.tail_meta) + off);
+    };
+    /* Absorbed: one chunk continuing 2 tokens of history, its last 2 rows kept. */
+    {
+        auto k = kit(d.b, {}, {6}, 2);
+        k->b.positions_h = k->pos.data();
+        int32_t tail[] = {2, 0, 0, 2, 0, 2, 4, 5, 6, 7};
+        k->b.prefill_tail_h = tail;
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK_LINT(d.b, &c);
+        CHECK(c.step_fail.empty());
+        const int64_t pf_cu = hyv4flash::TailLayout(1, 1, 2, false).pf_cu;
+        CHECK_EQ(pf_cu, 4);
+        int last_pf = 0, other_pf = 0;
+        for (const auto& issue : c.issues) {
+            if (issue.op == last.attn.op_paged_pf) {
+                ++last_pf;
+                CHECK_EQ(issue.n, 2);
+                CHECK(issue.opd[5].raw == raw_at(c, pf_cu));
+            } else {
+                for (const auto& l : m.layers)
+                    if (&l != &last && issue.op == l.attn.op_paged_pf) {
+                        ++other_pf;
+                        CHECK_EQ((rad_buf)issue.opd[5].handle, m.cu_prefill);
+                    }
+            }
+        }
+        CHECK_EQ(last_pf, 1);
+        CHECK(other_pf > 0);
+    }
+    /* Non-absorbed: the dense test's step (two chunks from position 0). */
+    {
+        auto k = kit(d.b, {}, {6, 4});
+        k->b.positions_h = k->pos.data();
+        int32_t tail[] = {2, 0, 0, 1, 2, 0, 1, 2, 5, 9, 5, 3};
+        k->b.prefill_tail_h = tail;
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        int dense = 0;
+        for (const auto& issue : c.issues)
+            if (issue.op == last.attn.op_dense) {
+                ++dense;
+                CHECK(issue.opd[3].raw == raw_at(c, hyv4flash::TailLayout(2, 2, 2, false).pf_cu));
+                CHECK_EQ((rad_buf)issue.opd[4].handle, m.cu_prefill);
+            }
+        CHECK_EQ(dense, 1);
+    }
+}
+
+/* #74 review, point 2: the compact pass reads its rows [0, DT) as the batch's decode rows, so a
+ * tail that does not keep them whole and in place (here decode row 1 dropped) runs the full pass
+ * rather than mis-map them; the same step with the decode rows kept compacts. */
+TEST(a_tail_without_every_decode_row_in_place_runs_the_full_pass) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const auto& m = *hyv4flash::models[0];
+    const auto& last = m.layers.back();
+    for (bool whole : {true, false}) {
+        auto k = kit(d.b, {1, 1}, {6});
+        k->b.positions_h = k->pos.data();
+        /* [m, DT, cu[4], pf_cu[2], ids[m], pos[m]] */
+        std::vector<int32_t> tail = whole
+            ? std::vector<int32_t>{3, 2, 0, 1, 2, 3, 0, 1, 0, 1, 7, 40, 47, 5}
+            : std::vector<int32_t>{2, 1, 0, 1, 1, 2, 0, 1, 0, 7, 40, 5};
+        k->b.prefill_tail_h = tail.data();
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK_LINT(d.b, &c);
+        CHECK(c.step_fail.empty());
+        int64_t q_rows = 0, unpacked = 0;
+        for (const auto& issue : c.issues) {
+            if (issue.op == last.attn.op_q_rope) q_rows += issue.n;
+            if (issue.op == m.unpack_hidden) ++unpacked;
+        }
+        CHECK_EQ(q_rows, whole ? 3 : 8);
+        CHECK_EQ(unpacked, whole ? 1 : 0);
+    }
+}
+
+/* #74 review, point 1: the tail's capacity counts the three rotary planes exactly when the
+ * derivation writes them, which is when the step carries rope_pos: the core hands it to a program
+ * that declares an encoder (batch.cpp, mm_on_). Served tower: an encoder, five planes; declared
+ * and not served (weights only): no encoder, two; left out: two. */
+TEST(the_tail_capacity_counts_the_rotary_planes_the_core_derives) {
+    auto check = [](const RadBuilder& b, bool weights) -> int64_t {
+        const auto& g = hyv4flash::models[0]->g;
+        const RecBuf* tail = find_b(b, "prefill_tail");
+        CHECK(tail != nullptr);
+        if (!tail) return 0;
+        CHECK_EQ(find_w(b, "v.blk.0.attn_qkv.weight") != nullptr, weights);
+        const int64_t planes = b.encoder.modalities ? 5 : 2;
+        CHECK_EQ(tail->d.shape[0], 7 + 2 * g.max_seqs + planes * g.max_logit_rows);
+        return planes;
+    };
+    for (int state : {0, 1, 2}) {   /* left out, declared and not served, served */
+        Declared d;
+        if (state) {
+            d.mk.set("vision_config.num_hidden_layers", "1").set("vision_config.hidden_size", "32")
+                .set("vision_config.intermediate_size", "64").set("vision_config.patch_size", "4")
+                .set("vision_config.num_channels", "3").set("vision_config.spatial_merge_size", "2")
+                .set("vision_config.num_attention_heads", "2")
+                .set("vision_config.max_image_size", "16")
+                .set("vision_config.max_vit_seq_len", "16")
+                .set("vision_config.rms_norm_eps", "1e-05");
+            if (state == 2)
+                d.mk.set("rope_parameters.sliding_attention.mrope_section", "2 1 1")
+                    .set("rope_parameters.deepseek_sparse_attention.mrope_section", "2 1 1");
+            d.b = RadBuilder();
+            bf16_encs(&d.b);
+            d.ctx = build_ctx();
+            d.ctx.max_enc_patches = 64;
+            d.rc = hyv4flash::declare(&d.b, d.mk.meta(), &d.ctx);
+        }
+        REQUIRE_EQ(d.rc, RAD_OK);
+        CHECK_EQ(check(d.b, state != 0), state == 2 ? 5 : 2);
+    }
 }
 
 /* WP13.0: a verify step that crosses the dense limit issues other ops (the selection) than one of
@@ -446,6 +661,100 @@ TEST(the_pass_key_tells_a_selecting_step_from_a_dense_one) {
     pf->b.positions_h = pf->pos.data();
     RadCtx pc{ .b = &d.b, .batch = &pf->b };
     CHECK_EQ(hyv4flash::pass_key(&pc, &pf->b, nullptr), (uint64_t)0);
+}
+
+/* P-08: a decode step whose every row is an output row skips the gather and reads the head off
+ * final_hidden; the choice changes what the step issues, so the pass key carries it. Two batches
+ * with the same choice (one verify row per sequence or per step, whatever the split) share a key;
+ * a step with a row that does not output differs from one where every row does. */
+TEST(the_pass_key_tells_a_direct_head_step_from_a_gathered_one) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    auto full = kit(d.b, { 6 }, {});
+    full->b.positions_h = full->pos.data();
+    RadCtx fc{ .b = &d.b, .batch = &full->b };
+    const uint64_t k_full = hyv4flash::pass_key(&fc, &full->b, nullptr);
+    CHECK(k_full != 0);
+    CHECK((k_full & 8u) != 0);
+    /* the same choice in another shape (two verifies): the same key */
+    auto split = kit(d.b, { 3, 3 }, {});
+    split->b.positions_h = split->pos.data();
+    RadCtx sc{ .b = &d.b, .batch = &split->b };
+    CHECK_EQ(hyv4flash::pass_key(&sc, &split->b, nullptr), k_full);
+    /* one row of the step is not an output row: the gather runs, another key */
+    auto part = kit(d.b, { 6 }, {});
+    part->b.positions_h = part->pos.data();
+    part->b.n_out = part->b.n_tok - 1;
+    RadCtx pc{ .b = &d.b, .batch = &part->b };
+    const uint64_t k_part = hyv4flash::pass_key(&pc, &part->b, nullptr);
+    CHECK_EQ(k_full ^ k_part, (uint64_t)8u);      /* the choice bit only */
+}
+
+/* P-08: on those steps the head reads final_hidden directly, one launch and the T x E round trip
+ * a step gone; a step with a row that does not output (or a prefill entry) keeps the gather. */
+TEST(the_head_reads_final_hidden_when_every_row_outputs) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    auto full = kit(d.b, { 6 }, {});
+    full->b.positions_h = full->pos.data();
+    RadCtx fc{ .b = &d.b, .batch = &full->b };
+    hyv4flash::step(&fc, &full->b);
+    CHECK(fc.step_fail.empty());
+    CHECK_LINT(d.b, &fc);
+    CHECK_EQ(count_issued(d.b, fc, "logits_gemm"), 1);
+    CHECK_EQ(count_issued(d.b, fc, "gather_rows"), 0);
+    /* a decode step with a row that does not output keeps the gather */
+    auto part = kit(d.b, { 6 }, {});
+    part->b.positions_h = part->pos.data();
+    part->b.n_out = part->b.n_tok - 1;
+    RadCtx pc{ .b = &d.b, .batch = &part->b };
+    hyv4flash::step(&pc, &part->b);
+    CHECK(pc.step_fail.empty());
+    CHECK_LINT(d.b, &pc);
+    CHECK_EQ(count_issued(d.b, pc, "gather_rows"), 1);
+    CHECK_EQ(count_issued(d.b, pc, "logits_gemm"), 1);
+    /* a mixed step: the prefill rows are not all outputs, the gather stays */
+    auto mix = kit(d.b, { 1 }, { 6 });
+    mix->b.positions_h = mix->pos.data();
+    RadCtx mc{ .b = &d.b, .batch = &mix->b };
+    hyv4flash::step(&mc, &mix->b);
+    CHECK(mc.step_fail.empty());
+    CHECK_LINT(d.b, &mc);
+    CHECK_EQ(count_issued(d.b, mc, "gather_rows"), 1);
+    CHECK_EQ(count_issued(d.b, mc, "logits_gemm"), 1);
+}
+
+/* K-49: the rotaries that turn over a whole prefill chunk are declared under the row-form name.
+ * `rope_rows` is the same op with the same parameters -- one thread per (token, pair) looping the
+ * heads, so one `sincosf` a (token, pair) instead of one a (token, head, pair) -- byte-identical,
+ * and libr4d's launch takes it at 64+ rows and 4+ heads (r4d_model_bf16.hip:1530-1541), so one
+ * declaration still runs the per-(head, pair) kernel at decode. What stays on `rope` is the key's
+ * rotary: one head a row, where the row form only cuts the thread count. The wide fixture is the
+ * one whose head counts reach the launch's bound; the mini's do not, and the declaration is the
+ * same either way. */
+TEST(the_rotaries_of_a_prefill_chunk_are_declared_under_the_row_form_name) {
+    for (const bool wide : { false, true }) {
+        Declared d(bf16_encs, 1, 0, wide);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        const RadBuilder& b = d.b;
+        /* The mini program, wide or not: a query rope and a key rope a layer (three layers), and
+         * the two sparse layers' indexer query rope. */
+        int rows_form = 0, per_pair = 0;
+        for (const auto& o : b.ops) {
+            if (o.op == "rope_rows") {
+                /* The query rotaries: the heads that share one position's angles. */
+                CHECK(pint(&o, "n_head") > 1);
+                CHECK_EQ(pint(&o, "n_head_kv"), 0);
+                CHECK(pflt(&o, "scale") > 0.0);
+                ++rows_form;
+            } else if (o.op == "rope") {
+                CHECK_EQ(pint(&o, "n_head"), 1);       /* the key part's rotary, alone */
+                ++per_pair;
+            }
+        }
+        CHECK_EQ(rows_form, 5);
+        CHECK_EQ(per_pair, 3);
+    }
 }
 
 /* The latent cache row's front (WP16.5): where a library declares mla_row_norm_rope_store the step
@@ -700,7 +1009,7 @@ TEST(the_tower_and_the_three_component_positions) {
     CHECK_EQ(count_op(b, "conv2d_unfold"), 1);
     CHECK_EQ(count_op(b, "scatter_rows"), 1);
     for (const auto& o : b.ops)
-        if (o.op == "rope") {
+        if (o.op == "rope" || o.op == "rope_rows") {   /* both names of one op (K-49) */
             CHECK_EQ(pstr(&o, "mode"), std::string("imrope_gptj"));
             CHECK_EQ(pstr(&o, "sections"), std::string("2 1 1"));
         }
@@ -763,7 +1072,8 @@ TEST(the_tower_and_the_three_component_positions) {
     REQUIRE_EQ(n.rc, RAD_OK);
     CHECK_EQ(n.b.encoder.out, (rad_buf)0);
     CHECK(find_w(n.b, "v.blk.0.attn_qkv.weight") != nullptr);
-    CHECK_EQ(pstr(find_op(n.b, "rope"), "mode"), std::string("gptj"));
+    CHECK_EQ(pstr(find_op(n.b, "rope"), "mode"), std::string("gptj"));       /* the key's */
+    CHECK_EQ(pstr(find_op(n.b, "rope_rows"), "mode"), std::string("gptj"));  /* the query's */
 }
 
 /* What this build does not serve is refused by name at declare: a quantised kv_b (DECISIONS U2),
@@ -940,6 +1250,16 @@ TEST(each_rank_declares_its_share_and_reduces_twice_a_layer) {
             CHECK_EQ(kv_named(b, "kv_latent_sparse")->d.head_dim, 20);
             CHECK_EQ(pint(find_op(b, "idx_score"), "heads"), 2);
             CHECK_EQ(pint(find_op(b, "router_sigmoid_topk"), "n_expert"), 8);
+            int packed_projections = 0;
+            for (const auto& o : b.ops) {
+                if (o.op != "gemm_nt_f32" || o.w.empty()) continue;
+                const auto& weight = b.weights.at(o.w[0] - 1);
+                if (weight.name.find(".glm_router.weight") == std::string::npos) continue;
+                CHECK_EQ(pint(&o, "weight_bf16") == 1, weight.d.dtype == RAD_BF16);
+                packed_projections += weight.d.dtype == RAD_BF16;
+            }
+            /* Eight experts split into four f32 logits per rank at TP2. */
+            CHECK_EQ(packed_projections, world == 2 ? 2 : 1);
             int based = 0;
             for (const auto& o : b.ops)
                 if (param(&o, "expert_base")) {

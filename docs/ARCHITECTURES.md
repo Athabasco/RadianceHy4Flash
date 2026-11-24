@@ -3335,7 +3335,7 @@ the drafter's `dfly.blk.<i>`, the tower `v.`.
 | `index_head`, `index_key`, `index_key_norm` | `head_weight_projection`, `token_key_projection`, `token_key_norm` | sparse layers |
 | `index_pool_value`, `index_pool_gate`, `index_pool_norm`, `index_ape` | `key_value_projection`, `key_gate_projection`, `key_norm`, `intra_group_ape` | f32 |
 | `ffn_gate_up`, `ffn_down`, `ffn_post_norm` | `mlp.gate_proj` + `up_proj`, `down_proj`, `post_fc2_norm` | layer 0 |
-| `glm_router.weight`, `glm_router.correction` | `mlp.gate.weight`, `mlp.gate.e_score_correction_bias` | f32; MoeFP8's router (GlmRouter) |
+| `glm_router.weight`, `glm_router.correction` | `mlp.gate.weight`, `mlp.gate.e_score_correction_bias` | bf16 weight, f32 correction (GlmRouter) |
 | `ffn_latent_in`, `ffn_latent_out` | `mlp.routed_expert_down_proj`, `mlp.routed_expert_up_proj` | |
 | `ffn_gate_up_exps.<e>`, `ffn_down_exps.<e>` | slice `e` of `mlp.experts.gate_up_proj` [512, 3072, 1536] and `down_proj` [512, 1536, 1536] | one movement unit an expert |
 | `ffn_gate_up_shexp`, `ffn_down_shexp`, `ffn_post_norm` | `mlp.shared_experts.gate_proj` + `up_proj`, `down_proj`, `mlp.combine_output_norm` | |
@@ -3388,10 +3388,12 @@ per layer
            the E4M3 round trip (quant_act_fp8 one group a row, dequant), engram_norm,
            gemm_nt_bias key and value, engram_gate into the streams
   ihc_pre (hc_attn), rmsnorm (attn_norm)
-  q_a, rmsnorm, q_nope / q_rope; kv_a, rmsnorm on the latent, rope (gptj) on q_rope and the key,
+  q_a, rmsnorm, q_nope / q_rope; kv_a, rmsnorm on the latent, rope (gptj) on q_rope -- under
+  `rope_rows`, its row-form name -- and on the key,
   kv_store of the row [latent | key] as one KV head of (512 + 64) / 2; attn_gate
   [sparse] index_key, rmsnorm, qsa_work, idx_pool_gated into the indexer cache, qsa_tail_store;
-           selecting: index_query_nope / _rope, rope, index_head, idx_score, qsa_select(own 1)
+           selecting: index_query_nope / _rope, rope_rows, index_head, idx_score,
+           qsa_select(own 1)
   absorbed:     mla_project_kv absorb, mla_attn_paged_sink (window) or mla_attn_sel_sink, expand
                 and gate_mul as one mla_expand_gate (libr4d fuses it; libref / libavx run the pair)
   non-absorbed: the latent copied, gemm_nt kv_b, mla_kv_split, the query assembled, attn_kv_sink
