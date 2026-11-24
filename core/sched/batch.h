@@ -422,7 +422,7 @@ private:
     void carve(Set& s, char* base);
     /* Reserve `need` bytes of the ring, waiting for old uploads when it is full. */
     int  reserve(int64_t need, int64_t* off);
-    int  run_derivations(const StepPlan& plan, Set& s);
+    int  run_derivations(const StepPlan& plan, Set& s, int64_t n_out, const int32_t*& tail);
     int  build_groups(const StepPlan& plan, const IKVManager& kv, Set& s, Out& o);
 };
 

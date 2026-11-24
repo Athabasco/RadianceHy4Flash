@@ -15,13 +15,13 @@ namespace {
 /* The `mini` preset as rad-convert records its config: 3 layers (sparse, sliding, sparse; layer 0
  * dense, 1-2 latent MoE), two streams, an Engram in front of layer 1, dense limit 16. `wide` is
  * `mini4`: 4 sparse and 8 sliding heads and 8 experts, so four ranks hold whole heads. */
-MetaKV mini_meta(bool wide = false, int64_t ff_exp = 128) {
+MetaKV mini_meta(bool wide = false, int64_t ff_exp = 128, int64_t n_embd = 128) {
     RadModelMeta m{};
     m.arch_id = "hyv4flash";
     m.name = "test-hy4-mini";
     m.quant = "";
     m.n_layers = 3;
-    m.n_embd = 128;
+    m.n_embd = n_embd;
     m.n_head = 2;
     m.n_head_kv = 2;
     m.head_dim = 8;
@@ -377,6 +377,209 @@ TEST(every_step_kind_is_lint_clean) {
     CHECK_EQ(count_issued(a.b, c, "sub_i32"), 1);   /* P-04: absorbed on every layer, rebased once */
 }
 
+TEST(last_layer_keeps_cache_writers_at_chunk_height_and_queries_at_output_height) {
+    RadBuilder b;
+    bf16_encs(&b);
+    b.encs.push_back({ "attn_q_a.", enc_i8(true) });
+    b.encs.push_back({ "attn_kv_a.", enc_i8(true) });
+    auto mk = mini_meta();
+    mk.set("kv_lora_rank", "56");  /* kv_a's 64 output channels admit an int8 weight */
+    auto ctx = build_ctx();
+    G3Env env;
+    REQUIRE_EQ(hyv4flash::declare(&b, mk.meta(), &ctx), RAD_OK);
+    const auto& last = hyv4flash::models[0]->layers.back();
+    REQUIRE(last.attn.kv_a.fed);
+    REQUIRE(last.attn.q_a.op_q);
+    for (int outputs : {0, 1}) {
+        auto k = kit(b, {}, {12}, 10);
+        k->b.positions_h = k->pos.data();
+        k->b.n_out = outputs;
+        int32_t tail[] = {outputs, 0, 0, outputs, 0, outputs, 11, 21};
+        k->b.prefill_tail_h = tail;
+        RadCtx c{ .b = &b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK_LINT(b, &c);
+        CHECK(c.step_fail.empty());
+        auto height = [&](rad_op op) {
+            int64_t total = 0;
+            for (const auto& issue : c.issues)
+                if (issue.op == op) total += issue.n;
+            return total;
+        };
+        CHECK_EQ(height(last.attn.q_a.op_q), 12);
+        CHECK_EQ(height(last.attn.kv_a.op), 12);
+        CHECK_EQ(height(last.ix.key.op), 12);
+        CHECK_EQ(height(last.ix.op_work), 12);
+        CHECK_EQ(height(last.ix.op_tail), 12);
+        CHECK_EQ(height(last.attn.q_a.op), outputs);
+        CHECK_EQ(height(last.ix.op_select), outputs);
+        CHECK_EQ(height(last.attn.op_sel_pf), outputs);
+        CHECK_EQ(height(last.attn.out.op), outputs);
+        CHECK_EQ(height(hyv4flash::models[0]->op_head), outputs);
+    }
+}
+
+TEST(compact_dense_prefill_keeps_full_keys_and_restores_gather_indices) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const auto& m = *hyv4flash::models[0];
+    const auto& last = m.layers.back();
+    auto k = kit(d.b, {}, {6, 4});
+    k->b.positions_h = k->pos.data();
+    int32_t tail[] = {2, 0, 0, 1, 2, 0, 1, 2, 5, 9, 5, 3};
+    k->b.prefill_tail_h = tail;
+    RadCtx c{ .b = &d.b, .batch = &k->b };
+    hyv4flash::step(&c, &k->b);
+    CHECK_LINT(d.b, &c);
+    CHECK(c.step_fail.empty());
+    int dense = 0;
+    std::vector<int64_t> restored;
+    for (const auto& issue : c.issues) {
+        if (issue.op == last.attn.op_dense) {
+            ++dense;
+            CHECK_EQ(issue.n, 2);
+            CHECK_EQ(issue.opd[0].rows, 2);
+            CHECK_EQ(issue.opd[1].rows, 10);
+            CHECK_EQ(issue.opd[2].rows, 10);
+            CHECK(issue.opd[3].kind != issue.opd[4].kind);
+        }
+        if (issue.op == m.unpack_hidden)
+            restored.push_back(issue.opd[1].offset / m.s.n_embd);
+    }
+    CHECK_EQ(dense, 1);
+    CHECK((restored == std::vector<int64_t>{9, 5}));
+}
+
+/* #74 review, point 3 (and the P-04 rebase): the last layer's compact pass reads its query
+ * bounds from the tail's prefill_cu, at the offset the derivation writes it (TailLayout), in both
+ * the absorbed (paged) and the non-absorbed (dense) prefill. Every other layer, and the keys,
+ * read the trunk's once-a-step rebase of the full batch (m.cu_prefill). */
+TEST(the_compact_pass_reads_its_query_bounds_from_the_tail) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const auto& m = *hyv4flash::models[0];
+    const auto& last = m.layers.back();
+    auto raw_at = [&](RadCtx& c, int64_t off) {
+        return (const void*)((const int32_t*)rad_buf_ptr(&c, m.tail_meta) + off);
+    };
+    /* Absorbed: one chunk continuing 2 tokens of history, its last 2 rows kept. */
+    {
+        auto k = kit(d.b, {}, {6}, 2);
+        k->b.positions_h = k->pos.data();
+        int32_t tail[] = {2, 0, 0, 2, 0, 2, 4, 5, 6, 7};
+        k->b.prefill_tail_h = tail;
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK_LINT(d.b, &c);
+        CHECK(c.step_fail.empty());
+        const int64_t pf_cu = hyv4flash::TailLayout(1, 1, 2, false).pf_cu;
+        CHECK_EQ(pf_cu, 4);
+        int last_pf = 0, other_pf = 0;
+        for (const auto& issue : c.issues) {
+            if (issue.op == last.attn.op_paged_pf) {
+                ++last_pf;
+                CHECK_EQ(issue.n, 2);
+                CHECK(issue.opd[5].raw == raw_at(c, pf_cu));
+            } else {
+                for (const auto& l : m.layers)
+                    if (&l != &last && issue.op == l.attn.op_paged_pf) {
+                        ++other_pf;
+                        CHECK_EQ((rad_buf)issue.opd[5].handle, m.cu_prefill);
+                    }
+            }
+        }
+        CHECK_EQ(last_pf, 1);
+        CHECK(other_pf > 0);
+    }
+    /* Non-absorbed: the dense test's step (two chunks from position 0). */
+    {
+        auto k = kit(d.b, {}, {6, 4});
+        k->b.positions_h = k->pos.data();
+        int32_t tail[] = {2, 0, 0, 1, 2, 0, 1, 2, 5, 9, 5, 3};
+        k->b.prefill_tail_h = tail;
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK(c.step_fail.empty());
+        int dense = 0;
+        for (const auto& issue : c.issues)
+            if (issue.op == last.attn.op_dense) {
+                ++dense;
+                CHECK(issue.opd[3].raw == raw_at(c, hyv4flash::TailLayout(2, 2, 2, false).pf_cu));
+                CHECK_EQ((rad_buf)issue.opd[4].handle, m.cu_prefill);
+            }
+        CHECK_EQ(dense, 1);
+    }
+}
+
+/* #74 review, point 2: the compact pass reads its rows [0, DT) as the batch's decode rows, so a
+ * tail that does not keep them whole and in place (here decode row 1 dropped) runs the full pass
+ * rather than mis-map them; the same step with the decode rows kept compacts. */
+TEST(a_tail_without_every_decode_row_in_place_runs_the_full_pass) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    const auto& m = *hyv4flash::models[0];
+    const auto& last = m.layers.back();
+    for (bool whole : {true, false}) {
+        auto k = kit(d.b, {1, 1}, {6});
+        k->b.positions_h = k->pos.data();
+        /* [m, DT, cu[4], pf_cu[2], ids[m], pos[m]] */
+        std::vector<int32_t> tail = whole
+            ? std::vector<int32_t>{3, 2, 0, 1, 2, 3, 0, 1, 0, 1, 7, 40, 47, 5}
+            : std::vector<int32_t>{2, 1, 0, 1, 1, 2, 0, 1, 0, 7, 40, 5};
+        k->b.prefill_tail_h = tail.data();
+        RadCtx c{ .b = &d.b, .batch = &k->b };
+        hyv4flash::step(&c, &k->b);
+        CHECK_LINT(d.b, &c);
+        CHECK(c.step_fail.empty());
+        int64_t q_rows = 0, unpacked = 0;
+        for (const auto& issue : c.issues) {
+            if (issue.op == last.attn.op_q_rope) q_rows += issue.n;
+            if (issue.op == m.unpack_hidden) ++unpacked;
+        }
+        CHECK_EQ(q_rows, whole ? 3 : 8);
+        CHECK_EQ(unpacked, whole ? 1 : 0);
+    }
+}
+
+/* #74 review, point 1: the tail's capacity counts the three rotary planes exactly when the
+ * derivation writes them, which is when the step carries rope_pos: the core hands it to a program
+ * that declares an encoder (batch.cpp, mm_on_). Served tower: an encoder, five planes; declared
+ * and not served (weights only): no encoder, two; left out: two. */
+TEST(the_tail_capacity_counts_the_rotary_planes_the_core_derives) {
+    auto check = [](const RadBuilder& b, bool weights) -> int64_t {
+        const auto& g = hyv4flash::models[0]->g;
+        const RecBuf* tail = find_b(b, "prefill_tail");
+        CHECK(tail != nullptr);
+        if (!tail) return 0;
+        CHECK_EQ(find_w(b, "v.blk.0.attn_qkv.weight") != nullptr, weights);
+        const int64_t planes = b.encoder.modalities ? 5 : 2;
+        CHECK_EQ(tail->d.shape[0], 7 + 2 * g.max_seqs + planes * g.max_logit_rows);
+        return planes;
+    };
+    for (int state : {0, 1, 2}) {   /* left out, declared and not served, served */
+        Declared d;
+        if (state) {
+            d.mk.set("vision_config.num_hidden_layers", "1").set("vision_config.hidden_size", "32")
+                .set("vision_config.intermediate_size", "64").set("vision_config.patch_size", "4")
+                .set("vision_config.num_channels", "3").set("vision_config.spatial_merge_size", "2")
+                .set("vision_config.num_attention_heads", "2")
+                .set("vision_config.max_image_size", "16")
+                .set("vision_config.max_vit_seq_len", "16")
+                .set("vision_config.rms_norm_eps", "1e-05");
+            if (state == 2)
+                d.mk.set("rope_parameters.sliding_attention.mrope_section", "2 1 1")
+                    .set("rope_parameters.deepseek_sparse_attention.mrope_section", "2 1 1");
+            d.b = RadBuilder();
+            bf16_encs(&d.b);
+            d.ctx = build_ctx();
+            d.ctx.max_enc_patches = 64;
+            d.rc = hyv4flash::declare(&d.b, d.mk.meta(), &d.ctx);
+        }
+        REQUIRE_EQ(d.rc, RAD_OK);
+        CHECK_EQ(check(d.b, state != 0), state == 2 ? 5 : 2);
+    }
+}
+
 /* WP13.0: a verify step that crosses the dense limit issues other ops (the selection) than one of
  * the same shape just below it, and the core's recording key holds only the rounded context bound.
  * The plugin's pass key must therefore tell the two apart, or the second step of a request that
@@ -409,6 +612,100 @@ TEST(the_pass_key_tells_a_selecting_step_from_a_dense_one) {
     pf->b.positions_h = pf->pos.data();
     RadCtx pc{ .b = &d.b, .batch = &pf->b };
     CHECK_EQ(hyv4flash::pass_key(&pc, &pf->b, nullptr), (uint64_t)0);
+}
+
+/* P-08: a decode step whose every row is an output row skips the gather and reads the head off
+ * final_hidden; the choice changes what the step issues, so the pass key carries it. Two batches
+ * with the same choice (one verify row per sequence or per step, whatever the split) share a key;
+ * a step with a row that does not output differs from one where every row does. */
+TEST(the_pass_key_tells_a_direct_head_step_from_a_gathered_one) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    auto full = kit(d.b, { 6 }, {});
+    full->b.positions_h = full->pos.data();
+    RadCtx fc{ .b = &d.b, .batch = &full->b };
+    const uint64_t k_full = hyv4flash::pass_key(&fc, &full->b, nullptr);
+    CHECK(k_full != 0);
+    CHECK((k_full & 8u) != 0);
+    /* the same choice in another shape (two verifies): the same key */
+    auto split = kit(d.b, { 3, 3 }, {});
+    split->b.positions_h = split->pos.data();
+    RadCtx sc{ .b = &d.b, .batch = &split->b };
+    CHECK_EQ(hyv4flash::pass_key(&sc, &split->b, nullptr), k_full);
+    /* one row of the step is not an output row: the gather runs, another key */
+    auto part = kit(d.b, { 6 }, {});
+    part->b.positions_h = part->pos.data();
+    part->b.n_out = part->b.n_tok - 1;
+    RadCtx pc{ .b = &d.b, .batch = &part->b };
+    const uint64_t k_part = hyv4flash::pass_key(&pc, &part->b, nullptr);
+    CHECK_EQ(k_full ^ k_part, (uint64_t)8u);      /* the choice bit only */
+}
+
+/* P-08: on those steps the head reads final_hidden directly, one launch and the T x E round trip
+ * a step gone; a step with a row that does not output (or a prefill entry) keeps the gather. */
+TEST(the_head_reads_final_hidden_when_every_row_outputs) {
+    Declared d;
+    REQUIRE_EQ(d.rc, RAD_OK);
+    auto full = kit(d.b, { 6 }, {});
+    full->b.positions_h = full->pos.data();
+    RadCtx fc{ .b = &d.b, .batch = &full->b };
+    hyv4flash::step(&fc, &full->b);
+    CHECK(fc.step_fail.empty());
+    CHECK_LINT(d.b, &fc);
+    CHECK_EQ(count_issued(d.b, fc, "logits_gemm"), 1);
+    CHECK_EQ(count_issued(d.b, fc, "gather_rows"), 0);
+    /* a decode step with a row that does not output keeps the gather */
+    auto part = kit(d.b, { 6 }, {});
+    part->b.positions_h = part->pos.data();
+    part->b.n_out = part->b.n_tok - 1;
+    RadCtx pc{ .b = &d.b, .batch = &part->b };
+    hyv4flash::step(&pc, &part->b);
+    CHECK(pc.step_fail.empty());
+    CHECK_LINT(d.b, &pc);
+    CHECK_EQ(count_issued(d.b, pc, "gather_rows"), 1);
+    CHECK_EQ(count_issued(d.b, pc, "logits_gemm"), 1);
+    /* a mixed step: the prefill rows are not all outputs, the gather stays */
+    auto mix = kit(d.b, { 1 }, { 6 });
+    mix->b.positions_h = mix->pos.data();
+    RadCtx mc{ .b = &d.b, .batch = &mix->b };
+    hyv4flash::step(&mc, &mix->b);
+    CHECK(mc.step_fail.empty());
+    CHECK_LINT(d.b, &mc);
+    CHECK_EQ(count_issued(d.b, mc, "gather_rows"), 1);
+    CHECK_EQ(count_issued(d.b, mc, "logits_gemm"), 1);
+}
+
+/* K-49: the rotaries that turn over a whole prefill chunk are declared under the row-form name.
+ * `rope_rows` is the same op with the same parameters -- one thread per (token, pair) looping the
+ * heads, so one `sincosf` a (token, pair) instead of one a (token, head, pair) -- byte-identical,
+ * and libr4d's launch takes it at 64+ rows and 4+ heads (r4d_model_bf16.hip:1530-1541), so one
+ * declaration still runs the per-(head, pair) kernel at decode. What stays on `rope` is the key's
+ * rotary: one head a row, where the row form only cuts the thread count. The wide fixture is the
+ * one whose head counts reach the launch's bound; the mini's do not, and the declaration is the
+ * same either way. */
+TEST(the_rotaries_of_a_prefill_chunk_are_declared_under_the_row_form_name) {
+    for (const bool wide : { false, true }) {
+        Declared d(bf16_encs, 1, 0, wide);
+        REQUIRE_EQ(d.rc, RAD_OK);
+        const RadBuilder& b = d.b;
+        /* The mini program, wide or not: a query rope and a key rope a layer (three layers), and
+         * the two sparse layers' indexer query rope. */
+        int rows_form = 0, per_pair = 0;
+        for (const auto& o : b.ops) {
+            if (o.op == "rope_rows") {
+                /* The query rotaries: the heads that share one position's angles. */
+                CHECK(pint(&o, "n_head") > 1);
+                CHECK_EQ(pint(&o, "n_head_kv"), 0);
+                CHECK(pflt(&o, "scale") > 0.0);
+                ++rows_form;
+            } else if (o.op == "rope") {
+                CHECK_EQ(pint(&o, "n_head"), 1);       /* the key part's rotary, alone */
+                ++per_pair;
+            }
+        }
+        CHECK_EQ(rows_form, 5);
+        CHECK_EQ(per_pair, 3);
+    }
 }
 
 /* The latent cache row's front (WP16.5): where a library declares mla_row_norm_rope_store the step
@@ -663,7 +960,7 @@ TEST(the_tower_and_the_three_component_positions) {
     CHECK_EQ(count_op(b, "conv2d_unfold"), 1);
     CHECK_EQ(count_op(b, "scatter_rows"), 1);
     for (const auto& o : b.ops)
-        if (o.op == "rope") {
+        if (o.op == "rope" || o.op == "rope_rows") {   /* both names of one op (K-49) */
             CHECK_EQ(pstr(&o, "mode"), std::string("imrope_gptj"));
             CHECK_EQ(pstr(&o, "sections"), std::string("2 1 1"));
         }
@@ -726,7 +1023,8 @@ TEST(the_tower_and_the_three_component_positions) {
     REQUIRE_EQ(n.rc, RAD_OK);
     CHECK_EQ(n.b.encoder.out, (rad_buf)0);
     CHECK(find_w(n.b, "v.blk.0.attn_qkv.weight") != nullptr);
-    CHECK_EQ(pstr(find_op(n.b, "rope"), "mode"), std::string("gptj"));
+    CHECK_EQ(pstr(find_op(n.b, "rope"), "mode"), std::string("gptj"));       /* the key's */
+    CHECK_EQ(pstr(find_op(n.b, "rope_rows"), "mode"), std::string("gptj"));  /* the query's */
 }
 
 /* What this build does not serve is refused by name at declare: a quantised kv_b (DECISIONS U2),
@@ -1389,8 +1687,8 @@ namespace {
  * group_topk * ratio. `two` is mini6d2's shape on mini's trunk: two draft layers, both over layer
  * 2 for the selection and layers 2 and 0 for the cache (0 is refused, so `two` uses 2 twice for
  * the selection and the test that wants distinct caches edits the keys). */
-MetaKV dfly_meta(int layers = 1, bool wide = false) {
-    MetaKV k = mini_meta(wide);
+MetaKV dfly_meta(int layers = 1, bool wide = false, int64_t n_embd = 128) {
+    MetaKV k = mini_meta(wide, 128, n_embd);
     k.set("dfly_num_hidden_layers", std::to_string(layers).c_str());
     k.set("dfly_target_kv_layers", layers == 1 ? "2" : "2 2");
     k.set("dfly_target_index_layer", layers == 1 ? "2" : "2 2");
@@ -1732,7 +2030,9 @@ TEST(dfly2_reads_quantised_linears_as_the_trunk_does) {
     const char* lin[] = { "attn_q_a", "attn_gate", "ffn_gate_up" };
     for (const int world : { 1, 2 }) {
         for (int rank = 0; rank < world; ++rank) {
-            DeclDfly d(5, dfly_meta(1, true), world, rank, dfly_i8_encs);
+            /* 256 wide, so that a rank's correction K (128 at two ranks) is a whole scale group:
+             * the down is a K split, and mini's 128 does not divide into 128-wide groups. */
+            DeclDfly d(5, dfly_meta(1, true, 256), world, rank, dfly_i8_encs);
             REQUIRE_EQ(d.rc, RAD_OK);
             if (!d.df().served) fprintf(stderr, "%s\n", d.df().why.c_str());
             REQUIRE(d.df().served);
@@ -1762,6 +2062,15 @@ TEST(dfly2_reads_quantised_linears_as_the_trunk_does) {
             }
             CHECK(find_w(b, "dfly.blk.0.attn_kv_b.weight")->d.dtype == RAD_BF16);
             CHECK(find_w(b, "dfly.blk.0.attn_q_a.weight") != nullptr);
+            /* The correction slices with it, its down as a K split in whole scale groups. */
+            CHECK_EQ(find_w(b, "dfly.correct_gate.weight")->d.shard,
+                     world > 1 ? (int)RAD_SHARD_ROW : (int)RAD_SHARD_NONE);
+            CHECK_EQ(find_w(b, "dfly.correct_down.weight")->d.shard,
+                     world > 1 ? (int)RAD_SHARD_COL : (int)RAD_SHARD_NONE);
+            CHECK(d.df().c_g.q && d.df().c_u.q && d.df().c_d.q);
+            CHECK_EQ(pint(b.op_of(d.df().c_g.lin.op), "N"), d.df().E / world);
+            CHECK_EQ(pint(b.op_of(d.df().c_d.lin.op), "K"), d.df().E / world);
+            CHECK(d.df().op_ar_c != 0 || world == 1);
             /* One engine step, lint clean, the query pass issuing the int8 chain. */
             auto trunk = kit(b, std::vector<int>(2, 6), {});
             trunk->b.positions_h = trunk->pos.data();
@@ -1920,11 +2229,13 @@ TEST(dfly2_configurations_it_cannot_serve_are_refused_by_name) {
 
 /* §3.6 (WP13.6): at 2 and 4 ranks the draft splits as the trunk's sparse layers -- whole heads a
  * rank in q_b, kv_b, the gate and the sinks (rows) and the output projection (columns), the MLP's
- * width (gate_up's rows of each half, down's columns), everything else whole -- its ops run this
- * rank's heads and width, each layer reduces twice (o_proj, the MLP) exactly before the norm or
- * residual that reads the sum, and each chain step ranks this rank's vocabulary shard (global ids,
- * the pair plane), gathers every rank's pairs and merges; one engine step lint clean on every rank.
- * At one rank none of the three TP ops is declared and the weights are whole and unsharded. */
+ * width (gate_up's rows of each half, down's columns), the correction's gate and up by their rows
+ * and its down by columns (one exact reduction of the chain's delta a step, before the residual),
+ * everything else whole -- its ops run this rank's heads and width, each layer reduces twice
+ * (o_proj, the MLP) exactly before the norm or residual that reads the sum, and each chain step
+ * ranks this rank's vocabulary shard (global ids, the pair plane), gathers every rank's pairs and
+ * merges; one engine step lint clean on every rank. At one rank none of the three TP ops is
+ * declared and the weights are whole and unsharded. */
 TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
     struct Want { const char* name; int shard; int dim; };
     const Want wants[] = {
@@ -1939,8 +2250,9 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
         { "dfly.blk.0.attn_kv_a.weight", RAD_SHARD_NONE, -1 },
         { "dfly.blk.0.attn_norm.weight", RAD_SHARD_NONE, -1 },
         { "dfly.fusion.weight", RAD_SHARD_NONE, -1 },
-        { "dfly.correct_gate.weight", RAD_SHARD_NONE, -1 },
-        { "dfly.correct_down.weight", RAD_SHARD_NONE, -1 },
+        { "dfly.correct_gate.weight", RAD_SHARD_ROW, 0 },
+        { "dfly.correct_up.weight", RAD_SHARD_ROW, 0 },
+        { "dfly.correct_down.weight", RAD_SHARD_COL, 1 },
     };
     for (const bool wide : { false, true }) {
         DeclDfly one(5, dfly_meta(1, wide));
@@ -1956,7 +2268,7 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
                 CHECK_EQ(w.d.n_row_parts, 0);
             }
         const int64_t H = wide ? 4 : 2, ff = one.df().ff;
-        CHECK(one.df().op_ar_o == 0 && one.df().op_ar_y == 0);
+        CHECK(one.df().op_ar_o == 0 && one.df().op_ar_y == 0 && one.df().op_ar_c == 0);
         for (int world : { 2, 4 }) {
             if (!wide && world == 4) continue;   /* mini's 2 sparse heads */
             for (int rank = 0; rank < world; ++rank) {
@@ -1986,6 +2298,27 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
                 CHECK_EQ(pint(b.op_of(L.p_down.op), "K"), ff / world);
                 CHECK_EQ(pint(b.op_of(df.steps[0].op_head), "n_vocab"), 320 / world);
                 CHECK_EQ(pint(b.op_of(df.steps[0].op_topk), "vocab_off"), 320 / world * rank);
+                /* The correction's three linears are this rank's width too, and its down's partial
+                 * sum is reduced exactly before the residual and the proposal law read it. */
+                CHECK_EQ(pint(b.op_of(df.c_g.op), "N"), df.E / world);
+                CHECK_EQ(pint(b.op_of(df.c_g.op), "K"), 2 * df.E);
+                CHECK_EQ(pint(b.op_of(df.c_u.op), "N"), df.E / world);
+                CHECK_EQ(pint(b.op_of(df.c_u.op), "K"), 2 * df.E);
+                CHECK_EQ(pint(b.op_of(df.c_d.op), "N"), df.E);
+                CHECK_EQ(pint(b.op_of(df.c_d.op), "K"), df.E / world);
+                CHECK_EQ(pint(b.op_of(df.steps[0].op_silu), "n"), df.E / world);
+                /* The chain's buffers are this rank's slice too: gate and up rows, the down's K. */
+                const RecBuf* bg = find_b(b, "dfly.chain_gate");
+                const RecBuf* bu = find_b(b, "dfly.chain_up");
+                const RecBuf* bgu = find_b(b, "dfly.chain_gate_up");
+                const RecBuf* ba = find_b(b, "dfly.chain_act");
+                REQUIRE(bg && bu && bgu && ba);
+                CHECK_EQ(bg->d.shape[1], df.E / world);
+                CHECK_EQ(bu->d.shape[1], df.E / world);
+                CHECK_EQ(bgu->d.shape[1], 2 * df.E / world);
+                CHECK_EQ(ba->d.shape[1], df.E / world);
+                CHECK(df.op_ar_c != 0);
+                CHECK_EQ(pint(b.op_of(df.op_ar_c), "exact"), 1);
                 for (const auto& st : df.steps) CHECK(st.op_gather != 0 && st.op_merge != 0);
                 CHECK(df.op_ar_o != 0 && df.op_ar_y != 0 && df.op_ar_o != df.op_ar_y);
                 /* One engine step: the trunk step, the empty context pass, the query pass. */
@@ -1997,17 +2330,22 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
                                      world);
                 CHECK_PASSES(b, ps);
                 CHECK_EQ(ps[1]->issues.size(), (size_t)0);
-                int ar = 0, ga = 0, me = 0, tk = 0;
+                int ar = 0, ga = 0, me = 0, tk = 0, arc = 0;
                 size_t i_out = SIZE_MAX, i_ar = SIZE_MAX, i_post = SIZE_MAX, i_down = SIZE_MAX,
                        i_ar2 = SIZE_MAX, i_add2 = SIZE_MAX;
+                std::vector<size_t> chain;
                 const auto& is = ps[2]->issues;
                 for (size_t i = 0; i < is.size(); ++i) {
                     const rad_op op = is[i].op;
                     if (op == df.op_ar_o || op == df.op_ar_y) ++ar;
+                    if (op == df.op_ar_c) ++arc;
+                    bool add = false;
                     for (const auto& st : df.steps) {
                         ga += op == st.op_gather;
                         me += op == st.op_merge;
+                        add = add || op == st.op_add;
                     }
+                    if (op == df.c_d.op || op == df.op_ar_c || add) chain.push_back(i);
                     if (op == df.steps[0].op_topk) ++tk;
                     if (op == L.p_out.op) i_out = i;
                     if (op == df.op_ar_o) i_ar = i;
@@ -2017,13 +2355,21 @@ TEST(dfly2_at_tp_splits_heads_and_width_and_merges_the_vocabulary_shards) {
                     if (op == L.op_add2) i_add2 = i;
                 }
                 CHECK_EQ(ar, 2);
+                CHECK_EQ(arc, 5);
+                REQUIRE_EQ(chain.size(), (size_t)15);
+                for (int r = 0; r < 5; ++r) {
+                    CHECK_EQ(is[chain[3 * r]].op, df.c_d.op);
+                    CHECK_EQ(is[chain[3 * r + 1]].op, df.op_ar_c);
+                    CHECK_EQ(is[chain[3 * r + 2]].op, df.steps[r].op_add);
+                    CHECK_EQ(is[chain[3 * r + 1]].n, 2 * df.E);
+                }
                 CHECK_EQ(ga, 5);
                 CHECK_EQ(me, 5);
                 CHECK_EQ(tk, 1);
                 CHECK(i_out < i_ar && i_ar < i_post);
                 CHECK(i_down < i_ar2 && i_ar2 < i_add2);
                 /* Exact reductions, in place over the draft's own buffers. */
-                for (rad_op op : { df.op_ar_o, df.op_ar_y })
+                for (rad_op op : { df.op_ar_o, df.op_ar_y, df.op_ar_c })
                     CHECK_EQ(pint(b.op_of(op), "exact"), 1);
             }
         }

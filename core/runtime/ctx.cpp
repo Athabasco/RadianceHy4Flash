@@ -1000,7 +1000,7 @@ int Ctx::lane_join(int from, int to) {
  * architecture callback. `agen_b`, `vgen_b` and `sgen_b` are set only on generator passes, which are
  * never recorded (below). `ckpt_cut` and `ckpt_cu`: a pass carrying them is never recorded.
  */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 504,
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 512,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
 static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 88,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
@@ -1009,7 +1009,7 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     /* Not recordable: encoder passes are shaped by their media, and passes carrying encoder rows
      * issue the scatter only when they have some (and the second attention over a run read both
      * ways, n_bidi, only on such a pass). */
-    if (b->enc || b->n_mm_rows > 0 || b->n_bidi > 0) return 0;
+    if (b->prefill_tail_h || b->enc || b->n_mm_rows > 0 || b->n_bidi > 0) return 0;
     /* A plugin with no pass-key callback cannot key a launch that splits its KV by the live
      * context, so a prefill or mixed pass of a program holding such a launcher is not recorded.
      * Its decode, verify and draft passes are: their launches get the keyed context bound in

@@ -3388,10 +3388,12 @@ per layer
            the E4M3 round trip (quant_act_fp8 one group a row, dequant), engram_norm,
            gemm_nt_bias key and value, engram_gate into the streams
   ihc_pre (hc_attn), rmsnorm (attn_norm)
-  q_a, rmsnorm, q_nope / q_rope; kv_a, rmsnorm on the latent, rope (gptj) on q_rope and the key,
+  q_a, rmsnorm, q_nope / q_rope; kv_a, rmsnorm on the latent, rope (gptj) on q_rope -- under
+  `rope_rows`, its row-form name -- and on the key,
   kv_store of the row [latent | key] as one KV head of (512 + 64) / 2; attn_gate
   [sparse] index_key, rmsnorm, qsa_work, idx_pool_gated into the indexer cache, qsa_tail_store;
-           selecting: index_query_nope / _rope, rope, index_head, idx_score, qsa_select(own 1)
+           selecting: index_query_nope / _rope, rope_rows, index_head, idx_score,
+           qsa_select(own 1)
   absorbed:     mla_project_kv absorb, mla_attn_paged_sink (window) or mla_attn_sel_sink, expand
                 and gate_mul as one mla_expand_gate (libr4d fuses it; libref / libavx run the pair)
   non-absorbed: the latent copied, gemm_nt kv_b, mla_kv_split, the query assembled, attn_kv_sink
@@ -3651,9 +3653,9 @@ prompt lookup): `RADIANCE_HY4_DFLY=0` (on purpose; `--spec-ngram` needs it, a de
 refuses `--spec-ngram` otherwise); a depth above 5; a mask token id outside the vocabulary; a
 `dfly_context_local_window` above 0; a Lkv / Lidx that is not a sparse layer above 0, a Lkv named
 twice, or a `dfly_target_index_topk` other than group_topk x ratio; a library without `dfly_sel`
-(libref, libavx and libr4d have it); at more ranks, draft heads or MLP width that do not split, or no
-`all_gather` / `row_topk_merge`; a `dfly.*` weight stored in a form the plugin cannot read (next
-paragraph).
+(libref, libavx and libr4d have it); at more ranks, draft heads, MLP width or correction width that
+do not split, or no `all_gather` / `row_topk_merge`; a `dfly.*` weight stored in a form the plugin
+cannot read (next paragraph).
 
 **Weights.** The draft's linears (`attn_q_a`, `attn_q_b`, `attn_kv_a`, `attn_gate`, `attn_output`,
 `ffn_gate_up`, `ffn_down`, and the fusion's `eh_proj` and the correction's gate, up and down) are read
@@ -3674,8 +3676,11 @@ by the draft (declined by name).
 
 **Tensor parallelism** (1, 2 or 4 ranks): whole heads a rank in `q_b`, `kv_b`, the gate and the sinks
 (rows) and in `attn_output` (columns); the MLP's width evenly (`ffn_gate_up`'s rows of each half,
-`ffn_down`'s columns); two exact all-reduces a layer (after the output projection, after the MLP);
-`q_a`, `kv_a`, the norms, the fusion, the correction and the embedding replicated, as is the latent
+`ffn_down`'s columns); the correction's `correct_gate` and `correct_up` by their rows and
+`correct_down` by its columns, so the chain runs a rank's width and reads a rank's slice; two exact
+all-reduces a layer (after the output projection, after the MLP) and one a chain step (the down's
+partial sum, before the residual that reads it); `q_a`, `kv_a`, the norms, the fusion and the
+embedding replicated, as is the latent
 cache. A quantised linear is sliced the same way (its codes and scales), by the same shard spans as
 the trunk's. The chain's logits are the trunk head's vocabulary shard: `row_topk` (global ids,
 a pair plane), `all_gather`, `row_topk_merge`, so every rank proposes the same tokens (ties to the lower

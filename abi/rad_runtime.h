@@ -376,6 +376,12 @@ typedef struct RadBatch {
      * ckpt_cut is 0. */
     int32_t        ckpt_cut;
     const int32_t* ckpt_cu;
+    /* ABI 44. Host mirror of the optional prefill_tail[_anchors] derivation.
+     * [rows, decode_rows, cu[n_seq+1], prefill_cu[n_prefill+1], original_row[rows], position[rows],
+     * optional three rotary planes of rows, optional compact ckpt_cu[3]].
+     * A full or empty tail needs only rows. */
+    const int32_t* prefill_tail_h;
+
     /* ---- appended in ABI 44 (a chunk planned as layer-sliced sub-steps) */
     /* The trunk layers a prefill chunk's rows run on this pass: [layer_lo, layer_hi), in the
      * model's own numbering. 0/0 is the whole trunk, the only shape a step had before ABI 44.
