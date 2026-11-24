@@ -85,8 +85,10 @@ static const Flag g_flags[] = {
                                         "the decode rows between them: off (default), auto (m from\n"
                                         "--chunk-slice-target-ms and -cost-pct), or m itself (1-8).\n"
                                         "Only a model whose plugin reports it can run the trunk over\n"
-                                        "a layer range (RadArchProbe::slice_layers_ok) is sliced, so\n"
-                                        "it is a no-op until a plugin reports it" },
+                                        "a layer range (RadArchProbe::slice_layers_ok) is sliced, and\n"
+                                        "never with the debug taps or a calibration window, which\n"
+                                        "read the trunk between two layers, so it is a no-op until\n"
+                                        "a plugin reports it" },
     { "--chunk-slice-target-ms", "N",   "the duration a sub-step targets, in milliseconds; m follows\n"
                                         "from it and the learned chunk and decode step times\n"
                                         "(default 150)" },
