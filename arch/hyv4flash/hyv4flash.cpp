@@ -1634,11 +1634,10 @@ static uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t*) {
     if (batch->phase != RAD_PHASE_DECODE) return 0;
     const StepPlan p = plan(*models[rad_slot(c)], batch);
     /* The gather-or-direct head choice (P-08) changes what the step issues; the key separates it.
-     * A sub-step of a chunk group issues the layers of its range only, so the key carries it too
-     * (inert for every graph that does not slice: layer_lo and layer_hi are 0). */
+     * A layer-sliced pass never reaches this: Ctx::pass_key refuses to record one by its layer
+     * range, because its layers are a range and the state it resumes from is not in the batch. */
     return 1u | (p.select ? 2u : 0u) | (p.nonabs ? 4u : 0u) |
-           (head_reads_all_rows(batch, p) ? 8u : 0u) |
-           ((batch->layer_lo || batch->layer_hi) ? 16u : 0u);
+           (head_reads_all_rows(batch, p) ? 8u : 0u);
 }
 } // namespace hyv4flash
 
