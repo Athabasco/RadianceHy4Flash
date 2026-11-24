@@ -358,6 +358,21 @@ TEST(a_control_vector_variant_under_defaults_reaches_every_model) {
              "defaults.control-vector-variant");
 }
 
+/* S-02: the prefill slice hook is a model key like its neighbour --chunk-slices, so a fleet's
+ * defaults can carry it and each model reads it; the flag table is what makes the key exist. */
+TEST(chunk_slices_prefill_is_a_model_key) {
+    fleet::FleetConfig fc;
+    CHECK_EQ(yload("defaults:\n  chunk-slices-prefill: 4\n"
+                   "models:\n  a:\n    model: /m/a.rad\n  b:\n    model: /m/b.rad\n"
+                   "    chunk-slices-prefill: 2\n", &fc), RAD_OK);
+    CHECK_EQ(fc.models[0].cfg.chunk_slices_prefill, 4ll);
+    CHECK_EQ(fc.models[0].cfg.given.at("--chunk-slices-prefill"), "defaults.chunk-slices-prefill");
+    CHECK_EQ(fc.models[1].cfg.chunk_slices_prefill, 2ll);
+    CHECK_EQ(fc.models[1].cfg.given.at("--chunk-slices-prefill"), "models.b.chunk-slices-prefill");
+    /* The same key on the server level is refused: it is per model, like --chunk-slices. */
+    CHECK(refused("server:\n  chunk-slices-prefill: 4\nmodels:\n  a: {model: /m/a.rad}\n"));
+}
+
 TEST(anchors_and_merge_keys) {
     fleet::FleetConfig fc;
     /* Top-level keys starting with x- are ignored, so they can hold anchors. */

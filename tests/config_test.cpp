@@ -149,8 +149,30 @@ TEST(a_flag_missing_its_argument_is_refused_rather_than_read_past) {
     CHECK_EQ(parse({ "--tp" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--port" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--kv-cache-dtype" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--chunk-slices-prefill" }, &c), RAD_E_INVAL);
     Argv a({ "--model" });
     CHECK_EQ(config_parse(a.argc(), a.argv.data(), &c), RAD_E_INVAL);
+}
+
+/* S-02: the prefill slice hook takes m itself (0-8; 0 and 1 leave the step whole). It is a value
+ * option like --chunk-slices: a number it does not take, or none at all, is refused by name
+ * rather than left behind as an unknown option, and the value reaches the field and the report. */
+TEST(chunk_slices_prefill_takes_m_and_reaches_the_field) {
+    Config c;
+    CHECK_OK(parse({ "--chunk-slices-prefill", "4" }, &c));
+    CHECK_EQ(c.chunk_slices_prefill, 4ll);
+    CHECK_EQ(c.chunk_slices, 0ll);   /* the test hook is the whole ask: the lever is off */
+    CHECK_EQ(c.given.at("--chunk-slices-prefill"), "command line");
+    CHECK_EQ(parse({ "--chunk-slices-prefill", "0" }, &c), RAD_OK);
+    CHECK_EQ(c.chunk_slices_prefill, 0ll);
+    CHECK_EQ(parse_fresh({ "--chunk-slices-prefill", "9" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--chunk-slices-prefill", "8x" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--chunk-slices-prefill" }), RAD_E_INVAL);
+    REQUIRE_EQ(parse({ "--chunk-slices-prefill", "4" }, &c), RAD_OK);
+    bool shown = false;
+    for (const diag::ConfigRow& r : diag::config_rows(c))
+        if (r.flag == "--chunk-slices-prefill") shown = r.value == "4" && r.source == "command line";
+    CHECK(shown);
 }
 
 /* --draft-short-from takes a count, 0 for never, or auto (the default): the engine resolves auto to

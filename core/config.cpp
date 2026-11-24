@@ -93,6 +93,11 @@ static const Flag g_flags[] = {
     { "--chunk-slice-cost-pct", "N",    "the share of a chunk step's time the decode waits between\n"
                                         "two slices may pay, in percent (default 10); 0 caps m at 1\n"
                                         "and turns slicing off" },
+    { "--chunk-slices-prefill", "N",   "a test hook, not a lever: cut a prefill-only step (no\n"
+                                        "decode row) into m layer-sliced sub-steps, so a single-\n"
+                                        "stream greedy run serves a prompt both ways and the two\n"
+                                        "results must be identical. It pays the slice overhead and\n"
+                                        "gains nothing; off (the default) and 1 leave the step whole" },
     { "--prefill-room-gate",  "MODE",   "on: a fresh prefill starts only when its whole prompt plus one\n"
                                         "decode position fits beside every runner; off (the default)\n"
                                         "admits a prompt when its first chunk fits" },
@@ -756,7 +761,8 @@ int config_parse(int argc, char** argv, Config* c) {
             else if (!parse_int(a.c_str(), v, 1, 8, &c->chunk_slices)) return RAD_E_INVAL;
         }
         else if (S("--chunk-slices-prefill")) {
-            if (!parse_int(a.c_str(), v ? v : "0", 0, 8, &c->chunk_slices_prefill)) return RAD_E_INVAL;
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!parse_int(a.c_str(), v, 0, 8, &c->chunk_slices_prefill)) return RAD_E_INVAL;
         }
         else if (S("--chunk-slice-target-ms")) { if (!num(1, 60000, &c->chunk_slice_target_ms)) return RAD_E_INVAL; }
         else if (S("--chunk-slice-cost-pct"))  { if (!num(0, 100, &c->chunk_slice_cost_pct)) return RAD_E_INVAL; }
