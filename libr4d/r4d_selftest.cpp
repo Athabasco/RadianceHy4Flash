@@ -17829,6 +17829,24 @@ static void fp8_logits_numeric(const Plugin& pl, int64_t N, int64_t K, int64_t M
     ok(i8 ? "logits_gemm_i8 vs host ref over its planes" : "logits_gemm_fp8 vs host ref over its planes",
        e < 2e-3, "rel_l2 " + std::to_string(e) + tag);
 
+    /* The chained form is the plain launch's bytes at every height: `chain` 1 takes the matvec at
+     * M <= 2 and the WMMA pass above it and changes nothing else (no engine record reaches
+     * r4d_selftest, so r4d_chain.h's wait returns at once and only the bracket differs). */
+    void* d_yc = dalloc((size_t)M * N * 4);
+    const std::string cn = std::string(i8 ? "logits_gemm_i8" : "logits_gemm_fp8") +
+                           " chained form is its plain form's bytes" + tag;
+    if (!d_yc) { ok(cn.c_str(), false, "hipMalloc failed"); return; }
+    st_memset(d_yc, 0xa5, (size_t)M * N * 4);
+    const int rcc = launch_row(lg, { T(d_x, RAD_BF16, { M, K }),
+                                     T(d_w, i8 ? RAD_I8 : RAD_F8E4M3, { N, K }),
+                                     T(d_yc, RAD_F32, { M, N }) },
+                               { PI("M", M), PI("n_vocab", N), PI("n_embd", K),
+                                 PS("dtype", "bf16"), PI("chain", 1) });
+    std::vector<float> gc((size_t)M * N);
+    if (rcc == RAD_OK) st_memcpy(gc.data(), d_yc, gc.size() * 4, hipMemcpyDeviceToHost);
+    ok(cn.c_str(), rcc == RAD_OK && gc == got,
+       rcc == RAD_OK ? "bytes differ" : "rc=" + std::to_string(rcc));
+
     /* The drafter's rescoring reads the same stored head, so it is checked over the same bytes:
      * R candidates per row (one an id past the shard, which must come back a pad), each scored
      * against the planes, sorted by value. */
@@ -38416,9 +38434,10 @@ static void device_phase(const Plugin& pl) {
             iqr_embed_case(pl, f, 512, 640, 3.25f);
         }
     }
-    /* The int8 head over the same stored row: both forms, and the padded K = 2560 row. */
+    /* The int8 head over the same stored row: both forms, both matvec heights (M = 1 and 2) and
+     * the padded K = 2560 row. */
     if (sel("logits_gemm_i8") || sel("logit_rerank_i8")) {
-        for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)33, (int64_t)64, (int64_t)100 })
+        for (const int64_t M : { (int64_t)1, (int64_t)2, (int64_t)8, (int64_t)33, (int64_t)64, (int64_t)100 })
             fp8_logits_numeric(pl, 5120, 5120, M, true);
         for (const int64_t M : { (int64_t)1, (int64_t)8 })
             fp8_logits_numeric(pl, 2560, 2560, M, true);
