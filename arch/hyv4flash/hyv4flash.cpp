@@ -1289,7 +1289,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
         l.t_attn_post.step(c, brows(m.tr.post, T), T);
         if (!entered)
             RAD_ISSUE_N(c, l.op_attn_norm, T, brows(m.tr.x, T), RAD_W(l.attn_gain), brows(m.tr.xn, T));
-        if (!l.attn.front(c, batch)) return;
+        if (!l.attn.front(c, batch, p)) return;
         m.calib.after_front(c, (int)i, l.attn, T);
         /* A pass on a streamed group's ring attends through the selection at every context
          * (hyv4flash_attn.h); every sparse layer of a pass agrees, the view being the pass's. */

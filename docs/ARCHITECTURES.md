@@ -3388,8 +3388,10 @@ per layer
            the E4M3 round trip (quant_act_fp8 one group a row, dequant), engram_norm,
            gemm_nt_bias key and value, engram_gate into the streams
   ihc_pre (hc_attn), rmsnorm (attn_norm)
-  q_a, rmsnorm, q_nope / q_rope; kv_a, rmsnorm on the latent, rope (gptj) on q_rope and the key,
-  kv_store of the row [latent | key] as one KV head of (512 + 64) / 2; attn_gate
+  q_a, rmsnorm, q_nope / q_rope; kv_a, rmsnorm on the latent, rope (gptj) on the key, kv_store
+  of the row [latent | key] as one KV head of (512 + 64) / 2; attn_gate (a decode step's query
+  rotary is folded into the sink instead: its stable instance's optional `rope_pos`, one launch a
+  layer less; `RADIANCE_HY4_FOLD_QROPE=0` issues the `rope` launch as well)
   [sparse] index_key, rmsnorm, qsa_work, idx_pool_gated into the indexer cache, qsa_tail_store;
            selecting: index_query_nope / _rope, rope, index_head, idx_score, qsa_select(own 1)
   absorbed:     mla_project_kv absorb, mla_attn_paged_sink (window) or mla_attn_sel_sink, expand

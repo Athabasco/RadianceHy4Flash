@@ -376,15 +376,44 @@ struct Attn {
                       { kv_b }, { in_ }, { out_ });
         };
         op_absorb = proj("absorb", w.q_nope, w.q_lat);
+        /* The rotary the sinks fold (their optional `rope_pos` operand): the stable instance's, so
+         * a decode step needs no separate `rope` launch (`front` then issues none, and the raw
+         * projection columns are what the operand holds). The fast instance keeps the rotated
+         * buffer, since a mixed step issues one `rope` over every row. */
+        const char* rsec = !s.mrope ? nullptr
+                          : sliding ? s.mrope_sliding.c_str() : s.mrope_sparse.c_str();
+        const double rtheta = sliding ? s.theta_sliding : s.theta_sparse;
         /* Decode-class rows: one a stream and its speculation rows. */
         const int64_t DTmax = std::max<int64_t>(1, std::min<int64_t>(T, g.max_logit_rows));
+        auto sink_params = [&](int64_t rows, int stable, bool windowed, int64_t blocks,
+                               int64_t win) {
+            std::vector<RadParam> ps = { RAD_RANGE("M", 1, rows), RAD_INT("heads", H),
+                                         RAD_INT("latent_dim", L), RAD_INT("rope_dim", R) };
+            if (windowed) {
+                ps.push_back(RAD_INT("block_size", bs));
+                ps.push_back(RAD_INT("window", win));
+            } else {
+                ps.push_back(RAD_INT("blocks", blocks));
+                ps.push_back(RAD_INT("block_size", bs));
+            }
+            ps.push_back(RAD_F64("scale", scale));
+            ps.push_back(RAD_STR("dtype", "bf16"));
+            ps.push_back(RAD_INT("stable", stable));
+            if (stable) {
+                ps.push_back(RAD_F64("rope_theta", rtheta));
+                ps.push_back(RAD_F64("rope_scale", 1.0));
+                if (rsec && *rsec) {
+                    ps.push_back(RAD_STR("rope_mode", "imrope_gptj"));
+                    ps.push_back(RAD_STR("rope_sections", rsec));
+                } else {
+                    ps.push_back(RAD_STR("rope_mode", "gptj"));
+                }
+            }
+            return ps;
+        };
         auto paged_op = [&](int64_t rows, int stable, std::initializer_list<rad_buf> in) {
-            return mk(b, "mla_attn_paged_sink",
-                      { RAD_RANGE("M", 1, rows), RAD_INT("heads", H), RAD_INT("latent_dim", L),
-                        RAD_INT("rope_dim", R), RAD_INT("block_size", bs),
-                        RAD_INT("window", window), RAD_F64("scale", scale),
-                        RAD_STR("dtype", "bf16"), RAD_INT("stable", stable) },
-                      { sinks }, in, { w.lat });
+            return mk_list(b, "mla_attn_paged_sink", sink_params(rows, stable, true, 0, window),
+                           { sinks }, in, { w.lat });
         };
         op_paged = paged_op(DTmax, 1, { w.q_lat, w.q_rope });
         op_paged_pf = paged_op(T, 0, { w.q_lat, w.q_rope, w.cu_p });
@@ -407,12 +436,9 @@ struct Attn {
         HY4_NEED(op_paged && op_paged_pf, "mla_attn_paged_sink");
         if (!sliding) {
             auto sel_op = [&](int64_t rows, int stable) {
-                return mk(b, "mla_attn_sel_sink",
-                          { RAD_RANGE("M", 1, rows), RAD_INT("heads", H), RAD_INT("latent_dim", L),
-                            RAD_INT("rope_dim", R), RAD_INT("blocks", s.ix_group_topk),
-                            RAD_INT("block_size", bs), RAD_F64("scale", scale),
-                            RAD_STR("dtype", "bf16"), RAD_INT("stable", stable) },
-                          { sinks }, { w.q_lat, w.q_rope, sel, len }, { w.lat });
+                return mk_list(b, "mla_attn_sel_sink",
+                               sink_params(rows, stable, false, s.ix_group_topk, 0), { sinks },
+                               { w.q_lat, w.q_rope, sel, len }, { w.lat });
             };
             op_sel = sel_op(DTmax, 1);
             op_sel_pf = sel_op(T, 0);
@@ -481,8 +507,17 @@ struct Attn {
         return RAD_OK;
     }
 
+    /* The decode rows' query rotary folded into the sinks' stable instances (their optional
+     * `rope_pos`), so a step with no prefill rows needs no `rope` launch. A step with prefill rows
+     * does not fold: one `rope` rotates every row there, and the fast instances and the
+     * non-absorbed path read the rotated buffer. Off with RADIANCE_HY4_FOLD_QROPE=0, which issues
+     * the `rope` launch back. */
+    bool fold_qrope(const StepPlan& p) const {
+        return p.T == p.DT && fuse_on("RADIANCE_HY4_FOLD_QROPE");
+    }
+
     /* The front: projections, norms, rotary and the cache store. */
-    bool front(RadCtx* c, const RadBatch* batch) const {
+    bool front(RadCtx* c, const RadBatch* batch, const StepPlan& p) const {
         const auto* kb = kv_batch(batch, kv);
         if (!kb || !kb->slot_mapping || !kb->block_table || !kb->seqused) {
             rad_step_fail(c, "hyv4flash: the latent cache's slot mapping, block table and "
@@ -508,6 +543,7 @@ struct Attn {
         q_rope.step(c, act(w.qa), w.q_rope, T);
         kv_a.step(c, act(xa), w.row, T);
         const RadOperand rpos = rope_pos_of(s, batch, T);
+        const bool qrope_folded = fold_qrope(p);
         const int64_t half = (L + R) / 2;
         /* The row's front in one launch (byte-identical to the norm, the rotary and the store). */
         const bool fused = op_row_front && !kb->stream;
@@ -518,7 +554,7 @@ struct Attn {
             RAD_ISSUE_N(c, op_kv_norm, T, bcol(w.row, 0, L, T), RAD_W(kv_gain), bcol(w.row, 0, L, T));
             t_kv_latent.step(c, bcol(w.row, 0, L, T), T);
         }
-        RAD_ISSUE_N(c, op_q_rope, T, brows(w.q_rope, T), rpos);
+        if (!qrope_folded) RAD_ISSUE_N(c, op_q_rope, T, brows(w.q_rope, T), rpos);
         if (!fused) {
             RAD_ISSUE_N(c, op_k_rope, T, bcol(w.row, L, R, T), rpos);
             t_kv_rope.step(c, bcol(w.row, L, R, T), T);
@@ -558,11 +594,15 @@ struct Attn {
         const auto* kb = kv_batch(batch, kv);
         const int64_t pitch = kb->block_table_pitch, D = p.D, DT = p.DT, L = s.kv_lora,
                       R = a.qk_rope, H = a.heads;
+        /* The rotary the decode rows fold (the stable instance's `rope_pos`): front() then issues
+         * no `rope` launch, and w.q_rope holds the projection's columns. Absent (RAD_NONE) when
+         * front() did not fold. */
+        const RadOperand rpos = fold_qrope(p) ? rope_pos_of(s, batch, DT) : RAD_NONE;
         if (D > 0 && DT > 0)
             RAD_ISSUE_N(c, op_paged, DT, brows(w.q_lat, DT), brows(w.q_rope, DT),
                         kv_cache(kv, layer), praw2(kb->block_table, RAD_I32, D, pitch),
                         praw(kb->seqused, RAD_I32, D), praw(batch->cu_seqlens, RAD_I32, D + 1),
-                        RAD_W(sinks), brows(w.lat, DT));
+                        RAD_W(sinks), brows(w.lat, DT), rpos);
         const int64_t M = p.T - DT;
         if (!prefill || p.P <= 0 || M <= 0) return;
         RAD_ISSUE_N(c, op_paged_pf, M, brow_slice(w.q_lat, DT, M, H * L),
@@ -573,13 +613,16 @@ struct Attn {
     }
 
     /* The selection form: decode-class rows [0, DT) stable, prefill rows [DT, T) fast. */
-    void selected(RadCtx* c, const StepPlan& p, rad_buf sel, rad_buf len) const {
+    void selected(RadCtx* c, const RadBatch* batch, const StepPlan& p, rad_buf sel,
+                  rad_buf len) const {
         const int64_t DT = p.DT, M = p.T - DT, L = s.kv_lora, R = a.qk_rope, H = a.heads,
                       K = s.ix_group_topk;
+        /* As paged(): the decode rows' rotary is folded into the stable instance. */
+        const RadOperand rpos = fold_qrope(p) ? rope_pos_of(s, batch, DT) : RAD_NONE;
         if (DT > 0)
             RAD_ISSUE_N(c, op_sel, DT, brows(w.q_lat, DT), brows(w.q_rope, DT),
                         kv_cache(kv, layer), brows(sel, DT), brows(len, DT), RAD_W(sinks),
-                        brows(w.lat, DT));
+                        brows(w.lat, DT), rpos);
         if (M > 0)
             RAD_ISSUE_N(c, op_sel_pf, M, brow_slice(w.q_lat, DT, M, H * L),
                         brow_slice(w.q_rope, DT, M, H * R), kv_cache(kv, layer),
@@ -655,7 +698,7 @@ struct Attn {
                 kv_resolve_issue(c, op_resolve, S, brows(sel, T), brows(nsel, T), kv, layer, T);
             }
             if (selecting)
-                selected(c, p, sel, len);
+                selected(c, batch, p, sel, len);
             else
                 paged(c, batch, p, !p.nonabs);
             if (fused_q)
