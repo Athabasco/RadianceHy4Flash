@@ -3987,7 +3987,10 @@ maximum is taken (libref shifts by the maximum of the scores and the sink).
   eight rotary columns of its own fragment; the other pairing (`neox`, `mrope`, `axial`) reaches
   half a head away, where no lane holds both, and is refused with `RAD_E_UNSUPPORTED` rather than
   half applied. Without `rope_pos` (or with a null operand) `q_rope` arrives rotated and the four
-  parameters are unused.
+  parameters are unused. `r4d_selftest` runs the folded launch against libref's own
+  rope-then-sink (a decode row, a verify's rows, the paged and the selected form, at a scale off 1)
+  and holds the launch's stable promise folded too: a verify's rows equal their single-row decode,
+  and the forms agree byte for byte.
 - **`attn_kv_sink`** is dense attention over separate keys and values (the non-absorbed prefill).
   `cu_q`, `cu_k` hold absolute offsets into `q` and into `k` / `v`; sequence `s` has `m_s` query
   rows and `n_s >= m_s` key rows (otherwise `RAD_E_SHAPE`), query `i` sits at key index
