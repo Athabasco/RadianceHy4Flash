@@ -1586,6 +1586,106 @@ TEST(quantised_trunk_linears_share_one_quantiser_an_input) {
     }
 }
 
+/* K-23: the iqr-gptq recipe's FFN is a u4 trellis gate_up and a rotated int8 down, so the gate
+ * and up rows' GEMM carries the product's rotated int8 quantiser in its own epilogue
+ * (decl_gated_fold_iqr = gemm_nt_q_gated at i8a8h) for the rows libr4d's gemm_iqr_gated serves
+ * (M <= 16): layer 0's dense MLP and both MoE layers' shared expert. The gate_up + gated_had_quant
+ * pair stays declared beside it for the longer rows, and it writes the same two code buffers, so a
+ * decode step is one launch where the pair is two and the codes are the pair's own (docs/OPS.md,
+ * "gemm_nt_q_gated": byte-identical). Where the library serves no such row, the pair runs. */
+void iqr_ffn_encs(RadBuilder* b) {
+    bf16_encs(b);
+    b->encs.insert(b->encs.begin(), { { "ffn_down_shexp", enc_i8(true) },
+                                      { "ffn_gate_up_shexp", enc_trellis(RAD_U4, true) },
+                                      { "ffn_down.", enc_i8(true) },
+                                      { "ffn_gate_up.", enc_trellis(RAD_U4, true) } });
+}
+TEST(the_gate_and_up_rows_fold_the_quantiser_into_the_gemm) {
+    for (int host = 0; host < 2; ++host) {
+        /* n_embd 256: the row's K and N are whole 256s, and the mini preset's 128 wide trunk
+         * leaves none to declare (decl_gated_fold_iqr refuses that geometry). */
+        MetaKV mk = mini_meta(false, 128, 256);
+        RadBuilder b;
+        iqr_ffn_encs(&b);
+        if (host) b.undeclared.insert("gemm_nt_q_gated");
+        RadBuildCtx ctx = build_ctx();
+        REQUIRE_EQ(hyv4flash::declare(&b, mk.meta(), &ctx), RAD_OK);
+        const int folds = host ? 0 : 3;
+        CHECK_EQ(count_op(b, "gemm_nt_q_gated"), folds);
+        CHECK_EQ(count_op(b, "gated_had_quant_i8g"), 3);   /* the pair, for the rows past 16 */
+        for (int i = 0; i < folds; ++i) {
+            const RecOp* f = find_op(b, "gemm_nt_q_gated", i);
+            REQUIRE(f != nullptr);
+            const RecParam* m = param(f, "M");
+            REQUIRE(m != nullptr);
+            CHECK_EQ(m->kind, (int)RAD_P_RANGE);
+            CHECK_EQ(m->ival, 1);
+            CHECK_EQ(m->ihi, 16);
+            CHECK_EQ(pstr(f, "dtype"), std::string("i8a8h"));
+            CHECK_EQ(pstr(f, "act"), std::string("silu"));
+            CHECK_EQ(pint(f, "group"), 128);
+            CHECK_EQ(pint(f, "K"), 256);                     /* the trunk width */
+            CHECK_EQ(pint(f, "N") % 256, 0);
+            /* the weight's two halves, the input's codes and the product's: no bf16 plane */
+            REQUIRE_EQ(f->w.size(), (size_t)2);
+            REQUIRE_EQ(f->reads.size(), (size_t)2);
+            REQUIRE_EQ(f->writes.size(), (size_t)2);
+            const RecOp* a = find_op(b, "gated_had_quant_i8g", i);
+            REQUIRE(a != nullptr);
+            CHECK(a->writes == f->writes);
+        }
+        /* A decode-class step issues the fold, not the pair; the pair stays for the longer ones. */
+        std::vector<std::unique_ptr<Kit>> dec;
+        dec.push_back(kit(b, { 1 }, {}));
+        dec.push_back(kit(b, { 16 }, {}));
+        for (auto& k : dec) {
+            k->b.positions_h = k->pos.data();
+            RadCtx c{ .b = &b, .batch = &k->b };
+            hyv4flash::step(&c, &k->b);
+            CHECK(c.step_fail.empty());
+            CHECK_EQ(count_issued(b, c, "gemm_nt_q_gated"), folds);
+            CHECK_EQ(count_issued(b, c, "gated_had_quant_i8g"), host ? 3 : 0);
+            /* the codes still go through the gate_up's own quantiser where they are not fed */
+            CHECK_EQ(count_issued(b, c, "had_quant_act_i8g"), 3);
+        }
+        auto pf = kit(b, {}, { 17 });
+        pf->b.positions_h = pf->pos.data();
+        RadCtx pc{ .b = &b, .batch = &pf->b };
+        hyv4flash::step(&pc, &pf->b);
+        CHECK(pc.step_fail.empty());
+        CHECK_EQ(count_issued(b, pc, "gemm_nt_q_gated"), 0);
+        CHECK_EQ(count_issued(b, pc, "gated_had_quant_i8g"), 3);
+        every_weight_read(b);
+        steps_clean_at(b, 0, 1);
+    }
+}
+
+/* The fold over a row-split gate_up: it takes the shard's own share of the weight and half of the
+ * gate|up rows, so a 2-rank split halves the dense MLP's 512 columns and the shared expert's 512
+ * to a whole 256 each. (The shared widths are set to 512 for the split: the mini preset's 256 would
+ * halve to 128 gate|up columns a rank, which the shared expert's int8 down refuses.) */
+TEST(the_fold_follows_the_gate_ups_own_row_share) {
+    MetaKV mk = mini_meta(false, 128, 256);
+    mk.set("moe_intermediate_size", "256");
+    for (int world : { 1, 2 }) {
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuilder b;
+            iqr_ffn_encs(&b);
+            RadBuildCtx ctx = build_ctx(rank, world);
+            G3Env g3env;
+            REQUIRE_EQ(hyv4flash::declare(&b, mk.meta(), &ctx), RAD_OK);
+            CHECK_EQ(count_op(b, "gemm_nt_q_gated"), 3);
+            CHECK_EQ(count_op(b, "gated_had_quant_i8g"), 3);
+            const RecOp* f = find_op(b, "gemm_nt_q_gated");
+            REQUIRE(f != nullptr);
+            CHECK_EQ(pint(f, "N"), world == 1 ? 512 : 256);
+            CHECK_EQ(pint(f, "K"), 256);
+            every_weight_read(b);
+            steps_clean_at(b, rank, world);
+        }
+    }
+}
+
 /* q_nope and q_rope rotated int8 of one form at a q_lora of whole 128 groups: the q residual's norm
  * writes their codes in its pass (rmsnorm_had_quant_i8g) from q_a's raw output, so neither has a
  * quantiser; on a CPU engine q_nope quantises the normed residual once and q_rope reads its codes. */
