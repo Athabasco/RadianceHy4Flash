@@ -3870,8 +3870,10 @@ over its latent, in one call: the same operands in the same order, `out` the lat
 and, past it, `w`, `g` and the expansion's three outputs. Where the sink splits a row (its scratch form)
 the expansion's workgroup folds the row's partials with `merge_sink`'s rule before it multiplies, so the
 merge and the latent's round trip go and `out` holds exactly the bytes `merge_sink` writes: libref and
-libavx run the pair itself, and libr4d's fold is held to `merge_sink` and to the expansion on the folded
-latent byte for byte (the fusion oracle, `tests/r4d_emu/test_mla_kv.cpp`). A call whose sink form is one
+libavx run the pair itself; `tests/r4d_emu/test_mla_kv.cpp` runs the fold itself and holds it to
+`merge_sink` and to the expansion on the folded latent byte for byte; and libr4d's row declares the
+pair's chain as its `replaces` (`mla_attn_paged_sink`, then `mla_expand_gate_had_quant_i8g` over the
+latent it wrote, `r4d_fuse.cpp`), which rad-kbench's fusion oracle runs. A call whose sink form is one
 pass, or a step whose expansion is not fused, keeps the two launches. The plugin also keeps them above
 four rows: the fold reads the partials through `heads * ceil(rows / 16)` workgroups, which off the small
 step cannot fill the memory system, and rad-kbench measures the fused launch 4-16 % of the pair faster at
