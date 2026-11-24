@@ -10,7 +10,9 @@
  * lengths 0..2049 (and past the law's last slot) at both windows; HG 1 / 2 / 4 equal; the table's
  * width moves no bit; the fused form (one workgroup a row folding the slots) equals the split form;
  * no room for the partials runs the fused form, no room for its accumulator is refused, never
- * unsplit. */
+ * unsplit. The split cap: `stable 1` splits to 48 rows (the verify heights, 8 streams x 6), which
+ * the scratch hook covers and the launch writes the parts for, and fuses past them; `stable 0`
+ * keeps its 16 / 32 rows. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
@@ -31,6 +33,9 @@ namespace {
 
 constexpr int L = 512, R = 64, W = L + R;
 constexpr double kScale = 0.0625;
+/* What the scratch holds for a row and head in either form: the 512 latent values it accumulates and
+ * after them the slot's maximum and denominator (r4d_mla_sink.hip's part, padded to 516). */
+constexpr int64_t kAccWords = 516;
 
 RadTensor tens(void* p, uint32_t dt, std::vector<int64_t> shape) {
     RadTensor t{};
@@ -200,9 +205,11 @@ struct Params {
     }
 };
 
-/* `stable` -1 leaves the parameter out (its default, 0). `scratch_cut` shortens the scratch. */
+/* `stable` -1 leaves the parameter out (its default, 0). `scratch_cut` shortens the scratch;
+ * `scr` (if given) gets the scratch's words after the call: the split form writes its slots' parts
+ * there, the fused form only the accumulator of a row and head (`kAccWords` floats). */
 int launch(const Problem& p, bool sel, int form, std::vector<uint16_t>& out, int stable = -1,
-           int64_t scratch_cut = 0) {
+           int64_t scratch_cut = 0, std::vector<uint32_t>* scr = nullptr) {
     const int M = p.rows();
     out.assign((size_t)M * p.heads * L, 0xffff);
     auto& P = const_cast<Problem&>(p);
@@ -244,7 +251,47 @@ int launch(const Problem& p, bool sel, int form, std::vector<uint16_t>& out, int
     const int rc = sel ? r4d_rad_mla_attn_sel_sink(&a, nullptr)
                        : r4d_rad_mla_attn_paged_sink(&a, nullptr);
     r4d_mla_sink_pin_form(0);
+    if (scr) {
+        const uint32_t* w = (const uint32_t*)a.scratch;
+        scr->assign(w, w + a.scratch_bytes / 4);
+    }
     return rc;
+}
+
+/* The scratch hook's answer for a shape: it reads shapes and parameters only, so the operands need
+ * no data behind them. */
+int64_t hook_size(const Problem& p, bool sel, int stable) {
+    const int M = p.rows();
+    std::vector<RadTensor> t;
+    t.push_back(tens(nullptr, RAD_BF16, { M, p.heads, L }));
+    t.push_back(tens(nullptr, RAD_BF16, { M, p.heads, R }));
+    t.push_back(tens(nullptr, RAD_BF16, { p.pages, 1, p.bs, W }));
+    Params ps;
+    ps.i("M", M);
+    ps.i("heads", p.heads);
+    ps.i("latent_dim", L);
+    ps.i("rope_dim", R);
+    if (sel) {
+        t.push_back(tens(nullptr, RAD_I32, { M, p.sel_blocks }));
+        t.push_back(tens(nullptr, RAD_I32, { M }));
+        ps.i("blocks", p.sel_blocks);
+    } else {
+        t.push_back(tens(nullptr, RAD_I32, { (int64_t)p.qlen.size(), p.blocks }));
+        t.push_back(tens(nullptr, RAD_I32, { (int64_t)p.used.size() }));
+        t.push_back(tens(nullptr, RAD_I32, { (int64_t)p.cu.size() }));
+        ps.i("window", p.window);
+    }
+    ps.i("block_size", p.bs);
+    ps.f("scale", kScale);
+    ps.i("stable", stable);
+    t.push_back(tens(nullptr, RAD_F32, { p.heads }));
+    t.push_back(tens(nullptr, RAD_BF16, { M, p.heads, L }));
+    RadArgs a{};
+    a.t = t.data();
+    a.n_t = (int)t.size();
+    a.p = ps.v.data();
+    a.n_p = (int)ps.v.size();
+    return sel ? r4d_rad_mla_attn_sel_sink_scratch(&a) : r4d_rad_mla_attn_paged_sink_scratch(&a);
 }
 
 int g_fail = 0;
@@ -373,8 +420,10 @@ Problem one_row(const Problem& p, int s, int i) {
 }
 
 /* stable 1: every row of a launch against its one-row launch (paged and, at window 0, the
- * selection form over the same pages), the launch against the f64 reference, and the HG forms. */
-void check_stable(const std::string& name, const Problem& p) {
+ * selection form over the same pages), the launch against the f64 reference, and the HG forms
+ * (`forms_pins` false where a case is about the rows alone and the forms are pinned elsewhere; the
+ * f64 reference and the row-per-row law always run). */
+void check_stable(const std::string& name, const Problem& p, bool forms_pins = true) {
     const std::vector<double> want = ref_paged(p);
     std::vector<uint16_t> all;
     int rc = launch(p, false, 0, all, 1);
@@ -393,14 +442,16 @@ void check_stable(const std::string& name, const Problem& p) {
                    std::equal(o.begin(), o.end(), all.begin() + (size_t)r * p.heads * L);
         }
     report(name + " stable 1: every row == its one-row launch (bytes)", same);
-    bool forms = true;
-    for (int form : { 1, 2, 3, 5, 6 }) {
-        if ((form == 2 && p.heads <= 16) || (form == 5 && p.heads <= 32)) continue;
-        std::vector<uint16_t> o;
-        forms = forms && launch(p, false, form, o, 1) == RAD_OK && o == all;
+    if (forms_pins) {
+        bool forms = true;
+        for (int form : { 1, 2, 3, 5, 6 }) {
+            if ((form == 2 && p.heads <= 16) || (form == 5 && p.heads <= 32)) continue;
+            std::vector<uint16_t> o;
+            forms = forms && launch(p, false, form, o, 1) == RAD_OK && o == all;
+        }
+        report(name + " stable 1: HG 1 / 2 / 4, the element load and the fused form equal (bytes)",
+               forms);
     }
-    report(name + " stable 1: HG 1 / 2 / 4, the element load and the fused form equal (bytes)",
-           forms);
     if (p.window == 0) {
         Problem q = p;
         make_sel_from_paged(q);
@@ -408,6 +459,63 @@ void check_stable(const std::string& name, const Problem& p) {
         report(name + " stable 1: paged(window 0) == sel (bytes)",
                launch(q, true, 0, b, 1) == RAD_OK && b == all);
     }
+}
+
+/* K-16: `stable 1` splits to the verify heights (48 rows, max_seqs x (max_spec + 1) = 8 x 6), where
+ * a workgroup takes a slot rather than walking the row; `stable 0` keeps its measured 16 / 32 rows.
+ * What the cap moves is the plan, not the bytes (the law is the same either way, and check_stable
+ * pins it): the scratch hook sizes the partials at those rows, and a launch up to the cap leaves
+ * them past the fused form's accumulator, while past the cap one workgroup walks the row. */
+void check_verify_cap(std::mt19937& rng) {
+    {
+        /* The hook covers 48 rows x the law's slots (8 at a window of 512, 20 at window 0, 16 in the
+         * selection form over blocks x block_size 2048) x heads x the part. */
+        Problem p;
+        make_paged(p, { 6, 6, 6, 6, 6, 6, 6, 6 }, { 600, 530, 511, 512, 513, 600, 700, 300 }, 32, 4,
+                   512, false, rng);
+        const int64_t split8 = 48 * 8 * 32 * kAccWords * 4;
+        report("stable 1: the scratch covers the split form at 48 rows (8 slots)",
+               hook_size(p, false, 1) >= split8);
+        report("stable 0: the scratch is still 16 rows at the window",
+               hook_size(p, false, 0) == 16 * 8 * 32 * kAccWords * 4);
+        p.heads = 16;
+        p.window = 0;
+        const int64_t split20 = 48 * 20 * 16 * kAccWords * 4;
+        report("stable 1: the scratch covers 20 slots at 48 rows (window 0)",
+               hook_size(p, false, 1) >= split20);
+        report("stable 0: the scratch is still 32 rows at window 0",
+               hook_size(p, false, 0) == 32 * 20 * 16 * kAccWords * 4);
+        p.sel_blocks = 512; /* blocks x block_size 2048: the law's 16 slots */
+        const int64_t split16 = 48 * 16 * 16 * kAccWords * 4;
+        report("stable 1: the scratch covers the selection form at 48 rows",
+               hook_size(p, true, 1) >= split16);
+        report("stable 0: the scratch is still 32 rows in the selection form",
+               hook_size(p, true, 0) == 32 * 16 * 16 * kAccWords * 4);
+    }
+    /* The form at the cap, both of them: 48 rows split (a slot a workgroup, its part in the scratch
+     * past the fused form's accumulator a row and head), 49 rows fuse. */
+    for (int window : { 512, 0 })
+        for (int rows : { 48, 49 }) {
+            Problem p;
+            make_paged(p, { rows }, { 600 }, 8, 4, window, true, rng);
+            std::vector<uint16_t> o;
+            std::vector<uint32_t> scr;
+            const int rc = launch(p, false, 0, o, 1, 0, &scr);
+            bool parts = false;
+            for (size_t i = (size_t)rows * p.heads * kAccWords; i < scr.size(); ++i)
+                parts = parts || scr[i] != 0;
+            report("stable 1 w" + std::to_string(window) + ": " + std::to_string(rows) +
+                       " rows run the " + (rows <= 48 ? "split" : "fused") + " form",
+                   rc == RAD_OK && parts == (rows <= 48));
+            if (window == 0 && rows == 48) {
+                /* the selection form at the verify height, over the same pages: the whole split */
+                Problem q = p;
+                make_sel_from_paged(q);
+                std::vector<uint16_t> b;
+                report("stable 1 w0: 48 rows, paged == the selection form (bytes)",
+                       launch(q, true, 0, b, 1) == RAD_OK && b == o);
+            }
+        }
 }
 
 void stable_suite(std::mt19937& rng, bool quick) {
@@ -518,6 +626,16 @@ void stable_suite(std::mt19937& rng, bool quick) {
         double err;
         const bool ok = launch(p, false, 0, o, 0) == RAD_OK && close_to(o, ref_paged(p), err);
         report("stable 0 past 16 rows (unsplit) vs f64", ok);
+    }
+    check_verify_cap(rng);
+    /* The verify height itself, where the split form now runs: 8 streams x 6 rows (48) on the
+     * sliding layer's shape at TP2 (32 heads, window 512). The HG forms are pinned at other row
+     * counts and head counts, so this case is about the rows: f64 and the row-per-row law. */
+    if (!quick) {
+        Problem p;
+        make_paged(p, { 6, 6, 6, 6, 6, 6, 6, 6 }, { 600, 530, 511, 512, 513, 1100, 2048, 700 }, 32,
+                   4, 512, true, rng);
+        check_stable("stable H32 w512 verify 8 x 6 (48 rows)", p, false);
     }
 }
 

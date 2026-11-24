@@ -3925,8 +3925,11 @@ maximum is taken (libref shifts by the maximum of the scores and the sink).
   order, the sink once), at every `M` under `stable 1`, sizing its scratch for every row of
   the declared `M` and refusing a launch whose scratch is short (`RAD_E_SCRATCH`); under `stable
   0` it runs that law up to 16 rows (window) / 32 rows (window 0, selection) and one unsplit pass
-  past them, which may differ in the last place. Hy4-flash declares its decode-class rows with
-  `stable 1` and its prefill rows with `stable 0`.
+  past them, which may differ in the last place. `stable 1` splits to its own cap, 48 rows (window,
+  window 0 and the selection form), which covers a speculative step's verify heights: up to there a
+  workgroup takes a slot instead of walking the row, and its scratch is sized for those partials (25
+  MiB at 48 rows of 32 heads and 8 slots). Hy4-flash declares its decode-class rows with `stable 1`
+  and its prefill rows with `stable 0`.
 - **`attn_kv_sink`** is dense attention over separate keys and values (the non-absorbed prefill).
   `cu_q`, `cu_k` hold absolute offsets into `q` and into `k` / `v`; sequence `s` has `m_s` query
   rows and `n_s >= m_s` key rows (otherwise `RAD_E_SHAPE`), query `i` sits at key index
