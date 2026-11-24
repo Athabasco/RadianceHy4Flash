@@ -37153,11 +37153,14 @@ static void device_phase(const Plugin& pl) {
                 iqr_gemm_case(pl, f, 300, 512, 1024);
             }
             /* K-02's shapes first, at the GEMV the pair serves: a sliding layer's q_nope 6144 and
-             * q_rope 2048 (four waves a tile for one part, eight for the other: the mix the launch
-             * exists for) and a sparse layer's 3072 and 1024 (eight for both), both u5 trellis, K
-             * 3072. Then other forms and the trellis under a per-row f32 scale, and the band's edge:
-             * the model's form takes one row, so a second is refused and both launches keep the
-             * work. */
+             * q_rope 2048 at TP2 (four waves a tile for one part, eight for the other: the mix the
+             * launch exists for) and a sparse layer's 3072 and 1024 (eight for both), both u5
+             * trellis, K 3072. Then the pair unsharded, 12288 and 4096 (the container's sliding
+             * layers, four times the TP2 pair), where both parts take four waves a tile and so two
+             * 16-row tiles a block -- the one pairing of the two wave counts the shapes above do
+             * not reach -- at the q_b site's own K 1024. Then other forms and the trellis under a
+             * per-row f32 scale, and the band's edge: the model's form takes one row, so a second is
+             * refused and both launches keep the work. */
             const IqrCase fd[] = {
                 /* the model's own pair: u5, tcq_code=mad, one f32 scale a row -- the form whose
                  * GEMV serves one row, which is the band the row is declared at */
@@ -37168,6 +37171,7 @@ static void device_phase(const Plugin& pl) {
                 { 6, 4, 0, 16, 1, true, true }, { 6, 4, 0, 16, 1, false, true, true },
             };
             iqr_dual_case(pl, fd[0], 1, 6144, 2048, 3072);
+            iqr_dual_case(pl, fd[0], 1, 12288, 4096, 1024);   /* both parts four waves a tile */
             iqr_dual_case(pl, fd[0], 1, 3072, 1024, 1536);
             iqr_dual_case(pl, fd[1], 1, 6144, 2048, 3072);
             iqr_dual_case(pl, fd[1], 1, 2048, 6144, 3072);   /* the roles the other way round */

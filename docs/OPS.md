@@ -756,9 +756,11 @@ own, which is why `N2` is a parameter of its own: each part's blocks are the blo
 gives it. libr4d's row is `gemm_iqr_dual`: both weights IQR, one row (the GEMV, where the two
 launches are launch and ramp cost), a block of eight waves per part -- two of its 16-row tiles where
 that part's own launch takes four waves a tile, one where it takes eight. K-02: Hy4-flash's
-`q_nope` and `q_rope` read the one q residual's codes at 6144 and 2048 columns on a sliding layer
-(3.84 and 1.32 MiB of codes) or 12288 and 4096 on a sparse one (7.61 and 2.58 MiB), and a layer's
-two launches become one.
+`q_nope` and `q_rope` read the one q residual's codes at 6144 and 2048 columns on a sparse layer
+(3.84 and 1.32 MiB of codes) or 12288 and 4096 on a sliding one (7.61 and 2.58 MiB), and a layer's
+two launches become one. A sparse layer is 32 heads unsharded and 16 a rank at TP2, a sliding one
+64 and 32, at 192 + 64 columns a head; the narrower pair is also what a sliding layer has at TP2
+and the wider one what it has at TP1.
 
 `gated_had_quant_i8g` and `rmsnorm_had_quant_i8g` are `gated_quant_fp8` and `rmsnorm_quant_fp8`
 with `had_quant_act_i8g`'s quantiser on their pass: the `group`-wide rotation of the bf16-rounded

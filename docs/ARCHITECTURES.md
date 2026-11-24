@@ -3468,8 +3468,9 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   two weights and their two widths, a concatenated grid of eight-wave blocks in which a part taking
   four waves a tile carries two of its 16-row tiles and one taking eight one, so each part does what
   the block of its own launch does and both products are the two launches' byte for byte
-  (`RADIANCE_HY4_FUSE_QPROJ`, `r4d_selftest`'s `gemm_iqr_dual` case comparing them at 6144/2048 and
-  3072/1024; a pass wider than one row stays two launches). The 128-group rotated quantisers
+  (`RADIANCE_HY4_FUSE_QPROJ`, `r4d_selftest`'s `gemm_iqr_dual` case comparing them at 6144/2048,
+  3072/1024 and 12288/4096, the last the one pair where both parts take four waves a tile; a pass
+  wider than one row stays two launches). The 128-group rotated quantisers
   (`had_quant_act_i8g`, `rmsnorm_had_quant_i8g`, the experts' `had_quant_act_fp8`) run their
   chained forms (`chained` 1, `Geom::chain_q8`), since every GEMM around them chains. Launches of a
   recorded gpu-mini decode pass: bf16 132 -> 129, int8 170 -> 148, three fewer again with the q
