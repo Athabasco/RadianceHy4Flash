@@ -84,15 +84,14 @@ struct GatedMlp {
             }
         }
         if (!gfuse) RAD_ARCH_TRY(act.declare(b, g, gu, ff, ff_w, "silu"));
-        /* The fold: gate_up, the gate and the codes of the product in one epilogue. Declared
-         * beside the pair, after `act`, so the codes it writes exist; the weight must be IQR (the
-         * layout the row decodes), gate_up and the input's codes int8 in the group the product's
-         * are in (one scale plane width on every operand), the gate write the codes alone (the
-         * fold has no bf16 product), and the library must serve the op (a CPU-only engine keeps
-         * the pair). */
+        /* The fold: gate_up, the gate and the codes of the product in one epilogue (the rule every
+         * gated MLP shares, gated_fold_iqr_ok). Declared beside the pair, after `act`, so the codes
+         * it writes exist; the gate write the codes alone (the fold has no bf16 product) and the
+         * library must serve the op (a CPU-only engine keeps the pair). A gate_up whose input codes
+         * are fed (the shared expert behind the latent linear, Lin::feed) declares no quantiser, so
+         * the fold reads the producer's pair; the others quantise their input in front of it. */
         const ActFP8 in_fold = gate_up.with_codes(in);
-        if (gfuse && !act.want_x && gate_up.iqr && gate_up.form.rot &&
-            gate_up.form.g8 == ff.g8 && in_fold.q8 && in_fold.s8 && in_fold.g8 == ff.g8 &&
+        if (gfuse && !act.want_x && gated_fold_iqr_ok(gate_up, in_fold, ff, in_fold.q8_fed) &&
             rad_op_declared(b, "gemm_nt_q_gated"))
             op_gated = decl_gated_fold_iqr(b, g.max_tok, gate_up.N, gate_up.K, gate_up.w,
                                            gate_up.ws, { in_fold.q8, in_fold.s8 },
