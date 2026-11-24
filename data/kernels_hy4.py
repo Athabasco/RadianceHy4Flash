@@ -306,7 +306,7 @@ def dfly(base, rec, out):
 #   ./build/bin/rad-kbench --home build/radiance_home --kernels libref --fixture k15.rkb --rerecord k15r.rkb
 #   ./build/bin/rad-kbench --home build/radiance_home --bench --kernels libr4d:libref \
 #       --fixture k15r.rkb --report k15.md
-#   python3 data/kernels_hy4.py append data/kernels_hy4.rkb k15.rkb data/kernels_hy4.rkb
+#   python3 data/kernels_hy4.py append data/kernels_hy4.rkb k15r.rkb data/kernels_hy4.rkb
 BF16, F32, I32, I8 = 3, 1, 11, 8
 IN_, OUT_, W_ = 0, 1, 3
 PINT, PSTR, PF64 = 1, 2, 4
@@ -355,8 +355,9 @@ def k15_cases(base):
     shares, the decode-class heights and both slot counts (window 0 is the 20-slot law, 512 the 8-slot
     one): the fused row, then mla_attn_paged_sink and mla_expand_gate_had_quant_i8g at the same M and H
     as its baseline. One sequence, its page table (block 4), with and without the bf16 plane. The heights
-    straddle the plugin's four-row bound (`kFoldRows`, where the fold stops paying), and the baseline
-    rows are the pair the fused row replaces: sum the sink and the expand of the same M and H."""
+    straddle both of the plugin's row bounds (`sink_fold_rows`: four rows at the 20-slot law, eight at the
+    8-slot one -- where the fold stops paying), and the baseline rows are the pair the fused row replaces:
+    sum the sink and the expand of the same M and H."""
     out, salt = [], base
     for H in (16, 8, 32):
         for M in (1, 2, 3, 4, 6, 8, 16, 17, 64):
