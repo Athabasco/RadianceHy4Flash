@@ -351,6 +351,13 @@ inline bool fuse_on(const char* name) {
  * the switch fuse_on's list names, now read here. */
 inline bool dual_fuse_on() { return fuse_on("RADIANCE_HY4_FUSE_QPROJ"); }
 
+/* K-03: q_a and the gate read one set of codes -- the attention input's, which q_a owns and the
+ * gate is fed from it -- and both are GEMVs at a decode step, while the gate's product is not read
+ * until `mla_expand_gate` (so it is off the critical path until then), which is the pair a launch
+ * wants: one `gemm_nt_q_dual` carries both where their encodings agree. Its own switch, so each
+ * pair's arm can be measured alone. Off with 0. */
+inline bool qa_gate_fuse_on() { return fuse_on("RADIANCE_HY4_FUSE_QA_GATE"); }
+
 /* The rows a pair's block covers of one part, off that part's own width: the GEMV takes four waves
  * a tile above 4096 columns and eight below (libr4d/r4d_gemm_iqr.hip), and a block of eight waves
  * is then two of its 16-row tiles or one. A part's N must be a whole number of them. */

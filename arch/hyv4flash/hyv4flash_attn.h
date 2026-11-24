@@ -371,6 +371,12 @@ struct Attn {
         RAD_ARCH_TRY(gate.declare(b, nm, g, nm.f("blk.%d.attn_gate", l), a.v_width(), s.n_embd,
                                   RAD_SHARD_ROW, grp, { nm.ckpt("%s.linear_gate.weight", ap) },
                                   act(xa), w.gate));
+        /* K-03: the gate reads q_a's codes and both are GEMVs at a decode step, so where the two
+         * encodings agree one launch carries the pair -- q_a's part is the eight-wave one -- and the
+         * gate's own launch stays the wider passes'. Its product is written at q_a's place, which is
+         * ahead of `mla_expand_gate`, its only reader. */
+        if (qa_gate_fuse_on())
+            RAD_ARCH_TRY(q_a.declare_dual(b, gate, xa, qa_out, w.gate, T));
 
         q_a.fed_codes = kv_a.fed_codes = gate.fed_codes = nullptr;
         RAD_ARCH_TRY(t_in_norm.declare(b, nm, T, "attn_in_norm", l, RAD_BF16, s.n_embd, xa));
