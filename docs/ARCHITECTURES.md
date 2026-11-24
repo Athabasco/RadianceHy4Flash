@@ -3473,8 +3473,10 @@ ihc_pre (hc_head), rmsnorm (output_norm), gather_rows, logits_gemm
   `ffn_latent_out`'s is the one fused producer that is not a norm or a gate: the routed MoE gather
   (`moe_gather_inv_i8g`, K-19) writes the sum's rotated int8 codes and scales in the launch that
   sums it, so that linear declares no `had_quant_act_i8g`. It needs the slot table, no shared arm
-  in the gather, `top_k` 16 and a latent the weight's scale group divides; else the plain gather
-  serves and the linear quantises for itself. `RADIANCE_HY4_FUSE_GATHER_Q8=0` turns it off.
+  in the gather, `top_k` 16, a latent that is a whole number of the codes' 256-column waves
+  (`latent % 256 == 0`), a latent its weight's scale group divides (128 or 256), and a write that
+  does not fold the gather in (a fold writes no codes); else the plain gather serves and the linear
+  quantises for itself. `RADIANCE_HY4_FUSE_GATHER_Q8=0` turns it off.
 - **The Engram table on disk** (`ngram-placement: disk`). The ids and the gathered rows are
   host-domain buffers (as `rad_block_ple.h`'s), so libavx's host gather reads and writes them in the
   host arena; a device gather (vram, ram) reads and writes them over the link. A prefill chunk's

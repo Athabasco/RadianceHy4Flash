@@ -2380,9 +2380,11 @@ same launch, so a linear reading the sum declares no quantiser of its own -- one
 layer (K-19). The gather's 256-column wave is exactly the 128-wide FWHT and the group's amax that
 `quant_act_i8g` runs (`group` 128, or 256 for an IQ8R trunk), so `q8` and `q8_scale` are
 byte-identical to running `quant_act_i8g` over `y` afterwards; `y` is byte-identical to
-`moe_gather_inv`'s (`tests/r4d_emu/test_moefuse.cpp`, codes and scales against a host reference
-over six shapes). `n` is a multiple of 256 and `group` divides it; operands are writes after the
-reads because the shared vocabulary's lists are fixed, hence an op of its own.
+`moe_gather_inv`'s (`tests/r4d_emu/test_moefuse.cpp` drives its entry point over both of its wave
+forms and each pinned form, codes and scales against a host reference over six shapes;
+`--perfmoefuse` checks the same against the gather + `had_quant_act_i8g` pair on the card). `n` is
+a multiple of 256 and `group` is 128 or 256; operands are writes after the reads because the shared
+vocabulary's lists are fixed, hence an op of its own.
 
 At `dtype=mxfp4a8` (the host libraries; libr4d has no row), `w` and `w_odd` are OCP e2m1 codes and `w_scale` and `w_odd_scale` hold one
 E8M0 exponent per (row, 32 of K), typed `e8m0` or raw `u8`; either way a byte is an exponent, not
