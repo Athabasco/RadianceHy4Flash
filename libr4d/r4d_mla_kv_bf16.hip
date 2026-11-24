@@ -706,9 +706,12 @@ extern "C" int r4d_rad_mla_attn_paged_sink_expand_i8g(const RadArgs* a, RadStrea
                       r4d_opt(a, 12), &k);
     if (rc != RAD_OK) return rc;
     /* The rows the sink walks are q's; the fold writes the latent's head slices the contraction
-     * reads, so both must be the plain layout. */
-    if (k.rows != a->t[0].shape[0] || lat->rank != 3 || lat->stride[1] != kLatent ||
-        lat->stride[2] != 1)
+     * reads, so both must be the plain layout: `kvq_args` has held the row to h * latent halves
+     * (the plugin hands it as [rows, heads * latent]), this the head inside it -- the last two axes
+     * of [rows, heads, latent] are latent-contiguous. */
+    if (k.rows != a->t[0].shape[0] ||
+        (lat->rank >= 3 && (lat->stride[lat->rank - 2] != kLatent ||
+                            lat->stride[lat->rank - 1] != 1)))
         return R4D_NO(RAD_E_SHAPE);
     MlaSinkForm form;
     rc = mla_sink_launch(a, s, &form);

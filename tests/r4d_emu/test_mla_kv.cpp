@@ -238,9 +238,11 @@ static int run_scratch(RadLaunchFn fn, int64_t (*scratch)(const RadArgs*), std::
 /* mla_attn_paged_sink_expand_i8g against the ops it replaces, bit for bit: the sink splits at
  * window 0, so the expansion's workgroup folds its head's partials into LDS (merge_sink's rule a
  * column at a time), and nothing of the latent, the codes, the scales or the gated product may
- * move. Two sequences, 8 and 32 heads (the sink's workgroup and four tiles), at both windows. */
+ * move. Two sequences, 8 and 32 heads (the sink's workgroup and four tiles), at both windows, and
+ * the latent as a shape hook describes it ([rows, heads, latent], `lat_rank` 3) or as the plugin
+ * hands it ([rows, heads * latent], 2) -- the fold writes a head's slice of a row either way. */
 static void sink_expand_fold_case(int64_t H, int64_t rows_per_seq, int64_t ctx_len, int64_t bs,
-                                  int window, uint32_t seed) {
+                                  int window, uint32_t seed, int lat_rank = 3) {
     const int64_t S = 2, M = rows_per_seq * S;
     const int64_t blocks = (ctx_len + bs - 1) / bs, pages = S * blocks + 2;
     const int64_t nv = H * kVd, ng = nv / 128;
@@ -288,8 +290,12 @@ static void sink_expand_fold_case(int64_t H, int64_t rows_per_seq, int64_t ctx_l
                     tused = bt_tensor(used, RAD_I32, { S }, 4),
                     tcu = bt_tensor(cu, RAD_I32, { S + 1 }, 4),
                     tsk = bt_tensor(sinks, RAD_F32, { H }, 4),
-                    tla = bt_tensor(lat_a, RAD_BF16, { M, H, kL }, 2),
-                    tlb = bt_tensor(lat_b, RAD_BF16, { M, H, kL }, 2),
+                    tla = bt_tensor(lat_a, RAD_BF16,
+                                    lat_rank >= 3 ? std::vector<int64_t>{ M, H, kL }
+                                                  : std::vector<int64_t>{ M, H * kL }, 2),
+                    tlb = bt_tensor(lat_b, RAD_BF16,
+                                    lat_rank >= 3 ? std::vector<int64_t>{ M, H, kL }
+                                                  : std::vector<int64_t>{ M, H * kL }, 2),
                     tw = bt_tensor(w, RAD_BF16, { H * (kKd + kVd), kL }, 2),
                     tg = bt_tensor(g, RAD_BF16, { M, nv }, 2),
                     tq8a = bt_tensor(q8a, RAD_I8, { M, nv }, 1),
@@ -304,8 +310,8 @@ static void sink_expand_fold_case(int64_t H, int64_t rows_per_seq, int64_t ctx_l
     MlaSinkForm form{};
     const int rc_form = run_scratch(nullptr, r4d_rad_mla_attn_paged_sink_scratch, sink_t, sp, &form);
     std::snprintf(what, sizeof what,
-                  "K-15 heads %lld: the sink splits (%d slots a row, %d rows) and leaves the merge",
-                  (long long)H, form.splits, form.rows);
+                  "K-15 heads %lld rank %d: the sink splits (%d slots a row, %d rows) and leaves the merge",
+                  (long long)H, lat_rank, form.splits, form.rows);
     ok(rc_form == RAD_OK && form.splits > 1 && !form.fused && form.rows == M, what);
     /* the three ops, in the plugin's order */
     const int rc1 = run_scratch(r4d_rad_mla_attn_paged_sink, r4d_rad_mla_attn_paged_sink_scratch,
@@ -315,17 +321,21 @@ static void sink_expand_fold_case(int64_t H, int64_t rows_per_seq, int64_t ctx_l
     std::vector<RadTensor> fuse_t = { tq, tqr, tkv, ttbl, tused, tcu, tsk, tlb, tw, tg, tq8b, ts8b, tyb };
     const int rc3 = run_scratch(r4d_rad_mla_attn_paged_sink_expand_i8g,
                                 r4d_rad_mla_attn_paged_sink_scratch, fuse_t, fp);
-    std::snprintf(what, sizeof what, "K-15 heads %lld: the three ops and the fused one launch", (long long)H);
+    std::snprintf(what, sizeof what, "K-15 heads %lld rank %d: the three ops and the fused one launch",
+                  (long long)H, lat_rank);
     ok(rc1 == RAD_OK && rc2 == RAD_OK && rc3 == RAD_OK, what);
     std::snprintf(what, sizeof what,
-                  "K-15 heads %lld: the fused op's latent is merge_sink's, bit for bit", (long long)H);
+                  "K-15 heads %lld rank %d: the fused op's latent is merge_sink's, bit for bit", (long long)H, lat_rank);
     ok(std::memcmp(tla.data, tlb.data, (size_t)(M * H * kL * 2)) == 0, what);
-    std::snprintf(what, sizeof what, "K-15 heads %lld: the fused op's int8 codes and scales are the expansion's",
-                  (long long)H);
+    std::snprintf(what, sizeof what,
+                  "K-15 heads %lld rank %d: the fused op's int8 codes and scales are the expansion's",
+                  (long long)H, lat_rank);
     ok(std::memcmp(tq8a.data, tq8b.data, (size_t)(M * nv)) == 0 &&
            std::memcmp(ts8a.data, ts8b.data, (size_t)(M * ng * 4)) == 0,
        what);
-    std::snprintf(what, sizeof what, "K-15 heads %lld: the fused op's gated product is the expansion's", (long long)H);
+    std::snprintf(what, sizeof what,
+                  "K-15 heads %lld rank %d: the fused op's gated product is the expansion's",
+                  (long long)H, lat_rank);
     ok(std::memcmp(tya.data, tyb.data, (size_t)(M * nv * 2)) == 0, what);
 }
 
@@ -383,7 +393,8 @@ int main() {
         }
     for (const int64_t H : { (int64_t)8, (int64_t)32 })
         for (const int window : { 0, 512 })
-            sink_expand_fold_case(H, 2, 9, 4, window, (uint32_t)(H * 7 + window));
+            for (const int lat_rank : { 3, 2 })
+                sink_expand_fold_case(H, 2, 9, 4, window, (uint32_t)(H * 7 + window), lat_rank);
     std::printf("%d case(s), %d failure(s)\n", g_cases, g_fails);
     return g_fails ? 1 : 0;
 }
