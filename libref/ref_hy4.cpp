@@ -646,7 +646,7 @@ int ref_mla_attn_paged_sink_expand_i8g(const RadArgs* a, RadStream s) {
     RadTensor et[6] = { a->t[7], a->t[8], a->t[9], a->t[10], a->t[11], y ? a->t[12] : RadTensor{} };
     RadArgs ex = *a;
     ex.t = et;
-    ex.n_t = y ? 6 : 5;
+    ex.n_t = 6;   /* the absent plane is a null tensor, not a shorter array (abi rule) */
     return ref_mla_expand_gate_had_quant_i8g(&ex, s);
 }
 

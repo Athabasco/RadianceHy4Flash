@@ -596,6 +596,66 @@ TEST(mla_attn_paged_sink_matches_hf_eager_attention_on_the_latent_at_both_window
     CHECK(worst(out, mla_out_w0, 2 * 2 * 16, 2e-5, 2e-6) <= 1.0);
 }
 
+TEST(k15_the_fused_sink_and_expand_is_the_pair_it_replaces_on_the_host) {
+    /* mla_attn_paged_sink_expand_i8g is the sink and the G-3c expansion over its latent: run the pair on
+     * the host and the fused op beside it on the same bytes, and every byte the pair wrote has to come
+     * back. This is the composition libr4d's fold is held to (the emu runs the kernel against this pair). */
+    MlaGolden g;
+    const int64_t H = 2, L = 16, kd = 4, vd = 8, m = 2, group = 8, n = H * vd;
+    const double scale = std::pow(256.0, -0.5);
+    T lat(RAD_BF16, {m, H, L}), lat2(RAD_BF16, {m, H, L}), w(RAD_BF16, {H * (kd + vd), L}),
+      gg(RAD_BF16, {m, n}), y(RAD_BF16, {m, n}), y2(RAD_BF16, {m, n}), q8(RAD_I8, {m, n}),
+      q82(RAD_I8, {m, n}), sc(RAD_F32, {m, n / group}), sc2(RAD_F32, {m, n / group});
+    for (int64_t i = 0; i < H * (kd + vd) * L; ++i) st_dt(RAD_BF16, w.t.data, i, 0.05f * (float)((i * 37) % 23) - 0.5f);
+    for (int64_t i = 0; i < m * n; ++i) st_dt(RAD_BF16, gg.t.data, i, 0.1f * (float)((i * 11) % 17) - 0.8f);
+    A sink; sink.t(g.q).t(g.qr).t(g.kv).t(g.bt).t(g.su).t(g.cu).t(g.sinks).t(lat).i("M", m)
+        .i("heads", H).i("latent_dim", L).i("rope_dim", 4).i("block_size", 4).i("window", 0)
+        .d("scale", scale).s("dtype", "bf16");
+    REQUIRE_EQ(run("mla_attn_paged_sink", sink), (int)RAD_OK);
+    A ex; ex.t(lat).t(w).t(gg).t(q8).t(sc).tnull().i("M", m).i("heads", H).i("k_dim", kd)
+        .i("v_dim", vd).i("latent_dim", L).i("group", group).s("dtype", "bf16");
+    REQUIRE_EQ(run("mla_expand_gate_had_quant_i8g", ex), (int)RAD_OK);
+
+    A one; one.t(g.q).t(g.qr).t(g.kv).t(g.bt).t(g.su).t(g.cu).t(g.sinks).t(lat2).t(w).t(gg).t(q82)
+        .t(sc2).tnull().i("M", m).i("heads", H).i("latent_dim", L).i("rope_dim", 4)
+        .i("block_size", 4).i("window", 0).d("scale", scale).s("dtype", "bf16").i("stable", 1)
+        .i("k_dim", kd).i("v_dim", vd).i("group", group);
+    REQUIRE_EQ(run("mla_attn_paged_sink_expand_i8g", one), (int)RAD_OK);
+    /* The latent, the codes and the scales: byte for byte, and a value that says the pair wrote them. */
+    int bad = 0;
+    for (int64_t i = 0; i < m * H * L && bad < 3; ++i)
+        if (ld_dt(RAD_BF16, lat.t.data, i) != ld_dt(RAD_BF16, lat2.t.data, i)) {
+            CHECK_EQ(ld_dt(RAD_BF16, lat2.t.data, i), ld_dt(RAD_BF16, lat.t.data, i)); ++bad;
+        }
+    CHECK(m * H * L > 0 && ld_dt(RAD_BF16, lat.t.data, 0) != 0.0f);
+    bad = 0;
+    for (int64_t i = 0; i < m * n && bad < 3; ++i)
+        if (ld_int(RAD_I8, q8.t.data, i) != ld_int(RAD_I8, q82.t.data, i)) {
+            CHECK_EQ(ld_int(RAD_I8, q82.t.data, i), ld_int(RAD_I8, q8.t.data, i)); ++bad;
+        }
+    CHECK(ld_int(RAD_I8, q8.t.data, 0) != 0);
+    bad = 0;
+    for (int64_t i = 0; i < m * n / group && bad < 3; ++i)
+        if (ld_dt(RAD_F32, sc.t.data, i) != ld_dt(RAD_F32, sc2.t.data, i)) {
+            CHECK_EQ(ld_dt(RAD_F32, sc2.t.data, i), ld_dt(RAD_F32, sc.t.data, i)); ++bad;
+        }
+    /* The plane, where a caller asks for it, is the pair's bf16 product too. */
+    A ex2; ex2.t(lat).t(w).t(gg).t(q8).t(sc).t(y).i("M", m).i("heads", H).i("k_dim", kd)
+        .i("v_dim", vd).i("latent_dim", L).i("group", group).s("dtype", "bf16");
+    REQUIRE_EQ(run("mla_expand_gate_had_quant_i8g", ex2), (int)RAD_OK);
+    A one2; one2.t(g.q).t(g.qr).t(g.kv).t(g.bt).t(g.su).t(g.cu).t(g.sinks).t(lat2).t(w).t(gg).t(q82)
+        .t(sc2).t(y2).i("M", m).i("heads", H).i("latent_dim", L).i("rope_dim", 4)
+        .i("block_size", 4).i("window", 0).d("scale", scale).s("dtype", "bf16").i("stable", 1)
+        .i("k_dim", kd).i("v_dim", vd).i("group", group);
+    REQUIRE_EQ(run("mla_attn_paged_sink_expand_i8g", one2), (int)RAD_OK);
+    bad = 0;
+    for (int64_t i = 0; i < m * n && bad < 3; ++i)
+        if (ld_dt(RAD_BF16, y.t.data, i) != ld_dt(RAD_BF16, y2.t.data, i)) {
+            CHECK_EQ(ld_dt(RAD_BF16, y2.t.data, i), ld_dt(RAD_BF16, y.t.data, i)); ++bad;
+        }
+    CHECK(ld_dt(RAD_BF16, y.t.data, 0) != 0.0f);
+}
+
 TEST(the_absorbed_path_equals_the_non_absorbed_path_on_the_same_inputs) {
     const int64_t H = 3, kd = 6, vd = 8, L = 16, R = 4, m = 5, N = 14, W = 6, bs = 4;
     const double scale = std::pow((double)(kd + R), -0.5);
