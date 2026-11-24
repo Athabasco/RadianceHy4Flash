@@ -31,6 +31,20 @@
 
 namespace rad {
 
+/* S-02: whether the engine must declare the chunk's persistent state (RadBuildCtx::layer_slices,
+ * i.e. the plugin's own `sliced`): some lever that can make the scheduler plan layer-sliced
+ * sub-steps, and a plugin that reports it can run the trunk over a layer range and resume from it
+ * (RadArchProbe::slice_layers_ok, as Engine::declare recorded it in cfg). The scheduler plans a
+ * slice only where the same conditions hold (Scheduler::start_group), so a sliced step always finds
+ * what it resumes declared rather than transient memory the next engine step resets. The answer is
+ * the layer count (a sliced pass runs the trunk over `layer_hi == n_layers` in more than one step)
+ * or 0 for a whole trunk. */
+inline int32_t declared_layer_slices(const Config& cfg, int32_t n_layers) {
+    if (n_layers < 2 || !cfg.slice_layers_ok) return 0;
+    if (cfg.chunk_slices == 0 && cfg.chunk_slices_prefill < 2) return 0;
+    return n_layers;
+}
+
 /* The scheduler's own per-request state. Request (rad_core.h) is shared across components and
  * frozen; state only the scheduler needs lives here. */
 struct SchedReq {

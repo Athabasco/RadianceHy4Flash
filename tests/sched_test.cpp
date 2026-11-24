@@ -10870,6 +10870,53 @@ TEST(the_hook_leaves_a_prefill_step_whole_where_it_cannot_slice_it) {
     }
 }
 
+/* S-02b: the same predicate decides both halves — that the scheduler plans a sliced step and that
+ * the builder was told to declare the chunk's persistent set (Engine::build_ctx →
+ * RadBuildCtx::layer_slices → the plugin's m.sliced). A slice planned over a graph declared whole
+ * would hand the next sub-step transient memory that the engine's next step resets. */
+TEST(a_sliced_plan_comes_with_the_persistent_set_declared) {
+    const int32_t L = 8;
+    /* The lever: a chunk beside a decoder, planned as layer slices. */
+    {
+        Fixture f;
+        slice_fixture(f, /*slices=*/4);
+        CHECK_OK(f.start());
+        uint64_t dec = 0, chunk = 0;
+        REQUIRE(slice_start(f, &dec, &chunk) != nullptr);
+        CHECK_EQ(f.sch.plan().slice_m, 4);
+        CHECK_EQ(f.sch.plan().layer_hi, L / 4);
+        CHECK_EQ(rad::declared_layer_slices(f.cfg, L), L);
+    }
+    /* The hook alone: a prefill-only step, the lever off. */
+    {
+        Fixture f;
+        slice_fixture(f, /*slices=*/0);
+        f.cfg.chunk_slices_prefill = 4;
+        CHECK_OK(f.start());
+        f.submit(496, 64);
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.plan().slice_m, 4);
+        CHECK_EQ(rad::declared_layer_slices(f.cfg, L), L);
+    }
+    /* Where nothing can be sliced, neither the plan nor the declaration says so: a plugin with no
+     * resumable layer range, a trunk of one layer, and m of 0 or 1 (1 leaves the step whole). */
+    for (int32_t m : { 0, 1, 4 }) {
+        for (int ok : { 0, 1 }) {
+            Fixture f;
+            slice_fixture(f, /*slices=*/0);
+            f.cfg.chunk_slices_prefill = m;
+            f.cfg.slice_layers_ok = ok != 0;
+            const int32_t want = (m >= 2 && ok) ? L : 0;
+            CHECK_EQ(rad::declared_layer_slices(f.cfg, L), want);
+            CHECK_EQ(rad::declared_layer_slices(f.cfg, 1), 0);
+            CHECK_OK(f.start());
+            f.submit(496, 64);
+            REQUIRE(f.sch.step() != nullptr);
+            CHECK_EQ(f.sch.plan().slice_m, want ? 4 : 0);
+        }
+    }
+}
+
 /* Nothing is admitted inside a group: a newcomer waits for the last sub-step, and the chunk's
  * rows and blocks stay what they were. */
 TEST(admission_waits_for_a_group_s_last_slice) {
