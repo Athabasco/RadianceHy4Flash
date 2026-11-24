@@ -325,11 +325,6 @@ inline bool fuse_on(const char* name) {
     return !(e && *e && std::strcmp(e, "0") == 0);
 }
 
-/* K-01's pair launch: the trunk's `latent_in` and the shared arm's gate_up, both over one
- * activation's rotated int8 codes, in one `gemm_nt_q_dual` (Lin::declare_dual). Byte-identical to
- * the two launches, and one GEMM shorter in the layer's ordered tail. Off: RADIANCE_HY4_FUSE_DUAL=0. */
-inline bool dual_fuse_on() { return fuse_on("RADIANCE_HY4_FUSE_DUAL"); }
-
 /* MoeFP8's fused selection and sort (Config::router_fuse). Off: RADIANCE_HY4_ROUTER_FUSE=0. */
 inline bool router_fuse_on() {
     const char* e = std::getenv("RADIANCE_HY4_ROUTER_FUSE");
@@ -371,22 +366,6 @@ struct Lin : LinearFP8 {
     const Lin* feed = nullptr;
     const ActFP8* fed_codes = nullptr;
     bool fed = false;   /* declared without a quantiser: its codes come from `feed` or `fed_codes` */
-    /* The pair's launch (`gemm_nt_q_dual`, K-01): `op_dual` over this Lin's weight and `w2`'s, both
-     * products written where their own launches write them -- this Lin's into its `y`, the mate's
-     * into `dual_y`. `dual_mate` is the second Lin of a pair: its own `op` is issued above the band
-     * the pair serves, and below it the first Lin's launch writes its product. */
-    rad_op op_dual = 0;
-    rad_weight w2 = 0, ws2 = 0;
-    rad_buf dual_y = 0;
-    bool dual_mate = false;
-    /* The heights a pair's launch serves: the IQR GEMV's and the 16-token tile's (a decode step). */
-    static constexpr int64_t kDualMaxM = 16;
-    /* This Lin's weight encoding spelled (rad_enc_format): a pair's launch reads one form's codes
-     * for both weights, so the two must be the same encoding, not merely the same code view. */
-    char enc_text[256] = {};
-    /* A trellis on a grid of `w_rb` rows a scale (libquant's tcq_rb), as LinearFP8 declares it: a
-     * pair's launch folds with the one Lin's value, so the two must agree. */
-    int64_t w_rb = 0;
     ActFP8 with_codes(const ActFP8& a) const {
         ActFP8 r = a;
         if (q8 && !r.q8) {
@@ -429,11 +408,6 @@ struct Lin : LinearFP8 {
                 return RAD_E_DTYPE;
             }
             form = code_form(b, wn);
-            rad_enc_format(&e, enc_text, sizeof enc_text);
-            {
-                const RadEncPlane* tpl = rad_enc_plane(&e, "trellis");
-                w_rb = tpl && tpl->block[1] > 1 ? tpl->block[1] : 0;
-            }
             Codes* c = codes_of(b);
             if (!c) return RAD_E_INVAL;
             if (fed_codes && fed_codes->q8 && fed_codes->s8 && fed_codes->g8 == form.g8 &&
@@ -463,52 +437,9 @@ struct Lin : LinearFP8 {
         return LinearFP8::declare(b, nm, gl, base, n_out, n_in, shard, grp, src, with_codes(a), y,
                                   max_rows, row_parts, span_lo, span_hi);
     }
-    /* One launch over this Lin's weight and `mate`'s, both over the codes this Lin's input was
-     * quantised to (`mate` reads them: Lin::feed). Declared beside both Lins' own ops, taken at the
-     * heights it serves; above them the two launches run. The pair must be one form -- equal code and
-     * scale views, so one decode serves both -- one N and one K, which is what makes each part's
-     * blocks the blocks of its own launch (byte-identical, the row's claim and its oracle's). */
-    int declare_dual(RadBuilder* b, Lin& mate, rad_buf x, rad_buf y, rad_buf mate_y, int64_t rows) {
-        if (bf16 || mate.bf16 || !q8 || !s8) return RAD_OK;
-        if (!iqr || !mate.iqr || !form.rot) return RAD_OK;
-        if (!mate.fed || mate.q8 != q8 || mate.s8 != s8 || mate.g8 != g8) return RAD_OK;
-        if (mate.N != N || mate.K != K || !form.same(mate.form) || mate.w_rb != w_rb) return RAD_OK;
-        if (std::strcmp(enc_text, mate.enc_text) || !rad_op_declared(b, "gemm_nt_q_dual")) return RAD_OK;
-        const RadParam ps[] = { RAD_RANGE("M", 1, rows < kDualMaxM ? rows : kDualMaxM),
-                                RAD_INT("N", N), RAD_INT("K", K), RAD_INT("group", g8),
-                                RAD_STR("dtype", "i8a8h") };
-        const rad_weight wts[] = { w, ws, mate.w, mate.ws };
-        op_dual = rw(b, rad_decl_op(b, "gemm_nt_q_dual", ps, 5, wts, 4), { x, q8, s8 },
-                     { y, mate_y });
-        if (!op_dual) return RAD_E_INVAL;
-        w2 = mate.w;
-        ws2 = mate.ws;
-        dual_y = mate_y;
-        mate.dual_mate = true;
-        return RAD_OK;
-    }
-    /* The pair's launch: this Lin's quantiser (it owns the codes then) and one GEMM over both
-     * weights into both products. */
-    void dual_step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0, int64_t rows,
-                   int64_t y0, bool codes_ready) const {
-        if (rows <= 0) rows = T - r0;
-        const int64_t yr = y0 < 0 ? r0 : y0;
-        if (op_q && !codes_ready)
-            RAD_ISSUE_N(c, op_q, rows, brow_slice(a.x, r0, rows, K), brow_slice(a.q8, r0, rows, K),
-                        brow_slice(a.s8, r0, rows, K / a.g8));
-        RAD_ISSUE_N(c, op_dual, rows, brow_slice(a.q8, r0, rows, K),
-                    brow_slice(a.s8, r0, rows, K / a.g8), RAD_W(w), RAD_W(ws),
-                    brow_slice(y, yr, rows, N), RAD_W(w2), RAD_W(ws2),
-                    brow_slice(dual_y, yr, rows, N));
-    }
     void step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0 = 0, int64_t rows = 0,
               int64_t y0 = -1, bool codes_ready = false) const {
-        const int64_t n = rows > 0 || !T ? rows : T - r0;
-        /* The pair's second Lin: within the band the first Lin's launch writes this product. */
-        if (dual_mate && n <= kDualMaxM) return;
-        const ActFP8 in = with_codes(a);
-        if (op_dual && n <= kDualMaxM) return dual_step(c, in, y, T, r0, rows, y0, codes_ready);
-        LinearFP8::step(c, in, y, T, r0, rows, y0, codes_ready);
+        LinearFP8::step(c, with_codes(a), y, T, r0, rows, y0, codes_ready);
     }
 };
 

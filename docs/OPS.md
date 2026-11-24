@@ -741,20 +741,9 @@ for it. `residual` present is the `fused_add_rms_norm` form.
 | `rmsnorm_quant_i8g` | `M` `n` `eps`:f64 `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `gelu_mul_quant_i8` | `M` `n` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `gelu_mul_quant_i8g` | `M` `n` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
-| `gemm_nt_q_dual` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w → `y`; `b2`w, `b2_scale`w → `y2` |
 
 `gelu_mul_quant_i8` is `gelu_mul` with `rmsnorm_quant_i8`'s quantiser on its pass, byte-identical
 to the pair.
-
-`gemm_nt_q_dual` is two GEMMs of one activation's codes over two weights of one shape and one form,
-in one launch: `b` → `y` and `b2` → `y2`, both reading the one `a` and `a_scale`. The two launches'
-blocks are concatenated in one grid, each part decoding and folding exactly as it does alone, so
-both outputs are byte-identical to the pair of calls it replaces -- which is what makes it a gain
-rather than a numerical path, and a pair of weights that differ in form or shape is not its subject.
-libr4d's row is `gemm_iqr_dual`: both weights IQR, up to 16 rows, at the GEMV's and the 16-token
-tile's heights. K-01: Hy4-flash's `latent_in` and its shared arm's `gate_up` are the same width over
-the same codes, and a decode step's two three-wave streams that never reach the card's bandwidth
-become one stream of six.
 
 `gated_had_quant_i8g` and `rmsnorm_had_quant_i8g` are `gated_quant_fp8` and `rmsnorm_quant_fp8`
 with `had_quant_act_i8g`'s quantiser on their pass: the `group`-wide rotation of the bf16-rounded

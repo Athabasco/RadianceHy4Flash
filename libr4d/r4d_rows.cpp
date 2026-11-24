@@ -1935,27 +1935,6 @@ static const RadOperandSpec oGemmNtQGated[] = {
     { "scale",    RAD_OPD_OUT,    0 },
     { "out_bf16", RAD_OPD_OUT,    1 },
 };
-/* Two IQR weights of one activation's codes, read in one launch: K-01's `latent_in` and the
- * shared arm's gate_up. Its own op rather than a flag on `gemm_nt_q` -- an op's operand count is
- * fixed -- with gemm_nt_q's operands as the prefix and the second weight's after them, so the
- * first part reads exactly as it does alone. */
-static const RadParamSpec pGemmNtQDual[] = {
-    { "M",     RAD_P_INT, RAD_REQUIRED },
-    { "N",     RAD_P_INT, RAD_REQUIRED },
-    { "K",     RAD_P_INT, RAD_REQUIRED },
-    { "group", RAD_P_INT, RAD_REQUIRED },
-    { "dtype", RAD_P_STR, RAD_REQUIRED },
-};
-static const RadOperandSpec oGemmNtQDual[] = {
-    { "a",        RAD_OPD_IN,     0 },
-    { "a_scale",  RAD_OPD_IN,     0 },
-    { "b",        RAD_OPD_WEIGHT, 0 },
-    { "b_scale",  RAD_OPD_WEIGHT, 0 },
-    { "y",        RAD_OPD_OUT,    0 },
-    { "b2",       RAD_OPD_WEIGHT, 0 },
-    { "b2_scale", RAD_OPD_WEIGHT, 0 },
-    { "y2",       RAD_OPD_OUT,    0 },
-};
 /* The same fold over an OCP-MXFP4 gate_up weight, which gemm_nt_q reads with a per-row reference
  * exponent (`b_ref`). A schema of its own, since an op's operand count is fixed for the plugins
  * built against it. */
@@ -4167,13 +4146,6 @@ static const RadOpSchema kSchemas[] = {
            "columns) and optionally the bf16 product, and no [M, 2n] tensor is ever written. "
            "Byte-identical to the two ops it replaces, which is what makes it substitutable "
            "rather than a second numerical path."),
-    SCHEMA("gemm_nt_q_dual", pGemmNtQDual, oGemmNtQDual,
-           "two GEMMs of ONE activation's codes over two weights of one shape and one form, in one "
-           "launch: `b` -> `y` and `b2` -> `y2`, the same [M, K] `a` and its scales read twice. "
-           "The two launches' blocks are concatenated in one grid, each part doing exactly what "
-           "its own launch does, so both outputs are byte-identical to the pair of `gemm_nt_q` "
-           "calls it replaces: K-01's latent_in and shared gate_up, a layer's three-wave stream "
-           "that never reaches bandwidth made one stream of six."),
     SCHEMA("gate_quant_fp8", pGateQuantFp8, oGateQuantFp8,
            "the same, with the gate in its own operand rather than packed beside x."),
     SCHEMA("gate_had_quant_i8g", pGateQuantFp8, oGateQuantFp8,
@@ -5804,13 +5776,6 @@ static const RadConstraint cGemmNtQGatedIqr[] = {
 };
 static const RadConstraint cGemmNtIqrTiled[] = {
     C_DIV("K", 256), C_DIV("N", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK),
-    C_IN("dtype", "i8a8 i8a8h"),
-};
-/* Two IQR weights of one input in one launch (K-01). The 16-token tile's band, since a dual launch
- * is a decode step's pair: both weights one form, so one N and one K, each N a multiple of 16 --
- * one block geometry, which is what keeps each part's blocks the blocks of its own launch. */
-static const RadConstraint cGemmNtQIqrDual[] = {
-    C_LE("M", 16), C_DIV("K", 256), C_DIV("N", 16), C_EQ("group", R4D_FP8_BLOCK),
     C_IN("dtype", "i8a8 i8a8h"),
 };
 /* libr4d's `K DIV 4`, renamed to docs/OPS.md's `n` as in every quantiser row here. */
@@ -9472,22 +9437,6 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   r4d_rad_layout_iqr, r4d_rad_relayout_iqr, nullptr, r4d_rad_unrelayout_iqr,
   /* The byte-identity claim above, as a chain of two rows of this plugin (r4d_fuse.cpp). */
   r4d_fuse_gemm_nt_q_gated_iqr },
-
-{ "gemm_iqr_dual", "gemm_nt_q_dual", "gemm",
-  "two IQR weights of one activation's codes in one launch: the two GEMV grids (or two 16-token "
-  "tiles') concatenated, a block of the grid's second half reading the second weight, tiling its "
-  "rows and folding them exactly as it does alone (K-01's latent_in and shared gate_up)",
-  "M <= 16; both weights one form and one N and K; K a multiple of 256, N of 16 and of a "
-  "trellis's run",
-  "i8 A with an f32 scale per (row, 128 K) read by both, W and W2 an IQR form's codes with their "
-  "scales, bf16 C and C2. Byte-identical to the two gemm_iqr_nt_m64 launches it replaces -- each "
-  "part's blocks are the blocks of its own launch",
-  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
-  ROW(cGemmNtQIqrDual), NOTUNE,
-  nullptr, nullptr, r4d_rad_gemm_iqr_dual, nullptr,
-  r4d_rad_layout_iqr_dual, r4d_rad_relayout_iqr_dual, nullptr, r4d_rad_unrelayout_iqr_dual,
-  /* The byte-identity claim above, as a chain of two rows of this plugin (r4d_fuse.cpp). */
-  r4d_fuse_gemm_nt_q_dual_iqr },
 
 { "gemm_iqr_tiled", "gemm_nt_q", "gemm",
   "the prefill GEMM over an IQR weight: the call decodes the weight's codes into the int8 fragment "
