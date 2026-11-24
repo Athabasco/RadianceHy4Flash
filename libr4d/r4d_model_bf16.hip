@@ -636,6 +636,13 @@ __global__ __launch_bounds__(kThreads) void r4dchain_gelu_mul(R4D_GM_PARAMS) {
 // Multi-component modes (ref_rope's rope_freqs): `mode` 2 mrope, 3 imrope, 4 axial, up to three
 // sections, with component c of token m at pos[c * plane + m]. `plane` 0 is the one-component
 // form, where every mode is neox.
+// The angle one rotary pair turns by, in one place. rope_body is the kernel that owns the rotation;
+// mla_row_front turns a pair by the same angle as it writes the cache slot from the registers that
+// produce the row. Both call rope_turn and rope_comp rather than restating them, so there is one
+// expression, no fast-math, and no accumulation in a narrower type: the per-component position
+// (mrope / imrope / axial), the base ladder's exponent over `den`, yarn's frequency scaling, the
+// proportional cut at `nfreq`, and the accurate sincosf. Do not "simplify" it here -- a kernel that
+// turns by a different angle is not byte-identical to the launch it replaces.
 __device__ __forceinline__ int rope_comp(int mode, uint32_t i, const int* sec, int n_sec,
                                          uint32_t* j) {
     *j = i;
@@ -648,6 +655,31 @@ __device__ __forceinline__ int rope_comp(int mode, uint32_t i, const int* sec, i
     while (c + 1 < n_sec && (int)i >= start + sec[c]) { start += sec[c]; ++c; }
     *j = i - (uint32_t)start;
     return c;
+}
+__device__ __forceinline__ void rope_turn(const int32_t* __restrict__ pos, uint32_t m, uint32_t i,
+                                          int den, uint32_t nfreq, float theta, float rscale,
+                                          int mode, const int* sec, int n_sec, uint32_t plane,
+                                          RadYarn yarn, RadLlama3 l3, float* c, float* s) {
+    const float div = rscale != 0.0f ? rscale : 1.0f;
+    const float p0 = (float)pos[m] / div;
+    float inv = 1.0f / powf(theta, (float)(2 * i) / (float)den);
+    float p = p0;
+    if (plane) {
+        uint32_t j = i;
+        const int comp = rope_comp(mode, i, sec, n_sec, &j);
+        p = (float)pos[(size_t)comp * plane + m] / div;
+        if (mode == 4)
+            inv = 1.0f / powf(theta, (float)(2 * j) / (float)(2 * sec[comp]));
+    }
+    inv = yarn.frequency(inv, (int)i);
+    inv = l3.frequency(inv);
+    /* The proportional ladder rotates the whole head with every frequency past nfreq zero (HF's
+     * _compute_proportional_rope_parameters): pair i is (i, i + head_dim/2), and pairs past nfreq
+     * turn by 0 (cos 1, sin 0), returning the value exactly. */
+    if (i >= nfreq) inv = 0.0f;
+    const float ang = p * inv;
+    sincosf(ang, s, c);
+    if (yarn.factor != 0.0f) { *c *= yarn.magnitude; *s *= yarn.magnitude; }
 }
 
 // r4dchain_rope is the chained form (r4d_chain.h), taken at decode heights.
@@ -662,33 +694,14 @@ __device__ __forceinline__ int rope_comp(int mode, uint32_t i, const int* sec, i
 __device__ __forceinline__ void rope_body(R4D_ROPE_PARAMS) {
     const uint32_t m = blockIdx.x;
     const uint32_t half = rot / 2;
-    const float div = rscale != 0.0f ? rscale : 1.0f;
-    const float p0 = (float)pos[m] / div;
     const int sec[3] = { s0, s1, s2 };
 
     for (uint32_t t = threadIdx.x + blockIdx.y * kThreads; t < n_rope_heads * half;
          t += kThreads * gridDim.y) {
         const uint32_t h = t / half, i = t % half;
         uint16_t* __restrict__ hd = qkv + (size_t)m * row_pitch + (size_t)h * head_dim;
-        float inv = 1.0f / powf(theta, (float)(2 * i) / (float)den);
-        float p = p0;
-        if (plane) {
-            uint32_t j = i;
-            const int c = rope_comp(mode, i, sec, n_sec, &j);
-            p = (float)pos[(size_t)c * plane + m] / div;
-            if (mode == 4)
-                inv = 1.0f / powf(theta, (float)(2 * j) / (float)(2 * sec[c]));
-        }
-        inv = yarn.frequency(inv, (int)i);
-        inv = l3.frequency(inv);
-        /* The proportional ladder rotates the whole head with every frequency past nfreq zero
-         * (HF's _compute_proportional_rope_parameters): pair i is (i, i + head_dim/2), and pairs
-         * past nfreq turn by 0 (cos 1, sin 0), returning the value exactly. */
-        if (i >= nfreq) inv = 0.0f;
-        const float ang = p * inv;
         float c, s;
-        sincosf(ang, &s, &c);
-        if (yarn.factor != 0.0f) { c *= yarn.magnitude; s *= yarn.magnitude; }
+        rope_turn(pos, m, i, den, nfreq, theta, rscale, mode, sec, n_sec, plane, yarn, l3, &c, &s);
         const uint32_t i0 = gptj ? 2 * i : i;
         const uint32_t i1 = gptj ? 2 * i + 1 : i + half;
         const float x0 = bf16_to_f32(hd[i0]), x1 = bf16_to_f32(hd[i1]);
@@ -796,10 +809,16 @@ __global__ __launch_bounds__(kThreads) void r4dchain_kv_store(R4D_KVS_PARAMS) {
 // Hy4-flash's latent cache row, [latent | rotary key] of L + R columns a token: the norm of the first
 // L, the rotary of the last R (one head, gptj pairs, plain or imrope positions) and the store of the
 // row as one KV head of (L + R) / 2 (its first half the key slot, the rest the value slot), in one
-// workgroup a token. The three bodies are the standalone kernels' own (rmsnorm_body at n = L in place,
-// rope_body at one head of R, kv_store_body), called in order with a barrier between: every
-// column goes through the same expressions in the same order, so the row and the cache slot are the
-// chain's bytes. The norm's sum is the 256-lane partition whatever the width (r4d_common.h), which
+// workgroup a token.
+//
+// The slot is a copy of the row's first L + R columns (kv_store_body with k = row, v = row + half),
+// so no phase has to read the row back from global: the norm writes each column into the row and
+// into its slot column, the rotary writes its pair into both, and each write comes from the
+// registers that produced the value -- two columns a thread, so the row and the slot take one dword
+// a store where that is aligned. The expressions are the three bodies' own (rmsnorm_body's
+// per-column form over the same 256-lane sum, rope_turn's angle above, kv_store_body's slot rule),
+// so the row and the cache slot are the chain's bytes, from one pass over the row instead of three
+// dependent ones. The norm's sum is the 256-lane partition whatever the width (r4d_common.h), which
 // is why this block's 256 threads fold what the standalone launch's 1024 or 512 do.
 struct MlaRowFront {
     uint16_t* row;            // [M][pitch], L + R columns used
@@ -816,15 +835,82 @@ static_assert(sizeof(MlaRowFront) == 104, "MlaRowFront has padding");
 template <bool WF32, class CH>
 __global__ __launch_bounds__(kThreads) void mla_row_front_kernel(MlaRowFront p) {
     if (CH::on) r4d_chain_wait();
-    rmsnorm_body<WF32, kThreads>(p.row, p.gain, p.row, p.L, p.eps, 0.0f, 1.0f, p.pitch, p.pitch,
-                                 gridDim.x);
-    __syncthreads();
-    rope_body(p.row + p.L, p.pos, p.R, 1u, p.R, p.R / 2, (int)p.R, p.gptj, p.theta, p.rscale,
-              p.pitch, p.mode, p.s0, p.s1, p.s2, p.n_sec, p.plane, RadYarn{}, RadLlama3{});
-    __syncthreads();
-    const uint32_t half = (p.L + p.R) / 2;
-    kv_store_body(p.row, p.row + half, p.slot, p.kv, half, 1u, p.block_size, p.n_blocks, p.pitch,
-                  p.pitch);
+    __shared__ float lds[kThreads / kWave];
+    const uint32_t m = blockIdx.x;
+    const uint32_t half = (p.L + p.R) / 2;   /* the slot's head_dim, and the row's column count */
+    const int sec[3] = { p.s0, p.s1, p.s2 };
+    uint16_t* __restrict__ yr = p.row + (size_t)m * p.pitch;
+    /* kv_store_body's rule: a negative slot is padding and stores nothing. */
+    const int32_t sl = p.slot[m];
+    uint16_t* __restrict__ c = nullptr;
+    if (sl >= 0 && (uint32_t)sl / p.block_size < p.n_blocks) {
+        const uint32_t blk = (uint32_t)sl / p.block_size, off = (uint32_t)sl % p.block_size;
+        c = p.kv + ((size_t)blk * p.block_size + (size_t)off) * 2 * half;
+    }
+    /* A pair of columns is one dword store when the base and the column are both even. */
+    const bool row_pk = ((uintptr_t)yr & 3u) == 0;
+    const bool kv_pk = c != nullptr && ((uintptr_t)c & 3u) == 0;
+
+    float ss = r4d_lanes_sumsq(yr, p.L, [](uint16_t h) { return act_f32(h); });
+    ss = block_sum<kThreads / kWave>(ss, lds);
+    const float ns = rsqrtf(ss / (float)p.L + p.eps);
+    const float wadd = 0.0f, mult = 1.0f;
+    /* rmsnorm_body's gain term: 1 without a gain, f32 or bf16 with one. */
+    auto gv = [&](uint32_t i) {
+        return !p.gain ? 1.0f
+                       : WF32 ? ((const float*)p.gain)[i]
+                              : bf16_to_f32(((const uint16_t*)p.gain)[i]);
+    };
+    for (uint32_t i = 2 * threadIdx.x; i < p.L; i += 2 * kThreads) {
+        const bool pair = i + 1 < p.L;
+        const uint16_t y0 = f32_to_bf16(act_f32(yr[i]) * ns * (gv(i) + wadd) * mult);
+        uint16_t y1 = y0;
+        if (pair) y1 = f32_to_bf16(act_f32(yr[i + 1]) * ns * (gv(i + 1) + wadd) * mult);
+        const uint32_t w = (uint32_t)y0 | ((uint32_t)y1 << 16);
+        if (pair && row_pk) *(uint32_t*)(yr + i) = w;
+        else {
+            yr[i] = y0;
+            if (pair) yr[i + 1] = y1;
+        }
+        if (c) {
+            /* Row column i is slot column i: the key slot is the row's first half, the value slot
+             * the rest (2 * half = L + R >= L, so every norm column has one). */
+            if (pair && kv_pk) *(uint32_t*)(c + i) = w;
+            else {
+                c[i] = y0;
+                if (pair) c[i + 1] = y1;
+            }
+        }
+    }
+    /* The rotary, from the same pair of registers: rope_body's angle (rope_turn) and its rounding,
+     * written to the row in place as rope_kernel writes it, and to the slot columns the pair
+     * owns. */
+    const uint32_t rhalf = p.R / 2;
+    if (threadIdx.x < rhalf) {
+        const uint32_t i = threadIdx.x;
+        uint16_t* __restrict__ hd = yr + p.L;
+        float cc, sn;
+        rope_turn(p.pos, m, i, (int)p.R, rhalf, p.theta, p.rscale, p.mode, sec, p.n_sec, p.plane,
+                  RadYarn{}, RadLlama3{}, &cc, &sn);
+        const uint32_t i0 = p.gptj ? 2 * i : i;
+        const uint32_t i1 = p.gptj ? 2 * i + 1 : i + rhalf;
+        const float x0 = bf16_to_f32(hd[i0]), x1 = bf16_to_f32(hd[i1]);
+        const uint16_t y0 = f32_to_bf16(x0 * cc - x1 * sn);
+        const uint16_t y1 = f32_to_bf16(x0 * sn + x1 * cc);
+        hd[i0] = y0;
+        hd[i1] = y1;
+        if (c) {
+            uint16_t* __restrict__ d = c + p.L + i0;
+            /* gptj's pair is adjacent and the row's rotary starts on an even column when L is
+             * even, so the slot takes the two as one dword; neox's partner is half apart. */
+            const uint32_t w = (uint32_t)y0 | ((uint32_t)y1 << 16);
+            if (p.gptj && kv_pk && (p.L & 1u) == 0) *(uint32_t*)d = w;
+            else {
+                d[0] = y0;
+                d[i1 - i0] = y1;
+            }
+        }
+    }
     if (CH::on) r4d_chain_done();
 }
 
