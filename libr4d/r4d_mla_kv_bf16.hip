@@ -416,9 +416,10 @@ int kvp_emit(RadStream s, unsigned heads, const uint16_t* x, const uint16_t* w, 
     static_assert(OUT % PER == 0, "the workgroups' column tiles divide the output");
     const unsigned groups = (unsigned)((m.rows + 16 * MB - 1) / (16 * MB));
     /* The heads axis is deliberately not stepped past the full-card cliff here: the K-17 A/B
-     * (notes/backlog/closed/K-17.md) measured this grid at 32 heads and 2048 wavefronts, exactly
-     * on the cliff, at 0.995-1.008x the padded launch: the window of r4d_common.h:349-375 is a
-     * 256-thread-workgroup effect and 128-thread workgroups do not pay it. */
+     * (notes/backlog/measurements/K-17.md) measured these 128-thread grids at 32 heads and a
+     * full-card wave count at 0.998-1.001x the padded launch (seven interleaved kbench sessions
+     * per arm, 24 shapes): a step here buys nothing measured. The window's exposure is the
+     * kernel's, not the wave count's alone -- the 1024-thread quantiser launch below pays it. */
     return R4D_EMIT(s, (kv_project_wmma<ABSORB, MB, NC, VEC, GATE, CH>),
                     dim3(OUT / PER, heads, groups), dim3(kvp_threads(ABSORB)), 0, x, w, g, y, m);
 }
@@ -589,8 +590,9 @@ extern "C" int r4d_rad_mla_expand_gate_had_quant_i8g(const RadArgs* a, RadStream
                          (int)h };
     const unsigned zt = (unsigned)((M + 15) / 16);
     /* The heads axis stepped past the full-card cliff (r4d_cliff_rows): at 32 heads one token
-     * tile is 2048 wavefronts (four at M = 64), a multiple that costs 4-18 % here (the K-17
-     * A/B, notes/backlog/closed/K-17.md), and the extra head's workgroup returns at once. */
+     * tile is 2048 wavefronts (two tiles at M = 32), a count the K-17 A/B measured here at
+     * 1.09-1.26x at 32 heads and 1.01-1.06x at 64 (0.975x at M = 16, the one exception), and
+     * the extra head's workgroup returns at once. See notes/backlog/measurements/K-17.md. */
     const dim3 grid(kVd / kQG, r4d_cliff_rows((unsigned)h, (unsigned)(kVd / kQG) * zt,
                                               (unsigned)(kQThreads / 32)), zt);
     if (r4d_geti_or(a, "chain", 0) != 0 && M <= 64)
