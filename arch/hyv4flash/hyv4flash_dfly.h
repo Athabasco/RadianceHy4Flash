@@ -17,8 +17,12 @@
  *     enorm(embed(prev))], prev the bonus then each proposal; proposal k = argmax(lm_head(zc))
  *     (the trunk's head, row_topk over the bf16-rounded logits, ties to the lower id)
  *
+ * Under load the core may stage the short block instead (D-06: kShortBlock = 4 rows, so 3
+ * proposals and 3 chain rounds; --draft-short-from). The draft is causal, so that pass is the
+ * full pass's first rows.
+ *
  * What the trunk step leaves for it (only while the drafter is served): final_hidden (PERSIST,
- * every row), and for each distinct Lidx a snapshot of the indexer's selection by trunk row
+ * every possible anchor row), and for each distinct Lidx a snapshot of the indexer's selection by trunk row
  * (`dfly.sel_snap.<l>`, `dfly.nsel_snap.<l>`, nsel 0 for a row that attended densely), taken right
  * after qsa_select and before a streamed group's kv_resolve rewrites it into ring slots.
  *
@@ -63,6 +67,12 @@ namespace hyv4flash {
 struct Dfly {
     /* ---------------------------------------------------------------- configuration */
     int64_t layers = 0, depth = 0, block = 0, ff = 0, window = 0, topk = 0;
+    /* D-06: the short block the core stages under load (rad_drafter_short_block, --draft-short-from):
+     * kShortBlock rows, the anchor and kShortBlock - 1 masks, declared when the drafter's own block
+     * is longer (depth 4 and 5). The draft is causal (dfly_sel gives a row the keys up to its own
+     * position), so the short pass is the full pass's first rows; 0 when there is none. */
+    static constexpr int64_t kShortBlock = 4;
+    int64_t block_lo = 0;
     int32_t mask = -1;
     std::vector<int> kv, idx;       /* per draft layer: Lkv[i], Lidx[i] */
     std::vector<int> idx_set;       /* the distinct Lidx */
@@ -100,9 +110,11 @@ struct Dfly {
         layers = s.dfly_layers;
         want = layers > 0 && ctx->max_spec > 0;
         served = false;
+        block_lo = 0;
         if (!want) return;
         depth = ctx->max_spec;
         block = depth + 1;
+        block_lo = block > kShortBlock ? kShortBlock : 0;
         mask = (int32_t)rad_meta_geti(m, "dfly_mask_token_id", -1);
         window = rad_meta_geti(m, "dfly_context_local_window", 0);
         topk = rad_meta_geti(m, "dfly_target_index_topk", -1);
@@ -128,7 +140,12 @@ struct Dfly {
         char buf[256];
         why.clear();
         auto no = [&](const char* fmt, auto... a) {
-            if (why.empty()) {
+            if (!why.empty()) return;
+            /* A message with no arguments is taken as written: giving it to std::snprintf would
+             * read any % in it as a conversion with nothing behind it. */
+            if constexpr (sizeof...(a) == 0) {
+                why = fmt;
+            } else {
                 std::snprintf(buf, sizeof buf, fmt, a...);
                 why = buf;
             }
@@ -154,6 +171,11 @@ struct Dfly {
         if (s.world > 1 && s.sparse.heads % s.world)
             no("the draft's %lld attention heads do not split evenly over %d ranks",
                (long long)s.sparse.heads, s.world);
+        /* The correction's gate and up hold this rank's rows and its down this rank's columns, so
+         * the chain's width splits over the same ranks. */
+        if (s.world > 1 && s.n_embd % s.world)
+            no("the draft's %lld-wide correction does not split evenly over %d ranks",
+               (long long)s.n_embd, s.world);
         if (s.world > 1 && b && (!rad_op_declared(b, "all_gather") ||
                                  !rad_op_declared(b, "row_topk_merge")))
             no("tensor parallelism (%d ranks) needs all_gather and row_topk_merge for the draft "
@@ -189,6 +211,7 @@ struct Dfly {
     /* ---------------------------------------------------------------- the trunk's snapshots */
     struct Snap {
         int layer = -1;
+        int64_t width = 0;
         rad_buf sel = 0, nsel = 0, ids = 0;   /* ids: taps only, the selection as group ids */
         rad_op op_sel = 0, op_nsel = 0, op_zero = 0, op_ids = 0;
     };
@@ -205,6 +228,7 @@ struct Dfly {
         const int64_t T = g.max_tok, G = s.ix_group_topk;
         Snap sn;
         sn.layer = l;
+        sn.width = G;
         sn.sel = decl_b(b, nm.f("dfly.sel_snap.%d", l), RAD_I32, { T, G }, RAD_BUF_PERSIST);
         sn.nsel = decl_b(b, nm.f("dfly.nsel_snap.%d", l), RAD_I32, { T }, RAD_BUF_PERSIST);
         if (!sn.sel || !sn.nsel) return RAD_E_INVAL;
@@ -225,15 +249,23 @@ struct Dfly {
     }
     /* Issued after layer l's Indexer::step, before its attention (whose kv_resolve may rewrite
      * `ix.selected` in place). */
-    void snap_step(RadCtx* c, int l, const IndexWire& iw, int64_t T, bool select) const {
+    void snap_step(RadCtx* c, int l, const IndexWire& iw, bool select, QueryRows rows) const {
         const Snap* sn = snap_of(l);
-        if (!sn || T <= 0) return;
+        if (!sn || !rows.n) return;
         if (select) {
-            RAD_ISSUE_N(c, sn->op_sel, T, brows(iw.sel, T), brows(sn->sel, T));
-            RAD_ISSUE_N(c, sn->op_nsel, T, brows(iw.nsel, T), brows(sn->nsel, T));
-            if (sn->op_ids) RAD_ISSUE_N(c, sn->op_ids, T, brows(iw.sel_ids, T), brows(sn->ids, T));
+            rows.spans([&](int64_t orig, int64_t compact, int64_t n) {
+                RAD_ISSUE_N(c, sn->op_sel, n, brow_slice(iw.sel, compact, n, sn->width),
+                            brow_slice(sn->sel, orig, n, sn->width));
+                RAD_ISSUE_N(c, sn->op_nsel, n, brow_slice(iw.nsel, compact, n, 1),
+                            brow_slice(sn->nsel, orig, n, 1));
+                if (sn->op_ids)
+                    RAD_ISSUE_N(c, sn->op_ids, n, brow_slice(iw.sel_ids, compact, n, sn->width),
+                                brow_slice(sn->ids, orig, n, sn->width));
+            });
         } else if (!break_nsel_keep) {
-            RAD_ISSUE_N(c, sn->op_zero, T, brows(sn->nsel, T));
+            rows.spans([&](int64_t orig, int64_t, int64_t n) {
+                RAD_ISSUE_N(c, sn->op_zero, n, brow_slice(sn->nsel, orig, n, 1));
+            });
         }
     }
 
@@ -277,6 +309,7 @@ struct Dfly {
         rad_op op_rowk = 0, op_zk = 0, op_pe = 0, op_hn = 0, op_en = 0,
                op_silu = 0, op_add = 0, op_head = 0, op_lcast = 0, op_topk = 0,
                op_tok = 0, op_prev = 0, op_gcp = 0, op_ucp = 0;
+        rad_op op_rowk_lo = 0;   /* rowk at the short block's stride (rounds < block_lo - 1) */
         /* --draft-coupling: the sampled proposal (and, sabotaged, the shortlist's ids replaced
          * first) */
         rad_op op_couple = 0, op_csab = 0;
@@ -285,7 +318,7 @@ struct Dfly {
     };
     Shape s{};
     Geom g{};
-    int64_t Md = 0, W = 0, R = 8, E = 0, H = 0, L = 0, RO = 0, N = 0, VD = 0, Q = 0, F = 0;
+    int64_t Md = 0, W = 0, R = 8, E = 0, Ew = 0, H = 0, L = 0, RO = 0, N = 0, VD = 0, Q = 0, F = 0;
     rad_kvgroup kvg = 0;
     rad_weight token = 0, head = 0, fusion = 0, f_enorm = 0, f_hnorm = 0, f_gate = 0, c_hnorm = 0,
                c_enorm = 0, c_gate = 0, c_up = 0, c_down = 0, out_norm = 0;
@@ -299,7 +332,7 @@ struct Dfly {
     /* --draft-coupling: the planes the engine binds by name (one draw a drafting row, one state a
      * (chain step, row)) */
     rad_buf couple_draws = 0, couple_state = 0;
-    rad_op op_ar_o = 0, op_ar_y = 0;   /* TP: the layers' two reductions; 0 at one rank */
+    rad_op op_ar_o = 0, op_ar_y = 0, op_ar_c = 0;   /* TP: the layers' two reductions and the chain's; 0 at one rank */
     rad_buf ident = 0;   /* taps: [max_seqs, P] the identity table */
     int64_t ident_w = 0;
     struct ChainCodes { int64_t k = 0, g8 = 0; rad_buf q8 = 0, s8 = 0; };
@@ -307,6 +340,7 @@ struct Dfly {
     Proj p_fuse, c_g, c_u, c_d;   /* the fusion and the correction's three linears */
     rad_op op_embed = 0, op_xcopy = 0, op_row0 = 0, op_ea = 0, op_th = 0, op_fen = 0, op_fhn = 0,
            op_fgate = 0, op_fadd = 0, op_scatter = 0, op_final = 0, op_sabotage = 0;
+    rad_op op_row0_lo = 0;   /* row0 at the short block's stride */
     rad_op op_ident = 0;
     std::vector<Layer> lay;
     std::vector<Step> steps;
@@ -342,6 +376,7 @@ struct Dfly {
         s = shape;
         g = geom;
         E = s.n_embd;
+        Ew = E / s.world;
         const AttnGeom& a = s.sparse_r;   /* this rank's heads */
         H = a.heads;
         F = ff / s.world;                 /* this rank's MLP width (drafter() checked it divides) */
@@ -447,11 +482,12 @@ struct Dfly {
         ccat = bf("chain_in", { S, 2 * E });
         /* gate and up each into a buffer of its own, then copied into the halves silu_mul reads: a GEMM
          * output as a column half of one [S, 2E] buffer is strided once two sequences draft, and
-         * libr4d's GEMMs refuse a strided output (the copies are exact, so the bytes are unchanged). */
-        cg = bf("chain_gate", { S, E });
-        cup = bf("chain_up", { S, E });
-        cgu = bf("chain_gate_up", { S, 2 * E });
-        cff = bf("chain_act", { S, E });
+         * libr4d's GEMMs refuse a strided output (the copies are exact, so the bytes are unchanged).
+         * At TP each holds this rank's width: the gate's and the up's rows and the down's input. */
+        cg = bf("chain_gate", { S, Ew });
+        cup = bf("chain_up", { S, Ew });
+        cgu = bf("chain_gate_up", { S, 2 * Ew });
+        cff = bf("chain_act", { S, Ew });
         cd = bf("chain_delta", { S, E });
         zc = bf("corrected", { S, E });
         logits = decl_b(b, nm.f("dfly.logits"), RAD_F32, { S, Vr });
@@ -556,9 +592,9 @@ struct Dfly {
             const rad_op h = rad_decl_op(b, "gather_rows", ps, 3, nullptr, 0);
             return ix ? rw(b, h, { src, ix }, { out }) : rw(b, h, { src }, { out });
         };
-        auto iota = [&](int64_t start, rad_buf out) {
+        auto iota = [&](int64_t start, rad_buf out, int64_t stride) {
             return mk(b, "iota",
-                      { RAD_RANGE("M", 1, S), RAD_INT("start", start), RAD_INT("step", block) },
+                      { RAD_RANGE("M", 1, S), RAD_INT("start", start), RAD_INT("step", stride) },
                       {}, {}, { out });
         };
 
@@ -572,7 +608,8 @@ struct Dfly {
         HY4_NEED(op_xcopy, "cast");
         RAD_ARCH_TRY(t_embed.declare(b, nm, Md, "dfly.embed", -1, RAD_BF16, E, emb));
         /* B: the fusion into each anchor row. */
-        op_row0 = iota(0, row0);
+        op_row0 = iota(0, row0, block);
+        if (block_lo) op_row0_lo = iota(0, row0, block_lo);
         op_ea = gather(S, emb, row0, ea);
         op_th = gather(S, final_hidden, 0, th);
         op_fen = decl_rmsnorm(b, S, E, s.eps, f_enorm, ea, cat);
@@ -586,6 +623,7 @@ struct Dfly {
                         { RAD_RANGE("M", 1, S), RAD_INT("n", E), RAD_STR("dtype", "bf16") }, {},
                         { ea, row0, x }, { x });
         HY4_NEED(op_row0, "iota");
+        HY4_NEED(!block_lo || op_row0_lo, "iota");
         HY4_NEED(op_ea && op_th, "gather_rows");
         HY4_NEED(op_fen && op_fhn, "rmsnorm");
         HY4_NEED(p_fuse.ok() && op_fgate && op_fadd, "gemm_nt / mul_weight / add");
@@ -599,6 +637,8 @@ struct Dfly {
             op_ar_o = decl_all_reduce(b, g, E, o, &rc);
             RAD_ARCH_TRY(rc);
             op_ar_y = decl_all_reduce(b, g, E, y, &rc);
+            RAD_ARCH_TRY(rc);
+            op_ar_c = decl_all_reduce(b, g, E, cd, &rc);
             RAD_ARCH_TRY(rc);
         }
         /* C, D: the layers, each with its table. */
@@ -727,16 +767,19 @@ struct Dfly {
 
         /* F: the chain, one step a proposal. */
         steps.assign((size_t)depth, Step{});
-        /* The correction's linears once, their ops issued by every step. */
-        RAD_ARCH_TRY(linear(c_g, "dfly.correct_gate", gtop, S, E, 2 * E, c_gate, ccat, cg, RAD_SHARD_NONE, {}, true));
-        RAD_ARCH_TRY(linear(c_u, "dfly.correct_up", gtop, S, E, 2 * E, c_up, ccat, cup, RAD_SHARD_NONE, {}, true));
-        RAD_ARCH_TRY(linear(c_d, "dfly.correct_down", gtop, S, E, E, c_down, cff, cd, RAD_SHARD_NONE, {}, true));
+        /* The correction's linears once, their ops issued by every step: gate and up by rows, down
+         * by columns, so each rank reads 1/world of each and the down's partial sum is reduced
+         * exactly once a step before the residual. */
+        RAD_ARCH_TRY(linear(c_g, "dfly.correct_gate", gtop, S, Ew, 2 * E, c_gate, ccat, cg, RAD_SHARD_ROW, {}, true));
+        RAD_ARCH_TRY(linear(c_u, "dfly.correct_up", gtop, S, Ew, 2 * E, c_up, ccat, cup, RAD_SHARD_ROW, {}, true));
+        RAD_ARCH_TRY(linear(c_d, "dfly.correct_down", gtop, S, E, Ew, c_down, cff, cd, RAD_SHARD_COL, {}, true));
         for (int64_t k = 0; k < depth; ++k) {
             Step& st = steps[(size_t)k];
             const int ki = (int)k;
             st.rowk = i32(nm.f("rowk.%lld", (long long)k), { S });
             if (!st.rowk) return RAD_E_INVAL;
-            st.op_rowk = iota(k + 1, st.rowk);
+            st.op_rowk = iota(k + 1, st.rowk, block);
+            if (block_lo && k < block_lo - 1) st.op_rowk_lo = iota(k + 1, st.rowk, block_lo);
             st.op_zk = gather(S, z, st.rowk, zk);
             if (k == 0)
                 st.op_pe = gather(S, emb, row0, pe);
@@ -747,9 +790,9 @@ struct Dfly {
                               { token }, { prev }, { pe });
             st.op_hn = decl_rmsnorm(b, S, E, s.eps, c_hnorm, zk, ccat);
             st.op_en = decl_rmsnorm(b, S, E, s.eps, c_enorm, pe, ccat);
-            st.op_gcp = decl_copy(b, S, E, RAD_BF16, cg, cgu);
-            st.op_ucp = decl_copy(b, S, E, RAD_BF16, cup, cgu);
-            st.op_silu = mk(b, "silu_mul", { RAD_RANGE("M", 1, S), RAD_INT("n", E), RAD_STR("dtype", "bf16") },
+            st.op_gcp = decl_copy(b, S, Ew, RAD_BF16, cg, cgu);
+            st.op_ucp = decl_copy(b, S, Ew, RAD_BF16, cup, cgu);
+            st.op_silu = mk(b, "silu_mul", { RAD_RANGE("M", 1, S), RAD_INT("n", Ew), RAD_STR("dtype", "bf16") },
                             {}, { cgu }, { cff });
             st.op_add = add(S, zk, cd, zc);
             RAD_ARCH_TRY(st.t_corr.declare(b, nm, S, "dfly.corrected", ki, RAD_BF16, E, zc));
@@ -819,6 +862,7 @@ struct Dfly {
             st.op_tok = decl_copy(b, S, 1, RAD_I32, cidx, tokens);
             st.op_prev = decl_copy(b, S, 1, RAD_I32, cidx, prev);
             HY4_NEED(st.op_rowk, "iota");
+            HY4_NEED(!(block_lo && k < block_lo - 1) || st.op_rowk_lo, "iota");
             HY4_NEED(st.op_zk && st.op_pe, "gather_rows / embed_lookup");
             HY4_NEED(st.op_hn && st.op_en, "rmsnorm");
             HY4_NEED(c_g.ok() && c_u.ok() && c_d.ok() && st.op_add && st.op_silu,
@@ -863,6 +907,8 @@ struct Dfly {
         dd.window = 1;
         dd.block = block;
         RAD_ARCH_TRY(rad_declare_drafter(b, &dd));
+        /* D-06: the short block, which the core stages per step under load (--draft-short-from). */
+        if (block_lo) RAD_ARCH_TRY(rad_drafter_short_block(b, block_lo));
         return RAD_OK;
     }
 
@@ -883,9 +929,13 @@ struct Dfly {
     /* The query pass (draft_pass 1). */
     void query(RadCtx* c, const RadBatch* batch) const {
         const int64_t n = batch->n_seq, M = batch->n_tok;
-        if (!served || n <= 0 || M != n * block || M > Md || !batch->anchor_rows) {
-            rad_step_fail(c, "hyv4flash: the DFly2 query pass needs block rows a sequence and the "
-                             "anchor rows (RadBatch::anchor_rows)");
+        /* The drafter's block or, under load, its short one (D-06): as many rounds as proposals. */
+        const int64_t blk = block_lo > 0 && n > 0 && M == n * block_lo ? block_lo : block;
+        const int64_t rounds = depth - (block - blk);
+        if (!served || n <= 0 || M != n * blk || M > Md || !batch->anchor_rows) {
+            rad_step_fail(c, "hyv4flash: the DFly2 query pass needs the drafter's block (or its "
+                             "short block) of rows a sequence and the anchor rows "
+                             "(RadBatch::anchor_rows)");
             return;
         }
         const auto* kb = kv_batch(batch, kvg);
@@ -908,7 +958,7 @@ struct Dfly {
         t_embed.step(c, brows(emb, M), M);
         RAD_ISSUE_N(c, op_xcopy, M, brows(emb, M), brows(x, M));
         /* B */
-        RAD_ISSUE_N(c, op_row0, n, brows(row0, n));
+        RAD_ISSUE_N(c, blk == block ? op_row0 : op_row0_lo, n, brows(row0, n));
         RAD_ISSUE_N(c, op_ea, n, brows(emb, M), brows(row0, n), brows(ea, n));
         RAD_ISSUE_N(c, op_th, n, RAD_B(final_hidden), src, brows(th, n));
         RAD_ISSUE_N(c, op_fen, n, brows(ea, n), RAD_W(f_enorm), bcol(cat, 0, E, n));
@@ -1012,9 +1062,9 @@ struct Dfly {
         RAD_ISSUE_N(c, op_final, M, brows(x, M), RAD_W(out_norm), brows(z, M));
         t_final.step(c, brows(z, M), M);
         /* F */
-        for (int64_t k = 0; k < depth; ++k) {
+        for (int64_t k = 0; k < rounds; ++k) {
             const Step& st = steps[(size_t)k];
-            RAD_ISSUE_N(c, st.op_rowk, n, brows(st.rowk, n));
+            RAD_ISSUE_N(c, blk == block ? st.op_rowk : st.op_rowk_lo, n, brows(st.rowk, n));
             RAD_ISSUE_N(c, st.op_zk, n, brows(z, M), brows(st.rowk, n), brows(zk, n));
             if (k == 0)
                 RAD_ISSUE_N(c, st.op_pe, n, brows(emb, M), brows(row0, n), brows(pe, n));
@@ -1024,10 +1074,11 @@ struct Dfly {
             RAD_ISSUE_N(c, st.op_en, n, brows(pe, n), RAD_W(c_enorm), bcol(ccat, E, E, n));
             run(c, c_g, ccat, cg, n);
             run(c, c_u, ccat, cup, n);
-            RAD_ISSUE_N(c, st.op_gcp, n, brows(cg, n), bcol(cgu, 0, E, n));
-            RAD_ISSUE_N(c, st.op_ucp, n, brows(cup, n), bcol(cgu, E, E, n));
+            RAD_ISSUE_N(c, st.op_gcp, n, brows(cg, n), bcol(cgu, 0, Ew, n));
+            RAD_ISSUE_N(c, st.op_ucp, n, brows(cup, n), bcol(cgu, Ew, Ew, n));
             RAD_ISSUE_N(c, st.op_silu, n, brows(cgu, n), brows(cff, n));
             run(c, c_d, cff, cd, n);
+            issue_all_reduce(c, op_ar_c, cd, n, E);
             RAD_ISSUE_N(c, st.op_add, n, brows(zk, n), brows(cd, n), brows(zc, n));
             st.t_corr.step(c, brows(zc, n), n);
             RAD_ISSUE_N(c, st.op_head, n, brows(zc, n), RAD_W(head), brows(logits, n));
