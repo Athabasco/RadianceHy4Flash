@@ -1425,6 +1425,49 @@ TEST(each_rank_declares_its_share_and_reduces_twice_a_layer) {
         }
 }
 
+/* P-02: the routing counts are the model's routing table (rad_route_table): an i32 PERSIST row a
+ * layer at the model's expert count on every rank, each MoE layer's router writing and reporting
+ * its own row. The core then copies nothing a report, and no wide prefill chunk can alias a
+ * transient histogram (qwen4exp_fp8's note). */
+TEST(the_routing_counts_are_the_models_routing_table) {
+    for (int world : { 1, 2 })
+        for (int rank = 0; rank < world; ++rank) {
+            Declared d(bf16_encs, world, rank, true);
+            REQUIRE_EQ(d.rc, RAD_OK);
+            RadBuilder& b = d.b;
+            const rad_buf tab = buf_named(b, "moe.expert_counts");
+            REQUIRE(tab != 0);
+            CHECK_EQ(b.route_table, tab);
+            const RecBuf& t = b.bufs[(size_t)tab - 1];
+            CHECK_EQ(t.d.kind, RAD_BUF_PERSIST);
+            CHECK_EQ(t.d.dtype, (uint32_t)RAD_I32);
+            CHECK_EQ(t.d.rank, 2u);
+            CHECK_EQ(t.d.shape[0], 3);   /* mini4: a row for each of the three layers */
+            CHECK_EQ(t.d.shape[1], 8);   /* the model's experts, whatever share this rank holds */
+            int writers = 0;   /* the routers write the table's rows through the declared buffer */
+            for (const auto& o : b.ops)
+                if (in(o.writes, tab)) ++writers;
+            CHECK(writers > 0);
+            const std::vector<int> dq[2] = { { 1, 1, 1 }, {} }, pq[2] = { {}, { 12 } };
+            for (int i = 0; i < 2; ++i) {   /* a decode step and a fresh prefill */
+                auto k = kit(b, dq[i], pq[i], 0);
+                k->b.positions_h = k->pos.data();
+                RadCtx c{ .b = &b, .batch = &k->b, .rank = rank, .world = world };
+                hyv4flash::step(&c, &k->b);
+                CHECK_LINT(b, &c);
+                CHECK(c.step_fail.empty());
+                CHECK(c.routed_layers == std::vector<int>({ 1, 2 }));   /* layer 0 is dense */
+                for (const auto& cp : c.copies) CHECK(cp.second != tab);   /* nothing is copied into it */
+                REQUIRE_EQ(c.routed_counts.size(), c.routed_layers.size());
+                for (size_t j = 0; j < c.routed_counts.size(); ++j) {
+                    CHECK_EQ(c.routed_counts[j].first, tab);
+                    CHECK_EQ(c.routed_counts[j].second,
+                             (int64_t)c.routed_layers[j] * 8 * (int64_t)sizeof(int32_t));
+                }
+            }
+        }
+}
+
 /* The taps the harness compares are the replicated values at every world; a rank's partial sums
  * (the gate logits of its heads, the arms' outputs) are tapped at one rank only, o_proj after its
  * reduction. */
