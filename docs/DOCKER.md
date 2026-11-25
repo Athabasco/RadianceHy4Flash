@@ -123,7 +123,7 @@ The options:
   holding the shared Engram copy is mounted on the host, sized for the table and with
   `huge=always`, and passed in. The container cannot set it up for itself: Docker's `/dev/shm` is
   64 MiB, `--shm-size` raises that size but takes no page size, `--tmpfs` refuses `huge=` outright,
-  and `shmem_enabled` is a host sysfs. A directory on a ordinary filesystem is not refused, it only
+  and `shmem_enabled` is a host sysfs. A directory on an ordinary filesystem is not refused, it only
   warns (the table is then written to disk and read back through the page cache), so the mount is
   what makes the reuse a memory operation instead of a 60 GiB read.
 
