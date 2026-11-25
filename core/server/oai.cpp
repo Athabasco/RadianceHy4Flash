@@ -44,13 +44,6 @@ std::string random_id(const char* prefix) {
     return s;
 }
 
-/* The clock the request prep phase times are taken on: the same steady_clock as HttpRequest's
- * t_received_ns and the sinks' stamps, so a prep delta shares their time base. */
-static int64_t prep_now_ns() {
-    using namespace std::chrono;
-    return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
-}
-
 static const char kB64[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -2002,6 +1995,22 @@ static int parse_logprobs(const json& b, const OaiLimits& lim, Endpoint ep, OaiR
     out->n_logprobs = (int)top;
     out->sp.n_probs = want ? (int)top : -1;
     return RAD_OK;
+}
+
+std::string format_prep_phases(const OaiRequest& r) {
+    std::string out;
+    auto add = [&](const char* name, int64_t ns) {
+        char buf[48];
+        if (ns >= 0) std::snprintf(buf, sizeof buf, " %s=%.2fms", name, (double)ns * 1e-6);
+        else std::snprintf(buf, sizeof buf, " %s=-", name);
+        out += buf;
+    };
+    add("parse", r.prep_parse_ns);
+    add("render", r.prep_render_ns);
+    add("encode", r.prep_encode_ns);
+    add("grammar", r.prep_grammar_ns);
+    add("submit", r.prep_submit_ns);
+    return out;
 }
 
 int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,

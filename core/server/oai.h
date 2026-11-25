@@ -14,6 +14,7 @@
 #include "rad_core.h"
 #include "sink.h"
 
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -177,6 +178,19 @@ struct OaiRequest {
 
     int  n_choices() const { return (int)prompts.size() * n; }
 };
+
+/* The clock the request prep phase times are taken on: the same steady_clock as HttpRequest's
+ * t_received_ns and the sinks' stamps, so a prep delta shares their time base. One definition,
+ * for the parsers (oai.cpp) and serve() (server.cpp). */
+inline int64_t prep_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+/* The prep phases of `r` as the tail of the `req ... done` log line: " parse=1.23ms render=-
+ * encode=.. grammar=.. submit=..", ms with two decimals, '-' for a phase the path did not run
+ * (-1). Starts with a space. */
+std::string format_prep_phases(const OaiRequest& r);
 
 /* What the server needs to know about itself to validate a request. */
 struct OaiLimits {
