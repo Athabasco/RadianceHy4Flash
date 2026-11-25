@@ -1444,6 +1444,10 @@ TEST(the_routing_counts_are_the_models_routing_table) {
             CHECK_EQ(t.d.rank, 2u);
             CHECK_EQ(t.d.shape[0], 3);   /* mini4: a row for each of the three layers */
             CHECK_EQ(t.d.shape[1], 8);   /* the model's experts, whatever share this rank holds */
+            int writers = 0;   /* the routers write the table's rows through the declared buffer */
+            for (const auto& o : b.ops)
+                if (in(o.writes, tab)) ++writers;
+            CHECK(writers > 0);
             const std::vector<int> dq[2] = { { 1, 1, 1 }, {} }, pq[2] = { {}, { 12 } };
             for (int i = 0; i < 2; ++i) {   /* a decode step and a fresh prefill */
                 auto k = kit(b, dq[i], pq[i], 0);
@@ -1453,6 +1457,7 @@ TEST(the_routing_counts_are_the_models_routing_table) {
                 CHECK_LINT(b, &c);
                 CHECK(c.step_fail.empty());
                 CHECK(c.routed_layers == std::vector<int>({ 1, 2 }));   /* layer 0 is dense */
+                for (const auto& cp : c.copies) CHECK(cp.second != tab);   /* nothing is copied into it */
                 REQUIRE_EQ(c.routed_counts.size(), c.routed_layers.size());
                 for (size_t j = 0; j < c.routed_counts.size(); ++j) {
                     CHECK_EQ(c.routed_counts[j].first, tab);
